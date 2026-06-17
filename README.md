@@ -35,8 +35,14 @@ ChatBantu is a real-world test of whether Bantu can serve a production-style web
 ```
 ChatBantu/
 ├── server.b          ← entire backend (one Bantu file)
-├── bantu             ← native Linux x86_64 Bantu binary
-├── Dockerfile        ← Ubuntu + libsqlite3 + libcurl-gnutls + bantu
+├── bantu             ← native Linux x86_64 Bantu binary (rebuilt for Ubuntu 22.04)
+├── bantu-src/        ← interpreter source (rebuildable via build.sh)
+│   └── compiler/
+│       ├── build.sh         ← one-command rebuild
+│       ├── CMakeLists.txt
+│       ├── src/             ← evaluator, lexer, parser, server, …
+│       └── stubs/           ← GLIBCXX compatibility shim
+├── Dockerfile        ← Ubuntu 22.04 + libsqlite3 + libcurl-gnutls + bantu
 ├── render.yaml       ← Render blueprint (free tier + 1 GB disk)
 ├── .dockerignore
 ├── .gitignore
@@ -137,6 +143,39 @@ for real-time features:
 This is enough for a small social network at modest scale. For higher throughput,
 the Bantu interpreter would need a threaded accept loop — a small C++ change
 in `evaluator.hpp` (the `bantuHandleHttpRequest` call site).
+
+## Binary compatibility (Render / Ubuntu 22.04)
+
+Render's free tier runs **Ubuntu 22.04 (jammy)** with **glibc 2.35** and
+**libstdc++ from GCC 11** (max `GLIBCXX_3.4.30`). The Bantu interpreter is
+developed on Debian 13 (glibc 2.41, GCC 14), so a naïve build will fail
+on Render with:
+
+```
+bantu: /lib/x86_64-linux-gnu/libm.so.6: version `GLIBC_2.38' not found (required by bantu)
+bantu: /lib/x86_64-linux-gnu/libstdc++.so.6: version `GLIBCXX_3.4.32' not found (required by bantu)
+```
+
+The fix lives in `bantu-src/compiler/`:
+
+1. **`src/evaluator.hpp`** — replaced `std::strtol` / `std::stoull` / `std::atoi`
+   (which redirect to `__isoc23_strtol@GLIBC_2.38` under `_GNU_SOURCE`) with
+   manual parsers. Replaced `std::fmod` (which pulls `fmod@GLIBC_2.38`) with
+   a manual `a - floor(a/b) * b` implementation.
+2. **`src/main.cpp`** — same treatment for `std::atoi`.
+3. **`stubs/ios_base_library_initv.c`** — provides a no-op
+   `_ZSt21ios_base_library_initv` so the binary doesn't require
+   `GLIBCXX_3.4.32` (only present on GCC 14+ runtimes).
+4. **`CMakeLists.txt` / `build.sh`** — dropped `-march=native`, use
+   `-mtune=generic` for CPU portability across Render's instances.
+
+After the fix the binary requires at most `GLIBC_2.34` and `GLIBCXX_3.4.9`,
+both well within Ubuntu 22.04's runtime. Rebuild with:
+
+```bash
+cd bantu-src/compiler
+./build.sh   # → produces ./build/bantu
+```
 
 ## Why Bantu?
 
