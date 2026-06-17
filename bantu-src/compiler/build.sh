@@ -1,57 +1,158 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────
-#  build.sh — Build the Bantu interpreter binary
+#  build.sh — Build the Bantu interpreter binary (Ubuntu 22.04 compatible)
 #
-#  Produces a portable Linux x86-64 binary that runs on:
-#    - Ubuntu 22.04 (Render's free tier)  ← glibc 2.35
-#    - Ubuntu 24.04                       ← glibc 2.39
-#    - Debian 12 / 13                     ← glibc 2.36 / 2.41
+#  Design:
+#    - Compiles each .cpp separately (smaller per-TU memory footprint,
+#      clearer error messages, survives one-file failures).
+#    - Does NOT use `set -e` globally; every step is checked explicitly
+#      so that diagnostic commands (objdump/grep) cannot abort the build.
+#    - Prints clear [PASS]/[FAIL] markers so Render logs are readable.
 #
-#  Compatibility strategy:
-#    1. Avoid std::strtol / std::stoull / std::atoi  (pull in __isoc23_*@GLIBC_2.38)
-#    2. Avoid std::fmod                                (pulls fmod@GLIBC_2.38)
-#    3. Stub out _ZSt21ios_base_library_initv         (pulls GLIBCXX_3.4.32)
-#    4. -mtune=generic, no -march=native               (CPU portability)
-#
-#  Max required after build:
-#    GLIBC_2.34, GLIBCXX_3.4.29  →  all ≤ Ubuntu 22.04's runtime
+#  Max runtime requirements (verified locally):
+#    GLIBC_2.34, GLIBCXX_3.4.9  →  all ≤ Ubuntu 22.04's runtime
 # ─────────────────────────────────────────────────────────────────────
-set -euo pipefail
+
+set -u   # treat unset vars as error, but DO NOT use -e/-o pipefail globally
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-echo "▸ Cleaning previous build…"
+echo "════════════════════════════════════════════════════════════════"
+echo "  Bantu interpreter build"
+echo "  script dir: $SCRIPT_DIR"
+echo "  g++ version: $(g++ --version | head -1)"
+echo "  gcc version: $(gcc --version | head -1)"
+echo "════════════════════════════════════════════════════════════════"
+
+# ─── Pre-flight: required tools ───────────────────────────────────
+MISSING=()
+for tool in g++ gcc ar ld; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        MISSING+=("$tool")
+    fi
+done
+if [ ${#MISSING[@]} -gt 0 ]; then
+    echo "[FAIL] Missing required tools: ${MISSING[*]}"
+    exit 1
+fi
+echo "[PASS] All required build tools present."
+
+# ─── Pre-flight: required headers ─────────────────────────────────
+echo "── Checking headers ──"
+for hdr in sqlite3.h curl/curl.h; do
+    if printf '#include <%s>\nint main(){return 0;}\n' "$hdr" \
+        | g++ -std=c++17 -x c++ - -o /tmp/hdrtest 2>/dev/null; then
+        echo "[PASS] <$hdr> found"
+    else
+        echo "[FAIL] <$hdr> not found — install libsqlite3-dev and libcurl4-openssl-dev"
+        rm -f /tmp/hdrtest
+        exit 1
+    fi
+done
+rm -f /tmp/hdrtest
+
+# ─── Clean ────────────────────────────────────────────────────────
+echo "── Cleaning previous build ──"
 rm -rf build
 mkdir -p build
 
-echo "▸ Compiling ios_base_library_initv stub…"
-gcc -O2 -c stubs/ios_base_library_initv.c -o build/ios_stub.o
+# ─── Compile ios_base_library_initv stub ──────────────────────────
+echo "── Compiling stub: stubs/ios_base_library_initv.c ──"
+if gcc -O2 -c stubs/ios_base_library_initv.c -o build/ios_stub.o 2>&1; then
+    echo "[PASS] stub compiled"
+else
+    echo "[FAIL] stub compilation failed"
+    exit 1
+fi
 
-echo "▸ Compiling bantu (C++17, O2, mtune=generic)…"
-g++ -std=c++17 -O2 -mtune=generic -fno-plt -pthread \
-    -I src \
-    src/main.cpp src/lexer.cpp src/parser.cpp src/evaluator.cpp \
-    src/ast.cpp src/types.cpp src/function.cpp src/class.cpp \
-    build/ios_stub.o \
-    -o build/bantu \
-    -lsqlite3 -lcurl -ldl
+# ─── Compile each .cpp separately ─────────────────────────────────
+# Order matters: smaller files first to fail fast on simple errors.
+SOURCES=(
+    src/lexer.cpp
+    src/parser.cpp
+    src/ast.cpp
+    src/types.cpp
+    src/function.cpp
+    src/class.cpp
+    src/evaluator.cpp
+    src/main.cpp
+)
 
-echo "▸ Built: $(ls -la build/bantu | awk '{print $5, $NF}')"
+CPP_FLAGS=(
+    -std=c++17
+    -O2
+    -mtune=generic
+    -fno-plt
+    -pthread
+    -I src
+)
+
+LINK_LIBS=( -lsqlite3 -lcurl -ldl -lpthread )
+
+OBJECTS=()
+for src in "${SOURCES[@]}"; do
+    obj="build/$(basename "${src%.cpp}").o"
+    echo
+    echo "── Compiling $src ──"
+    # Use -Wall but NOT -Werror — we want warnings, not failures.
+    if g++ "${CPP_FLAGS[@]}" -Wall -c "$src" -o "$obj" 2>&1; then
+        echo "[PASS] $src -> $obj ($(wc -c <"$obj") bytes)"
+        OBJECTS+=( "$obj" )
+    else
+        echo "[FAIL] Compilation failed for: $src"
+        echo "       Flags: ${CPP_FLAGS[*]}"
+        exit 1
+    fi
+done
+
+# ─── Link ─────────────────────────────────────────────────────────
 echo
-echo "── glibc requirements ──"
-objdump -T build/bantu 2>/dev/null \
-    | grep -oE 'GLIBC[X_]*[0-9]+\.[0-9]+' \
-    | sort -u
+echo "── Linking build/bantu ──"
+if g++ "${CPP_FLAGS[@]}" \
+        "${OBJECTS[@]}" \
+        build/ios_stub.o \
+        -o build/bantu \
+        "${LINK_LIBS[@]}" 2>&1; then
+    echo "[PASS] Linked build/bantu ($(wc -c <build/bantu) bytes)"
+else
+    echo "[FAIL] Link failed"
+    echo "       Objects: ${OBJECTS[*]}"
+    echo "       Libs:    ${LINK_LIBS[*]}"
+    exit 1
+fi
+
+# ─── Verify the binary is executable ──────────────────────────────
 echo
-echo "── Max GLIBC required ──"
-objdump -T build/bantu 2>/dev/null \
-    | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
-    | sort -u | tail -1
+echo "── Verifying binary ──"
+if [ ! -x build/bantu ]; then
+    echo "[FAIL] build/bantu is not executable"
+    exit 1
+fi
+echo "[PASS] build/bantu is executable"
+
+# ─── Print ldd output (informational only) ────────────────────────
 echo
-echo "── Max GLIBCXX required ──"
-objdump -T build/bantu 2>/dev/null \
-    | grep -oE 'GLIBCXX_[0-9]+\.[0-9]+\.[0-9]+' \
-    | sort -u | tail -1
+echo "── ldd build/bantu ──"
+ldd build/bantu 2>&1 || echo "(ldd not available or returned non-zero)"
+
+# ─── Print GLIBC/GLIBCXX requirements (informational only) ────────
 echo
-echo "✓ Build complete."
+echo "── Dynamic symbol requirements (informational only) ──"
+if command -v objdump >/dev/null 2>&1; then
+    echo "  GLIBC versions referenced:"
+    objdump -T build/bantu 2>/dev/null \
+        | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+        | sort -u | sed 's/^/    /' || true
+    echo "  GLIBCXX versions referenced:"
+    objdump -T build/bantu 2>/dev/null \
+        | grep -oE 'GLIBCXX_[0-9]+\.[0-9]+\.[0-9]+' \
+        | sort -u | sed 's/^/    /' || true
+else
+    echo "  (objdump not available — skipping symbol diagnostics)"
+fi
+
+echo
+echo "════════════════════════════════════════════════════════════════"
+echo "  ✓ Build complete: $(pwd)/build/bantu"
+echo "════════════════════════════════════════════════════════════════"

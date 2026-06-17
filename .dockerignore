@@ -12,6 +12,8 @@ __pycache__
 # bantu-src/ is NOT ignored — the multi-stage Dockerfile builds the
 # Bantu interpreter from source inside Ubuntu 22.04 to guarantee
 # ABI compatibility with the runtime image.
+# BUT exclude the local build/ directory so we don't ship stale artifacts.
+bantu-src/compiler/build/
 render.yaml
 chatbantu.db
 chatbantu.db-shm

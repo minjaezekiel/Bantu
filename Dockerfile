@@ -18,15 +18,22 @@ FROM ubuntu:22.04 AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Build tools + dev headers for SQLite and libcurl.
-# We use libcurl4-openssl-dev (OpenSSL flavor) for building. The resulting
-# binary will link against libcurl.so.4, which is provided at runtime by
-# the libcurl4 package. This matches Ubuntu 22.04's default libcurl setup.
+#   build-essential         → g++, gcc, make, libc-dev
+#   binutils                → ld, as, objdump (explicit; transitively pulled
+#                            by build-essential but listed here for clarity
+#                            so build.sh's diagnostics never fail)
+#   file                    → so we can inspect the binary type if linking fails
+#   libsqlite3-dev          → sqlite3.h + libsqlite3.so (dev symlink)
+#   libcurl4-openssl-dev    → curl/curl.h + libcurl.so (OpenSSL flavor,
+#                            matches the runtime libcurl4 package)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         g++ \
         gcc \
         make \
+        binutils \
+        file \
         libsqlite3-dev \
         libcurl4-openssl-dev \
         ca-certificates \
@@ -37,12 +44,28 @@ WORKDIR /build
 # Copy the Bantu interpreter source tree
 COPY bantu-src/compiler/ /build/compiler/
 
-# Build Bantu inside Ubuntu 22.04 — guaranteed ABI compatibility
+# Show what we have, so the Render log clearly shows tool versions.
+RUN echo "=== Builder environment ===" \
+    && uname -a \
+    && cat /etc/os-release | head -3 \
+    && g++ --version | head -1 \
+    && gcc --version | head -1 \
+    && ld --version | head -1 \
+    && echo "libcurl dev:" && dpkg -l | grep -E 'libcurl4-openssl-dev|libsqlite3-dev' || true
+
+# Build Bantu inside Ubuntu 22.04 — guaranteed ABI compatibility.
+# We split "build" and "verify" into separate RUN layers so that, if build.sh
+# fails, Render's log clearly shows the build.sh output without truncation
+# (a single combined RUN would only show the exit code).
 RUN cd /build/compiler \
     && chmod +x build.sh \
-    && ./build.sh \
-    && test -f build/bantu \
-    && cp build/bantu /build/bantu
+    && ./build.sh
+
+# Verify the binary exists and is a Linux executable.
+RUN test -f /build/compiler/build/bantu \
+    && file /build/compiler/build/bantu \
+    && cp /build/compiler/build/bantu /build/bantu \
+    && chmod +x /build/bantu
 
 # ─── Stage 2: Runtime ──────────────────────────────────────────────
 FROM ubuntu:22.04
