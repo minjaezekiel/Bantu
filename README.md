@@ -130,10 +130,7 @@ Alternatively, deploy manually:
 
 ## How real-time works
 
-Bantu's HTTP server is **single-threaded and synchronous** — each request
-runs to completion before the next one is accepted. That makes WebSocket
-upgrade tricky in the current build, so ChatBantu uses **HTTP long-polling**
-for real-time features:
+Bantu's HTTP server is **mult-threaded and synchronous** 
 
 - **Chat** — client polls `/api/messages/:id?since=<lastId>` every 1.5 s
 - **Presence** — client POSTs `/api/presence` every 30 s; "online" = heartbeat within last 60 s
@@ -179,7 +176,7 @@ cd bantu-src/compiler
 
 ## Why Bantu?
 
-Bantu is a programming language designed for African developers, by African developers.
+Bantu is a programming language designed for  developers who need speed, readability,fast deployment.
 This project proves that Bantu + Sua + SQLite can serve a real, multi-user, real-time
 app in production — not just demo scripts. Every line of backend code is `.b`, and the
 only process running on the server is the `bantu` binary.
