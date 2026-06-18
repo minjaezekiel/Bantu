@@ -106,8 +106,8 @@ ChatBantu ships with a one-command local dev launcher. See **`QUICKSTART.md`** f
 ### Option A — Native (Linux x86_64, fastest)
 
 ```bash
-git clone https://github.com/AsseySilivestir/ChatBantu.git
-cd ChatBantu
+git clone https://github.com/AsseySilivestir/bantusua-local.git
+cd bantusua-local
 chmod +x dev.sh
 ./dev.sh
 ```
@@ -156,8 +156,10 @@ The repo includes a `render.yaml` blueprint. In Render:
 
 1. **New → Blueprint** → connect this GitHub repo.
 2. Render will detect `render.yaml` and create the `chatbantu` web service.
-3. The Dockerfile installs `libsqlite3-0`, `libcurl-gnutls4`, and `ca-certificates`,
-   copies the Bantu binary and the app, then runs `bantu run server.b`.
+3. The Dockerfile is **multi-stage**: it first builds the Bantu binary inside
+   Ubuntu 22.04 (guaranteeing ABI compatibility), then in the runtime stage
+   installs `libsqlite3-0`, `libcurl4`, and `ca-certificates`, copies the
+   freshly-built Bantu binary and the app, then runs `bantu run server.b`.
 4. Render injects `$PORT` (read by `env("PORT")` in `server.b`).
 5. SQLite is persisted at `/data/chatbantu.db` via a 1 GB disk.
 

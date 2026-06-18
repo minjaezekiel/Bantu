@@ -9,8 +9,8 @@ Get ChatBantu running on your machine in **under 60 seconds**, three different w
 > Requires: Linux x86_64 with `libsqlite3` and `libcurl4` installed.
 
 ```bash
-git clone https://github.com/AsseySilivestir/ChatBantu.git
-cd ChatBantu
+git clone https://github.com/AsseySilivestir/bantusua-local.git
+cd bantusua-local
 chmod +x dev.sh
 ./dev.sh
 ```
@@ -32,8 +32,8 @@ That's it. The script will:
 > Requires: Docker (or Docker Desktop).
 
 ```bash
-git clone https://github.com/AsseySilivestir/ChatBantu.git
-cd ChatBantu
+git clone https://github.com/AsseySilivestir/bantusua-local.git
+cd bantusua-local
 ./dev.sh --docker
 ```
 
@@ -54,8 +54,8 @@ The SQLite DB is persisted in a Docker volume (`chatbantu-data`) so your data su
 > Requires: `g++`, `cmake`, `make`, `libsqlite3-dev`, `libcurl4-openssl-dev`.
 
 ```bash
-git clone https://github.com/AsseySilivestir/ChatBantu.git
-cd ChatBantu
+git clone https://github.com/AsseySilivestir/bantusua-local.git
+cd bantusua-local
 ./dev.sh --build        # rebuilds bantu-src/compiler/ → ./bantu
 ```
 
