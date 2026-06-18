@@ -34,16 +34,23 @@ ChatBantu is a real-world test of whether Bantu can serve a production-style web
 
 ```
 ChatBantu/
-├── server.b          ← entire backend (one Bantu file)
-├── bantu             ← native Linux x86_64 Bantu binary (rebuilt for Ubuntu 22.04)
-├── bantu-src/        ← interpreter source (rebuildable via build.sh)
+├── server.b              ← entire backend (one Bantu file)
+├── bantu                 ← native Linux x86_64 Bantu binary (rebuilt for Ubuntu 22.04)
+├── bantu-src/            ← interpreter source (rebuildable via build.sh)
 │   └── compiler/
-│       ├── build.sh         ← one-command rebuild
+│       ├── build.sh           ← one-command rebuild
 │       ├── CMakeLists.txt
-│       ├── src/             ← evaluator, lexer, parser, server, …
-│       └── stubs/           ← GLIBCXX compatibility shim
-├── Dockerfile        ← Ubuntu 22.04 + libsqlite3 + libcurl-gnutls + bantu
-├── render.yaml       ← Render blueprint (free tier + 1 GB disk)
+│       ├── src/               ← evaluator, lexer, parser, server, …
+│       └── stubs/             ← GLIBCXX compatibility shim
+├── dev.sh                ← one-command local dev launcher (Linux/Mac)
+├── Makefile              ← common dev tasks (run, build, reset-db, test, …)
+├── Dockerfile            ← production Dockerfile (multi-stage, builds Bantu)
+├── Dockerfile.dev        ← local dev Dockerfile (uses prebuilt binary)
+├── docker-compose.dev.yml← one-command local Docker dev
+├── render.yaml           ← Render blueprint (free tier + 1 GB disk)
+├── .env.example          ← environment variable template
+├── .vscode/launch.json   ← VS Code F5 to start the server
+├── QUICKSTART.md         ← 60-second quick start guide
 ├── .dockerignore
 ├── .gitignore
 └── public/
@@ -94,17 +101,49 @@ All endpoints are JSON. Pass `Authorization: Bearer <token>` for authed routes.
 
 ## Run locally
 
-You need a Linux x86_64 machine with `libsqlite3` and `libcurl-gnutls4` installed
-(the repo ships a prebuilt `bantu` binary).
+ChatBantu ships with a one-command local dev launcher. See **`QUICKSTART.md`** for the full guide — short version below.
+
+### Option A — Native (Linux x86_64, fastest)
 
 ```bash
-# Install runtime deps (Debian/Ubuntu)
-sudo apt-get install -y libsqlite3-0 libcurl-gnutls4 ca-certificates
-
-# Clone & run
 git clone https://github.com/AsseySilivestir/ChatBantu.git
 cd ChatBantu
-PORT=8080 ./bantu run server.b
+chmod +x dev.sh
+./dev.sh
+```
+
+The script auto-detects missing libraries and tells you exactly what to install:
+```bash
+sudo apt-get install -y libsqlite3-0 libcurl4 ca-certificates
+```
+
+Common flags:
+```bash
+./dev.sh --port 9000        # use a different port
+./dev.sh --reset-db         # wipe chatbantu.db and reseed
+./dev.sh --build            # rebuild the bantu binary from source first
+./dev.sh --no-browser       # don't auto-open browser
+./dev.sh --help             # show all options
+```
+
+### Option B — Docker (cross-platform, no system deps)
+
+```bash
+./dev.sh --docker
+# or directly:
+docker compose -f docker-compose.dev.yml up --build
+```
+
+### Option C — Makefile shortcuts
+
+```bash
+make run          # foreground server (Ctrl-C to stop)
+make bg           # background server (logs: tail -f /tmp/chatbantu.log)
+make stop         # stop background server
+make test         # curl health + demo login
+make build        # rebuild bantu from source
+make reset-db     # wipe DB
+make help         # show all targets
 ```
 
 Open `http://localhost:8080` and sign in with the demo account:

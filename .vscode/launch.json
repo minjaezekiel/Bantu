@@ -1,0 +1,48 @@
+{
+  // ══════════════════════════════════════════════════════════════════
+  //  ChatBantu — VS Code launch & task config
+  //
+  //  • Press F5 to start the server in the integrated terminal
+  //    (with PORT=8080) and attach the JavaScript debugger.
+  //  • Tasks: Run Build Task (Ctrl+Shift+B) to rebuild the bantu binary.
+  // ══════════════════════════════════════════════════════════════════
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "ChatBantu: Run server.b",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "./dev.sh --no-browser",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PORT": "8080"
+      }
+    },
+    {
+      "name": "ChatBantu: Run in Docker",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "./dev.sh --docker",
+      "cwd": "${workspaceFolder}"
+    }
+  ],
+  "tasks": [
+    {
+      "label": "Rebuild bantu binary",
+      "type": "shell",
+      "command": "./dev.sh --build --no-browser",
+      "windows": {
+        "command": "bash -c \"./dev.sh --build --no-browser\""
+      },
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Reset DB + Run",
+      "type": "shell",
+      "command": "./dev.sh --reset-db --no-browser",
+      "group": "build",
+      "problemMatcher": []
+    }
+  ]
+}

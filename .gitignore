@@ -8,3 +8,10 @@
 .DS_Store
 __pycache__/
 *.log
+
+# Editor / OS junk
+*.swp
+*.swo
+*~
+.idea/
+.vscode/.rope*

@@ -1,0 +1,43 @@
+# ════════════════════════════════════════════════════════════════════
+#  ChatBantu — Local Development docker-compose
+#
+#  One-command local dev with Docker — no need to install libsqlite3 / libcurl
+#  on your host. Just run:
+#
+#     docker compose -f docker-compose.dev.yml up --build
+#
+#  Or via the dev.sh launcher:
+#
+#     ./dev.sh --docker
+#
+#  Then open http://localhost:8080
+# ════════════════════════════════════════════════════════════════════
+
+services:
+  chatbantu:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: chatbantu:dev
+    container_name: chatbantu-dev
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      - PORT=8080
+    volumes:
+      # Persist SQLite DB across restarts
+      - chatbantu-data:/data
+      # Live-reload the Bantu source code (edit on host, container sees it)
+      - ./server.b:/app/server.b:ro
+      - ./public:/app/public:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  chatbantu-data:
+    driver: local
