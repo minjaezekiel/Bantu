@@ -88,7 +88,15 @@ CPP_FLAGS=(
     -I src
 )
 
-LINK_LIBS=( -lsqlite3 -lcurl -ldl -lpthread )
+# Use -l:libcurl.so.4 (explicit filename) instead of -lcurl.
+# Why: on Debian 13 the default `libcurl.so` symlink points to the GnuTLS
+# flavor (`libcurl-gnutls.so.4`), which would make our binary depend on
+# `libcurl-gnutls.so.4` at runtime — a package that doesn't exist on
+# Ubuntu 22.04 (`libcurl4` there only provides `libcurl.so.4`, OpenSSL flavor).
+# Forcing the exact soname `libcurl.so.4` makes the binary depend on the
+# library that IS universally shipped as `libcurl4` on both Debian and
+# Ubuntu, matching what the Dockerfile installs at runtime.
+LINK_LIBS=( -lsqlite3 -l:libcurl.so.4 -ldl -lpthread )
 
 OBJECTS=()
 for src in "${SOURCES[@]}"; do

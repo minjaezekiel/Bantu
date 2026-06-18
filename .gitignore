@@ -9,6 +9,9 @@
 __pycache__/
 *.log
 
+# Build artifacts (regenerate with: cd bantu-src/compiler && ./build.sh)
+bantu-src/compiler/build/
+
 # Editor / OS junk
 *.swp
 *.swo
