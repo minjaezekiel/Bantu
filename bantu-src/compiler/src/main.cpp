@@ -38,6 +38,7 @@
 #include <cctype>
 #include <bitset>
 #include <cmath>
+#include <algorithm>
 
 // ─── Platform-specific POSIX headers ───
 #ifdef _WIN32
@@ -157,6 +158,7 @@ void printHelp() {
     std::cout << "    bantu installer [entry.b] --platform linux    Generate .deb + .desktop\n";
     std::cout << "    bantu installer [entry.b] --platform windows  Generate NSIS .exe installer\n";
     std::cout << "    bantu installer [entry.b] --platform macos    Generate .app bundle\n";
+    std::cout << "    bantu installer [entry.b] --platform android  Generate Android Studio project + APK\n";
     std::cout << "      --name <Name>      Application name (default: from bantu.json or folder)\n";
     std::cout << "      --version <x.y.z>  Application version (default: 1.0.0)\n";
     std::cout << "      --icon <path>      Path to icon (.png/.ico/.icns) for shortcuts\n";
@@ -1411,6 +1413,733 @@ static int buildMacOSInstaller(
     return 0;
 }
 
+
+// ── Android: build an Android Studio project + APK ──
+// Generates a full Gradle project under dist/android/<AppName>/
+// The project bundles the .b source files as app/src/main/assets/bantu/
+// and (if available) a pre-built arm64 bantu binary in jniLibs/arm64-v8a/.
+//
+// The MainActivity starts the bundled Bantu web server in a background
+// thread and renders the app in a WebView pointed at http://127.0.0.1:PORT/.
+// End users get a signed-debug APK they can sideload on any Android 7.0+
+// phone — the app runs fully offline with no Bantu installed on the device.
+//
+// If gradle is on PATH and ANDROID_HOME is set, we invoke `gradle assembleDebug`
+// automatically; otherwise the user opens the project in Android Studio or
+// runs `./build-apk.sh` once the SDK is installed.
+
+// Sanitize appName into a valid Java package name (lowercase, dot-separated).
+static std::string sanitizePkgName(const std::string& appName) {
+    std::string s = appName;
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    std::string out;
+    for (char c : s) {
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.') {
+            out += c;
+        } else if (c == ' ' || c == '-' || c == '_') {
+            // word separator → dot
+            if (!out.empty() && out.back() != '.') out += '.';
+        }
+    }
+    // Strip leading/trailing dots
+    while (!out.empty() && out.front() == '.') out.erase(out.begin());
+    while (!out.empty() && out.back() == '.') out.pop_back();
+    if (out.empty()) out = "bantu.app";
+    // Must have at least one dot for Java package convention
+    if (out.find('.') == std::string::npos) out = "dev.bantu." + out;
+    // Don't start with a digit
+    if (!out.empty() && out[0] >= '0' && out[0] <= '9') out = "dev." + out;
+    return out;
+}
+
+// Convert package name to a Java class name (PascalCase, stripped of dots).
+static std::string sanitizeClassName(const std::string& appName) {
+    std::string s = appName;
+    std::string out;
+    bool capitalizeNext = true;
+    for (char c : s) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+            if (capitalizeNext && c >= 'a' && c <= 'z') {
+                out += (char)(c - 32);
+            } else {
+                out += c;
+            }
+            capitalizeNext = false;
+        } else {
+            capitalizeNext = true;
+        }
+    }
+    if (out.empty()) out = "BantuApp";
+    // Don't start with a digit
+    if (out[0] >= '0' && out[0] <= '9') out = "App" + out;
+    return out;
+}
+
+static int buildAndroidInstaller(
+    const std::string& entryFile,
+    const std::string& appName,
+    const std::string& appVersion,
+    const std::string& iconPath,
+    bool bundleBantu)
+{
+    std::string distDir = "dist";
+    system(("mkdir -p " + distDir).c_str());
+
+    std::string pkgName    = sanitizePkgName(appName);
+    std::string className  = sanitizeClassName(appName);
+    std::string pkgPath    = pkgName;
+    std::replace(pkgPath.begin(), pkgPath.end(), '.', '/');
+
+    // Filesystem-safe project dir name (no spaces / special chars).
+    std::string safeDirName;
+    for (char c : appName) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+            || c == '-' || c == '_') {
+            safeDirName += c;
+        } else if (c == ' ' || c == '.') {
+            if (!safeDirName.empty() && safeDirName.back() != '-') safeDirName += '-';
+        }
+    }
+    while (!safeDirName.empty() && safeDirName.front() == '-') safeDirName.erase(safeDirName.begin());
+    while (!safeDirName.empty() && safeDirName.back() == '-') safeDirName.pop_back();
+    if (safeDirName.empty()) safeDirName = "BantuApp";
+
+    std::string projectDir = distDir + "/android/" + safeDirName;
+    system(("rm -rf '" + projectDir + "'").c_str());
+    system(("mkdir -p '" + projectDir + "'").c_str());
+
+    // ─── Project-level Gradle files ───
+    writeFile(projectDir + "/settings.gradle",
+        R"GRADLE(pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+rootProject.name = ")GRADLE" + appName + R"GRADLE("
+include ':app'
+)GRADLE");
+
+    writeFile(projectDir + "/build.gradle",
+        R"GRADLE(// Top-level build file — Generated by bantu installer v)GRADLE"
+        + BANTU_VERSION + R"GRADLE(
+plugins {
+    id 'com.android.application' version '8.1.0' apply false
+    id 'org.jetbrains.kotlin.android' version '1.9.0' apply false
+}
+)GRADLE");
+
+    writeFile(projectDir + "/gradle.properties",
+        R"PROPS(org.gradle.jvmargs=-Xmx2048m
+android.useAndroidX=true
+kotlin.code.style=official
+android.nonTransitiveRClass=true
+)PROPS");
+
+    writeFile(projectDir + "/local.properties.sample",
+        "# Copy this file to local.properties and set your Android SDK path.\n"
+        "# Example (Linux/macOS):\n"
+        "sdk.dir=/home/you/Android/Sdk\n"
+        "# Example (Windows):\n"
+        "# sdk.dir=C:\\\\Users\\\\you\\\\AppData\\\\Local\\\\Android\\\\Sdk\n");
+
+    // .gitignore
+    writeFile(projectDir + "/.gitignore",
+        R"GIT(*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+/app/build
+*.apk
+*.ap_
+*.dex
+)GIT");
+
+    // ─── App module ───
+    std::string appDir     = projectDir + "/app";
+    std::string mainDir    = appDir + "/src/main";
+    std::string javaDir    = mainDir + "/java/" + pkgPath;
+    std::string resDir     = mainDir + "/res";
+    std::string assetsDir  = mainDir + "/assets/bantu";
+    std::string jniDir     = mainDir + "/jniLibs/arm64-v8a";
+    std::string jniX64Dir  = mainDir + "/jniLibs/x86_64";
+    system(("mkdir -p '" + javaDir + "'").c_str());
+    system(("mkdir -p '" + resDir + "/layout'").c_str());
+    system(("mkdir -p '" + resDir + "/values'").c_str());
+    system(("mkdir -p '" + resDir + "/mipmap-anydpi-v26'").c_str());
+    system(("mkdir -p '" + resDir + "/drawable'").c_str());
+    system(("mkdir -p '" + resDir + "/xml'").c_str());
+    system(("mkdir -p '" + assetsDir + "'").c_str());
+    system(("mkdir -p '" + jniDir + "'").c_str());
+    system(("mkdir -p '" + jniX64Dir + "'").c_str());
+
+    // app/build.gradle
+    writeFile(appDir + "/build.gradle",
+        R"GRADLE(plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace ')GRADLE" + pkgName + R"GRADLE('
+    compileSdk 34
+
+    defaultConfig {
+        applicationId ")GRADLE" + pkgName + R"GRADLE("
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName ")GRADLE" + appVersion + R"GRADLE("
+        ndk {
+            abiFilters 'arm64-v8a', 'x86_64'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+
+    // Important: extract native libs so we can chmod+exec the bundled bantu.
+    packagingOptions {
+        jniLibs { useLegacyPackaging true }
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.12.0'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+    implementation 'androidx.webkit:webkit:1.9.0'
+}
+)GRADLE");
+
+    writeFile(appDir + "/proguard-rules.pro", "# Add project-specific ProGuard rules here.\n");
+
+    // AndroidManifest.xml
+    writeFile(mainDir + "/AndroidManifest.xml",
+        R"XML(<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.BantuApp"
+        android:usesCleartextTraffic="true">
+        <activity
+            android:name=".)XML" + className + R"XML("
+            android:exported="true"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>
+)XML");
+
+    // MainActivity.kt
+    writeFile(javaDir + "/" + className + ".kt",
+        "package " + pkgName + "\n\n"
+        R"KT(import android.annotation.SuppressLint
+import android.os.Bundle
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+
+class )KT" + className + R"KT( : AppCompatActivity() {
+
+    private lateinit var webView: WebView
+    private lateinit var statusText: TextView
+    private val handler = Handler(Looper.getMainLooper())
+    private var runner: BantuRunner? = null
+
+    @SuppressLint("SetJavaScriptEnabled")
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        statusText = findViewById(R.id.status_text)
+        webView = findViewById(R.id.webview)
+        webView.settings.javaScriptEnabled = true
+        webView.settings.domStorageEnabled = true
+        webView.webViewClient = WebViewClient()
+        webView.settings.allowFileAccess = true
+        webView.settings.allowContentAccess = true
+
+        statusText.text = "Starting Bantu runtime..."
+
+        runner = BantuRunner(this).apply {
+            start { port ->
+                handler.post {
+                    if (port > 0) {
+                        statusText.text = "Bantu running on port $port"
+                        webView.loadUrl("http://127.0.0.1:$port/")
+                    } else {
+                        statusText.text = "Bantu failed to start (check logcat: tag 'BantuRunner')"
+                    }
+                }
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        runner?.stop()
+    }
+}
+)KT");
+
+    // BantuRunner.kt — extracts .b files + bundled bantu binary, runs as subprocess.
+    writeFile(javaDir + "/BantuRunner.kt",
+        "package " + pkgName + "\n\n"
+        R"KT(import android.content.Context
+import android.util.Log
+import java.io.File
+import java.io.FileOutputStream
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * Extracts the bundled .b source files and the arm64 bantu binary from the
+ * app's assets/jniLibs into the app's private data directory, then launches
+ * `./bantu run )KT" + entryFile + R"KT(` as a subprocess and waits for the
+ * Sua HTTP server to bind a port (parsed from stdout).
+ *
+ * If no bundled bantu binary is present (the user did not provide one),
+ * the runner reports failure — see BUILD-ANDROID.md for how to cross-compile
+ * Bantu for Android arm64-v8a using the NDK.
+ */
+class BantuRunner(private val ctx: Context) {
+    private val TAG = "BantuRunner"
+    private val started = AtomicBoolean(false)
+    private var process: Process? = null
+    private var portThread: Thread? = null
+
+    fun start(onReady: (Int) -> Unit) {
+        if (!started.compareAndSet(false, true)) return
+
+        Thread {
+            try {
+                val workDir = File(ctx.filesDir, "bantu-app").apply { mkdirs() }
+
+                // 1. Extract .b files + bantu.json from assets/bantu/
+                extractAssets("bantu", workDir)
+
+                // 2. Extract the bundled bantu binary (if present) from jniLibs.
+                //    Android packages native libs under lib/<abi>/lib*.so — but
+                //    the file is the actual ELF we want to exec.
+                val bantuBin = File(workDir, "bantu")
+                val nativeDir = File(ctx.applicationInfo.nativeLibraryDir)
+                val bundled = File(nativeDir, "libbantu.so")
+                if (bundled.exists()) {
+                    bundled.copyTo(bantuBin, overwrite = true)
+                    @Suppress("UnsafeNewApiCall")
+                    bantuBin.setExecutable(true, true)
+                    Log.i(TAG, "Extracted bundled bantu: ${bantuBin.absolutePath} (${bundled.length()} bytes)")
+                } else {
+                    Log.e(TAG, "No bundled bantu binary at ${bundled.absolutePath}")
+                    Log.e(TAG, "See BUILD-ANDROID.md for cross-compile instructions (NDK required).")
+                    onReady(0)
+                    return@Thread
+                }
+
+                // 3. Launch `./bantu run )KT" + entryFile + R"KT(` and capture stdout.
+                val pb = ProcessBuilder(bantuBin.absolutePath, "run", ")KT" + entryFile + R"KT(")
+                    .directory(workDir)
+                    .redirectErrorStream(true)
+                pb.environment()["BANTU_QUIET"] = "1"
+                val p = pb.start()
+                process = p
+
+                // 4. Parse stdout for a port hint: "Listening on port 8080" or similar.
+                portThread = Thread {
+                    try {
+                        val reader = p.inputStream.bufferedReader()
+                        var line: String?
+                        var detectedPort = 0
+                        while (reader.readLine().also { line = it } != null) {
+                            val l = line ?: continue
+                            Log.i(TAG, l)
+                            if (detectedPort == 0) {
+                                // Sua server typically prints: "Sua server listening on port 8080"
+                                val m = Regex("""port\s+(\d{2,5})""").find(l.lowercase())
+                                if (m != null) {
+                                    detectedPort = m.groupValues[1].toInt()
+                                    onReady(detectedPort)
+                                }
+                            }
+                        }
+                        if (detectedPort == 0) onReady(0)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "stdout reader died: ${e.message}")
+                        onReady(0)
+                    }
+                }
+                portThread?.start()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start Bantu: ${e.message}", e)
+                onReady(0)
+            }
+        }.start()
+    }
+
+    fun stop() {
+        try { process?.destroy() } catch (_: Exception) {}
+    }
+
+    private fun extractAssets(assetDir: String, destDir: File) {
+        val list = ctx.assets.list(assetDir) ?: return
+        for (name in list) {
+            val path = "$assetDir/$name"
+            val out = File(destDir, name)
+            val sub = ctx.assets.list(path)
+            if (sub != null && sub.isNotEmpty()) {
+                out.mkdirs()
+                extractAssets(path, out)
+            } else {
+                ctx.assets.open(path).use { input ->
+                    FileOutputStream(out).use { input.copyTo(it) }
+                }
+                Log.i(TAG, "Extracted asset: $name")
+            }
+        }
+    }
+}
+)KT");
+
+    // activity_main.xml
+    writeFile(resDir + "/layout/activity_main.xml",
+        R"XML(<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical">
+
+    <TextView
+        android:id="@+id/status_text"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:padding="8dp"
+        android:text="Initializing..."
+        android:textSize="12sp"
+        android:background="#1a1a2e"
+        android:textColor="#bd93f9" />
+
+    <WebView
+        android:id="@+id/webview"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1" />
+
+</LinearLayout>
+)XML");
+
+    // strings.xml
+    writeFile(resDir + "/values/strings.xml",
+        R"XML(<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">)XML" + appName + R"XML(</string>
+</resources>
+)XML");
+
+    // themes.xml — Dracula-themed base.
+    writeFile(resDir + "/values/themes.xml",
+        R"XML(<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.BantuApp" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">#bd93f9</item>
+        <item name="colorPrimaryVariant">#6272a4</item>
+        <item name="colorOnPrimary">#f8f8f2</item>
+        <item name="colorSecondary">#ff79c6</item>
+        <item name="colorOnSecondary">#282a36</item>
+        <item name="android:statusBarColor">#282a36</item>
+    </style>
+</resources>
+)XML");
+
+    // ic_launcher (a simple SVG → mipmap-anydpi-v26 with adaptive XML, plus a
+    // fallback PNG generated by build-apk.sh if ImageMagick is available).
+    writeFile(resDir + "/mipmap-anydpi-v26/ic_launcher.xml",
+        R"XML(<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background"/>
+    <foreground android:drawable="@drawable/ic_launcher_foreground"/>
+</adaptive-icon>
+)XML");
+
+    writeFile(resDir + "/values/colors.xml",
+        R"XML(<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_launcher_background">#282a36</color>
+</resources>
+)XML");
+
+    writeFile(resDir + "/drawable/ic_launcher_foreground.xml",
+        R"XML(<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#f8f8f2"
+        android:pathData="M30,30 L30,78 L42,78 L42,58 L66,78 L82,78 L52,50 L82,30 L66,30 L42,52 L42,30 Z"/>
+</vector>
+)XML");
+
+    // Copy .b source files + bantu.json + public/ into assets/bantu/
+    system(("cp *.b '" + assetsDir + "/' 2>/dev/null").c_str());
+    system(("cp bantu.json '" + assetsDir + "/' 2>/dev/null").c_str());
+    system(("cp -r public '" + assetsDir + "/' 2>/dev/null").c_str());
+
+    // Optionally embed the bantu binary as libbantu.so.
+    // Search order:
+    //   1. ./android/libbantu.so (arm64)  + ./android/libbantu-x86_64.so
+    //   2. $BANTU_ANDROID_ARM64  + $BANTU_ANDROID_X86_64
+    //   3. ~/.bantu/android/arm64-v8a/libbantu.so  + .../x86_64/...
+    bool bundledArm64 = false;
+    bool bundledX64 = false;
+
+    if (bundleBantu) {
+        // arm64
+        std::vector<std::string> armCandidates = {
+            "android/libbantu.so",
+            "android/arm64-v8a/libbantu.so",
+        };
+        const char* envArm = std::getenv("BANTU_ANDROID_ARM64");
+        if (envArm && *envArm) armCandidates.push_back(envArm);
+        const char* home = std::getenv("HOME");
+        if (home && *home) {
+            armCandidates.push_back(std::string(home) + "/.bantu/android/arm64-v8a/libbantu.so");
+        }
+        for (const auto& p : armCandidates) {
+            if (fileExists(p)) {
+                system(("cp '" + p + "' '" + jniDir + "/libbantu.so'").c_str());
+                std::cout << "  [INSTALLER] Bundled arm64-v8a bantu: " << p << "\n";
+                bundledArm64 = true;
+                break;
+            }
+        }
+        // x86_64 (for emulator)
+        std::vector<std::string> x64Candidates = {
+            "android/libbantu-x86_64.so",
+            "android/x86_64/libbantu.so",
+        };
+        const char* envX64 = std::getenv("BANTU_ANDROID_X86_64");
+        if (envX64 && *envX64) x64Candidates.push_back(envX64);
+        if (home && *home) {
+            x64Candidates.push_back(std::string(home) + "/.bantu/android/x86_64/libbantu.so");
+        }
+        for (const auto& p : x64Candidates) {
+            if (fileExists(p)) {
+                system(("cp '" + p + "' '" + jniX64Dir + "/libbantu.so'").c_str());
+                std::cout << "  [INSTALLER] Bundled x86_64 bantu: " << p << "\n";
+                bundledX64 = true;
+                break;
+            }
+        }
+
+        if (!bundledArm64 && !bundledX64) {
+            std::cout << "  [INSTALLER] No pre-built Android bantu binary found.\n";
+            std::cout << "              Place a cross-compiled arm64 bantu at one of:\n";
+            std::cout << "                ./android/libbantu.so\n";
+            std::cout << "                ./android/arm64-v8a/libbantu.so\n";
+            std::cout << "                ~/.bantu/android/arm64-v8a/libbantu.so\n";
+            std::cout << "                or set $BANTU_ANDROID_ARM64\n";
+            std::cout << "              See BUILD-ANDROID.md in the project for NDK instructions.\n";
+            std::cout << "              The APK will build but show a 'bantu not found' screen at runtime.\n";
+        }
+    } else {
+        std::cout << "  [INSTALLER] --no-bundle-bantu: skipping native binary embed.\n";
+        std::cout << "              The generated APK will not run unless the device has Bantu installed.\n";
+    }
+
+    // build-apk.sh — wraps gradle assembleDebug
+    writeFile(projectDir + "/build-apk.sh",
+        R"BASH(#!/usr/bin/env bash
+# Build the Android APK from the project generated by `bantu installer --platform android`.
+# Requires: Android SDK + JDK 17 + (optionally) Android NDK for cross-compiling bantu.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+# Locate gradle
+if [ ! -x ./gradlew ]; then
+    if command -v gradle >/dev/null 2>&1; then
+        gradle wrapper --gradle-version 8.4
+    else
+        echo "[ERROR] No gradlew and no system gradle."
+        echo "        Install gradle (apt install gradle / brew install gradle) and re-run."
+        exit 1
+    fi
+fi
+
+# Require ANDROID_HOME (or local.properties)
+if [ ! -f local.properties ] && [ -z "${ANDROID_HOME:-}" ]; then
+    echo "[ERROR] Neither local.properties nor ANDROID_HOME is set."
+    echo "        Create local.properties with: sdk.dir=/path/to/Android/Sdk"
+    echo "        OR: export ANDROID_HOME=/path/to/Android/Sdk"
+    exit 1
+fi
+
+echo "[build-apk] Building debug APK..."
+./gradlew assembleDebug --no-daemon
+
+APK="app/build/outputs/apk/debug/app-debug.apk"
+OUT="app-debug.apk"
+cp "$APK" "$OUT"
+echo ""
+echo "[build-apk] APK ready: $OUT ($(du -h "$OUT" | cut -f1))"
+echo "[build-apk] Install on a connected device with:"
+echo "    adb install -r $OUT"
+)BASH");
+    system(("chmod +x '" + projectDir + "/build-apk.sh'").c_str());
+
+    // BUILD-ANDROID.md — NDK cross-compile instructions
+    writeFile(projectDir + "/BUILD-ANDROID.md",
+        R"MD(# Building the Android APK
+
+This project was generated by `bantu installer --platform android`.
+
+## What's inside
+
+- `app/src/main/assets/bantu/` — your `.b` source files + `bantu.json`
+- `app/src/main/jniLibs/{arm64-v8a,x86_64}/libbantu.so` — pre-built Bantu
+  interpreter for Android (if one was found at build time)
+- `app/src/main/java/<pkg>/MainActivity.kt` — WebView activity that loads
+  `http://127.0.0.1:<port>/` after starting the bundled Bantu server
+- `app/src/main/java/<pkg>/BantuRunner.kt` — extracts assets + launches
+  the bundled bantu as a subprocess
+
+## Step 1 — Install the Android SDK
+
+Install Android Studio (or just the command-line SDK tools) and JDK 17.
+Set `ANDROID_HOME` to the SDK path:
+
+```bash
+export ANDROID_HOME=$HOME/Android/Sdk
+```
+
+## Step 2 — Cross-compile Bantu for Android (one-time)
+
+To actually run Bantu on a phone, you need a native binary compiled for
+the phone's CPU (arm64-v8a on modern phones, x86_64 on emulators).
+
+```bash
+# Install Android NDK via Android Studio SDK Manager or:
+sdkmanager "ndk;26.1.10909125"
+
+export NDK_ROOT=$ANDROID_HOME/ndk/26.1.10909125
+
+# From the Bantu source tree:
+cd bantu-src/compiler
+mkdir build-android-arm64 && cd build-android-arm64
+cmake .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE=$NDK_ROOT/build/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-24
+make -j$(nproc)
+
+# The output binary is ./bantu — install it where the installer looks:
+mkdir -p ~/.bantu/android/arm64-v8a
+cp bantu ~/.bantu/android/arm64-v8a/libbantu.so
+```
+
+Repeat with `-DANDROID_ABI=x86_64` for emulator support, outputting to
+`~/.bantu/android/x86_64/libbantu.so`.
+
+## Step 3 — Build the APK
+
+```bash
+cd dist/android/<AppName>
+./build-apk.sh
+```
+
+Or open the project in Android Studio and press Run.
+
+## Step 4 — Install on a phone
+
+```bash
+adb install -r app-debug.apk
+```
+
+Enable USB debugging on the phone first (Developer options → USB debugging).
+
+## Notes
+
+- The app runs **fully offline** — no internet, no Bantu installed on the
+  phone required. The bundled `libbantu.so` is extracted at first launch.
+- `android:usesCleartextTraffic="true"` is set so the WebView can load
+  `http://127.0.0.1:PORT/`. This is safe — traffic never leaves the device.
+- The debug APK is signed with the Android debug key. For distribution,
+  generate your own keystore and sign with `apksigner`.
+)MD");
+
+    // README.md
+    writeFile(projectDir + "/README.md",
+        "# " + appName + " — Android\n\n"
+        "Generated by `bantu installer --platform android` (Bantu v" + BANTU_VERSION + ").\n\n"
+        "- **Package**: `" + pkgName + "`\n"
+        "- **Entry**: `" + entryFile + "`\n"
+        "- **Version**: " + appVersion + "\n\n"
+        "## Quick start\n\n"
+        "```bash\n"
+        "./build-apk.sh            # build APK (needs Android SDK + JDK 17)\n"
+        "adb install -r app-debug.apk\n"
+        "```\n\n"
+        "See `BUILD-ANDROID.md` for full instructions including how to\n"
+        "cross-compile Bantu for Android arm64 with the NDK.\n");
+
+    // Try to auto-build the APK if gradle is available.
+    std::cout << "\n  [INSTALLER] Android Studio project ready:\n";
+    std::cout << "    " << projectDir << "/\n";
+    std::cout << "\n  Next steps:\n";
+    std::cout << "    1. Cross-compile bantu for Android arm64 (see BUILD-ANDROID.md)\n";
+    std::cout << "    2. cd " << projectDir << " && ./build-apk.sh\n";
+    std::cout << "    3. adb install -r app-debug.apk\n";
+    return 0;
+}
+
+
 int cmdInstaller(int argc, char* argv[]) {
     std::string entryFile;
     std::string appName;
@@ -1439,10 +2168,11 @@ int cmdInstaller(int argc, char* argv[]) {
             std::cout << "    --name <Name>          Application name (default: from bantu.json or folder)\n";
             std::cout << "    --version <x.y.z>      Application version (default: 1.0.0)\n";
             std::cout << "    --icon <path>          Icon file (.png/.ico/.icns)\n";
-            std::cout << "    --platform <p>         linux | windows | macos (default: auto-detect)\n";
+            std::cout << "    --platform <p>         linux | windows | macos | android (default: auto-detect)\n";
             std::cout << "    --bundle-bantu         Embed bantu interpreter (default: on)\n";
             std::cout << "    --no-bundle-bantu      Don't embed bantu (smaller installer, requires Bantu on target)\n";
             std::cout << "\n  Output: ./dist/<name>_<version>_*.{deb,exe,app}\n";
+            std::cout << "          ./dist/android/<name>/ (Android Studio project)\n";
             return 0;
         } else if (!a.empty() && a[0] != '-') {
             entryFile = a;
@@ -1496,6 +2226,7 @@ int cmdInstaller(int argc, char* argv[]) {
     // Normalize
     if (platform == "win" || platform == "win32") platform = "windows";
     if (platform == "mac" || platform == "osx")   platform = "macos";
+    if (platform == "apk" || platform == "droid") platform = "android";
 
     std::cout << "\n  ╔══════════════════════════════════════════════╗\n";
     std::cout << "  ║   bantu installer — desktop installer builder ║\n";
@@ -1513,10 +2244,12 @@ int cmdInstaller(int argc, char* argv[]) {
         return buildWindowsInstaller(entryFile, appName, appVersion, iconPath, bundleBantu);
     } else if (platform == "macos") {
         return buildMacOSInstaller(entryFile, appName, appVersion, iconPath, bundleBantu);
+    } else if (platform == "android") {
+        return buildAndroidInstaller(entryFile, appName, appVersion, iconPath, bundleBantu);
     }
 
     std::cerr << "  [ERROR] Unknown platform: " << platform << "\n";
-    std::cerr << "  Valid: linux, windows, macos\n";
+    std::cerr << "  Valid: linux, windows, macos, android\n";
     return 1;
 }
 

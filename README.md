@@ -16,7 +16,7 @@ v1.2.2 is a **drop-in maintenance release** on top of v1.2.1. No language change
 
 | Change | Highlights |
 |---|---|
-| **`bantu installer` command [NEW]** | One command packages any Bantu project into a cross-platform desktop installer: `.deb` for Linux, `.exe` for Windows (NSIS), `.app` for macOS. **Bundles the bantu interpreter by default** so the app runs on machines without Bantu installed. See `bantu installer --help` or the docs chapter. |
+| **`bantu installer` command [NEW]** | One command packages any Bantu project into a cross-platform installer: `.deb` for Linux, `.exe` for Windows (NSIS), `.app` for macOS, and a full Android Studio project + APK for Android phones. **Bundles the bantu interpreter by default** so the app runs on machines without Bantu installed. See `bantu installer --help` or the docs chapter. |
 | **Path canonicalization** | `include` paths are now resolved through `realpath()` (POSIX) / `GetFullPathName` (Windows). The same file reached via `./pkg/x.b`, `../pkg/x.b`, and `pkg/x.b` now collapses to a single canonical key — so the cycle guard can no longer accidentally execute a module twice when it is reached via two different relative paths in the same project. |
 | **Cycle-guard diagnostic** | Circular includes used to be silently skipped. They now print `Skipping already-loaded module: <path>` (or `[INCLUDE ERROR] Maximum include depth (64) exceeded` for pathological chains). |
 | **Depth limit** | New `kMaxIncludeDepth = 64` guard prevents stack-exhaustion crashes on self-generating or pathological include chains. |
@@ -193,7 +193,7 @@ $chan  = sua.webrtc.dataChannel("chat");
 sua.webrtc.send("chat", "hello, world!");
 ```
 
-## Build Desktop Installers (v1.2.2 NEW — cross-platform)
+## Build Desktop Installers (v1.2.2 NEW — cross-platform, incl. Android)
 
 The `bantu installer` command packages any Bantu project into a single
 self-contained desktop installer — **the installer bundles the Bantu
@@ -206,6 +206,7 @@ bantu installer                            # auto-detect host platform
 bantu installer app.b --platform linux     # → dist/<name>_<ver>_amd64.deb
 bantu installer app.b --platform windows   # → dist/<name>-Setup-<ver>.exe
 bantu installer app.b --platform macos     # → dist/<Name>.app
+bantu installer app.b --platform android   # → dist/android/<name>/ (Android Studio project + APK)
 ```
 
 | Platform | Output | What it does |
@@ -213,6 +214,36 @@ bantu installer app.b --platform macos     # → dist/<Name>.app
 | **Linux**   | `.deb` + `.desktop` entry | Bundles `bantu` at `/usr/lib/<name>/`, drops launcher at `/usr/bin/<name>`, adds app launcher icon |
 | **Windows** | NSIS `.exe` installer     | Installs to `%LOCALAPPDATA%\<name>`, adds Start Menu shortcut, registers uninstaller in *Add/Remove Programs* |
 | **macOS**   | `.app` bundle             | Standard `Contents/{MacOS,Resources}` layout with `Info.plist` — wrap into `.dmg` with `hdiutil` |
+| **Android** | Android Studio project    | Full Gradle project under `dist/android/<name>/` — bundles `.b` sources in `assets/`, optional arm64 `bantu` in `jniLibs/`, builds a debug APK via `./build-apk.sh`. App runs fully offline in a WebView pointed at the bundled Bantu HTTP server. |
+
+### Android specifics
+
+The Android target generates a complete, ready-to-build Android Studio
+project. End users sideload the resulting `app-debug.apk` on any Android
+7.0+ phone — **no Bantu installed on the device required**.
+
+The project bundles:
+
+- your `.b` source files + `bantu.json` under `app/src/main/assets/bantu/`
+- a pre-built `arm64-v8a/libbantu.so` under `app/src/main/jniLibs/`
+  (if you provide one — see `BUILD-ANDROID.md` for NDK cross-compile
+  instructions; the installer looks in `./android/libbantu.so`,
+  `~/.bantu/android/arm64-v8a/libbantu.so`, or `$BANTU_ANDROID_ARM64`)
+- a `MainActivity.kt` that launches `./bantu run <entry>.b` as a
+  subprocess and renders the Sua web app in a WebView
+- a `build-apk.sh` wrapper that runs `gradle assembleDebug`
+
+```bash
+# Generate the Android project from your Bantu web app
+bantu installer app.b --platform android
+
+# Build the APK (one-time: install Android SDK + NDK + cross-compile bantu for arm64)
+cd dist/android/MyApp
+./build-apk.sh
+
+# Install on a connected phone
+adb install -r app-debug.apk
+```
 
 Options: `--name`, `--version`, `--icon`, `--bundle-bantu` / `--no-bundle-bantu`.
 Defaults are read from `bantu.json` if present. See **Chapter 9** of the

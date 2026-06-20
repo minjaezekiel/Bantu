@@ -28,6 +28,7 @@ All notable changes to the Bantu programming language are documented in this fil
   export BANTU_PATH=/opt/bantu/lib:~/bantu-modules
   bantu run app.b   # can `include "auth.b";` from either dir
   ```
+- **`bantu installer --platform android`** — Cross-platform desktop installer generator now also produces a complete Android Studio project (Gradle, Kotlin, WebView-based launcher) ready to build into a sideloadable APK. Bundles `.b` sources in `app/src/main/assets/bantu/`, looks for a pre-built arm64 `libbantu.so` in `./android/`, `~/.bantu/android/arm64-v8a/`, or `$BANTU_ANDROID_ARM64`, and ships a `build-apk.sh` wrapper plus `BUILD-ANDROID.md` with full NDK cross-compile instructions. The resulting APK runs fully offline on Android 7.0+ phones with no Bantu installed on the device.
 
 ### Changed
 
