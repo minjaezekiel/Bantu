@@ -730,20 +730,20 @@ private:
         Value right = evalNode(n->right);
 
         switch (n->op) {
-            case TokenType::PLUS:
+            case BantuTokenType::PLUS:
                 if (left.isString() || right.isString()) {
                     return Value(left.toString() + right.toString());
                 }
                 return Value(left.numberVal + right.numberVal);
-            case TokenType::MINUS: return Value(left.numberVal - right.numberVal);
-            case TokenType::MULTIPLY: return Value(left.numberVal * right.numberVal);
-            case TokenType::DIVIDE:
+            case BantuTokenType::MINUS: return Value(left.numberVal - right.numberVal);
+            case BantuTokenType::MULTIPLY: return Value(left.numberVal * right.numberVal);
+            case BantuTokenType::DIVIDE:
                 if (right.numberVal == 0) {
                     ErrorHandler::throwRuntimeError("Division by zero", n->line, n->col);
                     return Value();
                 }
                 return Value(left.numberVal / right.numberVal);
-            case TokenType::MODULO:
+            case BantuTokenType::MODULO:
                 if (right.numberVal == 0) {
                     ErrorHandler::throwRuntimeError("Modulo by zero", n->line, n->col);
                     return Value();
@@ -758,14 +758,14 @@ private:
                     if (r > 0 && a < 0)  r -= b;
                     return Value(r);
                 }
-            case TokenType::EQUALTO: return Value(left.equals(right));
-            case TokenType::NOTEQUALTO: return Value(!left.equals(right));
-            case TokenType::GREATERTHAN: return Value(left.numberVal > right.numberVal);
-            case TokenType::LESSTHAN: return Value(left.numberVal < right.numberVal);
-            case TokenType::GREATERTHANEQUAL: return Value(left.numberVal >= right.numberVal);
-            case TokenType::LESSTHANEQUAL: return Value(left.numberVal <= right.numberVal);
-            case TokenType::AND: return Value(left.isTruthy() && right.isTruthy());
-            case TokenType::OR: return Value(left.isTruthy() || right.isTruthy());
+            case BantuTokenType::EQUALTO: return Value(left.equals(right));
+            case BantuTokenType::NOTEQUALTO: return Value(!left.equals(right));
+            case BantuTokenType::GREATERTHAN: return Value(left.numberVal > right.numberVal);
+            case BantuTokenType::LESSTHAN: return Value(left.numberVal < right.numberVal);
+            case BantuTokenType::GREATERTHANEQUAL: return Value(left.numberVal >= right.numberVal);
+            case BantuTokenType::LESSTHANEQUAL: return Value(left.numberVal <= right.numberVal);
+            case BantuTokenType::AND: return Value(left.isTruthy() && right.isTruthy());
+            case BantuTokenType::OR: return Value(left.isTruthy() || right.isTruthy());
             default:
                 ErrorHandler::throwRuntimeError("Unknown operator", n->line, n->col);
                 return Value();
@@ -775,8 +775,8 @@ private:
     Value evalUnaryOp(UnaryOpNode* n) {
         Value operand = evalNode(n->operand);
         switch (n->op) {
-            case TokenType::NOT: return Value(!operand.isTruthy());
-            case TokenType::MINUS: return Value(-operand.numberVal);
+            case BantuTokenType::NOT: return Value(!operand.isTruthy());
+            case BantuTokenType::MINUS: return Value(-operand.numberVal);
             default: return Value();
         }
     }

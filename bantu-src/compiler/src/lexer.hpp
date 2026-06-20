@@ -8,6 +8,25 @@
 #include <cctype>
 #include <unordered_map>
 
+// Windows headers (pulled in transitively via <curl/curl.h> → <winsock2.h> → <windows.h>)
+// define CONST/DELETE/TRUE/FALSE macros that clash with BantuTokenType enum values.
+#ifdef CONST
+#undef CONST
+#endif
+#ifdef DELETE
+#undef DELETE
+#endif
+#ifdef TRUE
+#undef TRUE
+#endif
+#ifdef FALSE
+#undef FALSE
+#endif
+// IN is a Windows SAL annotation macro
+#ifdef IN
+#undef IN
+#endif
+
 class Lexer {
 public:
     explicit Lexer(const std::string& source) : source_(source), pos_(0), line_(1), col_(1) {}
@@ -48,7 +67,7 @@ public:
 
             // Variable declarator $
             if (c == '$') {
-                tokens.emplace_back(TokenType::DECLARATOR, "$", line_, col_);
+                tokens.emplace_back(BantuTokenType::DECLARATOR, "$", line_, col_);
                 advance();
                 continue;
             }
@@ -62,31 +81,31 @@ public:
             // Three-character operators
             if (pos_ + 2 < source_.size()) {
                 std::string threeChar = source_.substr(pos_, 3);
-                if (threeChar == "===") { tokens.emplace_back(TokenType::EQUALTO, "===", line_, col_); advance(); advance(); advance(); continue; }
-                if (threeChar == "!==") { tokens.emplace_back(TokenType::NOTEQUALTO, "!==", line_, col_); advance(); advance(); advance(); continue; }
+                if (threeChar == "===") { tokens.emplace_back(BantuTokenType::EQUALTO, "===", line_, col_); advance(); advance(); advance(); continue; }
+                if (threeChar == "!==") { tokens.emplace_back(BantuTokenType::NOTEQUALTO, "!==", line_, col_); advance(); advance(); advance(); continue; }
             }
 
             // Two-character operators
             if (pos_ + 1 < source_.size()) {
                 std::string twoChar = source_.substr(pos_, 2);
-                if (twoChar == "=>")  { tokens.emplace_back(TokenType::FATARROW, "=>", line_, col_); advance(); advance(); continue; }
-                if (twoChar == "==")  { tokens.emplace_back(TokenType::EQUALTO, "==", line_, col_); advance(); advance(); continue; }
-                if (twoChar == "!=")  { tokens.emplace_back(TokenType::NOTEQUALTO, "!=", line_, col_); advance(); advance(); continue; }
-                if (twoChar == ">=")  { tokens.emplace_back(TokenType::GREATERTHANEQUAL, ">=", line_, col_); advance(); advance(); continue; }
-                if (twoChar == "<=")  { tokens.emplace_back(TokenType::LESSTHANEQUAL, "<=", line_, col_); advance(); advance(); continue; }
-                if (twoChar == "&&")  { tokens.emplace_back(TokenType::AND, "&&", line_, col_); advance(); advance(); continue; }
-                if (twoChar == "||")  { tokens.emplace_back(TokenType::OR, "||", line_, col_); advance(); advance(); continue; }
-                if (twoChar == "+=")  { tokens.emplace_back(TokenType::PLUS_EQUALS, "+=", line_, col_); advance(); advance(); continue; }
-                if (twoChar == "-=")  { tokens.emplace_back(TokenType::MINUS_EQUALS, "-=", line_, col_); advance(); advance(); continue; }
-                if (twoChar == "*=")  { tokens.emplace_back(TokenType::MULTIPLY_EQUALS, "*=", line_, col_); advance(); advance(); continue; }
-                if (twoChar == "/=")  { tokens.emplace_back(TokenType::DIVIDE_EQUALS, "/=", line_, col_); advance(); advance(); continue; }
-                if (twoChar == "++")  { tokens.emplace_back(TokenType::INCREMENT, "++", line_, col_); advance(); advance(); continue; }
-                if (twoChar == "--")  { tokens.emplace_back(TokenType::DECREMENT, "--", line_, col_); advance(); advance(); continue; }
+                if (twoChar == "=>")  { tokens.emplace_back(BantuTokenType::FATARROW, "=>", line_, col_); advance(); advance(); continue; }
+                if (twoChar == "==")  { tokens.emplace_back(BantuTokenType::EQUALTO, "==", line_, col_); advance(); advance(); continue; }
+                if (twoChar == "!=")  { tokens.emplace_back(BantuTokenType::NOTEQUALTO, "!=", line_, col_); advance(); advance(); continue; }
+                if (twoChar == ">=")  { tokens.emplace_back(BantuTokenType::GREATERTHANEQUAL, ">=", line_, col_); advance(); advance(); continue; }
+                if (twoChar == "<=")  { tokens.emplace_back(BantuTokenType::LESSTHANEQUAL, "<=", line_, col_); advance(); advance(); continue; }
+                if (twoChar == "&&")  { tokens.emplace_back(BantuTokenType::AND, "&&", line_, col_); advance(); advance(); continue; }
+                if (twoChar == "||")  { tokens.emplace_back(BantuTokenType::OR, "||", line_, col_); advance(); advance(); continue; }
+                if (twoChar == "+=")  { tokens.emplace_back(BantuTokenType::PLUS_EQUALS, "+=", line_, col_); advance(); advance(); continue; }
+                if (twoChar == "-=")  { tokens.emplace_back(BantuTokenType::MINUS_EQUALS, "-=", line_, col_); advance(); advance(); continue; }
+                if (twoChar == "*=")  { tokens.emplace_back(BantuTokenType::MULTIPLY_EQUALS, "*=", line_, col_); advance(); advance(); continue; }
+                if (twoChar == "/=")  { tokens.emplace_back(BantuTokenType::DIVIDE_EQUALS, "/=", line_, col_); advance(); advance(); continue; }
+                if (twoChar == "++")  { tokens.emplace_back(BantuTokenType::INCREMENT, "++", line_, col_); advance(); advance(); continue; }
+                if (twoChar == "--")  { tokens.emplace_back(BantuTokenType::DECREMENT, "--", line_, col_); advance(); advance(); continue; }
             }
 
             // Single-character tokens
-            TokenType tt = charToTokenType(c);
-            if (tt != TokenType::UNRECOGNIZED) {
+            BantuTokenType tt = charToTokenType(c);
+            if (tt != BantuTokenType::UNRECOGNIZED) {
                 tokens.emplace_back(tt, std::string(1, c), line_, col_);
                 advance();
                 continue;
@@ -96,7 +115,7 @@ public:
             advance();
         }
 
-        tokens.emplace_back(TokenType::END_OF_FILE, "", line_, col_);
+        tokens.emplace_back(BantuTokenType::END_OF_FILE, "", line_, col_);
         return tokens;
     }
 
@@ -162,7 +181,7 @@ private:
             advance();
         }
         if (pos_ < source_.size()) advance();
-        return Token(TokenType::STRING, value, startLine, startCol);
+        return Token(BantuTokenType::STRING, value, startLine, startCol);
     }
 
     Token readNumber() {
@@ -179,7 +198,7 @@ private:
             value += source_[pos_];
             advance();
         }
-        return Token(TokenType::NUMBER, value, startLine, startCol);
+        return Token(BantuTokenType::NUMBER, value, startLine, startCol);
     }
 
     Token readIdentifier() {
@@ -189,122 +208,122 @@ private:
             value += source_[pos_];
             advance();
         }
-        TokenType tt = keywordToTokenType(value);
+        BantuTokenType tt = keywordToTokenType(value);
         return Token(tt, value, startLine, startCol);
     }
 
-    static TokenType charToTokenType(char c) {
+    static BantuTokenType charToTokenType(char c) {
         switch (c) {
-            case '+': return TokenType::PLUS;
-            case '-': return TokenType::MINUS;
-            case '*': return TokenType::MULTIPLY;
-            case '/': return TokenType::DIVIDE;
-            case '%': return TokenType::MODULO;
-            case '=': return TokenType::EQUALS;
-            case '>': return TokenType::GREATERTHAN;
-            case '<': return TokenType::LESSTHAN;
-            case '!': return TokenType::NOT;
-            case '(': return TokenType::LPAREN;
-            case ')': return TokenType::RPAREN;
-            case '{': return TokenType::LBRACE;
-            case '}': return TokenType::RBRACE;
-            case '[': return TokenType::LBRACKET;
-            case ']': return TokenType::RBRACKET;
-            case ':': return TokenType::COLON;
-            case '|': return TokenType::PIPE;
-            case ',': return TokenType::COMMA;
-            case ';': return TokenType::SEMICOLON;
-            case '.': return TokenType::DOT;
-            default: return TokenType::UNRECOGNIZED;
+            case '+': return BantuTokenType::PLUS;
+            case '-': return BantuTokenType::MINUS;
+            case '*': return BantuTokenType::MULTIPLY;
+            case '/': return BantuTokenType::DIVIDE;
+            case '%': return BantuTokenType::MODULO;
+            case '=': return BantuTokenType::EQUALS;
+            case '>': return BantuTokenType::GREATERTHAN;
+            case '<': return BantuTokenType::LESSTHAN;
+            case '!': return BantuTokenType::NOT;
+            case '(': return BantuTokenType::LPAREN;
+            case ')': return BantuTokenType::RPAREN;
+            case '{': return BantuTokenType::LBRACE;
+            case '}': return BantuTokenType::RBRACE;
+            case '[': return BantuTokenType::LBRACKET;
+            case ']': return BantuTokenType::RBRACKET;
+            case ':': return BantuTokenType::COLON;
+            case '|': return BantuTokenType::PIPE;
+            case ',': return BantuTokenType::COMMA;
+            case ';': return BantuTokenType::SEMICOLON;
+            case '.': return BantuTokenType::DOT;
+            default: return BantuTokenType::UNRECOGNIZED;
         }
     }
 
-    static TokenType keywordToTokenType(const std::string& word) {
-        static const std::unordered_map<std::string, TokenType> keywords = {
+    static BantuTokenType keywordToTokenType(const std::string& word) {
+        static const std::unordered_map<std::string, BantuTokenType> keywords = {
             // Control flow
-            {"if",       TokenType::IF},
-            {"else",     TokenType::ELSE},
-            {"while",    TokenType::WHILE},
-            {"for",      TokenType::FOR},
-            {"each",     TokenType::EACH},
-            {"in",       TokenType::IN},
-            {"switch",   TokenType::SWITCH},
-            {"case",     TokenType::CASE},
-            {"default",  TokenType::DEFAULT},
-            {"break",    TokenType::BREAK},
-            {"continue", TokenType::CONTINUE},
+            {"if",       BantuTokenType::IF},
+            {"else",     BantuTokenType::ELSE},
+            {"while",    BantuTokenType::WHILE},
+            {"for",      BantuTokenType::FOR},
+            {"each",     BantuTokenType::EACH},
+            {"in",       BantuTokenType::IN},
+            {"switch",   BantuTokenType::SWITCH},
+            {"case",     BantuTokenType::CASE},
+            {"default",  BantuTokenType::DEFAULT},
+            {"break",    BantuTokenType::BREAK},
+            {"continue", BantuTokenType::CONTINUE},
 
             // Functions
-            {"def",      TokenType::DEF},
-            {"return",   TokenType::RETURN},
+            {"def",      BantuTokenType::DEF},
+            {"return",   BantuTokenType::RETURN},
 
             // I/O
-            {"print",    TokenType::PRINT},
-            {"read",     TokenType::READ},
-            {"db",       TokenType::DB},
-            {"fetch",    TokenType::FETCH},
-            {"await",    TokenType::AWAIT},
+            {"print",    BantuTokenType::PRINT},
+            {"read",     BantuTokenType::READ},
+            {"db",       BantuTokenType::DB},
+            {"fetch",    BantuTokenType::FETCH},
+            {"await",    BantuTokenType::AWAIT},
 
             // Modifiers
-            {"const",    TokenType::CONST},
-            {"private",  TokenType::PRIVATE},
-            {"public",   TokenType::PUBLIC},
-            {"from",     TokenType::FROM},
+            {"const",    BantuTokenType::CONST},
+            {"private",  BantuTokenType::PRIVATE},
+            {"public",   BantuTokenType::PUBLIC},
+            {"from",     BantuTokenType::FROM},
 
             // Error handling
-            {"try",      TokenType::TRY},
-            {"catch",    TokenType::CATCH},
+            {"try",      BantuTokenType::TRY},
+            {"catch",    BantuTokenType::CATCH},
 
             // Object operations
-            {"new",      TokenType::NEW},
-            {"create",   TokenType::CREATE},
-            {"delete",   TokenType::DELETE},
-            {"update",   TokenType::UPDATE},
-            {"calc",     TokenType::CALC},
+            {"new",      BantuTokenType::NEW},
+            {"create",   BantuTokenType::CREATE},
+            {"delete",   BantuTokenType::DELETE},
+            {"update",   BantuTokenType::UPDATE},
+            {"calc",     BantuTokenType::CALC},
 
             // Class
-            {"class",     TokenType::CLASS},
-            {"extends",   TokenType::EXTENDS},
-            {"implements",TokenType::IMPLEMENTS},
-            {"super",     TokenType::SUPER},
+            {"class",     BantuTokenType::CLASS},
+            {"extends",   BantuTokenType::EXTENDS},
+            {"implements",BantuTokenType::IMPLEMENTS},
+            {"super",     BantuTokenType::SUPER},
 
             // Module
-            {"import",   TokenType::IMPORT},
-            {"export",   TokenType::EXPORT},
+            {"import",   BantuTokenType::IMPORT},
+            {"export",   BantuTokenType::EXPORT},
             // v1.2.1: module include (Bantu-style imports)
-            {"include",  TokenType::INCLUDE},
+            {"include",  BantuTokenType::INCLUDE},
 
             // Real-Time (sua framework)
-            {"channel",   TokenType::CHANNEL},
-            {"signal",    TokenType::SIGNAL},
-            {"stun",      TokenType::STUN},
-            {"stream",    TokenType::STREAM},
-            {"broadcast", TokenType::BROADCAST},
-            {"relay",     TokenType::RELAY},
-            {"connect",   TokenType::CONNECT},
-            {"peer",      TokenType::PEER},
-            {"ice",       TokenType::ICE},
-            {"candidate", TokenType::CANDIDATE},
-            {"room",      TokenType::ROOM},
-            {"offer",     TokenType::OFFER},
-            {"answer",    TokenType::ANSWER},
+            {"channel",   BantuTokenType::CHANNEL},
+            {"signal",    BantuTokenType::SIGNAL},
+            {"stun",      BantuTokenType::STUN},
+            {"stream",    BantuTokenType::STREAM},
+            {"broadcast", BantuTokenType::BROADCAST},
+            {"relay",     BantuTokenType::RELAY},
+            {"connect",   BantuTokenType::CONNECT},
+            {"peer",      BantuTokenType::PEER},
+            {"ice",       BantuTokenType::ICE},
+            {"candidate", BantuTokenType::CANDIDATE},
+            {"room",      BantuTokenType::ROOM},
+            {"offer",     BantuTokenType::OFFER},
+            {"answer",    BantuTokenType::ANSWER},
 
             // Values
-            {"true",     TokenType::TRUE},
-            {"false",    TokenType::FALSE},
-            {"null",     TokenType::NULL_T},
+            {"true",     BantuTokenType::TRUE},
+            {"false",    BantuTokenType::FALSE},
+            {"null",     BantuTokenType::NULL_T},
 
             // Type annotations
-            {"number",   TokenType::TYPE_NUMBER},
-            {"string",   TokenType::TYPE_STRING},
-            {"bool",     TokenType::TYPE_BOOL},
-            {"list",     TokenType::TYPE_LIST},
-            {"dict",     TokenType::TYPE_DICT},
-            {"any",      TokenType::TYPE_ANY},
-            {"func",     TokenType::TYPE_FUNC},
+            {"number",   BantuTokenType::TYPE_NUMBER},
+            {"string",   BantuTokenType::TYPE_STRING},
+            {"bool",     BantuTokenType::TYPE_BOOL},
+            {"list",     BantuTokenType::TYPE_LIST},
+            {"dict",     BantuTokenType::TYPE_DICT},
+            {"any",      BantuTokenType::TYPE_ANY},
+            {"func",     BantuTokenType::TYPE_FUNC},
         };
         auto it = keywords.find(word);
         if (it != keywords.end()) return it->second;
-        return TokenType::IDENTIFIER;
+        return BantuTokenType::IDENTIFIER;
     }
 };

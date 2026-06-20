@@ -67,16 +67,16 @@ struct AssignNode : ASTNode {
 
 // ─── Operations ───
 struct BinaryOpNode : ASTNode {
-    TokenType op;
+    BantuTokenType op;
     std::shared_ptr<ASTNode> left, right;
-    BinaryOpNode(TokenType o, std::shared_ptr<ASTNode> l, std::shared_ptr<ASTNode> r, int ln, int c)
+    BinaryOpNode(BantuTokenType o, std::shared_ptr<ASTNode> l, std::shared_ptr<ASTNode> r, int ln, int c)
         : ASTNode(ln, c), op(o), left(std::move(l)), right(std::move(r)) {}
 };
 
 struct UnaryOpNode : ASTNode {
-    TokenType op;
+    BantuTokenType op;
     std::shared_ptr<ASTNode> operand;
-    UnaryOpNode(TokenType o, std::shared_ptr<ASTNode> e, int l, int c)
+    UnaryOpNode(BantuTokenType o, std::shared_ptr<ASTNode> e, int l, int c)
         : ASTNode(l, c), op(o), operand(std::move(e)) {}
 };
 

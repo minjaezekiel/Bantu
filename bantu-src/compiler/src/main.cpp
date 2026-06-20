@@ -1018,6 +1018,16 @@ static std::string findSelfBinary() {
     if (envBin && *envBin && fileExists(envBin)) {
         return std::string(envBin);
     }
+#ifdef _WIN32
+    // Windows: GetModuleFileNameA returns the absolute path of the running .exe
+    char buf[4096];
+    DWORD n = GetModuleFileNameA(nullptr, buf, sizeof(buf) - 1);
+    if (n > 0 && n < sizeof(buf)) {
+        buf[n] = 0;
+        return std::string(buf);
+    }
+    return "";
+#else
     // Try /proc/self/exe on Linux
     if (fileExists("/proc/self/exe")) {
         char buf[4096];
@@ -1034,6 +1044,7 @@ static std::string findSelfBinary() {
         if (!line.empty() && fileExists(line)) return line;
     }
     return "";
+#endif
 }
 
 // ── Linux: build a .deb package ──

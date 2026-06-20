@@ -176,7 +176,27 @@ public:
 // TOKEN TYPE
 // ============================================================
 
-enum class TokenType {
+// Windows headers (pulled in via <curl/curl.h> → <winsock2.h> → <windows.h>)
+// define macros named CONST, DELETE, TRUE, FALSE that clash with the
+// BantuTokenType enum values below. Undefine them so the enum compiles.
+#ifdef CONST
+#undef CONST
+#endif
+#ifdef DELETE
+#undef DELETE
+#endif
+#ifdef TRUE
+#undef TRUE
+#endif
+#ifdef FALSE
+#undef FALSE
+#endif
+// IN is a Windows SAL annotation macro
+#ifdef IN
+#undef IN
+#endif
+
+enum class BantuTokenType {
     // Literals
     NUMBER, STRING, TRUE, FALSE, NULL_T,
     // Identifiers
@@ -214,13 +234,13 @@ enum class TokenType {
 };
 
 struct Token {
-    TokenType type;
+    BantuTokenType type;
     std::string value;
     int line;
     int col;
 
-    Token() : type(TokenType::UNRECOGNIZED), line(0), col(0) {}
-    Token(TokenType t, std::string v, int l, int c) : type(t), value(std::move(v)), line(l), col(c) {}
+    Token() : type(BantuTokenType::UNRECOGNIZED), line(0), col(0) {}
+    Token(BantuTokenType t, std::string v, int l, int c) : type(t), value(std::move(v)), line(l), col(c) {}
 };
 
 // ============================================================
