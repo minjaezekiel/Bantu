@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bantu POS — Products</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand">
+            <span class="logo">B</span>
+            <span class="title">Bantu POS</span>
+        </div>
+        <nav class="nav">
+            <a href="/">Checkout</a>
+            <a href="/products.html" class="active">Products</a>
+            <a href="/sales.html">Sales</a>
+            <a href="/dashboard.html">Dashboard</a>
+        </nav>
+        <div class="clock" id="clock">--:--:--</div>
+    </header>
+
+    <main class="page">
+        <div class="page-header">
+            <h1>Products</h1>
+            <button id="newProductBtn" class="btn btn-primary">+ New Product</button>
+        </div>
+
+        <div class="toolbar">
+            <input type="text" id="searchInput" placeholder="Search products..." autocomplete="off">
+        </div>
+
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>SKU</th>
+                    <th>Name</th>
+                    <th>Category</th>
+                    <th class="num">Price</th>
+                    <th class="num">Cost</th>
+                    <th class="num">Stock</th>
+                    <th class="num">Tax %</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody id="productsTableBody">
+                <tr><td colspan="8" class="empty">Loading...</td></tr>
+            </tbody>
+        </table>
+    </main>
+
+    <!-- Product editor modal -->
+    <div id="productModal" class="modal hidden">
+        <div class="modal-content">
+            <h2 id="modalTitle">New Product</h2>
+            <form id="productForm">
+                <input type="hidden" id="productId">
+                <div class="form-grid">
+                    <label>Name <input type="text" id="pName" required></label>
+                    <label>SKU <input type="text" id="pSku" required></label>
+                    <label>Barcode <input type="text" id="pBarcode"></label>
+                    <label>Category <input type="text" id="pCategory" list="catList" value="General"></label>
+                    <datalist id="catList">
+                        <option value="Beverages">
+                        <option value="Bakery">
+                        <option value="Dairy">
+                        <option value="Groceries">
+                        <option value="Household">
+                        <option value="Stationery">
+                        <option value="Electronics">
+                    </datalist>
+                    <label>Price <input type="number" id="pPrice" step="0.01" min="0" required></label>
+                    <label>Cost <input type="number" id="pCost" step="0.01" min="0" value="0"></label>
+                    <label>Stock <input type="number" id="pStock" step="1" min="0" value="0" required></label>
+                    <label>Tax Rate % <input type="number" id="pTax" step="0.01" min="0" max="100" value="18.00"></label>
+                </div>
+                <div class="form-actions">
+                    <button type="button" id="cancelProductBtn" class="btn btn-ghost">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="/js/app.js"></script>
+    <script src="/js/products.js"></script>
+</body>
+</html>

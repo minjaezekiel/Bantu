@@ -280,12 +280,19 @@ inline std::vector<std::string> bantuSplitPath(const std::string& p) {
 static sqlite3* bantuSqliteDb = nullptr;
 static std::string bantuSqlitePath = "";
 
-// ─── PostgreSQL State (simulated for static binary) ───
+// ─── PostgreSQL State ───
+// When built with -DBANTU_POSTGRES=ON (and libpq available), bantuPgConn
+// holds a real PGconn* and queries hit a real PostgreSQL database.
+// Otherwise the static binary uses the deterministic stub below.
 static bool bantuPgConnected = false;
 static std::string bantuPgConnStr = "";
 static std::string bantuPgHost = "";
 static std::string bantuPgDb = "";
 static std::string bantuPgUser = "";
+#ifdef HAS_LIBPQ
+    #include <libpq-fe.h>
+    static PGconn* bantuPgConn = nullptr;
+#endif
 
 // ─── MySQL State (simulated for static binary) ───
 static bool bantuMysqlConnected = false;
@@ -2719,11 +2726,13 @@ private:
         ObjectMap postgresObj;
 
         // sua.postgres.connect(connStr)
+        // When built with -DBANTU_POSTGRES=ON, opens a real PG connection.
+        // Otherwise stores the connStr and sets the connected flag (stub mode).
         postgresObj["connect"] = makeNative([](std::vector<Value> args) -> Value {
             std::string connStr = args.size() > 0 ? args[0].toString()
                 : "host=localhost dbname=test user=postgres password=postgres";
 
-            // Parse connection string
+            // Parse connection string for display + stub fallback
             bantuPgHost = "localhost"; bantuPgDb = "test"; bantuPgUser = "postgres";
             std::string port = "5432";
             if (connStr.find("host=") != std::string::npos) {
@@ -2748,10 +2757,29 @@ private:
             }
 
             bantuPgConnStr = connStr;
-            bantuPgConnected = true;
 
             std::cout << "  [POSTGRES] Connecting to " << bantuPgHost << ":" << port << "/" << bantuPgDb << "\n";
-            std::cout << "  [POSTGRES] Connected as " << bantuPgUser << "\n";
+
+#ifdef HAS_LIBPQ
+            // Real PostgreSQL connection via libpq
+            if (bantuPgConn != nullptr) {
+                PQfinish(bantuPgConn);
+                bantuPgConn = nullptr;
+            }
+            bantuPgConn = PQconnectdb(connStr.c_str());
+            if (bantuPgConn == nullptr || PQstatus(bantuPgConn) != CONNECTION_OK) {
+                std::string errMsg = bantuPgConn ? PQerrorMessage(bantuPgConn) : "PQconnectdb returned null";
+                std::cout << "  [POSTGRES] Connection FAILED: " << errMsg << "\n";
+                if (bantuPgConn) { PQfinish(bantuPgConn); bantuPgConn = nullptr; }
+                bantuPgConnected = false;
+                ObjectMap errInfo;
+                errInfo["connected"] = Value(false);
+                errInfo["error"] = Value(errMsg);
+                return Value(std::move(errInfo));
+            }
+            bantuPgConnected = true;
+            std::cout << "  [POSTGRES] Connected as " << bantuPgUser
+                      << " (server: " << PQserverVersion(bantuPgConn) << ")\n";
             ObjectMap connInfo;
             connInfo["connected"] = Value(true);
             connInfo["host"] = Value(bantuPgHost);
@@ -2759,12 +2787,30 @@ private:
             connInfo["user"] = Value(bantuPgUser);
             connInfo["port"] = Value(port);
             connInfo["type"] = Value(std::string("postgresql"));
-            connInfo["serverVersion"] = Value(std::string("PostgreSQL 16.x"));
+            connInfo["serverVersion"] = Value((double)PQserverVersion(bantuPgConn));
+            connInfo["protocolVersion"] = Value((double)PQprotocolVersion(bantuPgConn));
+            return Value(std::move(connInfo));
+#else
+            // Stub mode (no libpq linked)
+            bantuPgConnected = true;
+            std::cout << "  [POSTGRES] Connected as " << bantuPgUser
+                      << " (stub mode — rebuild with -DBANTU_POSTGRES=ON for real queries)\n";
+            ObjectMap connInfo;
+            connInfo["connected"] = Value(true);
+            connInfo["host"] = Value(bantuPgHost);
+            connInfo["dbname"] = Value(bantuPgDb);
+            connInfo["user"] = Value(bantuPgUser);
+            connInfo["port"] = Value(port);
+            connInfo["type"] = Value(std::string("postgresql"));
+            connInfo["serverVersion"] = Value(std::string("PostgreSQL 16.x (stub)"));
             connInfo["protocolVersion"] = Value(3.0);
             return Value(std::move(connInfo));
+#endif
         });
 
-        // sua.postgres.query(sql)
+        // sua.postgres.query(sql) — returns a list of row objects for SELECT,
+        // or an execInfo object for INSERT/UPDATE/DELETE/CREATE/DROP.
+        // In stub mode (no libpq), returns simulated data.
         postgresObj["query"] = makeNative([](std::vector<Value> args) -> Value {
             std::string sql = args.size() > 0 ? args[0].toString() : "SELECT 1";
 
@@ -2776,14 +2822,86 @@ private:
                 return Value(std::move(errInfo));
             }
 
+#ifdef HAS_LIBPQ
+            // Real PostgreSQL query via libpq
+            if (bantuPgConn == nullptr) {
+                ObjectMap errInfo;
+                errInfo["error"] = Value(std::string("PGconn is null"));
+                errInfo["success"] = Value(false);
+                return Value(std::move(errInfo));
+            }
+            std::cout << "  [POSTGRES] Query: " << sql.substr(0, 80)
+                      << (sql.length() > 80 ? "..." : "") << "\n";
+            PGresult* res = PQexec(bantuPgConn, sql.c_str());
+            if (res == nullptr) {
+                ObjectMap errInfo;
+                errInfo["error"] = Value(std::string("PQexec returned null"));
+                errInfo["success"] = Value(false);
+                return Value(std::move(errInfo));
+            }
+            ExecStatusType status = PQresultStatus(res);
+            if (status == PGRES_FATAL_ERROR || status == PGRES_NONFATAL_ERROR) {
+                std::string errMsg = PQresultErrorMessage(res);
+                std::cout << "  [POSTGRES] ERROR: " << errMsg << "\n";
+                PQclear(res);
+                ObjectMap errInfo;
+                errInfo["error"] = Value(errMsg);
+                errInfo["success"] = Value(false);
+                return Value(std::move(errInfo));
+            }
+            if (status == PGRES_TUPLES_OK) {
+                // SELECT — return list of row objects
+                int nRows = PQntuples(res);
+                int nCols = PQnfields(res);
+                std::vector<Value> rows;
+                rows.reserve(nRows);
+                for (int r = 0; r < nRows; r++) {
+                    ObjectMap row;
+                    for (int c = 0; c < nCols; c++) {
+                        std::string colName = PQfname(res, c);
+                        char* val = PQgetvalue(res, r, c);
+                        if (PQgetisnull(res, r, c)) {
+                            row[colName] = Value();
+                        } else {
+                            Oid colType = PQftype(res, c);
+                            // Numeric OIDs: 23=int4, 20=int8, 1700=numeric,
+                            // 700=float4, 701=float8, 16=bool, 17=bytea
+                            if (colType == 23 || colType == 20 || colType == 21) {
+                                row[colName] = Value((double)atoll(val));
+                            } else if (colType == 700 || colType == 701 || colType == 1700) {
+                                row[colName] = Value(atof(val));
+                            } else if (colType == 16) {
+                                row[colName] = Value(std::string(val) == "t");
+                            } else {
+                                row[colName] = Value(std::string(val));
+                            }
+                        }
+                    }
+                    rows.push_back(Value(std::move(row)));
+                }
+                    std::cout << "  [POSTGRES]   Rows: " << rows.size() << "\n";
+                PQclear(res);
+                return Value(std::move(rows));
+            }
+            // Non-SELECT (INSERT/UPDATE/DELETE/CREATE/DROP/etc.)
+            int affected = atoi(PQcmdTuples(res));
+            std::string oidStr = PQoidStatus(res);
+            PQclear(res);
+            ObjectMap execInfo;
+            execInfo["affectedRows"] = Value((double)affected);
+            execInfo["success"] = Value(true);
+            if (!oidStr.empty() && oidStr != "0") {
+                execInfo["insertId"] = Value((double)atoll(oidStr.c_str()));
+            }
+                std::cout << "  [POSTGRES]   Affected " << affected << " row(s)\n";
+            return Value(std::move(execInfo));
+#else
+            // Stub mode — simulate based on SQL keyword
             std::cout << "  [POSTGRES] Query: " << sql.substr(0, 80) << (sql.length() > 80 ? "..." : "") << "\n";
-
-            // Determine query type for simulation
             std::string sqlUpper = sql;
             std::transform(sqlUpper.begin(), sqlUpper.end(), sqlUpper.begin(), ::toupper);
 
             if (sqlUpper.find("SELECT") != std::string::npos) {
-                // Simulate SELECT result
                 std::vector<Value> rows;
                 ObjectMap row1;
                 row1["id"] = Value(1.0); row1["name"] = Value(std::string("Alice")); row1["email"] = Value(std::string("alice@" + bantuPgDb + ".com"));
@@ -2791,49 +2909,115 @@ private:
                 row2["id"] = Value(2.0); row2["name"] = Value(std::string("Bob")); row2["email"] = Value(std::string("bob@" + bantuPgDb + ".com"));
                 rows.push_back(Value(std::move(row1)));
                 rows.push_back(Value(std::move(row2)));
-                std::cout << "  [POSTGRES]   Rows: " << rows.size() << "\n";
+                std::cout << "  [POSTGRES]   Rows: " << rows.size() << " (simulated)\n";
                 return Value(std::move(rows));
             } else if (sqlUpper.find("INSERT") != std::string::npos) {
                 ObjectMap execInfo;
                 execInfo["affectedRows"] = Value(1.0);
                 execInfo["insertId"] = Value(1.0);
                 execInfo["success"] = Value(true);
-                std::cout << "  [POSTGRES]   Inserted 1 row\n";
+                std::cout << "  [POSTGRES]   Inserted 1 row (simulated)\n";
                 return Value(std::move(execInfo));
             } else if (sqlUpper.find("UPDATE") != std::string::npos) {
                 ObjectMap execInfo;
                 execInfo["affectedRows"] = Value(1.0);
                 execInfo["success"] = Value(true);
-                std::cout << "  [POSTGRES]   Updated 1 row\n";
+                std::cout << "  [POSTGRES]   Updated 1 row (simulated)\n";
                 return Value(std::move(execInfo));
             } else if (sqlUpper.find("DELETE") != std::string::npos) {
                 ObjectMap execInfo;
                 execInfo["affectedRows"] = Value(1.0);
                 execInfo["success"] = Value(true);
-                std::cout << "  [POSTGRES]   Deleted 1 row\n";
+                std::cout << "  [POSTGRES]   Deleted 1 row (simulated)\n";
                 return Value(std::move(execInfo));
             } else if (sqlUpper.find("CREATE") != std::string::npos) {
                 ObjectMap execInfo;
                 execInfo["success"] = Value(true);
-                std::cout << "  [POSTGRES]   Table created\n";
+                std::cout << "  [POSTGRES]   Table created (simulated)\n";
                 return Value(std::move(execInfo));
             } else if (sqlUpper.find("DROP") != std::string::npos) {
                 ObjectMap execInfo;
                 execInfo["success"] = Value(true);
-                std::cout << "  [POSTGRES]   Table dropped\n";
+                std::cout << "  [POSTGRES]   Table dropped (simulated)\n";
                 return Value(std::move(execInfo));
             }
-
-            // Generic
-            std::cout << "  [POSTGRES]   OK\n";
+            std::cout << "  [POSTGRES]   OK (simulated)\n";
             ObjectMap execInfo;
             execInfo["success"] = Value(true);
             return Value(std::move(execInfo));
+#endif
+        });
+
+        // sua.postgres.exec(sql) — alias for query(); convenience method
+        // for INSERT/UPDATE/DELETE/CREATE/DROP. Returns the same execInfo
+        // object that query() returns for non-SELECT statements.
+        postgresObj["exec"] = makeNative([](std::vector<Value> args) -> Value {
+            std::string sql = args.size() > 0 ? args[0].toString() : "";
+            // Re-dispatch via the query handler — same code path, same return shape
+            std::vector<Value> queryArgs;
+            queryArgs.push_back(Value(sql));
+            // Find query on the same postgresObj — easier: just call PQexec directly
+#ifdef HAS_LIBPQ
+            if (!bantuPgConnected || bantuPgConn == nullptr) {
+                ObjectMap errInfo;
+                errInfo["error"] = Value(std::string("Not connected to PostgreSQL"));
+                errInfo["success"] = Value(false);
+                return Value(std::move(errInfo));
+            }
+                std::cout << "  [POSTGRES] Exec: " << sql.substr(0, 80)
+                          << (sql.length() > 80 ? "..." : "") << "\n";
+            PGresult* res = PQexec(bantuPgConn, sql.c_str());
+            if (res == nullptr) {
+                ObjectMap errInfo;
+                errInfo["error"] = Value(std::string("PQexec returned null"));
+                errInfo["success"] = Value(false);
+                return Value(std::move(errInfo));
+            }
+            ExecStatusType status = PQresultStatus(res);
+            if (status == PGRES_FATAL_ERROR || status == PGRES_NONFATAL_ERROR) {
+                std::string errMsg = PQresultErrorMessage(res);
+                std::cout << "  [POSTGRES] ERROR: " << errMsg << "\n";
+                PQclear(res);
+                ObjectMap errInfo;
+                errInfo["error"] = Value(errMsg);
+                errInfo["success"] = Value(false);
+                return Value(std::move(errInfo));
+            }
+            int affected = atoi(PQcmdTuples(res));
+            std::string oidStr = PQoidStatus(res);
+            PQclear(res);
+            ObjectMap execInfo;
+            execInfo["affectedRows"] = Value((double)affected);
+            execInfo["success"] = Value(true);
+            if (!oidStr.empty() && oidStr != "0") {
+                execInfo["insertId"] = Value((double)atoll(oidStr.c_str()));
+            }
+                std::cout << "  [POSTGRES]   Affected " << affected << " row(s)\n";
+            return Value(std::move(execInfo));
+#else
+            // Stub: dispatch through the same simulation as query()
+            // by re-calling this lambda with sql. Simpler: just simulate here.
+            if (!bantuPgConnected) {
+                ObjectMap errInfo;
+                errInfo["error"] = Value(std::string("Not connected to PostgreSQL"));
+                errInfo["success"] = Value(false);
+                return Value(std::move(errInfo));
+            }
+            std::cout << "  [POSTGRES] Exec: " << sql.substr(0, 80) << (sql.length() > 80 ? "..." : "") << "\n";
+            ObjectMap execInfo;
+            execInfo["success"] = Value(true);
+            execInfo["affectedRows"] = Value(1.0);
+            std::cout << "  [POSTGRES]   OK (simulated)\n";
+            return Value(std::move(execInfo));
+#endif
         });
 
         // sua.postgres.close()
         postgresObj["close"] = makeNative([](std::vector<Value> args) -> Value {
             if (bantuPgConnected) {
+#ifdef HAS_LIBPQ
+                if (bantuPgConn) { PQfinish(bantuPgConn); bantuPgConn = nullptr; }
+#endif
                 bantuPgConnected = false;
                 bantuPgConnStr = "";
                 std::cout << "  [POSTGRES] Connection closed\n";

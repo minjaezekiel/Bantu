@@ -45,6 +45,10 @@
     #include <direct.h>      // _getcwd
     #include <sys/stat.h>    // stat (works on Windows too)
     #define getcwd _getcwd
+#elif defined(__APPLE__)
+    #include <mach-o/dyld.h>  // _NSGetExecutablePath
+    #include <sys/stat.h>
+    #include <unistd.h>
 #else
     #include <sys/stat.h>
     #include <unistd.h>
@@ -1027,8 +1031,46 @@ static std::string findSelfBinary() {
         return std::string(buf);
     }
     return "";
+#elif defined(__APPLE__)
+    // macOS: use _NSGetExecutablePath (from <mach-o/dyld.h>)
+    // Returns the absolute path of the current process's executable,
+    // even if invoked via a symlink or relative path.
+    char buf[4096];
+    uint32_t size = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &size) == 0) {
+        // Resolve any symlinks in the path (e.g. /usr/local/bin/bantu → real location)
+        char resolved[4096];
+        if (realpath(buf, resolved) != nullptr) {
+            return std::string(resolved);
+        }
+        return std::string(buf);
+    }
+    // Buffer too small — try with a heap allocation
+    if (size > 0 && size < 1'000'000) {
+        char* heapBuf = new char[size + 1];
+        if (_NSGetExecutablePath(heapBuf, &size) == 0) {
+            std::string result(heapBuf);
+            delete[] heapBuf;
+            char resolved[4096];
+            if (realpath(result.c_str(), resolved) != nullptr) {
+                return std::string(resolved);
+            }
+            return result;
+        }
+        delete[] heapBuf;
+    }
+    // Fall back to PATH lookup
+    int rc = system("command -v bantu > /tmp/.bantu_bin_path 2>/dev/null");
+    (void)rc;
+    std::ifstream f("/tmp/.bantu_bin_path");
+    if (f.is_open()) {
+        std::string line;
+        std::getline(f, line);
+        if (!line.empty() && fileExists(line)) return line;
+    }
+    return "";
 #else
-    // Try /proc/self/exe on Linux
+    // Linux: /proc/self/exe is a symlink to the actual executable
     if (fileExists("/proc/self/exe")) {
         char buf[4096];
         ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);

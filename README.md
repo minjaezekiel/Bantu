@@ -43,10 +43,11 @@ Grab the latest zip from the [v1.2.2 release](https://github.com/AsseySilivestir
 
 | Asset | Size | Platform | Includes |
 |---|---|---|---|
-| [`Bantu-v1.2.2-linux-x64.zip`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.2/Bantu-v1.2.2-linux-x64.zip) | ~350 KB | Linux x86-64 | Pre-built `bantu` binary + samples + docs + VSIX |
-| [`Bantu-v1.2.2-windows-x64.zip`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.2/Bantu-v1.2.2-windows-x64.zip) | ~610 KB | Windows x64 | Pre-built `bantu.exe` + `install.bat` + samples + VSIX + PDF (no compilation needed) |
+| [`Bantu-v1.2.2-linux-x64.zip`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.2/Bantu-v1.2.2-linux-x64.zip) | ~380 KB | Linux x86-64 | Pre-built `bantu` binary + samples + docs + VSIX |
+| [`Bantu-v1.2.2-windows-x64.zip`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.2/Bantu-v1.2.2-windows-x64.zip) | ~650 KB | Windows x64 | Pre-built `bantu.exe` + `install.bat` + samples + VSIX + PDF (no compilation needed) |
 | [`bantu-vscode-1.2.2.vsix`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.2/bantu-vscode-1.2.2.vsix) | ~24 KB | VSCode 1.75+ | Standalone extension (also inside both zips) |
-| [`Bantu-Programming-Language-v1.2.2.pdf`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.2/Bantu-Programming-Language-v1.2.2.pdf) | ~65 KB | Any | 30-page official guide |
+| [`Bantu-Programming-Language-v1.2.2.pdf`](https://github.com/AsseySilivestir/Bantu/releases/download/v1.2.2/Bantu-Programming-Language-v1.2.2.pdf) | ~75 KB | Any | Dracula-themed 31-page official guide |
+| — *(build from source)* | — | **macOS** | No pre-built binary — see [One-time setup (macOS)](#one-time-setup-macos--build-from-source) below |
 
 ## Quick Start
 
@@ -100,6 +101,86 @@ bantu --version
 
 To uninstall later: run `uninstall.bat` from the original zip folder,
 or use *Add/Remove Programs* in Windows Settings.
+
+### One-time setup (macOS) — build from source
+
+The v1.2.2 release ships pre-built binaries for **Linux x86-64** and
+**Windows x64** only. There is no pre-built macOS binary in the release
+(yet) — on macOS, build `bantu` from source. It's a single C++17 file
+that compiles in ~30 seconds with the Xcode command-line tools.
+
+```bash
+# 1. Install Xcode command-line tools (one-time, ~200 MB)
+xcode-select --install
+
+# 2. Clone the Bantu source
+git clone https://github.com/AsseySilivestir/Bantu.git
+cd Bantu/bantu-src/compiler
+
+# 3. Build (uses clang++ shipped with Xcode)
+./build.sh
+
+# 4. The freshly-built bantu binary lands at ./build/bantu
+#    Add it to your PATH:
+sudo cp build/bantu /usr/local/bin/bantu
+sudo chmod +x /usr/local/bin/bantu
+
+# 5. Open a NEW terminal, then verify
+bantu --version
+# → Bantu v1.2.2
+```
+
+**Optional — real PostgreSQL/MySQL/WebRTC drivers:**
+
+The default macOS build ships deterministic stubs (same as Linux/Windows
+release builds). To link real drivers:
+
+```bash
+# Install dependencies via Homebrew
+brew install libpq mysql-client libdatachannel
+
+# Rebuild with the drivers you want
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release \
+         -DBANTU_POSTGRES=ON \
+         -DBANTU_MYSQL=ON \
+         -DBANTU_WEBRTC=ON \
+         -DCMAKE_PREFIX_PATH="$(brew --prefix libpq);$(brew --prefix libdatachannel)"
+cmake --build . --config Release -j
+sudo cp bantu /usr/local/bin/bantu
+```
+
+**Common macOS install failures and fixes:**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `xcode-select: error: command line tools are already installed` then build fails | Stale Xcode CLT | `sudo rm -rf /Library/Developer/CommandLineTools && xcode-select --install` |
+| `'iostream' file not found` | Xcode CLT missing or broken | `xcode-select --install` (allow the ~200 MB install to finish) |
+| `clang: error: no such file or directory: 'build.sh'` | Wrong directory | `cd Bantu/bantu-src/compiler` (build.sh lives there) |
+| `bantu: command not found` after install | PATH not refreshed | Open a **new** Terminal tab, or `source ~/.zshrc` |
+| `bantu installer ... --platform macos` warns "Could not locate bantu binary to bundle" | Older bantu binary using PATH-lookup fallback | Rebuild from this commit or later — `_NSGetExecutablePath` is now used |
+| `permission denied: /usr/local/bin/bantu` | Owned by root | `sudo chown $(whoami) /usr/local/bin/bantu` (or reinstall with `sudo`) |
+| dyld library load errors at runtime | Built with shared libpq / libdatachannel but those aren't on DYLD_LIBRARY_PATH | Either rebuild without `-DBANTU_POSTGRES=ON` or `export DYLD_LIBRARY_PATH="$(brew --prefix libpq)/lib"` |
+
+### Building a macOS `.app` for your own Bantu app
+
+Once Bantu itself is installed, you can package any `.b` program as a
+standard macOS `.app` bundle:
+
+```bash
+cd /path/to/your-bantu-app
+bantu installer server.b --platform macos --name "MyApp" --version "1.0.0"
+# → dist/MyApp.app
+
+open dist/MyApp.app       # runs it
+# Distribute as a .dmg:
+hdiutil create -volname 'MyApp' -srcfolder dist/MyApp.app -ov -format UDZO dist/MyApp-1.0.0.dmg
+```
+
+The `.app` bundles the `bantu` interpreter at `Contents/MacOS/bantu`
+(via `_NSGetExecutablePath` — so the bundle is fully self-contained and
+runs on any macOS 10.13+ machine, no Bantu install required on the
+target).
 
 ### Your first project
 

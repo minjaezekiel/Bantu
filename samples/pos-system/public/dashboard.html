@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bantu POS — Dashboard</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand">
+            <span class="logo">B</span>
+            <span class="title">Bantu POS</span>
+        </div>
+        <nav class="nav">
+            <a href="/">Checkout</a>
+            <a href="/products.html">Products</a>
+            <a href="/sales.html">Sales</a>
+            <a href="/dashboard.html" class="active">Dashboard</a>
+        </nav>
+        <div class="clock" id="clock">--:--:--</div>
+    </header>
+
+    <main class="page">
+        <div class="page-header">
+            <h1>Dashboard</h1>
+            <button id="refreshBtn" class="btn btn-ghost">⟳ Refresh</button>
+        </div>
+
+        <!-- KPI cards -->
+        <div class="kpi-grid">
+            <div class="kpi-card kpi-green">
+                <div class="kpi-label">Today's Revenue</div>
+                <div class="kpi-value" id="todayRevenue">0.00</div>
+                <div class="kpi-sub" id="todaySales">0 sales</div>
+            </div>
+            <div class="kpi-card kpi-blue">
+                <div class="kpi-label">This Week</div>
+                <div class="kpi-value" id="weekRevenue">0.00</div>
+                <div class="kpi-sub" id="weekSales">0 sales</div>
+            </div>
+            <div class="kpi-card kpi-purple">
+                <div class="kpi-label">This Month</div>
+                <div class="kpi-value" id="monthRevenue">0.00</div>
+                <div class="kpi-sub" id="monthSales">0 sales</div>
+            </div>
+            <div class="kpi-card kpi-orange">
+                <div class="kpi-label">Inventory Value</div>
+                <div class="kpi-value" id="invValue">0.00</div>
+                <div class="kpi-sub" id="invProducts">0 products</div>
+            </div>
+            <div class="kpi-card kpi-red">
+                <div class="kpi-label">Low Stock Items</div>
+                <div class="kpi-value" id="lowStock">0</div>
+                <div class="kpi-sub">≤ 5 units</div>
+            </div>
+        </div>
+
+        <!-- Charts and top items -->
+        <div class="dashboard-grid">
+            <div class="card">
+                <h3>Revenue — Last 7 Days</h3>
+                <div id="last7Chart" class="bar-chart"></div>
+            </div>
+            <div class="card">
+                <h3>Top 5 Products</h3>
+                <table class="data-table compact">
+                    <thead>
+                        <tr>
+                            <th>Product</th>
+                            <th class="num">Units</th>
+                            <th class="num">Revenue</th>
+                        </tr>
+                    </thead>
+                    <tbody id="topItemsBody">
+                        <tr><td colspan="3" class="empty">No sales yet</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="/js/app.js"></script>
+    <script src="/js/dashboard.js"></script>
+</body>
+</html>

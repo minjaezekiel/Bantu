@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bantu POS — Checkout</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand">
+            <span class="logo">B</span>
+            <span class="title">Bantu POS</span>
+        </div>
+        <nav class="nav">
+            <a href="/" class="active">Checkout</a>
+            <a href="/products.html">Products</a>
+            <a href="/sales.html">Sales</a>
+            <a href="/dashboard.html">Dashboard</a>
+        </nav>
+        <div class="clock" id="clock">--:--:--</div>
+    </header>
+
+    <main class="pos-layout">
+        <!-- LEFT: Product grid -->
+        <section class="products-panel">
+            <div class="search-row">
+                <input type="text" id="searchInput" placeholder="Search name, SKU, or barcode..." autocomplete="off">
+                <select id="categoryFilter">
+                    <option value="">All categories</option>
+                </select>
+                <button id="scanBtn" title="Scan barcode">📷 Scan</button>
+            </div>
+            <div class="product-grid" id="productGrid">
+                <div class="empty">Loading products...</div>
+            </div>
+        </section>
+
+        <!-- RIGHT: Cart -->
+        <aside class="cart-panel">
+            <div class="cart-header">
+                <h2>Current Sale</h2>
+                <button id="clearCartBtn" class="btn btn-ghost btn-sm">Clear</button>
+            </div>
+            <div class="cart-items" id="cartItems">
+                <div class="empty">Scan or click products to add to cart</div>
+            </div>
+            <div class="cart-totals">
+                <div class="row"><span>Subtotal</span><span id="subtotal">0.00</span></div>
+                <div class="row"><span>Tax (VAT)</span><span id="taxTotal">0.00</span></div>
+                <div class="row">
+                    <span>Discount</span>
+                    <input type="number" id="discountInput" value="0" min="0" step="0.01" />
+                </div>
+                <div class="row total"><span>TOTAL</span><span id="grandTotal">0.00</span></div>
+            </div>
+            <div class="cart-actions">
+                <select id="paymentMethod">
+                    <option value="cash">💵 Cash</option>
+                    <option value="card">💳 Card</option>
+                    <option value="mpesa">📱 M-Pesa</option>
+                    <option value="mobile">📱 Mobile Money</option>
+                </select>
+                <input type="number" id="paymentAmount" placeholder="Amount tendered" min="0" step="0.01">
+                <button id="checkoutBtn" class="btn btn-primary">Checkout</button>
+            </div>
+        </aside>
+    </main>
+
+    <!-- Receipt modal -->
+    <div id="receiptModal" class="modal hidden">
+        <div class="modal-content receipt-modal">
+            <div id="receiptContent"></div>
+            <div class="receipt-actions">
+                <button onclick="window.print()" class="btn btn-primary">🖨 Print</button>
+                <button id="newSaleBtn" class="btn btn-ghost">New Sale</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scanner modal (uses device camera via BarcodeDetector API if available) -->
+    <div id="scannerModal" class="modal hidden">
+        <div class="modal-content">
+            <h2>Barcode Scanner</h2>
+            <video id="scannerVideo" autoplay playsinline></video>
+            <p id="scannerStatus">Point camera at a barcode...</p>
+            <input type="text" id="manualBarcode" placeholder="Or type barcode + Enter">
+            <button id="closeScannerBtn" class="btn btn-ghost">Cancel</button>
+        </div>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="/js/app.js"></script>
+    <script src="/js/pos.js"></script>
+</body>
+</html>

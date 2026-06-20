@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bantu POS — Sales History</title>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand">
+            <span class="logo">B</span>
+            <span class="title">Bantu POS</span>
+        </div>
+        <nav class="nav">
+            <a href="/">Checkout</a>
+            <a href="/products.html">Products</a>
+            <a href="/sales.html" class="active">Sales</a>
+            <a href="/dashboard.html">Dashboard</a>
+        </nav>
+        <div class="clock" id="clock">--:--:--</div>
+    </header>
+
+    <main class="page">
+        <div class="page-header">
+            <h1>Sales History</h1>
+            <button id="refreshBtn" class="btn btn-ghost">⟳ Refresh</button>
+        </div>
+
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Receipt #</th>
+                    <th>Date / Time</th>
+                    <th>Customer</th>
+                    <th class="num">Items</th>
+                    <th class="num">Subtotal</th>
+                    <th class="num">Tax</th>
+                    <th class="num">Total</th>
+                    <th>Payment</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody id="salesTableBody">
+                <tr><td colspan="9" class="empty">Loading...</td></tr>
+            </tbody>
+        </table>
+    </main>
+
+    <!-- Sale detail / receipt modal -->
+    <div id="saleModal" class="modal hidden">
+        <div class="modal-content receipt-modal">
+            <div id="saleDetail"></div>
+            <div class="receipt-actions">
+                <button onclick="window.print()" class="btn btn-primary">🖨 Print</button>
+                <button id="closeSaleBtn" class="btn btn-ghost">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="/js/app.js"></script>
+    <script src="/js/sales.js"></script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+{
+    "name": "bantu-pos",
+    "version": "1.0.0",
+    "description": "Point-of-Sale system built with Bantu + PostgreSQL + HTML/CSS/JS",
+    "entry": "server.b",
+    "port": 4000,
+    "dependencies": []
+}
