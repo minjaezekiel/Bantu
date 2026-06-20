@@ -55,7 +55,7 @@ sua.server.static("./public");
 $port = 4000;
 $envPort = sua.env("PORT");
 if ($envPort != null && $envPort != "") {
-    $port = parseInt($envPort);
+    $port = floor(num($envPort));
 }
 print("[server] POS UI:  http://localhost:" + $port);
 print("[server] API:     http://localhost:" + $port + "/api/health");

@@ -19,7 +19,7 @@ def fmtNum($n) {
     $s = "" + $n;
     $dot = indexOf($s, ".");
     if ($dot < 0) { return $s + ".00"; }
-    $dec = length($s) - $dot - 1;
+    $dec = len($s) - $dot - 1;
     if ($dec == 1) { return $s + "0"; }
     if ($dec == 0) { return $s + "00"; }
     return substr($s, 0, $dot + 3);
@@ -30,7 +30,7 @@ def escStr($s) {
     if ($s == null) { return ""; }
     $out = "";
     $i = 0;
-    while ($i < length($s)) {
+    while ($i < len($s)) {
         $c = charAt($s, $i);
         if ($c == "'") {
             $out = $out + "''";
@@ -43,19 +43,16 @@ def escStr($s) {
 }
 
 // Coerce a value to int (handles NUMERIC returning as a float)
+// Bantu has no parseInt() builtin — use num() then floor().
 def toInt($v) {
     if ($v == null) { return 0; }
-    $i = parseInt($v);
-    if ($i == null) { return 0; }
-    return $i;
+    return floor(num($v));
 }
 
 // Coerce to float
 def toFloat($v) {
     if ($v == null) { return 0.0; }
-    $f = parseFloat($v);
-    if ($f == null) { return 0.0; }
-    return $f;
+    return num($v);
 }
 
 // ── Schema initialization ────────────────────────────────────────────────
@@ -183,7 +180,7 @@ def getProduct($id) {
         + "stock, tax_rate, active, "
         + "TO_CHAR(created_at, 'YYYY-MM-DD') AS created_at "
         + "FROM products WHERE id = " + toInt($id));
-    if (length($rows) == 0) { return null; }
+    if (len($rows) == 0) { return null; }
     return $rows[0];
 }
 
@@ -201,7 +198,7 @@ def createProduct($p) {
         + $price + ", " + $cost + ", " + $stock + ", " + $taxRate + ")");
     $rows = $pg.query("SELECT id, name, sku, barcode, category, price, cost, stock, tax_rate "
         + "FROM products WHERE sku = '" + $sku + "' ORDER BY id DESC LIMIT 1");
-    if (length($rows) == 0) { return null; }
+    if (len($rows) == 0) { return null; }
     return $rows[0];
 }
 
@@ -243,7 +240,7 @@ def findByCode($code) {
     $rows = $pg.query("SELECT id, name, sku, barcode, category, price, stock, tax_rate "
         + "FROM products WHERE active = TRUE AND "
         + "(barcode = '" + $c + "' OR sku = '" + $c + "') LIMIT 1");
-    if (length($rows) == 0) { return null; }
+    if (len($rows) == 0) { return null; }
     return $rows[0];
 }
 
@@ -267,7 +264,7 @@ def getSale($id) {
         + "TO_CHAR(s.created_at, 'YYYY-MM-DD HH24:MI') AS created_at "
         + "FROM sales s LEFT JOIN customers c ON c.id = s.customer_id "
         + "WHERE s.id = " + toInt($id));
-    if (length($rows) == 0) { return null; }
+    if (len($rows) == 0) { return null; }
     $sale = $rows[0];
     $items = $pg.query("SELECT si.id, si.product_id, si.name, si.sku, si.price, si.qty, "
         + "si.tax_rate, si.line_total "
@@ -282,14 +279,14 @@ def getSale($id) {
 // Returns the new sale record (with items) or null on failure.
 def createSale($payload) {
     $items = $payload["items"];
-    if ($items == null || length($items) == 0) { return null; }
+    if ($items == null || len($items) == 0) { return null; }
 
     // ── Compute totals server-side (don't trust the client) ────────────
     $subtotal = 0.0;
     $taxTotal = 0.0;
     $lineItems = [];       // resolved rows ready for INSERT
     $i = 0;
-    while ($i < length($items)) {
+    while ($i < len($items)) {
         $it = $items[$i];
         $prod = getProduct(toInt($it["id"]));
         if ($prod != null) {
@@ -314,7 +311,7 @@ def createSale($payload) {
         $i = $i + 1;
     }
 
-    if (length($lineItems) == 0) { return null; }
+    if (len($lineItems) == 0) { return null; }
 
     $discount = toFloat($payload["discount"]);
     if ($discount < 0) { $discount = 0; }
@@ -348,12 +345,12 @@ def createSale($payload) {
 
     // Fetch the sale id back
     $saleRows = $pg.query("SELECT id FROM sales WHERE receipt_no = '" + $receiptNo + "'");
-    if (length($saleRows) == 0) { return null; }
+    if (len($saleRows) == 0) { return null; }
     $saleId = toInt($saleRows[0]["id"]);
 
     // Insert sale items + decrement stock
     $j = 0;
-    while ($j < length($lineItems)) {
+    while ($j < len($lineItems)) {
         $li = $lineItems[$j];
         $pg.exec("INSERT INTO sale_items (sale_id, product_id, name, sku, price, qty, tax_rate, line_total) VALUES "
             + "(" + $saleId + ", " + $li["product_id"] + ", '" + escStr($li["name"]) + "', '"

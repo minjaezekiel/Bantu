@@ -26,7 +26,7 @@ def listProductsHandler($req, $res) {
     $q = $req.query["q"];
     if ($q == null) { $q = ""; }
     $rows = listProducts($q);
-    $res.json({ "ok": true, "count": length($rows), "products": $rows });
+    $res.json({ "ok": true, "count": len($rows), "products": $rows });
 }
 
 def getProductHandler($req, $res) {
@@ -85,7 +85,7 @@ def listSalesHandler($req, $res) {
     $lim = $req.query["limit"];
     if ($lim == null) { $lim = 100; }
     $rows = listSales($lim);
-    $res.json({ "ok": true, "count": length($rows), "sales": $rows });
+    $res.json({ "ok": true, "count": len($rows), "sales": $rows });
 }
 
 def getSaleHandler($req, $res) {
@@ -100,7 +100,7 @@ def getSaleHandler($req, $res) {
 
 def checkoutHandler($req, $res) {
     $payload = $req.body;
-    if ($payload == null || $payload["items"] == null || length($payload["items"]) == 0) {
+    if ($payload == null || $payload["items"] == null || len($payload["items"]) == 0) {
         $res.status(400);
         $res.json({ "ok": false, "error": "Cart is empty" });
         return null;
