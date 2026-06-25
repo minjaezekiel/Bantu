@@ -24,17 +24,11 @@ cd "$SCRIPT_DIR"
 #  Macros — tiny helpers that return 0 on success, 1 on failure
 # ═══════════════════════════════════════════════════════════════════════
 
-# Banner-style section header
 section()  { echo; echo "── $* ──"; }
-
-# Thin horizontal rule (full-width)
 hr()       { echo "════════════════════════════════════════════════════════════════"; }
-
-# Status one-liners — usage: pass "msg" / fail "msg"
 pass()     { echo "[PASS] $*"; }
 fail()     { echo "[FAIL] $*"; }
 
-# fail-and-die: print [FAIL], optional extra lines, then exit 1
 die() {
     fail "$1"
     shift
@@ -42,8 +36,6 @@ die() {
     exit 1
 }
 
-# Run a command silently; pass/fail based on exit code.
-#   run_check "description" cmd arg1 arg2 ...
 run_check() {
     local desc="$1"; shift
     if "$@" >/dev/null 2>&1; then
@@ -55,7 +47,6 @@ run_check() {
     fi
 }
 
-# Compile one source file: $1=src  $2=obj  ${@:3}=extra flags
 compile_one() {
     local src="$1" obj="$2"; shift 2
     section "Compiling $src"
@@ -67,7 +58,6 @@ compile_one() {
     fi
 }
 
-# Check that a C/C++ header is includable
 check_header() {
     local hdr="$1"
     if printf '#include <%s>\nint main(){return 0;}\n' "$hdr" \
@@ -104,9 +94,7 @@ CPP_FLAGS=(
     -I src
 )
 
-# Force the exact soname so the binary links to the OpenSSL flavour
-# universally shipped as `libcurl4` on both Debian and Ubuntu 22.04.
-LINK_LIBS=( -lsqlite3 -l:libcurl.so.4 -ldl -lpthread )
+LINK_LIBS=( -lsqlite3 -lcurl -ldl -lpthread )
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Build
@@ -119,7 +107,6 @@ echo "  g++ version: $(g++ --version  | head -1)"
 echo "  gcc version: $(gcc --version  | head -1)"
 hr
 
-# ─── Pre-flight: required tools ───────────────────────────────────
 section "Checking build tools"
 MISSING=()
 for tool in g++ gcc ar ld; do
@@ -128,18 +115,15 @@ done
 [ ${#MISSING[@]} -eq 0 ] || die "Missing required tools: ${MISSING[*]}"
 pass "All required build tools present."
 
-# ─── Pre-flight: required headers ─────────────────────────────────
 section "Checking headers"
 for hdr in sqlite3.h curl/curl.h; do
     check_header "$hdr"
 done
 rm -f /tmp/hdrtest
 
-# ─── Clean ────────────────────────────────────────────────────────
 section "Cleaning previous build"
 rm -rf build; mkdir -p build
 
-# ─── Compile ios_base_library_initv stub ──────────────────────────
 section "Compiling stub: stubs/ios_base_library_initv.c"
 if gcc -O2 -c stubs/ios_base_library_initv.c -o build/ios_stub.o 2>&1; then
     pass "stub compiled"
@@ -147,15 +131,13 @@ else
     die "stub compilation failed"
 fi
 
-# ─── Compile each .cpp separately ─────────────────────────────────
 OBJECTS=()
 for src in "${SOURCES[@]}"; do
     obj="build/$(basename "${src%.cpp}").o"
-    compile_one "$src" "$obj"          # appends nothing extra
+    compile_one "$src" "$obj"
     OBJECTS+=( "$obj" )
 done
 
-# ─── Link ─────────────────────────────────────────────────────────
 section "Linking build/bantu"
 if g++ "${CPP_FLAGS[@]}" \
         "${OBJECTS[@]}" \
@@ -169,12 +151,10 @@ else
         "Libs:    ${LINK_LIBS[*]}"
 fi
 
-# ─── Verify the binary is executable ──────────────────────────────
 section "Verifying binary"
 [ -x build/bantu ] || die "build/bantu is not executable"
 pass "build/bantu is executable"
 
-# ─── Informational diagnostics (must not abort the build) ─────────
 section "ldd build/bantu"
 ldd build/bantu 2>&1 || echo "(ldd not available or returned non-zero)"
 
