@@ -1,18 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────
-#  build.sh — Build the Bantu interpreter binary (Ubuntu 22.04 compatible)
-#
-#  Design:
-#    - Compiles each .cpp separately (smaller per-TU memory footprint,
-#      clearer error messages, survives one-file failures).
-#    - Does NOT use `set -e` globally; every step is checked explicitly
-#      so that diagnostic commands (objdump/grep) cannot abort the build.
-#    - Uses shell "macros" (small helper functions) to eliminate repetition
-#      while keeping the flat, linear readability of the original.
-#    - Prints clear [PASS]/[FAIL] markers so Render logs are readable.
-#
-#  Max runtime requirements (verified locally):
-#    GLIBC_2.34, GLIBCXX_3.4.9  →  all ≤ Ubuntu 22.04's runtime
+#  build-mac.sh — Build the Bantu interpreter binary (macOS)
 # ─────────────────────────────────────────────────────────────────────
 
 set -u
@@ -21,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Macros — tiny helpers that return 0 on success, 1 on failure
+#  Macros
 # ═══════════════════════════════════════════════════════════════════════
 
 section()  { echo; echo "── $* ──"; }
@@ -36,17 +24,6 @@ die() {
     exit 1
 }
 
-run_check() {
-    local desc="$1"; shift
-    if "$@" >/dev/null 2>&1; then
-        pass "$desc"
-        return 0
-    else
-        fail "$desc"
-        return 1
-    fi
-}
-
 compile_one() {
     local src="$1" obj="$2"; shift 2
     section "Compiling $src"
@@ -54,7 +31,7 @@ compile_one() {
         pass "$src -> $obj ($(wc -c <"$obj") bytes)"
         return 0
     else
-        die "Compilation failed for: $src" "Flags: ${CPP_FLAGS[*]} -Wall -c $src -o $obj $*"
+        die "Compilation failed for: $src"
     fi
 }
 
@@ -65,13 +42,12 @@ check_header() {
         pass "<$hdr> found"
     else
         rm -f /tmp/hdrtest
-        die "<$hdr> not found" \
-            "Install libsqlite3-dev and libcurl4-openssl-dev"
+        die "<$hdr> not found" "Run: brew install sqlite curl"
     fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Configuration
+#  Configuration — macOS
 # ═══════════════════════════════════════════════════════════════════════
 
 SOURCES=(
@@ -85,34 +61,43 @@ SOURCES=(
     src/main.cpp
 )
 
+# Detect Homebrew prefix
+if [ -d /opt/homebrew ]; then
+    BREW_PREFIX="/opt/homebrew"
+else
+    BREW_PREFIX="/usr/local"
+fi
+
 CPP_FLAGS=(
     -std=c++17
     -O2
-    -mtune=generic
-    -fno-plt
-    -pthread
     -I src
+    -I"$BREW_PREFIX/include"
 )
 
-LINK_LIBS=( -lsqlite3 -lcurl -ldl -lpthread )
+LINK_LIBS=(
+    -L"$BREW_PREFIX/lib"
+    -lsqlite3
+    -lcurl
+)
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Build
 # ═══════════════════════════════════════════════════════════════════════
 
 hr
-echo "  Bantu interpreter build"
+echo "  Bantu interpreter build (macOS)"
 echo "  script dir: $SCRIPT_DIR"
+echo "  brew prefix: $BREW_PREFIX"
 echo "  g++ version: $(g++ --version  | head -1)"
-echo "  gcc version: $(gcc --version  | head -1)"
 hr
 
 section "Checking build tools"
 MISSING=()
-for tool in g++ gcc ar ld; do
+for tool in g++ gcc; do
     command -v "$tool" >/dev/null 2>&1 || MISSING+=("$tool")
 done
-[ ${#MISSING[@]} -eq 0 ] || die "Missing required tools: ${MISSING[*]}"
+[ ${#MISSING[@]} -eq 0 ] || die "Missing tools: ${MISSING[*]} — Run: brew install gcc"
 pass "All required build tools present."
 
 section "Checking headers"
@@ -124,13 +109,6 @@ rm -f /tmp/hdrtest
 section "Cleaning previous build"
 rm -rf build; mkdir -p build
 
-section "Compiling stub: stubs/ios_base_library_initv.c"
-if gcc -O2 -c stubs/ios_base_library_initv.c -o build/ios_stub.o 2>&1; then
-    pass "stub compiled"
-else
-    die "stub compilation failed"
-fi
-
 OBJECTS=()
 for src in "${SOURCES[@]}"; do
     obj="build/$(basename "${src%.cpp}").o"
@@ -141,7 +119,6 @@ done
 section "Linking build/bantu"
 if g++ "${CPP_FLAGS[@]}" \
         "${OBJECTS[@]}" \
-        build/ios_stub.o \
         -o build/bantu \
         "${LINK_LIBS[@]}" 2>&1; then
     pass "Linked build/bantu ($(wc -c <build/bantu) bytes)"
@@ -155,22 +132,8 @@ section "Verifying binary"
 [ -x build/bantu ] || die "build/bantu is not executable"
 pass "build/bantu is executable"
 
-section "ldd build/bantu"
-ldd build/bantu 2>&1 || echo "(ldd not available or returned non-zero)"
-
-section "Dynamic symbol requirements (informational only)"
-if command -v objdump >/dev/null 2>&1; then
-    echo "  GLIBC versions referenced:"
-    objdump -T build/bantu 2>/dev/null \
-        | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
-        | sort -u | sed 's/^/    /' || true
-    echo "  GLIBCXX versions referenced:"
-    objdump -T build/bantu 2>/dev/null \
-        | grep -oE 'GLIBCXX_[0-9]+\.[0-9]+\.[0-9]+' \
-        | sort -u | sed 's/^/    /' || true
-else
-    echo "  (objdump not available — skipping symbol diagnostics)"
-fi
+section "otool -L build/bantu"
+otool -L build/bantu 2>&1 || true
 
 echo
 hr
