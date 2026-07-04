@@ -37,9 +37,34 @@ v1.2.2 is a **drop-in maintenance release** on top of v1.2.1. No language change
 | **Three sample apps** | `samples/blogsite` (modular Sua + SQLite), `samples/webrtc-chat` (signaling + browser UI), `samples/pg-dashboard` (PostgreSQL analytics). |
 | **PDF documentation** | 36-page official guide at `docs/Bantu-Programming-Language-v1.2.2.pdf` (Dracula-themed). |
 
+## Install (standalone, one line)
+
+The fastest way to get the `bantu` toolchain — no manual PATH editing, no compiler:
+
+**Linux / macOS**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/AsseySilivestir/Bantu/main/scripts/installers/install.sh | sh
+```
+
+**Windows (PowerShell)**
+
+```powershell
+irm https://raw.githubusercontent.com/AsseySilivestir/Bantu/main/scripts/installers/install.ps1 | iex
+```
+
+**macOS installer package** — prefer a graphical install? Download `Bantu-<ver>-macos-<arch>.pkg`
+from the [releases page](https://github.com/AsseySilivestir/Bantu/releases) and double-click it
+(installs `bantu` to `/usr/local/bin`, the Python-style standard). Windows users can likewise use
+the `Bantu-<ver>-x64.msi`.
+
+Then open a new terminal and run `bantu --version`. Installer sources live in
+[`scripts/installers/`](scripts/installers/); release artifacts are built by
+[`.github/workflows/release.yml`](.github/workflows/release.yml).
+
 ## Download
 
-Grab the latest zip from the [v1.2.2 release](https://github.com/AsseySilivestir/Bantu/releases/tag/v1.2.2):
+Prefer to grab an archive yourself? Get the latest zip from the [v1.2.2 release](https://github.com/AsseySilivestir/Bantu/releases/tag/v1.2.2):
 
 | Asset | Size | Platform | Includes |
 |---|---|---|---|
@@ -264,6 +289,30 @@ $rows = sua.postgres.query("SELECT * FROM users");
 sua.mysql.connect("localhost", "root", "secret", "app", 3306);
 $rows = sua.mysql.query("SELECT * FROM users");
 ```
+
+## ORM (Django + ultraorm style)
+
+Prefer models and query builders to raw SQL? Bantu ships a full ORM written in
+Bantu itself — models, chained/lazy querysets with field lookups (`age__gte`,
+`name__icontains`, `id__in`, …), `Q` objects for OR/NOT, bulk insert, auto-diff
+migrations, and one-line database switching across SQLite/Postgres/MySQL.
+
+```bantu
+include "lib/orm.b" as orm;
+
+$conn = orm.open({"driver": "sqlite", "path": "app.db"});
+$User = orm.model($conn, "users", [
+    orm.pk("id"),
+    orm.field("name",  "text", {"nullable": false}),
+    orm.field("age",   "int",  {})
+]);
+
+orm.insert($User, {"name": "Ada", "age": 36});
+$adults = orm.all(orm.orderBy(orm.filter(orm.query($User), [["age__gte", 18]]), ["-age"]));
+```
+
+Full reference: **[docs/orm.md](docs/orm.md)** · library: [`lib/orm.b`](lib/orm.b) ·
+tests: `bantu run lib/orm_test.b` · demo: `bantu run samples/orm-demo/main.b`.
 
 ## WebRTC (v1.2.2)
 
