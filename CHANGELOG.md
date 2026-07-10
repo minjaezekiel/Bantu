@@ -2,6 +2,72 @@
 
 All notable changes to the Bantu programming language are documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+> **Searchable tags:** every entry below is prefixed with `[feature]`, `[bug fix]`, or
+> `[patch]` so you can grep the log, e.g. `grep '\[bug fix\]' CHANGELOG.md`.
+
+## [1.3.0] — 2026-07-10
+
+Core-language correctness release: the features that were advertised via keywords but silently
+failed now work, the parser can no longer spin on a bad token, and several requested capabilities
+(dict iteration, file I/O, FFI, parameterized SQL) land. **Object-oriented features were not
+touched.**
+
+### Fixed
+
+- **[bug fix] Compound assignment** — `+=`, `-=`, `*=`, `/=` now apply the base arithmetic
+  operator (the parser had passed the compound token `PLUS_EQUALS` straight into the evaluator,
+  which rejected it as "Unknown operator"). This also removes an infinite loop where a `for`
+  counter using `i += 1` never advanced. (`parser.hpp` `parseAssignment`)
+- **[bug fix] `break` / `continue`** — were inert no-op nodes; they now compile to real AST nodes
+  and throw the loop-control signals that `while`/`for`/`each` already caught.
+- **[bug fix] `try` / `catch`** — runtime errors are now actually catchable. `ErrorHandler` throws
+  a `BantuError` instead of merely printing, so `catch ($e)` receives a structured
+  `{message, type, line}` (or the thrown value for `throw`).
+- **[bug fix] Deterministic parser recovery** — a syntax error is reported once and the parser
+  synchronizes to the next statement instead of re-reading the stuck token forever. `bantu run`
+  now prints all diagnostics and refuses to execute (compile gate).
+- **[bug fix] `$`-prefixed reserved words** — `$db`, `$create`, `$list`, `$switch`, … are valid
+  variable names again; the `$` sigil forces the following word to be an identifier.
+- **[bug fix] Bare `return;`** — returning with no value (or at the end of a block) yields null
+  instead of a parse error.
+- **[bug fix] Mutating `.push()`/`.pop()` clarified** — the value-copying list methods no longer
+  mislead; use the new `append`/`pop` builtins (below) for in-place mutation.
+
+### Added
+
+- **[feature] `switch` / `case` / `default`** — `switch ($x) { case 1 { … } default { … } }`,
+  braces required, no fallthrough (first match wins).
+- **[feature] `throw`** — `throw <value>;` raises any value; caught by `try/catch`.
+- **[feature] `const` is truly constant** — reassigning a `const` binding is now an error (like
+  Java `final`), enforced at runtime and flagged by the linter. The referenced object may still
+  be mutated.
+- **[feature] Anonymous functions** — `def($a, $b) { … }` is a first-class value (usable as a
+  dict entry, argument, etc.).
+- **[feature] Python-style `for … in …`** — `for $x in $list { }` and
+  `for $key, $value in $dict.items() { }`; `each` also accepts a second variable.
+- **[feature] Dict iteration & methods** — `$d.items()`, `$d.keys()`, `$d.values()`,
+  `$d.size()`, plus `keys()`/`values()`/`entries()` builtins; `.size()` on lists/strings.
+- **[feature] In-place list mutators** — `append(l, x)`, `pop(l)`, `insert(l, i, x)`,
+  `remove(l, i)`, `extend(l, l2)`.
+- **[feature] Python-style file I/O** — `open(path, mode)` (`"r"`/`"w"`/`"a"`),
+  `read`, `readline`, `readlines`, `write`, `close`, plus one-shot `readfile`, `writefile`,
+  `appendfile`.
+- **[feature] FFI via libffi** — `loadlib("libm.dylib")` + `func(lib, "sqrt", "double",
+  ["double"])` returns a callable that invokes the C symbol. Types: `int`, `double`, `string`,
+  `pointer`, `void`. Built in on Linux/macOS (`-DBANTU_FFI -lffi -ldl`).
+- **[feature] Parameterized SQL** — `sua.sqlite.exec/query(sql, [params])` binds `?` placeholders
+  via prepared statements (injection-safe); the ORM can use it.
+- **[feature] Linter + compile gate** — `bantu lint <file> [--json]` reports syntax errors and
+  const/type issues (error = red, warning = yellow). `run`/`build` refuse to execute on errors
+  (`--no-lint` opts out). The VS Code extension shows these live as you type.
+
+### Notes
+
+- **[patch]** Deferred to future releases: a bytecode VM (performance), `async`/`await`, and
+  native binary compilation.
+- **[patch]** Windows FFI is stubbed for now (the builtins raise a clear "not available" error);
+  Linux/macOS ship it enabled.
+
 ## [1.2.2] — 2026-06-20
 
 ### Fixed

@@ -3,7 +3,7 @@
 //  Run from the repo root:   ./bantu run samples/orm-demo/main.b
 // ════════════════════════════════════════════════════════════════════════
 
-include "../../lib/orm.b" as orm;
+include "../../orm/orm.b" as orm;
 
 print("");
 print("╔══════════════════════════════════════════╗");
