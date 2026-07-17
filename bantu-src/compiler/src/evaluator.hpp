@@ -418,6 +418,31 @@ static std::string bantuPgUser = "";
 #ifdef HAS_LIBPQ
     #include <libpq-fe.h>
     static PGconn* bantuPgConn = nullptr;
+
+    // Build libpq text-format parameter arrays from a Bantu params list, for
+    // PQexecParams ($1..$n placeholders). libpq sends every parameter as text
+    // and lets the server coerce it, so this stays type-agnostic and is
+    // injection-safe. A null Bantu value maps to a SQL NULL (null pointer).
+    // NOTE: `storage` is reserved up-front so it never reallocates — the
+    // c_str() pointers handed to libpq must stay valid for the call.
+    static void bantuPgBuildParams(const std::vector<Value>& params,
+                                   std::vector<std::string>& storage,
+                                   std::vector<const char*>& out) {
+        storage.reserve(params.size());
+        out.reserve(params.size());
+        for (const auto& p : params) {
+            if (p.isNull()) {
+                storage.push_back("");
+                out.push_back(nullptr);
+            } else if (p.isBool()) {
+                storage.push_back(p.boolVal ? "true" : "false");
+                out.push_back(storage.back().c_str());
+            } else {
+                storage.push_back(p.toString());
+                out.push_back(storage.back().c_str());
+            }
+        }
+    }
 #endif
 
 // ─── MySQL State (simulated for static binary) ───
@@ -1590,15 +1615,23 @@ private:
         return nullptr;
     }
 
-    // In-place list mutators (arg0 already resolved to the list `lst`):
-    //   append(l, x…) · pop(l) · insert(l, i, x) · remove(l, i) · extend(l, l2)
-    Value listMutator(const std::string& op, Value& lst, CallNode* n) {
+    // In-place list mutators operating on the resolved list `lst`.
+    //   append(l, x…) · push(l, x…) · pop(l) · insert(l, i, x) · remove(l, i) · extend(l, l2)
+    // `argStart` is where the value arguments begin: 1 for function form
+    // (arg0 is the list), 0 for method form ($l.push(x) — the list is the receiver).
+    Value listMutator(const std::string& op, Value& lst, CallNode* n, size_t argStart = 1) {
         std::vector<Value> args;
-        for (size_t i = 1; i < n->args.size(); i++) args.push_back(evalNode(n->args[i]));
+        for (size_t i = argStart; i < n->args.size(); i++) args.push_back(evalNode(n->args[i]));
         auto& vec = lst.listVal;
         if (op == "append") {
             for (auto& a : args) vec.push_back(a);
             return Value((double)vec.size());
+        }
+        if (op == "push") {
+            // Same as append, but returns the (mutated) list so the older
+            // `$l = push($l, x)` idiom keeps working correctly.
+            for (auto& a : args) vec.push_back(a);
+            return lst;
         }
         if (op == "pop") {
             if (vec.empty()) return Value();
@@ -1629,19 +1662,32 @@ private:
     }
 
     Value evalCall(CallNode* n) {
-        // In-place list mutators (append/pop/insert/remove/extend). Resolved here
-        // because a native builtin only receives args by value and could not
+        // In-place list mutators (append/push/pop/insert/remove/extend). Resolved
+        // here because a native builtin only receives args by value and could not
         // mutate the caller's list. A user-defined function of the same name wins.
         if (auto callVar = dynamic_cast<VariableNode*>(n->callee.get())) {
             const std::string& fname = callVar->name;
             if (!env_->has(fname) && !n->args.empty() &&
-                (fname == "append" || fname == "pop" || fname == "insert" ||
+                (fname == "append" || fname == "push" || fname == "pop" || fname == "insert" ||
                  fname == "remove" || fname == "extend")) {
                 Value* lv = resolveLValue(n->args[0].get());
                 if (!lv || !lv->isList()) {
                     ErrorHandler::throwRuntimeError(fname + "() expects a list variable as its first argument", n->line, n->col);
                 }
-                return listMutator(fname, *lv, n);
+                return listMutator(fname, *lv, n, 1);
+            }
+        }
+
+        // Method-style list mutation: $list.push(x) / $list.pop().
+        // evalDotAccess only ever sees a COPY of the list, so these are resolved
+        // against the real storage here. If the receiver isn't an addressable
+        // list (e.g. a literal), we fall through to the value-copy methods.
+        if (auto dot = dynamic_cast<DotAccessNode*>(n->callee.get())) {
+            if (dot->property == "push" || dot->property == "pop") {
+                Value* lv = resolveLValue(dot->object.get());
+                if (lv && lv->isList()) {
+                    return listMutator(dot->property, *lv, n, 0);
+                }
             }
         }
 
@@ -2337,13 +2383,11 @@ private:
             return Value(std::string(1, (char)code));
         }));
 
-        env_->define("push", makeNative([](std::vector<Value> args) -> Value {
-            // push(list, item) - adds item to list
-            if (args.size() >= 2 && args[0].isList()) {
-                args[0].listVal.push_back(args[1]);
-            }
-            return Value();
-        }));
+        // NOTE: `push` is intentionally NOT registered as a builtin. A native fn
+        // receives its args by value and so could never mutate the caller's list
+        // (the old registration here silently did nothing). It is handled in
+        // evalCall's lvalue intercept instead, alongside append/pop/insert/
+        // remove/extend, so that it mutates in place for real.
 
         // ─── Dict introspection (v1.3.0) ───
         // keys($d) → list of keys, values($d) → list of values,
@@ -3413,7 +3457,18 @@ private:
             }
             std::cout << "  [POSTGRES] Query: " << sql.substr(0, 80)
                       << (sql.length() > 80 ? "..." : "") << "\n";
-            PGresult* res = PQexec(bantuPgConn, sql.c_str());
+            // Parameterized path: query(sql, [params]) binds $1..$n via
+            // PQexecParams (injection-safe); otherwise a plain PQexec.
+            PGresult* res = nullptr;
+            if (args.size() > 1 && args[1].isList()) {
+                std::vector<std::string> storage;
+                std::vector<const char*> vals;
+                bantuPgBuildParams(args[1].listVal, storage, vals);
+                res = PQexecParams(bantuPgConn, sql.c_str(), (int)vals.size(), nullptr,
+                                   vals.empty() ? nullptr : vals.data(), nullptr, nullptr, 0);
+            } else {
+                res = PQexec(bantuPgConn, sql.c_str());
+            }
             if (res == nullptr) {
                 ObjectMap errInfo;
                 errInfo["error"] = Value(std::string("PQexec returned null"));
@@ -3547,7 +3602,18 @@ private:
             }
                 std::cout << "  [POSTGRES] Exec: " << sql.substr(0, 80)
                           << (sql.length() > 80 ? "..." : "") << "\n";
-            PGresult* res = PQexec(bantuPgConn, sql.c_str());
+            // Parameterized path: exec(sql, [params]) binds $1..$n via
+            // PQexecParams (injection-safe); otherwise a plain PQexec.
+            PGresult* res = nullptr;
+            if (args.size() > 1 && args[1].isList()) {
+                std::vector<std::string> storage;
+                std::vector<const char*> vals;
+                bantuPgBuildParams(args[1].listVal, storage, vals);
+                res = PQexecParams(bantuPgConn, sql.c_str(), (int)vals.size(), nullptr,
+                                   vals.empty() ? nullptr : vals.data(), nullptr, nullptr, 0);
+            } else {
+                res = PQexec(bantuPgConn, sql.c_str());
+            }
             if (res == nullptr) {
                 ObjectMap errInfo;
                 errInfo["error"] = Value(std::string("PQexec returned null"));

@@ -26,13 +26,16 @@
 //  DESIGN NOTES (why the API looks the way it does)
 //  ------------------------------------------------
 //  Bantu's `each` iterates lists only — there is no way to enumerate the keys
-//  of an arbitrary dict, and there are no prepared statements. Therefore:
+//  of an arbitrary dict. Therefore:
 //    * Model fields are declared as an ordered LIST of field descriptors.
 //    * Filters are passed as a LIST of [field_lookup, value] pairs.
-//    * QuerySets accumulate SQL as STRINGS (never mutate nested lists), so
-//      chaining is free of aliasing surprises.
-//    * ALL values pass through _escape() — the single, dialect-aware SQL
-//      injection boundary. Keep it that way and keep it well tested.
+//    * QuerySets accumulate SQL as STRINGS, with bound values collected in a
+//      binder dict (dicts are reference-shared in Bantu; lists are copied).
+//
+//  SAFETY: values are BOUND as parameters (v1.3.0+), never inlined — SQLite via
+//  sqlite3_bind_*, PostgreSQL via PQexecParams. `_escape()` remains only for
+//  identifiers/DDL defaults and as the fallback for dialects that lack a
+//  parameter path (see `supportsParams` on each dialect).
 // ════════════════════════════════════════════════════════════════════════
 
 
@@ -41,6 +44,14 @@
 // just adding one of these descriptors and wiring _exec/_query dispatch.
 
 // _dialect($name) → dialect descriptor dict.
+//
+// supportsParams / paramStyle drive the SAFE value path: when a backend accepts
+// bound parameters the ORM emits a placeholder and collects the value, instead
+// of inlining an escaped literal. Backends without it fall back to _escape().
+//   sqlite   → "?"   (sqlite3_bind_*)
+//   postgres → "$n"  (PQexecParams)
+//   mysql    → none  (sua.mysql.* is a simulation, not a real driver — see
+//                     docs/v1.3.0-status.md; it keeps the escaping path)
 def _dialect($name) {
     if ($name == "postgres") {
         return {
@@ -49,7 +60,9 @@ def _dialect($name) {
             "autopk": "SERIAL PRIMARY KEY",
             "boolTrue": "TRUE", "boolFalse": "FALSE",
             "quoteBackslash": false,
-            "nowExpr": "CURRENT_TIMESTAMP"
+            "nowExpr": "CURRENT_TIMESTAMP",
+            "supportsParams": true,
+            "paramStyle": "$n"
         };
     }
     if ($name == "mysql") {
@@ -59,7 +72,9 @@ def _dialect($name) {
             "autopk": "INT AUTO_INCREMENT PRIMARY KEY",
             "boolTrue": "1", "boolFalse": "0",
             "quoteBackslash": true,
-            "nowExpr": "CURRENT_TIMESTAMP"
+            "nowExpr": "CURRENT_TIMESTAMP",
+            "supportsParams": false,
+            "paramStyle": "?"
         };
     }
     // default: sqlite
@@ -69,7 +84,9 @@ def _dialect($name) {
         "autopk": "INTEGER PRIMARY KEY AUTOINCREMENT",
         "boolTrue": "1", "boolFalse": "0",
         "quoteBackslash": false,
-        "nowExpr": "CURRENT_TIMESTAMP"
+        "nowExpr": "CURRENT_TIMESTAMP",
+        "supportsParams": true,
+        "paramStyle": "?"
     };
 }
 
@@ -159,6 +176,51 @@ def _joinValues($dialect, $items) {
 }
 
 
+// ─── Parameter binding (the preferred, injection-proof value path) ──────
+//
+// A "binder" carries the dialect plus the ordered list of bound values. It is a
+// DICT on purpose: dicts are reference-shared in Bantu (lists are copied), so a
+// binder passed into a helper accumulates params visible to the caller.
+//
+//   $b = _binder($dialect);
+//   $sqlFragment = _bind($b, 42);   // → "?"  (and 42 is appended to $b.params)
+//   ... _exec($conn, $sql, $b.params)
+
+// _binder($dialect) → a fresh binder { dialect, params }.
+def _binder($dialect) {
+    return {"dialect": $dialect, "params": []};
+}
+
+// _bind($b, $v) → the SQL text to emit for value $v.
+// When the dialect supports parameters this appends $v to $b.params and returns
+// a placeholder; otherwise it falls back to an inline escaped literal. raw()/F()
+// markers are SQL fragments and are never parameterized.
+def _bind($b, $v) {
+    dict $d = $b.dialect;
+    if (type($v) == "dict") {
+        if ($v.__raw) { return $v.sql; }
+        if ($v.__f) { return _ident($d, $v.col); }
+    }
+    if (!$d.supportsParams) { return _escape($d, $v); }
+    append($b.params, $v);
+    if ($d.paramStyle == "$n") { return "$" + str(len($b.params)); }
+    return "?";
+}
+
+// _bindList($b, $items) → comma-joined placeholders for every element
+// (used by the `__in` lookup), binding each value.
+def _bindList($b, $items) {
+    string $out = "";
+    number $i = 0;
+    each ($v in $items) {
+        if ($i > 0) { $out = $out + ", "; }
+        $out = $out + _bind($b, $v);
+        $i = $i + 1;
+    }
+    return $out;
+}
+
+
 // ─── Connection & runtime DB switching ──────────────────────────────────
 
 // open($cfg) → open a backend and return a connection handle.
@@ -194,18 +256,32 @@ def use($cfg) {
     return open($cfg);
 }
 
-// _exec($conn, $sql) — run a write statement, dispatching on driver.
-def _exec($conn, $sql) {
-    if ($conn.driver == "postgres") { return sua.postgres.exec($sql); }
-    if ($conn.driver == "mysql") { return sua.mysql.query($sql); }
-    return sua.sqlite.exec($sql);
+// _exec($conn, $sql, $params) — run a write statement, dispatching on driver.
+// $params is the list of bound values ([] for plain SQL). When it is empty we
+// deliberately use the NON-parameterized call: the driver's plain path handles
+// multi-statement SQL (DDL), whereas the prepared path only runs the first
+// statement.
+def _exec($conn, $sql, $params) {
+    if (len($params) == 0) {
+        if ($conn.driver == "postgres") { return sua.postgres.exec($sql); }
+        if ($conn.driver == "mysql") { return sua.mysql.query($sql); }
+        return sua.sqlite.exec($sql);
+    }
+    if ($conn.driver == "postgres") { return sua.postgres.exec($sql, $params); }
+    if ($conn.driver == "mysql") { return sua.mysql.query($sql); }   // simulation: no params
+    return sua.sqlite.exec($sql, $params);
 }
 
-// _query($conn, $sql) — run a read query, returns a LIST of row dicts.
-def _query($conn, $sql) {
-    if ($conn.driver == "postgres") { return sua.postgres.query($sql); }
-    if ($conn.driver == "mysql") { return sua.mysql.query($sql); }
-    return sua.sqlite.query($sql);
+// _query($conn, $sql, $params) — run a read query, returns a LIST of row dicts.
+def _query($conn, $sql, $params) {
+    if (len($params) == 0) {
+        if ($conn.driver == "postgres") { return sua.postgres.query($sql); }
+        if ($conn.driver == "mysql") { return sua.mysql.query($sql); }
+        return sua.sqlite.query($sql);
+    }
+    if ($conn.driver == "postgres") { return sua.postgres.query($sql, $params); }
+    if ($conn.driver == "mysql") { return sua.mysql.query($sql); }   // simulation: no params
+    return sua.sqlite.query($sql, $params);
 }
 
 
@@ -292,13 +368,13 @@ def _createTableSql($model) {
 
 // sync($model) — create the table if it does not exist. Idempotent.
 def sync($model) {
-    return _exec($model.conn, _createTableSql($model));
+    return _exec($model.conn, _createTableSql($model), []);
 }
 
 // drop($model) — DROP TABLE IF EXISTS.
 def drop($model) {
     dict $d = $model.conn.dialect;
-    return _exec($model.conn, "DROP TABLE IF EXISTS " + _ident($d, $model.table) + ";");
+    return _exec($model.conn, "DROP TABLE IF EXISTS " + _ident($d, $model.table) + ";", []);
 }
 
 
@@ -318,6 +394,7 @@ def _insertColumns($model) {
 // their database defaults. (Named insert() because `create` is a Bantu keyword.)
 def insert($model, $data) {
     dict $d = $model.conn.dialect;
+    dict $b = _binder($d);
     string $colSql = "";
     string $valSql = "";
     number $i = 0;
@@ -326,12 +403,12 @@ def insert($model, $data) {
         if (type($data[$col]) != "null") {
             if ($i > 0) { $colSql = $colSql + ", "; $valSql = $valSql + ", "; }
             $colSql = $colSql + _ident($d, $col);
-            $valSql = $valSql + _escape($d, $data[$col]);
+            $valSql = $valSql + _bind($b, $data[$col]);
             $i = $i + 1;
         }
     }
     string $sql = "INSERT INTO " + _ident($d, $model.table) + " (" + $colSql + ") VALUES (" + $valSql + ");";
-    dict $r = _exec($model.conn, $sql);
+    dict $r = _exec($model.conn, $sql, $b.params);
     dict $out = {"ok": true, "changes": 0, "id": 0};
     if (type($r.success) != "null") { $out.ok = $r.success; }
     if (type($r.changes) != "null") { $out.changes = $r.changes; }
@@ -344,6 +421,7 @@ def insert($model, $data) {
 // so provide values for NOT NULL columns without a default).
 def bulkCreate($model, $rows) {
     dict $d = $model.conn.dialect;
+    dict $b = _binder($d);
     list $cols = _insertColumns($model);
     string $colSql = "";
     number $ci = 0;
@@ -360,14 +438,14 @@ def bulkCreate($model, $rows) {
         number $vi = 0;
         each ($c in $cols) {
             if ($vi > 0) { $vals = $vals + ", "; }
-            $vals = $vals + _escape($d, $row[$c]);
+            $vals = $vals + _bind($b, $row[$c]);
             $vi = $vi + 1;
         }
         $rowsSql = $rowsSql + "(" + $vals + ")";
         $ri = $ri + 1;
     }
     string $sql = "INSERT INTO " + _ident($d, $model.table) + " (" + $colSql + ") VALUES " + $rowsSql + ";";
-    dict $r = _exec($model.conn, $sql);
+    dict $r = _exec($model.conn, $sql, $b.params);
     dict $out = {"ok": true, "count": $ri};
     if (type($r.success) != "null") { $out.ok = $r.success; }
     return $out;
@@ -401,53 +479,55 @@ def _parseLookup($field) {
 }
 
 // _cond($dialect, $col, $op, $value) → a single SQL condition string.
-def _cond($dialect, $col, $op, $value) {
-    string $c = _ident($dialect, $col);
+// Values are bound through $b (placeholders) rather than inlined, so untrusted
+// input never reaches the SQL text on backends that support parameters.
+def _cond($b, $col, $op, $value) {
+    string $c = _ident($b.dialect, $col);
 
     if ($op == "eq") {
         if (type($value) == "null") { return $c + " IS NULL"; }
-        return $c + " = " + _escape($dialect, $value);
+        return $c + " = " + _bind($b, $value);
     }
     if ($op == "ne") {
         if (type($value) == "null") { return $c + " IS NOT NULL"; }
-        return $c + " <> " + _escape($dialect, $value);
+        return $c + " <> " + _bind($b, $value);
     }
-    if ($op == "gt") { return $c + " > " + _escape($dialect, $value); }
-    if ($op == "gte") { return $c + " >= " + _escape($dialect, $value); }
-    if ($op == "lt") { return $c + " < " + _escape($dialect, $value); }
-    if ($op == "lte") { return $c + " <= " + _escape($dialect, $value); }
-    if ($op == "in") { return $c + " IN (" + _joinValues($dialect, $value) + ")"; }
+    if ($op == "gt") { return $c + " > " + _bind($b, $value); }
+    if ($op == "gte") { return $c + " >= " + _bind($b, $value); }
+    if ($op == "lt") { return $c + " < " + _bind($b, $value); }
+    if ($op == "lte") { return $c + " <= " + _bind($b, $value); }
+    if ($op == "in") { return $c + " IN (" + _bindList($b, $value) + ")"; }
     if ($op == "contains") {
-        return $c + " LIKE " + _escape($dialect, "%" + str($value) + "%");
+        return $c + " LIKE " + _bind($b, "%" + str($value) + "%");
     }
     if ($op == "icontains") {
-        return "LOWER(" + $c + ") LIKE LOWER(" + _escape($dialect, "%" + str($value) + "%") + ")";
+        return "LOWER(" + $c + ") LIKE LOWER(" + _bind($b, "%" + str($value) + "%") + ")";
     }
     if ($op == "startswith") {
-        return $c + " LIKE " + _escape($dialect, str($value) + "%");
+        return $c + " LIKE " + _bind($b, str($value) + "%");
     }
     if ($op == "istartswith") {
-        return "LOWER(" + $c + ") LIKE LOWER(" + _escape($dialect, str($value) + "%") + ")";
+        return "LOWER(" + $c + ") LIKE LOWER(" + _bind($b, str($value) + "%") + ")";
     }
     if ($op == "endswith") {
-        return $c + " LIKE " + _escape($dialect, "%" + str($value));
+        return $c + " LIKE " + _bind($b, "%" + str($value));
     }
     if ($op == "isnull") {
         if ($value) { return $c + " IS NULL"; }
         return $c + " IS NOT NULL";
     }
     // unknown operator → safe equality fallback
-    return $c + " = " + _escape($dialect, $value);
+    return $c + " = " + _bind($b, $value);
 }
 
 // _compilePairs($dialect, $pairs) → AND-joined condition string from a list of
 // [field_lookup, value] pairs.
-def _compilePairs($dialect, $pairs) {
+def _compilePairs($b, $pairs) {
     string $out = "";
     number $i = 0;
     each ($p in $pairs) {
         dict $lk = _parseLookup($p[0]);
-        string $frag = _cond($dialect, $lk.col, $lk.op, $p[1]);
+        string $frag = _cond($b, $lk.col, $lk.op, $p[1]);
         if ($i > 0) { $out = $out + " AND "; }
         $out = $out + $frag;
         $i = $i + 1;
@@ -473,16 +553,16 @@ def qOr($a, $b) { return {"__q": true, "kind": "or", "left": $a, "right": $b}; }
 def qNot($a) { return {"__q": true, "kind": "not", "node": $a}; }
 
 // _compileQ($dialect, $q) → SQL string for a Q tree.
-def _compileQ($dialect, $q) {
-    if ($q.kind == "leaf") { return "(" + _compilePairs($dialect, $q.pairs) + ")"; }
+def _compileQ($b, $q) {
+    if ($q.kind == "leaf") { return "(" + _compilePairs($b, $q.pairs) + ")"; }
     if ($q.kind == "and") {
-        return "(" + _compileQ($dialect, $q.left) + " AND " + _compileQ($dialect, $q.right) + ")";
+        return "(" + _compileQ($b, $q.left) + " AND " + _compileQ($b, $q.right) + ")";
     }
     if ($q.kind == "or") {
-        return "(" + _compileQ($dialect, $q.left) + " OR " + _compileQ($dialect, $q.right) + ")";
+        return "(" + _compileQ($b, $q.left) + " OR " + _compileQ($b, $q.right) + ")";
     }
     if ($q.kind == "not") {
-        return "(NOT " + _compileQ($dialect, $q.node) + ")";
+        return "(NOT " + _compileQ($b, $q.node) + ")";
     }
     return "1=1";
 }
@@ -500,9 +580,12 @@ def F($col) { return {"__f": true, "col": $col}; }
 // ─── QuerySet (lazy, chainable, string-accumulating) ────────────────────
 
 // query($model) → a fresh QuerySet over $model.
+// The queryset carries its own binder, so WHERE values accumulate as bound
+// parameters (in qs.binder.params) alongside the SQL text.
 def query($model) {
     return {
         "model": $model,
+        "binder": _binder($model.conn.dialect),
         "where": "",
         "order": "",
         "limitN": -1,
@@ -515,23 +598,26 @@ def query($model) {
 // _dialectOf($qs) → the active dialect for a queryset.
 def _dialectOf($qs) { return $qs.model.conn.dialect; }
 
+// _paramsOf($qs) → the values bound by this queryset's WHERE clause.
+def _paramsOf($qs) { return $qs.binder.params; }
+
 // filter($qs, $pairs) → AND the given [field,value] pairs into WHERE.
 def filter($qs, $pairs) {
-    string $frag = _compilePairs(_dialectOf($qs), $pairs);
+    string $frag = _compilePairs($qs.binder, $pairs);
     $qs.where = _and($qs.where, $frag);
     return $qs;
 }
 
 // exclude($qs, $pairs) → AND NOT (pairs) into WHERE.
 def exclude($qs, $pairs) {
-    string $frag = _compilePairs(_dialectOf($qs), $pairs);
+    string $frag = _compilePairs($qs.binder, $pairs);
     if ($frag != "") { $qs.where = _and($qs.where, "NOT (" + $frag + ")"); }
     return $qs;
 }
 
 // filterQ($qs, $q) → AND a Q tree into WHERE (for OR / NOT logic).
 def filterQ($qs, $q) {
-    $qs.where = _and($qs.where, _compileQ(_dialectOf($qs), $q));
+    $qs.where = _and($qs.where, _compileQ($qs.binder, $q));
     return $qs;
 }
 
@@ -599,7 +685,7 @@ def _buildSelect($qs) {
 
 // all($qs) → LIST of row dicts.
 def all($qs) {
-    return _query($qs.model.conn, _buildSelect($qs));
+    return _query($qs.model.conn, _buildSelect($qs), _paramsOf($qs));
 }
 
 // first($qs) → the first row dict, or null.
@@ -622,7 +708,7 @@ def count($qs) {
     string $sql = "SELECT COUNT(*) AS n FROM " + _ident($d, $qs.model.table);
     if ($qs.where != "") { $sql = $sql + " WHERE " + $qs.where; }
     $sql = $sql + ";";
-    list $rows = _query($qs.model.conn, $sql);
+    list $rows = _query($qs.model.conn, $sql, _paramsOf($qs));
     if (len($rows) == 0) { return 0; }
     return num($rows[0].n);
 }
@@ -639,7 +725,7 @@ def aggregate($qs, $expr, $alias) {
     string $sql = "SELECT " + $expr + " AS " + _ident($d, $alias) + " FROM " + _ident($d, $qs.model.table);
     if ($qs.where != "") { $sql = $sql + " WHERE " + $qs.where; }
     $sql = $sql + ";";
-    list $rows = _query($qs.model.conn, $sql);
+    list $rows = _query($qs.model.conn, $sql, _paramsOf($qs));
     if (len($rows) == 0) { return null; }
     return $rows[0][$alias];
 }
@@ -653,19 +739,40 @@ def aggregate($qs, $expr, $alias) {
 def modify($qs, $data) {
     dict $model = $qs.model;
     dict $d = $model.conn.dialect;
+
+    // Placeholder ordering differs by dialect:
+    //  * "$n" (postgres) — placeholders are numbered explicitly, so SET values
+    //    can just continue the queryset's binder (they become $k+1…), and the
+    //    params list stays [where…, set…].
+    //  * "?"  (sqlite)   — binding is positional by TEXT order, and SET appears
+    //    before WHERE, so SET values must be bound into a fresh binder and
+    //    placed FIRST: [set…, where…].
+    bool $numbered = ($d.paramStyle == "$n");
+    dict $b = _binder($d);
+    if ($numbered) { $b = $qs.binder; }
+
     string $set = "";
     number $i = 0;
     each ($col in _insertColumns($model)) {
         if (type($data[$col]) != "null") {
             if ($i > 0) { $set = $set + ", "; }
-            $set = $set + _ident($d, $col) + " = " + _escape($d, $data[$col]);
+            $set = $set + _ident($d, $col) + " = " + _bind($b, $data[$col]);
             $i = $i + 1;
         }
     }
+
+    list $params = [];
+    if ($numbered) {
+        $params = $qs.binder.params;
+    } else {
+        $params = $b.params;
+        extend($params, _paramsOf($qs));
+    }
+
     string $sql = "UPDATE " + _ident($d, $model.table) + " SET " + $set;
     if ($qs.where != "") { $sql = $sql + " WHERE " + $qs.where; }
     $sql = $sql + ";";
-    dict $r = _exec($model.conn, $sql);
+    dict $r = _exec($model.conn, $sql, $params);
     dict $out = {"ok": true, "changes": 0};
     if (type($r.success) != "null") { $out.ok = $r.success; }
     if (type($r.changes) != "null") { $out.changes = $r.changes; }
@@ -685,7 +792,7 @@ def remove($qs, $force) {
     string $sql = "DELETE FROM " + _ident($d, $model.table);
     if ($qs.where != "") { $sql = $sql + " WHERE " + $qs.where; }
     $sql = $sql + ";";
-    dict $r = _exec($model.conn, $sql);
+    dict $r = _exec($model.conn, $sql, _paramsOf($qs));
     dict $out = {"ok": true, "changes": 0};
     if (type($r.success) != "null") { $out.ok = $r.success; }
     if (type($r.changes) != "null") { $out.changes = $r.changes; }
@@ -708,15 +815,18 @@ def _listHas($items, $val) {
 def _existingColumns($conn, $table) {
     list $names = [];
     if ($conn.driver == "sqlite") {
-        list $rows = _query($conn, "PRAGMA table_info(" + _ident($conn.dialect, $table) + ");");
+        list $rows = _query($conn, "PRAGMA table_info(" + _ident($conn.dialect, $table) + ");", []);
         each ($r in $rows) {
             if (type($r.name) != "null") { $names[len($names)] = $r.name; }
         }
         return $names;
     }
-    // postgres / mysql
+    // postgres / mysql — bind the table name through the dialect's own
+    // placeholder style ("$1" on postgres, escaped literal on mysql).
+    dict $b = _binder($conn.dialect);
+    string $ph = _bind($b, $table);
     list $rows = _query($conn,
-        "SELECT column_name FROM information_schema.columns WHERE table_name = '" + $table + "';");
+        "SELECT column_name FROM information_schema.columns WHERE table_name = " + $ph + ";", $b.params);
     each ($r in $rows) {
         if (type($r.column_name) != "null") { $names[len($names)] = $r.column_name; }
     }
@@ -754,7 +864,7 @@ def migrate($models, $opts) {
     }
     if (!$dry) {
         each ($sql in $statements) {
-            _exec($models[0].conn, $sql);
+            _exec($models[0].conn, $sql, []);
         }
     }
     return $statements;

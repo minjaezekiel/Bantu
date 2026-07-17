@@ -83,13 +83,38 @@ eq($l4.op, "icontains", "icontains beats contains");
 
 
 print("");
-print("-- Unit: condition compilation --");
+print("-- Unit: condition compilation (values are BOUND, not inlined) --");
 
-eq(orm._cond($sq, "age", "gte", 18), "\"age\" >= 18", "cond gte");
-eq(orm._cond($sq, "id", "in", [1, 2, 3]), "\"id\" IN (1, 2, 3)", "cond in");
-eq(orm._cond($sq, "name", "contains", "al"), "\"name\" LIKE '%al%'", "cond contains");
-eq(orm._cond($sq, "deleted", "isnull", true), "\"deleted\" IS NULL", "cond isnull true");
-eq(orm._cond($sq, "name", "eq", null), "\"name\" IS NULL", "cond eq null becomes IS NULL");
+// _cond now takes a binder; values become placeholders and land in b.params.
+$bg = orm._binder($sq);
+eq(orm._cond($bg, "age", "gte", 18), "\"age\" >= ?", "cond gte emits placeholder");
+eq(str($bg.params), "[18]", "cond gte binds the value");
+
+$bi = orm._binder($sq);
+eq(orm._cond($bi, "id", "in", [1, 2, 3]), "\"id\" IN (?, ?, ?)", "cond in emits one placeholder each");
+eq(str($bi.params), "[1, 2, 3]", "cond in binds every value");
+
+$bc = orm._binder($sq);
+eq(orm._cond($bc, "name", "contains", "al"), "\"name\" LIKE ?", "cond contains emits placeholder");
+eq(str($bc.params), "[%al%]", "cond contains binds the LIKE pattern");
+
+$bn = orm._binder($sq);
+eq(orm._cond($bn, "deleted", "isnull", true), "\"deleted\" IS NULL", "cond isnull true");
+eq(len($bn.params), 0, "cond isnull binds nothing");
+
+$be = orm._binder($sq);
+eq(orm._cond($be, "name", "eq", null), "\"name\" IS NULL", "cond eq null becomes IS NULL");
+eq(len($be.params), 0, "cond eq null binds nothing");
+
+// Postgres uses numbered placeholders ($1, $2 …)
+$bp = orm._binder($pg);
+eq(orm._cond($bp, "age", "gte", 18), "\"age\" >= $1", "postgres cond uses $1");
+eq(orm._cond($bp, "name", "eq", "x"), "\"name\" = $2", "postgres numbering increments");
+
+// MySQL has no real driver (simulation) → falls back to inline escaping
+$bm = orm._binder($my);
+eq(orm._cond($bm, "name", "eq", "al"), "`name` = 'al'", "mysql falls back to escaping");
+eq(len($bm.params), 0, "mysql binds nothing (no param support)");
 
 
 print("");
@@ -101,13 +126,15 @@ $q = orm.filter($q, [["age__gte", 18]]);
 $q = orm.orderBy($q, ["-age"]);
 $q = orm.limit($q, 5);
 eq(orm._buildSelect($q),
-   "SELECT * FROM \"users\" WHERE \"age\" >= 18 ORDER BY \"age\" DESC LIMIT 5;",
+   "SELECT * FROM \"users\" WHERE \"age\" >= ? ORDER BY \"age\" DESC LIMIT 5;",
    "buildSelect filter+order+limit");
+eq(str(orm._paramsOf($q)), "[18]", "queryset collects the bound value");
 
 $q2 = orm.exclude(orm.query($m), [["name", "bob"]]);
 eq(orm._buildSelect($q2),
-   "SELECT * FROM \"users\" WHERE NOT (\"name\" = 'bob');",
+   "SELECT * FROM \"users\" WHERE NOT (\"name\" = ?);",
    "buildSelect exclude becomes NOT");
+eq(str(orm._paramsOf($q2)), "[bob]", "exclude binds its value");
 
 $q3 = orm.values(orm.query($m), ["id", "name"]);
 eq(orm._buildSelect($q3),
@@ -116,8 +143,9 @@ eq(orm._buildSelect($q3),
 
 $q4 = orm.filterQ(orm.query($m), orm.qOr(orm.Q([["age__lt", 18]]), orm.Q([["age__gte", 65]])));
 eq(orm._buildSelect($q4),
-   "SELECT * FROM \"users\" WHERE ((\"age\" < 18) OR (\"age\" >= 65));",
+   "SELECT * FROM \"users\" WHERE ((\"age\" < ?) OR (\"age\" >= ?));",
    "buildSelect Q OR tree");
+eq(str(orm._paramsOf($q4)), "[18, 65]", "Q tree binds values in order");
 
 
 print("");
@@ -160,6 +188,18 @@ eq($one.name, "Ada", "get returns Ada");
 // icontains
 $aNames = orm.all(orm.filter(orm.query($User), [["name__icontains", "a"]]));
 ok(len($aNames) >= 3, "icontains a matches Ada/Alan/Grace");
+
+// SQL injection is neutralized: the payload is BOUND as a value, so it is
+// stored verbatim as data and the table survives.
+$before = orm.count(orm.query($User));
+orm.insert($User, {"name": "Robert'); DROP TABLE people;--", "age": 7, "email": "bobby@x.io"});
+eq(orm.count(orm.query($User)), $before + 1, "injection payload inserted as one ordinary row");
+$bobby = orm.get(orm.query($User), [["email", "bobby@x.io"]]);
+eq($bobby.name, "Robert'); DROP TABLE people;--", "payload round-trips verbatim (not executed)");
+// a filter carrying a payload matches nothing rather than altering the query
+$evil = orm.all(orm.filter(orm.query($User), [["name", "x' OR '1'='1"]]));
+eq(len($evil), 0, "injection in a filter matches nothing");
+orm.remove(orm.filter(orm.query($User), [["email", "bobby@x.io"]]), false);
 
 // aggregate
 $sum = orm.aggregate(orm.query($User), "SUM(age)", "total");

@@ -99,6 +99,24 @@ extend($l, [7, 8]);
 eq(str($l), "[0, 1, 3, 4, 7, 8]", "append/pop/insert/remove/extend");
 eq($last, 5, "pop returns last");
 
+// push() now mutates in place (it used to be a silent no-op) and returns the
+// list, so the older `$x = push($x, v)` idiom also works.
+$p = [1, 2];
+push($p, 3);
+eq(str($p), "[1, 2, 3]", "push() mutates in place");
+$p2 = [1];
+$p2 = push($p2, 2);
+eq(str($p2), "[1, 2]", "$x = push($x, v) idiom");
+// method form mutates too, including a list nested in a dict
+$m = [1, 2];
+$m.push(3);
+$popped = $m.pop();
+eq(str($m), "[1, 2]", "$l.push() / $l.pop() mutate");
+eq($popped, 3, "$l.pop() returns last");
+$nest = {"r": [10]};
+$nest.r.push(20);
+eq(str($nest.r), "[10, 20]", "nested $d.list.push() mutates");
+
 print("");
 print("-- file I/O --");
 writefile("/tmp/bantu_lang_test.txt", "alpha\nbeta\ngamma\n");

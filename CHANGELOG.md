@@ -30,8 +30,17 @@ touched.**
   variable names again; the `$` sigil forces the following word to be an identifier.
 - **[bug fix] Bare `return;`** — returning with no value (or at the end of a block) yields null
   instead of a parse error.
-- **[bug fix] Mutating `.push()`/`.pop()` clarified** — the value-copying list methods no longer
-  mislead; use the new `append`/`pop` builtins (below) for in-place mutation.
+- **[bug fix] `push()`, `$l.push()` and `$l.pop()` now mutate** — all three captured the list by
+  value and were silent no-ops. They are resolved against the real storage now. `push()` returns
+  the mutated list, so the older `$l = push($l, x)` idiom works correctly too.
+- **[bug fix] ORM binds values instead of escaping them** — `orm/orm.b` now emits placeholders and
+  collects bound parameters (SQLite `?`, PostgreSQL `$1…$n`), retiring string interpolation as the
+  injection boundary. `_escape()` remains only for identifiers/DDL defaults and dialects without a
+  parameter path. Covered by injection tests in `orm/orm_test.b` (61 assertions).
+- **[patch] `sua.mysql.*` documented as a simulation** — `HAS_MYSQL` is defined by CMake but never
+  referenced by the evaluator, so MySQL returns canned rows regardless of build flags, and
+  `drivers/mysql_driver.hpp` / `drivers/postgres_driver.hpp` are included by nothing. The README's
+  "real with `-DBANTU_MYSQL=ON`" claim is corrected; see `docs/v1.3.0-status.md`.
 
 ### Added
 
@@ -56,7 +65,8 @@ touched.**
   ["double"])` returns a callable that invokes the C symbol. Types: `int`, `double`, `string`,
   `pointer`, `void`. Built in on Linux/macOS (`-DBANTU_FFI -lffi -ldl`).
 - **[feature] Parameterized SQL** — `sua.sqlite.exec/query(sql, [params])` binds `?` placeholders
-  via prepared statements (injection-safe); the ORM can use it.
+  via prepared statements, and `sua.postgres.exec/query(sql, [params])` binds `$1…$n` via
+  `PQexecParams` (both injection-safe). The ORM now uses this path for every value.
 - **[feature] Linter + compile gate** — `bantu lint <file> [--json]` reports syntax errors and
   const/type issues (error = red, warning = yellow). `run`/`build` refuse to execute on errors
   (`--no-lint` opts out). The VS Code extension shows these live as you type.
