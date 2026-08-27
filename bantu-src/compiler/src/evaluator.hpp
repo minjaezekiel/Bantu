@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
+#include <cstdint>
 
 // ─── External Library Headers ───
 #include <curl/curl.h>
@@ -41,6 +42,65 @@
 
 // Helper to create native function values without ambiguity
 inline Value makeNative(NativeFn fn) { return Value(std::move(fn)); }
+
+// ════════════════════════════════════════════════════════════════
+// CRYPTO PRIMITIVES — support for the pure-Bantu hash/crypto/uuid modules.
+// General-purpose low-level ops the language otherwise lacks: 32-bit bitwise
+// arithmetic, byte<->list conversion, an OS CSPRNG, and constant-time compare.
+// Binary data is represented in Bantu as a LIST of numbers 0..255 (no new
+// type). These are the atoms; the hash/cipher algorithms live in .b files.
+// ════════════════════════════════════════════════════════════════
+
+// Interpret a Bantu number as a 32-bit unsigned word (defined wraparound).
+static inline uint32_t bantuU32(double d) {
+    long long ll = (long long)std::llround(d);
+    return (uint32_t)(uint64_t)ll;
+}
+
+// A Bantu string or byte-list → raw bytes.
+static inline std::vector<unsigned char> bantuToBytes(const Value& v) {
+    std::vector<unsigned char> out;
+    if (v.isString()) {
+        out.assign(v.stringVal.begin(), v.stringVal.end());
+    } else if (v.isList()) {
+        out.reserve(v.listVal.size());
+        for (const auto& e : v.listVal) {
+            out.push_back((unsigned char)((unsigned)bantuU32(e.numberVal) & 0xFFu));
+        }
+    }
+    return out;
+}
+
+// Raw bytes → a Bantu list-of-numbers (0..255) value.
+static inline Value bantuBytesToList(const unsigned char* p, size_t n) {
+    std::vector<Value> out;
+    out.reserve(n);
+    for (size_t i = 0; i < n; i++) out.push_back(Value((double)p[i]));
+    return Value(std::move(out));
+}
+
+// Fill buf with cryptographically-secure random bytes from the OS.
+static inline bool bantuCsprng(unsigned char* buf, size_t n) {
+    if (n == 0) return true;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    arc4random_buf(buf, n);
+    return true;
+#else
+    std::ifstream f("/dev/urandom", std::ios::binary);
+    if (!f) return false;
+    f.read(reinterpret_cast<char*>(buf), (std::streamsize)n);
+    return (size_t)f.gcount() == n;
+#endif
+}
+
+// Raw bytes → lowercase hex string.
+static inline std::string bantuHexOf(const std::vector<unsigned char>& b) {
+    static const char* HX = "0123456789abcdef";
+    std::string s;
+    s.reserve(b.size() * 2);
+    for (unsigned char c : b) { s.push_back(HX[c >> 4]); s.push_back(HX[c & 0xF]); }
+    return s;
+}
 
 // ════════════════════════════════════════════════════════════════
 // SUA BACKEND FRAMEWORK — Static State & Helpers
@@ -665,6 +725,7 @@ struct ReturnSignal { Value value; };
 class Evaluator {
 public:
     Evaluator() : env_(std::make_shared<Environment>()), globalEnv_(env_) {
+        env_->functionScope = true;   // global root is an assignment boundary
         curl_global_init(CURL_GLOBAL_DEFAULT);
         registerBuiltins();
     }
@@ -844,11 +905,10 @@ private:
 
     Value evalAssign(AssignNode* n) {
         Value val = evalNode(n->value);
-        if (env_->has(n->name)) {
-            env_->set(n->name, val);
-        } else {
-            env_->define(n->name, val);
-        }
+        // Function-local assignment: resolve up to the enclosing function
+        // boundary only, else define locally. Prevents a callee from clobbering
+        // a caller's/global's variable of the same name (e.g. a loop counter).
+        env_->assign(n->name, val);
         return val;
     }
 
@@ -1133,6 +1193,7 @@ private:
         if (callee.isFunction()) {
             auto fn = callee.functionVal;
             auto callEnv = std::make_shared<Environment>(fn->closure);
+            callEnv->functionScope = true;   // function-local assignment boundary
             if (env_->has("this")) {
                 callEnv->define("this", env_->get("this"));
                 callEnv->define("self", env_->get("this"));
@@ -1727,6 +1788,7 @@ private:
         if (callee.isFunction()) {
             auto fn = callee.functionVal;
             auto callEnv = std::make_shared<Environment>(fn->closure);
+            callEnv->functionScope = true;   // function-local assignment boundary
 
             // If 'this' exists in current scope, pass it along
             if (env_->has("this")) {
@@ -2379,8 +2441,128 @@ private:
         env_->define("chr", makeNative([](std::vector<Value> args) -> Value {
             if (args.empty()) return Value(std::string(""));
             int code = (int)args[0].numberVal;
-            if (code < 0 || code > 127) return Value(std::string("?"));
-            return Value(std::string(1, (char)code));
+            // Full byte range 0..255 (was ASCII-clamped to 127); needed so byte
+            // sequences can be materialized for the crypto/hash modules.
+            if (code < 0 || code > 255) return Value(std::string("?"));
+            return Value(std::string(1, (char)(unsigned char)code));
+        }));
+
+        // ─── Crypto primitives (crypto-suite): u32 bitwise/modular ops ───
+        // Operate on Bantu numbers treated as 32-bit unsigned words, with
+        // defined wraparound. These are the atoms of MD5/SHA/HMAC written in .b.
+        env_->define("band", makeNative([](std::vector<Value> a) -> Value {
+            return Value((double)(bantuU32(a.size() > 0 ? a[0].numberVal : 0) & bantuU32(a.size() > 1 ? a[1].numberVal : 0)));
+        }));
+        env_->define("bor", makeNative([](std::vector<Value> a) -> Value {
+            return Value((double)(bantuU32(a.size() > 0 ? a[0].numberVal : 0) | bantuU32(a.size() > 1 ? a[1].numberVal : 0)));
+        }));
+        env_->define("bxor", makeNative([](std::vector<Value> a) -> Value {
+            return Value((double)(bantuU32(a.size() > 0 ? a[0].numberVal : 0) ^ bantuU32(a.size() > 1 ? a[1].numberVal : 0)));
+        }));
+        env_->define("bnot", makeNative([](std::vector<Value> a) -> Value {
+            return Value((double)(uint32_t)(~bantuU32(a.size() > 0 ? a[0].numberVal : 0)));
+        }));
+        env_->define("shl", makeNative([](std::vector<Value> a) -> Value {
+            uint32_t x = bantuU32(a.size() > 0 ? a[0].numberVal : 0);
+            uint32_t s = bantuU32(a.size() > 1 ? a[1].numberVal : 0) & 31u;
+            return Value((double)(uint32_t)(x << s));
+        }));
+        env_->define("shr", makeNative([](std::vector<Value> a) -> Value {
+            uint32_t x = bantuU32(a.size() > 0 ? a[0].numberVal : 0);
+            uint32_t s = bantuU32(a.size() > 1 ? a[1].numberVal : 0) & 31u;
+            return Value((double)(uint32_t)(x >> s));
+        }));
+        env_->define("rotl", makeNative([](std::vector<Value> a) -> Value {
+            uint32_t x = bantuU32(a.size() > 0 ? a[0].numberVal : 0);
+            uint32_t r = bantuU32(a.size() > 1 ? a[1].numberVal : 0) & 31u;
+            uint32_t y = (r == 0) ? x : (uint32_t)((x << r) | (x >> (32 - r)));
+            return Value((double)y);
+        }));
+        env_->define("rotr", makeNative([](std::vector<Value> a) -> Value {
+            uint32_t x = bantuU32(a.size() > 0 ? a[0].numberVal : 0);
+            uint32_t r = bantuU32(a.size() > 1 ? a[1].numberVal : 0) & 31u;
+            uint32_t y = (r == 0) ? x : (uint32_t)((x >> r) | (x << (32 - r)));
+            return Value((double)y);
+        }));
+        env_->define("add32", makeNative([](std::vector<Value> a) -> Value {
+            return Value((double)(uint32_t)(bantuU32(a.size() > 0 ? a[0].numberVal : 0) + bantuU32(a.size() > 1 ? a[1].numberVal : 0)));
+        }));
+        env_->define("mul32", makeNative([](std::vector<Value> a) -> Value {
+            uint64_t p = (uint64_t)bantuU32(a.size() > 0 ? a[0].numberVal : 0) * (uint64_t)bantuU32(a.size() > 1 ? a[1].numberVal : 0);
+            return Value((double)(uint32_t)p);
+        }));
+
+        // ─── Crypto primitives: byte / hex conversion ───
+        // Bytes are a Bantu list of numbers 0..255. bytes() is the missing
+        // whole-string ord(); frombytes() rebuilds a string from bytes.
+        env_->define("bytes", makeNative([](std::vector<Value> a) -> Value {
+            if (a.empty()) return Value(std::vector<Value>{});
+            auto b = bantuToBytes(a[0]);
+            return bantuBytesToList(b.data(), b.size());
+        }));
+        env_->define("frombytes", makeNative([](std::vector<Value> a) -> Value {
+            if (a.empty() || !a[0].isList()) return Value(std::string(""));
+            std::string s;
+            s.reserve(a[0].listVal.size());
+            for (auto& e : a[0].listVal) s.push_back((char)(unsigned char)(bantuU32(e.numberVal) & 0xFFu));
+            return Value(s);
+        }));
+        env_->define("ord", makeNative([](std::vector<Value> a) -> Value {
+            if (a.empty()) return Value(-1.0);
+            if (a[0].isNumber()) return a[0];
+            if (a[0].isString() && !a[0].stringVal.empty()) return Value((double)(unsigned char)a[0].stringVal[0]);
+            return Value(-1.0);
+        }));
+        env_->define("tohex", makeNative([](std::vector<Value> a) -> Value {
+            if (a.empty()) return Value(std::string(""));
+            return Value(bantuHexOf(bantuToBytes(a[0])));
+        }));
+        env_->define("fromhex", makeNative([](std::vector<Value> a) -> Value {
+            std::vector<Value> out;
+            if (!a.empty() && a[0].isString()) {
+                const std::string& h = a[0].stringVal;
+                auto nyb = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                    return -1;
+                };
+                int hi = -1;
+                for (char c : h) {
+                    int v = nyb(c);
+                    if (v < 0) continue;                 // skip spaces/colons/etc.
+                    if (hi < 0) { hi = v; }
+                    else { out.push_back(Value((double)((hi << 4) | v))); hi = -1; }
+                }
+            }
+            return Value(std::move(out));
+        }));
+
+        // ─── Crypto primitives: OS CSPRNG + constant-time compare ───
+        // randbytes(n) → list of n cryptographically-secure bytes. This is the
+        // ONLY safe randomness source for keys/salts/nonces/UUIDv4.
+        env_->define("randbytes", makeNative([](std::vector<Value> a) -> Value {
+            long long n = a.empty() ? 0 : (long long)std::llround(a[0].numberVal);
+            if (n < 0) n = 0;
+            if (n > 1048576) n = 1048576;               // 1 MiB sanity cap
+            std::vector<unsigned char> buf((size_t)n);
+            if (n > 0 && !bantuCsprng(buf.data(), (size_t)n)) {
+                ErrorHandler::throwError("randbytes(): OS CSPRNG unavailable", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            return bantuBytesToList(buf.data(), buf.size());
+        }));
+        // ct_equal(a, b) → bool. Constant-time (no early exit) over strings or
+        // byte-lists; use for MAC/tag/digest verification to avoid timing leaks.
+        env_->define("ct_equal", makeNative([](std::vector<Value> a) -> Value {
+            if (a.size() < 2) return Value(false);
+            auto x = bantuToBytes(a[0]);
+            auto y = bantuToBytes(a[1]);
+            unsigned diff = (unsigned)(x.size() ^ y.size());
+            for (size_t i = 0; i < x.size(); i++) {
+                unsigned char yb = (i < y.size()) ? y[i] : 0;
+                diff |= (unsigned)(x[i] ^ yb);
+            }
+            return Value(diff == 0);
         }));
 
         // NOTE: `push` is intentionally NOT registered as a builtin. A native fn
@@ -3824,6 +4006,7 @@ private:
             loadedModules_.push_back(mod.resolvedPath);
 
             auto childEnv = std::make_shared<Environment>(globalEnv_);
+            childEnv->functionScope = true;   // module scope: top-level $vars stay in the module, not global
             auto savedEnv = env_;
             env_ = childEnv;
             filePathStack_.push_back(mod.resolvedPath);
@@ -4257,6 +4440,7 @@ private:
         // Execute module in a CHILD environment so its definitions
         // don't pollute the importer's scope unless requested.
         auto childEnv = std::make_shared<Environment>(globalEnv_);
+        childEnv->functionScope = true;   // module scope: top-level $vars stay in the module, not global
         auto savedEnv = env_;
         env_ = childEnv;
         filePathStack_.push_back(mod.resolvedPath);
