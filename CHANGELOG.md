@@ -7,8 +7,39 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ## [Unreleased]
 
+### Fixed
+
+- **[bug fix] Function-local variable scoping** — a plain assignment `$x = v` inside a function used
+  to walk the whole scope chain and mutate a caller's or a global variable of the same name. A
+  callee reusing a caller's loop counter (e.g. `$i`) would reset it, causing infinite loops. Plain
+  assignment is now **function-local** (Python-style): it resolves only up to the enclosing function
+  boundary and otherwise defines a local; reads still fall through to enclosing scopes so functions
+  can read globals. Module top-level `$vars` now correctly stay in the module (and are exposed as
+  namespace members) instead of leaking into global. Implemented via an `Environment::assign()` with
+  a `functionScope` boundary flag on function-call envs, module envs, and the global root. OOP
+  dispatch/inheritance untouched. Guarded by `tests/scope_test.b`; no regressions (lang/classes,
+  ORM, Sua, random all green). This is what let the hash/HMAC/UUID functions be called in loops.
+
 ### Added
 
+- **[feature] Native crypto primitives** — additive builtins in the interpreter enabling
+  production-grade cryptography written in pure Bantu: 32-bit bitwise/modular ops
+  (`band/bor/bxor/bnot/shl/shr/rotl/rotr/add32/mul32`), byte/hex conversion (`bytes/frombytes/ord/
+  tohex/fromhex`, with `chr` extended 0–127 → 0–255), an OS CSPRNG (`randbytes`), and constant-time
+  `ct_equal`. Bytes are represented as a Bantu list of 0–255. Covered by
+  `tests/crypto_primitives_test.b` (40 assertions).
+- **[feature] `hash` package** — MD5, SHA-1, SHA-224, SHA-256 and HMAC-SHA256, written in pure
+  Bantu on the primitives above and **bit-exact to the RFC/NIST test vectors** (cross-checked vs
+  `shasum`/`md5`/`openssl`), plus non-crypto `djb2`/`fnv1a` and `hash_file`. MD5/SHA-1 documented as
+  non-secure (checksums/UUID-namespace only). `hash/hash_test.b` (25 vectors). Docs `docs/hash.md`.
+- **[feature] `crypto` package** — OS-CSPRNG secure random (`random_bytes`, `token_hex`,
+  `token_urlsafe`, unbiased `random_int`), HMAC-SHA256 with constant-time `verify_hmac`,
+  HKDF-SHA256 (RFC 5869), and base64/base64url/hex (RFC 4648). AES and password-KDFs are
+  intentionally out of scope (a future vetted native layer). `crypto/crypto_test.b` (31 tests).
+  Docs `docs/crypto.md`.
+- **[feature] `uuid` package** — RFC 4122 / RFC 9562 `uuid4` (CSPRNG), `uuid7` (time-ordered),
+  `uuid3`/`uuid5` (name-based, bit-exact to RFC vectors), namespaces, and
+  `parse/format/is_valid/version_of`. `uuid/uuid_test.b` (17 tests). Docs `docs/uuid.md`.
 - **[feature] `random` standard-library package** — a Python-style random-number module written
   entirely in Bantu (`random/random.b`), with a **seedable** pure-Bantu generator so
   `random.seed(n)` reproduces sequences exactly (Bantu's built-in `random()` is a
