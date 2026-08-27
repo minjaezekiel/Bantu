@@ -5,6 +5,20 @@ All notable changes to the Bantu programming language are documented in this fil
 > **Searchable tags:** every entry below is prefixed with `[feature]`, `[bug fix]`, or
 > `[patch]` so you can grep the log, e.g. `grep '\[bug fix\]' CHANGELOG.md`.
 
+## [Unreleased]
+
+### Added
+
+- **[feature] `random` standard-library package** — a Python-style random-number module written
+  entirely in Bantu (`random/random.b`), with a **seedable** pure-Bantu generator so
+  `random.seed(n)` reproduces sequences exactly (Bantu's built-in `random()` is a
+  Mersenne-Twister that cannot be seeded). API: `seed`/`getstate`/`setstate`, `random`, `uniform`,
+  `randint`, `randbelow`, `randrange`, `randrangeStep`, `randbool`, `choice`, `choices`,
+  `choicesUniform`, `sample`, `shuffle` (returns a copy — Bantu lists are pass-by-value),
+  `gauss`/`normalvariate`, `expovariate`, `triangular`, and `getrandbits`. Engine is a 32-bit LCG
+  whose arithmetic stays exact in doubles; documented as non-cryptographic. Include with
+  `include "./random.b" as random;`. Covered by `random/random_test.b`; docs at `docs/random.md`.
+
 ## [1.3.0] — 2026-07-10
 
 Core-language correctness release: the features that were advertised via keywords but silently
