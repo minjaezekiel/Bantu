@@ -22,6 +22,55 @@
 // ════════════════════════════════════════════════════════════════════════
 
 
+// ─── Native accelerator detection ───────────────────────────────────────
+// When the interpreter ships the native (C++) digest accelerators, the public
+// hashes below delegate to them — byte-identical to the pure-Bantu code but
+// ~10^5x faster. We probe ONCE at load, inside try/catch, so this module also
+// runs correctly on an older interpreter that lacks `has_native` (it simply
+// uses the pure-Bantu path). SHA-384/512 are native-ONLY (float64 can't hold
+// 64-bit words) and return null when the accelerator is absent.
+$_NATIVE_OK = false;
+try { $_NATIVE_OK = has_native("sha256"); } catch ($e) { $_NATIVE_OK = false; }
+
+// _hasNative($name) → is a specific native accelerator available?
+// Short-circuits on the once-probed flag so old interpreters never call the
+// (possibly undefined) has_native, and new ones pay no per-call try/catch cost.
+def _hasNative($name) {
+    if (!$_NATIVE_OK) { return false; }
+    return has_native($name);
+}
+
+
+// ─── Insecure-primitive guard (C5) ──────────────────────────────────────
+// MD5 and SHA-1 are collision-broken. We emit a ONE-TIME notice to stderr the
+// first time each is used as a full message digest, steering callers to
+// SHA-256/HMAC — without breaking output (stderr, not stdout) and without
+// nagging (once per process). The notice fires only on the public string
+// digests (md5/sha1/*_hex), NOT on the *_bytes cores, so RFC-4122 UUID v3/v5
+// (which legitimately need MD5/SHA-1 over a namespace) stay silent.
+// Silence it entirely with:  hash.allow_insecure(true);
+// State lives in a dict: functions mutate module state via FIELD assignment
+// (which targets the object), since a plain `$x = ...` inside a function would
+// bind a function-local instead of the module var (function-local scoping).
+$_INSEC = {"allow": false, "md5": false, "sha1": false};
+
+// Opt out of the MD5/SHA-1 deprecation notices (e.g. for checksum tooling).
+def allow_insecure($yes) { $_INSEC.allow = $yes; }
+
+def _warnInsecure($algo) {
+    if ($_INSEC.allow) { return null; }
+    if ($_INSEC[$algo]) { return null; }
+    $_INSEC[$algo] = true;
+    // eprint may be absent on very old interpreters; degrade silently.
+    try {
+        eprint("[hash] WARNING: " + $algo + " is cryptographically broken; " +
+               "use sha256/hmac_sha256 for security. " +
+               "(hash.allow_insecure(true) silences this.)");
+    } catch ($e) { }
+    return null;
+}
+
+
 // ─── Constant tables (parsed once at load) ──────────────────────────────
 
 // _wordsFromHex($hex) → list of 32-bit words (big-endian grouping of the bytes).
@@ -165,11 +214,21 @@ def _sha256_run($msg, $IV) {
     return [$h0, $h1, $h2, $h3, $h4, $h5, $h6, $h7];
 }
 
-def sha256_bytes($input) { return _beBytes(_sha256_run(_toBytes($input), $_SHA256_IV), 8); }
+// Public SHA-256/224. When the interpreter ships the native accelerator we
+// delegate to it (bit-identical, ~10^5x faster); otherwise we run the pure
+// reference above. Delegating in the *_bytes form accelerates the hex form and
+// any caller that needs raw bytes (e.g. uuid5) alike.
+def sha256_bytes($input) {
+    if (_hasNative("sha256")) { return fromhex(native_sha256($input)); }
+    return _beBytes(_sha256_run(_toBytes($input), $_SHA256_IV), 8);
+}
 def sha256($input)       { return tohex(sha256_bytes($input)); }
 def sha256_hex($input)   { return tohex(sha256_bytes($input)); }
 
-def sha224_bytes($input) { return _beBytes(_sha256_run(_toBytes($input), $_SHA224_IV), 7); }
+def sha224_bytes($input) {
+    if (_hasNative("sha224")) { return fromhex(native_sha224($input)); }
+    return _beBytes(_sha256_run(_toBytes($input), $_SHA224_IV), 7);
+}
 def sha224($input)       { return tohex(sha224_bytes($input)); }
 def sha224_hex($input)   { return tohex(sha224_bytes($input)); }
 
@@ -233,9 +292,12 @@ def _sha1_run($msg) {
     return [$h0, $h1, $h2, $h3, $h4];
 }
 
-def sha1_bytes($input) { return _beBytes(_sha1_run(_toBytes($input)), 5); }
-def sha1($input)       { return tohex(sha1_bytes($input)); }
-def sha1_hex($input)   { return tohex(sha1_bytes($input)); }
+def sha1_bytes($input) {
+    if (_hasNative("sha1")) { return fromhex(native_sha1($input)); }
+    return _beBytes(_sha1_run(_toBytes($input)), 5);
+}
+def sha1($input)       { _warnInsecure("sha1"); return tohex(sha1_bytes($input)); }
+def sha1_hex($input)   { _warnInsecure("sha1"); return tohex(sha1_bytes($input)); }
 
 
 // ─── MD5 ────────────────────────────────────────────────────────────────
@@ -317,14 +379,18 @@ def _md5_bytes($words) {
     return $out;
 }
 
-def md5_bytes($input) { return _md5_bytes(_md5_run(_toBytes($input))); }
-def md5($input)       { return tohex(md5_bytes($input)); }
-def md5_hex($input)   { return tohex(md5_bytes($input)); }
+def md5_bytes($input) {
+    if (_hasNative("md5")) { return fromhex(native_md5($input)); }
+    return _md5_bytes(_md5_run(_toBytes($input)));
+}
+def md5($input)       { _warnInsecure("md5"); return tohex(md5_bytes($input)); }
+def md5_hex($input)   { _warnInsecure("md5"); return tohex(md5_bytes($input)); }
 
 
 // ─── HMAC-SHA256 (RFC 2104) ─────────────────────────────────────────────
 
 def hmac_sha256_bytes($key, $msg) {
+    if (_hasNative("hmac_sha256")) { return fromhex(native_hmac_sha256($key, $msg)); }
     $kb = _toBytes($key);
     $mb = _toBytes($msg);
     if (len($kb) > 64) { $kb = sha256_bytes($kb); }
@@ -343,6 +409,32 @@ def hmac_sha256_bytes($key, $msg) {
 }
 def hmac_sha256($key, $msg)     { return tohex(hmac_sha256_bytes($key, $msg)); }
 def hmac_sha256_hex($key, $msg) { return tohex(hmac_sha256_bytes($key, $msg)); }
+
+
+// ─── SHA-512 / SHA-384 (native-only) ────────────────────────────────────
+// The SHA-512 family uses 64-bit words, which Bantu's float64 numbers cannot
+// represent exactly — so these are provided ONLY by the native accelerator
+// (there is no pure-Bantu fallback). They are secure, modern digests; prefer
+// them when you want a 512/384-bit output. If a build lacks the accelerator
+// these return null, which callers can detect.
+def sha512($input) {
+    if (_hasNative("sha512")) { return native_sha512($input); }
+    return null;
+}
+def sha512_hex($input)   { return sha512($input); }
+def sha512_bytes($input) {
+    if (_hasNative("sha512")) { return fromhex(native_sha512($input)); }
+    return null;
+}
+def sha384($input) {
+    if (_hasNative("sha384")) { return native_sha384($input); }
+    return null;
+}
+def sha384_hex($input)   { return sha384($input); }
+def sha384_bytes($input) {
+    if (_hasNative("sha384")) { return fromhex(native_sha384($input)); }
+    return null;
+}
 
 
 // ─── Non-cryptographic hashes (fast; for hashtables/checksums ONLY) ─────
@@ -375,8 +467,19 @@ def fnv1a($input) {
 
 // ─── File hashing helper ────────────────────────────────────────────────
 
-// hash_file($path, $algo) → hex digest of a file. $algo ∈ "md5"|"sha1"|"sha224"|"sha256".
+// hash_file($path, $algo) → hex digest of a file.
+// $algo ∈ "md5"|"sha1"|"sha224"|"sha256"|"sha384"|"sha512".
+// When the native accelerator is present, the file is read and digested
+// entirely in C++ (native_hash_file), so large files never have to be
+// materialized as a Bantu byte-list — this is what makes bulk file hashing
+// usable. Falls back to reading + the pure digests otherwise.
 def hash_file($path, $algo) {
+    if (_hasNative("hash_file")) {
+        $r = native_hash_file($path, $algo);
+        if ($r == null) { return null; }   // missing file, unreadable, or unknown algo
+        return $r;
+    }
+    // Pure-Bantu fallback (kept for builds without the accelerator).
     $data = readfile($path);
     if ($algo == "md5")    { return md5($data); }
     if ($algo == "sha1")   { return sha1($data); }

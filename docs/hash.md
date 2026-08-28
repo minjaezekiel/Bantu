@@ -61,15 +61,31 @@ if (ct_equal($expected, $actual)) { /* authentic */ }
 
 ---
 
-## How it works
-The 64-bit SHA-512 family and AES/password-KDFs are intentionally **not** here (Bantu's numbers are
-float64, so SHA-512's 64-bit words aren't exact; AES/KDFs belong in a vetted native layer). The
-32-bit families (MD5/SHA-1/SHA-224/SHA-256) use only 32-bit words, which are exact in float64 once
-the native `add32`/`mul32`/bitwise primitives provide defined wraparound.
+## SHA-512 / SHA-384
+`sha512`, `sha384` (plus `*_hex` / `*_bytes`) are also provided. Their 64-bit words can't be
+represented exactly by Bantu's float64, so these are **native-only**: they return a digest when the
+interpreter ships the native accelerator (the normal case) and `null` on a build without it.
 
-**Performance.** These are pure-Bantu digests on a tree-walking interpreter — throughput is roughly
-**~3 KB/s**. Ideal for the common cases (passwords, API keys, tokens, short messages, UUID
-namespaces — all well under a kilobyte) and correct at any size, but **not suited to hashing large
-files** (a 1 MB file takes minutes); shell out to a native tool for bulk file hashing. Correctness is
-validated by differential fuzzing against Python's `hashlib` (480 digests over random inputs, zero
-mismatches) and cross-checked against `openssl`/`shasum`/`md5`.
+```
+print(hash.sha512("abc"));  // ddaf35a1…54ca49f
+print(hash.sha384("abc"));  // cb00753f…34c825a7
+```
+
+## How it works
+The hash **algorithms are written in Bantu** on the native 32-bit primitives
+(`add32`/`mul32`/bitwise), and are **bit-exact to the RFC/NIST vectors**. For speed, each public
+digest transparently **delegates to a byte-identical native (C++) accelerator** when the interpreter
+provides one (`has_native(...)`); otherwise it runs the pure-Bantu reference. A differential test
+(`tests/crypto_differential_test.b`) asserts the two paths agree over random inputs at every block
+boundary, so the fast path can never drift from the audited spec.
+
+**Performance.** With the native accelerator (default build) throughput is **hundreds of MB/s** — a
+multi-MB file hashes in milliseconds, and `hash_file` reads + digests the file entirely in C++ (the
+bytes never cross into the interpreter). On a build without the accelerator the pure-Bantu path still
+runs correctly at ~3 KB/s (fine for passwords/tokens/UUIDs; slow for large files). Correctness is
+validated by differential fuzzing against Python's `hashlib` and cross-checked against
+`openssl`/`shasum`/`md5`.
+
+**MD5 / SHA-1 notice.** Calling `md5(...)` or `sha1(...)` as a full digest prints a one-time notice
+to **stderr** steering you to SHA-256/HMAC (they remain available for checksums / UUID v3·v5).
+Silence it with `hash.allow_insecure(true)`. The `*_bytes` cores (used by UUID v3/v5) never warn.

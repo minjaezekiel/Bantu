@@ -13,6 +13,8 @@
 #include "class.hpp"
 #include "server.hpp"
 #include "module_resolver.hpp"
+#include "crypto_native.hpp"   // native (C++) accelerators for the hash/crypto/uuid suite
+#include "crypto_sodium.hpp"    // optional libsodium AEAD + argon2id (feature-gated)
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -24,6 +26,18 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <set>
+#include <iterator>
+
+// ─── Platform CSPRNG headers (used by bantuCsprng) ───
+#if defined(_WIN32)
+  #include <windows.h>
+  #include <bcrypt.h>           // BCryptGenRandom (link: -lbcrypt)
+#elif defined(__linux__)
+  #include <unistd.h>
+  #include <errno.h>
+  #include <sys/syscall.h>      // SYS_getrandom
+#endif
 
 // ─── External Library Headers ───
 #include <curl/curl.h>
@@ -80,12 +94,39 @@ static inline Value bantuBytesToList(const unsigned char* p, size_t n) {
 }
 
 // Fill buf with cryptographically-secure random bytes from the OS.
+//
+// SECURITY (fail-closed): this returns false rather than ever producing
+// predictable output. Callers MUST surface that failure — a fallback to a
+// non-cryptographic PRNG (the `random` LCG) for key/salt/nonce material is the
+// vulnerability this whole suite exists to avoid, so it is intentionally absent.
+// Platform sources, in order of preference:
+//   • Windows  : BCryptGenRandom (CNG, system-preferred RNG)
+//   • Apple/BSD: arc4random_buf  (cannot fail)
+//   • Linux    : getrandom(2) if available, else /dev/urandom
 static inline bool bantuCsprng(unsigned char* buf, size_t n) {
     if (n == 0) return true;
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#if defined(_WIN32)
+    // BCryptGenRandom with BCRYPT_USE_SYSTEM_PREFERRED_RNG needs no algorithm
+    // handle. Returns 0 (STATUS_SUCCESS) on success.
+    return BCryptGenRandom(nullptr, buf, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
     arc4random_buf(buf, n);
     return true;
 #else
+    // Prefer getrandom(2); it needs no file descriptor and cannot be starved by
+    // an exhausted FD table. Fall back to /dev/urandom on older kernels.
+  #if defined(__linux__) && defined(SYS_getrandom)
+    size_t got = 0;
+    while (got < n) {
+        long r = ::syscall(SYS_getrandom, buf + got, n - got, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;   // retry on signal
+            break;                          // fall through to /dev/urandom
+        }
+        got += (size_t)r;
+    }
+    if (got == n) return true;
+  #endif
     std::ifstream f("/dev/urandom", std::ios::binary);
     if (!f) return false;
     f.read(reinterpret_cast<char*>(buf), (std::streamsize)n);
@@ -2564,6 +2605,162 @@ private:
             }
             return Value(diff == 0);
         }));
+
+        // ════════════════════════════════════════════════════════════════
+        // NATIVE DIGEST ACCELERATORS (C++ fast paths for the hash/ module)
+        // ----------------------------------------------------------------
+        // Byte-identical to the pure-Bantu digests but ~10^5x faster, so the
+        // .b modules delegate to these when present (gated on has_native).
+        // The pure-Bantu implementations remain the auditable reference and
+        // the portability fallback; a differential test asserts they agree.
+        // Each accepts a string OR a byte-list (0..255) and returns lowercase
+        // hex. These digest PUBLIC data, so constant-time is not required;
+        // secret comparisons still go through ct_equal.
+        // ════════════════════════════════════════════════════════════════
+        {
+            // Register one string|list -> hex digest under `name`, computing
+            // `outLen` bytes via `fn(msg, len, out)`.
+            auto defDigest = [&](const char* name, size_t outLen,
+                                 void(*fn)(const unsigned char*, size_t, unsigned char*)) {
+                env_->define(name, makeNative([outLen, fn](std::vector<Value> a) -> Value {
+                    if (a.empty()) return Value(std::string(""));
+                    auto b = bantuToBytes(a[0]);
+                    std::vector<unsigned char> out(outLen);
+                    fn(b.data(), b.size(), out.data());
+                    return Value(bantu_native::toHex(out.data(), outLen));
+                }));
+            };
+            defDigest("native_md5",    16, bantu_native::md5_raw);
+            defDigest("native_sha1",   20, bantu_native::sha1_raw);
+            defDigest("native_sha224", 28, bantu_native::sha224_raw);
+            defDigest("native_sha256", 32, bantu_native::sha256_raw);
+            defDigest("native_sha384", 48, bantu_native::sha384_raw);
+            defDigest("native_sha512", 64, bantu_native::sha512_raw);
+
+            // HMAC-SHA256(key, msg) -> hex. Both args accept string|byte-list.
+            env_->define("native_hmac_sha256", makeNative([](std::vector<Value> a) -> Value {
+                if (a.size() < 2) return Value(std::string(""));
+                auto key = bantuToBytes(a[0]);
+                auto msg = bantuToBytes(a[1]);
+                unsigned char out[32];
+                bantu_native::hmac_sha256_raw(key.data(), key.size(), msg.data(), msg.size(), out);
+                return Value(bantu_native::toHex(out, 32));
+            }));
+
+            // native_hash_file(path, algo) -> hex. Reads the file in C++ so a
+            // large file never has to be materialized as a Bantu byte-list —
+            // this is what makes bulk file hashing usable (see docs/hash.md).
+            // Streams in 64 KiB chunks would need incremental state; for now we
+            // read the whole file (bounded by available memory) then digest.
+            env_->define("native_hash_file", makeNative([](std::vector<Value> a) -> Value {
+                if (a.size() < 2 || !a[0].isString() || !a[1].isString()) return Value(nullptr);
+                std::ifstream f(a[0].stringVal, std::ios::binary);
+                if (!f) return Value(nullptr);   // caller distinguishes null (missing/unreadable)
+                std::vector<unsigned char> data((std::istreambuf_iterator<char>(f)),
+                                                 std::istreambuf_iterator<char>());
+                const std::string& algo = a[1].stringVal;
+                std::vector<unsigned char> out;
+                if      (algo == "md5")    { out.resize(16); bantu_native::md5_raw(data.data(), data.size(), out.data()); }
+                else if (algo == "sha1")   { out.resize(20); bantu_native::sha1_raw(data.data(), data.size(), out.data()); }
+                else if (algo == "sha224") { out.resize(28); bantu_native::sha224_raw(data.data(), data.size(), out.data()); }
+                else if (algo == "sha256") { out.resize(32); bantu_native::sha256_raw(data.data(), data.size(), out.data()); }
+                else if (algo == "sha384") { out.resize(48); bantu_native::sha384_raw(data.data(), data.size(), out.data()); }
+                else if (algo == "sha512") { out.resize(64); bantu_native::sha512_raw(data.data(), data.size(), out.data()); }
+                else return Value(nullptr);      // unknown algo
+                return Value(bantu_native::toHex(out.data(), out.size()));
+            }));
+
+            // has_native(name) -> bool. Lets .b modules feature-detect an
+            // accelerator and fall back to the pure implementation when a given
+            // interpreter build doesn't ship it. Kept in sync with the set above.
+            env_->define("has_native", makeNative([](std::vector<Value> a) -> Value {
+                if (a.empty() || !a[0].isString()) return Value(false);
+                static const std::set<std::string> kNatives = {
+                    "md5","sha1","sha224","sha256","sha384","sha512",
+                    "hmac_sha256","hash_file"
+                };
+                return Value(kNatives.count(a[0].stringVal) > 0);
+            }));
+
+            // eprint(...) — write to STDERR (diagnostics / warnings). Keeps
+            // security notices and logs off stdout so they never corrupt piped
+            // program output (e.g. a bare digest). Space-separated, newline-out.
+            env_->define("eprint", makeNative([](std::vector<Value> a) -> Value {
+                for (size_t i = 0; i < a.size(); i++) {
+                    if (i) std::cerr << " ";
+                    std::cerr << a[i].toString();
+                }
+                std::cerr << std::endl;
+                return Value(nullptr);
+            }));
+
+            // ════════════════════════════════════════════════════════════
+            // AUTHENTICATED ENCRYPTION + PASSWORD HASHING (libsodium, C3)
+            // ------------------------------------------------------------
+            // Present as working crypto ONLY when the interpreter was built
+            // with BANTU_SODIUM (and libsodium linked). Otherwise the builtins
+            // are still registered but report unavailability, so crypto.b can
+            // detect and raise a clear "rebuild with libsodium" error rather
+            // than silently doing nothing. Bytes cross as byte-lists (0..255).
+            // ════════════════════════════════════════════════════════════
+
+            // sodium_available() -> bool. Feature-detection for crypto.b.
+            env_->define("sodium_available", makeNative([](std::vector<Value>) -> Value {
+                return Value(bantu_sodium::available());
+            }));
+
+            // aead_encrypt(key, message, aad?) -> byte-list (nonce||ct||tag), or
+            // null on error (bad key size / not compiled in). key must be 32 bytes.
+            env_->define("aead_encrypt", makeNative([](std::vector<Value> a) -> Value {
+                if (a.size() < 2) return Value(nullptr);
+                auto key = bantuToBytes(a[0]);
+                auto msg = bantuToBytes(a[1]);
+                std::vector<unsigned char> aad = (a.size() > 2) ? bantuToBytes(a[2])
+                                                                : std::vector<unsigned char>();
+                bool ok = false;
+                auto out = bantu_sodium::aeadEncrypt(
+                    std::vector<uint8_t>(key.begin(), key.end()),
+                    std::vector<uint8_t>(msg.begin(), msg.end()),
+                    std::vector<uint8_t>(aad.begin(), aad.end()), ok);
+                if (!ok) return Value(nullptr);
+                return bantuBytesToList(out.data(), out.size());
+            }));
+
+            // aead_decrypt(key, blob, aad?) -> byte-list plaintext, or null if
+            // authentication fails (wrong key / tampered data / truncated). A
+            // null result MUST be treated as "reject", never as empty plaintext.
+            env_->define("aead_decrypt", makeNative([](std::vector<Value> a) -> Value {
+                if (a.size() < 2) return Value(nullptr);
+                auto key  = bantuToBytes(a[0]);
+                auto blob = bantuToBytes(a[1]);
+                std::vector<unsigned char> aad = (a.size() > 2) ? bantuToBytes(a[2])
+                                                                : std::vector<unsigned char>();
+                bool ok = false;
+                auto out = bantu_sodium::aeadDecrypt(
+                    std::vector<uint8_t>(key.begin(), key.end()),
+                    std::vector<uint8_t>(blob.begin(), blob.end()),
+                    std::vector<uint8_t>(aad.begin(), aad.end()), ok);
+                if (!ok) return Value(nullptr);
+                return bantuBytesToList(out.data(), out.size());
+            }));
+
+            // pwhash(password) -> encoded argon2id string (store this), or null.
+            env_->define("pwhash", makeNative([](std::vector<Value> a) -> Value {
+                if (a.empty()) return Value(nullptr);
+                std::string pw = a[0].isString() ? a[0].stringVal : a[0].toString();
+                bool ok = false;
+                std::string h = bantu_sodium::pwhash(pw, ok);
+                if (!ok) return Value(nullptr);
+                return Value(h);
+            }));
+
+            // pwhash_verify(encoded, password) -> bool (constant-time).
+            env_->define("pwhash_verify", makeNative([](std::vector<Value> a) -> Value {
+                if (a.size() < 2 || !a[0].isString()) return Value(false);
+                std::string pw = a[1].isString() ? a[1].stringVal : a[1].toString();
+                return Value(bantu_sodium::pwhashVerify(a[0].stringVal, pw));
+            }));
+        }
 
         // NOTE: `push` is intentionally NOT registered as a builtin. A native fn
         // receives its args by value and so could never mutate the caller's list

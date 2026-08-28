@@ -84,6 +84,27 @@ LINK_LIBS=(
     -ldl                 # dlopen/dlsym
 )
 
+# ── Optional: libsodium AEAD + argon2id (C3), OFF by default ──────────────
+# Enable with:  BANTU_SODIUM=1 bash build-mac.sh
+# Kept opt-in so the default binary gains NO new runtime dependency (important
+# for existing production deployments). When enabled we STATICALLY link
+# libsodium (libsodium.a) so the resulting binary stays self-contained.
+if [ "${BANTU_SODIUM:-0}" = "1" ]; then
+    SODIUM_PREFIX="$(brew --prefix libsodium 2>/dev/null || true)"
+    if [ -z "$SODIUM_PREFIX" ] || [ ! -f "$SODIUM_PREFIX/include/sodium.h" ]; then
+        die "BANTU_SODIUM=1 but libsodium not found" \
+            "Install it first:  brew install libsodium"
+    fi
+    echo "  libsodium: $SODIUM_PREFIX (static link)"
+    CPP_FLAGS+=( -DBANTU_SODIUM -I"$SODIUM_PREFIX/include" )
+    # Prefer the static archive so the binary carries no libsodium .dylib dep.
+    if [ -f "$SODIUM_PREFIX/lib/libsodium.a" ]; then
+        LINK_LIBS+=( "$SODIUM_PREFIX/lib/libsodium.a" )
+    else
+        LINK_LIBS+=( -L"$SODIUM_PREFIX/lib" -lsodium )
+    fi
+fi
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Build
 # ═══════════════════════════════════════════════════════════════════════

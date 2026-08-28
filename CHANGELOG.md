@@ -7,7 +7,40 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ## [Unreleased]
 
+### Added
+
+- **[feature] Native digest accelerators (hash performance)** — byte-identical C++ fast paths for
+  MD5/SHA-1/SHA-224/SHA-256/HMAC-SHA256 (`crypto_native.hpp`), which the `hash` module transparently
+  delegates to via a new `has_native(name)` feature check, falling back to the pure-Bantu reference
+  when absent. Throughput goes from ~3 KB/s to **hundreds of MB/s**; `hash_file` now reads+digests a
+  file entirely in C++ (a 5 MB file hashes in ~0.15 s, matching `shasum`). A differential test
+  (`tests/crypto_differential_test.b`, 69 assertions) asserts native == pure at every block boundary.
+- **[feature] SHA-512 / SHA-384** — `hash.sha512`/`hash.sha384` (+`_hex`/`_bytes`). Native-only
+  (64-bit words can't be represented exactly by Bantu's float64); return `null` on a build without
+  the accelerator. Validated against the official vectors.
+- **[feature] Authenticated encryption + password hashing (libsodium, opt-in)** — `crypto.encrypt`/
+  `decrypt` (XChaCha20-Poly1305-IETF, random per-message nonce, constant-time tag; `null` on
+  tamper/wrong-key) and `crypto.hash_password`/`verify_password` (argon2id). Backed by libsodium via
+  `crypto_sodium.hpp`; **compiled only with `BANTU_SODIUM=1`** (statically linked), so the default
+  build gains no runtime dependency. Guard with `crypto.encryption_available()`. Covered by
+  `crypto/crypto_encrypt_test.b` (skips cleanly when not built in).
+- **[feature] `eprint(...)` builtin** — writes to stderr (diagnostics/warnings without corrupting
+  stdout).
+
+### Changed
+
+- **[feature] Transitive dependency resolution** — `bantu add <pkg>` now installs the package's
+  declared `dependencies` recursively (cycle-safe), so e.g. `bantu add crypto` auto-pulls `hash`.
+  `crypto`/`uuid` manifests declare their `hash` dependency. No-dependency packages behave as before.
+- **[patch] MD5/SHA-1 misuse guard** — `md5(...)`/`sha1(...)` full digests now emit a one-time
+  stderr notice steering to SHA-256/HMAC (silence with `hash.allow_insecure(true)`); the `*_bytes`
+  cores used by UUID v3/v5 stay silent.
+
 ### Fixed
+
+- **[bug fix] CSPRNG portability + fail-closed** — `randbytes`/all secret material now sources OS
+  entropy on Windows (`BCryptGenRandom`) and Linux (`getrandom(2)` → `/dev/urandom`) as well as
+  Apple/BSD, and **fails closed** (errors rather than ever falling back to a predictable PRNG).
 
 - **[bug fix] Function-local variable scoping** — a plain assignment `$x = v` inside a function used
   to walk the whole scope chain and mutate a caller's or a global variable of the same name. A

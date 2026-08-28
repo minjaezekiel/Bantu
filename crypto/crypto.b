@@ -11,10 +11,11 @@
 //      $mac   = crypto.hmac_sha256("k", "msg");    // hex MAC
 //      $key   = crypto.hkdf_sha256($ikm, $salt, "context", 32);
 //
-//  ⚠ SCOPE: this module intentionally does NOT include symmetric encryption
-//  (AES / ChaCha20) or password hashing (PBKDF2 / argon2). Those require a
-//  vetted native implementation for both security and performance and are
-//  out of scope for the pure-Bantu "Core" suite — do not hand-roll them.
+//  ENCRYPTION & PASSWORDS: authenticated encryption (XChaCha20-Poly1305) and
+//  password hashing (argon2id) are provided via a vetted native library
+//  (libsodium) — see the "Authenticated encryption" section below. They are
+//  available only when the interpreter was built with libsodium support
+//  (crypto.encryption_available()); we never hand-roll these primitives.
 // ════════════════════════════════════════════════════════════════════════
 
 include "../hash/hash.b" as hash;
@@ -177,3 +178,85 @@ def base64_encode($x)    { return _b64enc($x, $_B64, true); }
 def base64_decode($s)    { return _b64dec($s, $_B64); }
 def base64url_encode($x) { return _b64enc($x, $_B64URL, false); }
 def base64url_decode($s) { return _b64dec($s, $_B64URL); }
+
+
+// ─── Authenticated encryption (libsodium; native, optional) ─────────────
+// XChaCha20-Poly1305-IETF via libsodium. Confidentiality + integrity in one
+// step: decrypt returns null (never garbage) if the key is wrong or the data
+// was tampered with. A fresh 192-bit random nonce is generated per message, so
+// you never manage nonces yourself. Requires an interpreter built with
+// libsodium (see encryption_available); otherwise these throw a clear error.
+//
+//   $key = crypto.new_key();                      // 32-byte random key — STORE SAFELY
+//   $tok = crypto.encrypt($key, "secret", "aad"); // base64url token (nonce+ct+tag)
+//   $pt  = crypto.decrypt($key, $tok, "aad");     // byte-list, or null if invalid
+
+// Probe once whether the native encryption layer is compiled in. Wrapped in
+// try/catch so this module still loads on interpreters lacking the builtin.
+$_ENC = {"ok": false};
+try { $_ENC.ok = sodium_available(); } catch ($e) { $_ENC.ok = false; }
+
+// encryption_available() → is native AEAD / password hashing usable here?
+def encryption_available() { return $_ENC.ok; }
+
+def _requireEnc() {
+    if (!$_ENC.ok) {
+        throw "crypto: encryption not available — rebuild the interpreter with libsodium (BANTU_SODIUM=1).";
+    }
+    return null;
+}
+
+// new_key() → a fresh 32-byte AEAD key (byte-list) from the OS CSPRNG.
+def new_key() { return randbytes(32); }
+
+// encrypt_bytes(key, message, aad?) → raw blob byte-list (nonce||ct||tag).
+// key must be 32 bytes; aad (optional) is authenticated but not encrypted.
+def encrypt_bytes($key, $message, $aad) {
+    _requireEnc();
+    $blob = aead_encrypt($key, $message, $aad);
+    if ($blob == null) {
+        throw "crypto.encrypt: invalid key (must be 32 bytes) or encryption failed.";
+    }
+    return $blob;
+}
+
+// decrypt_bytes(key, blob, aad?) → plaintext byte-list, or null if the data
+// fails authentication (wrong key / tampered / truncated). Treat null as REJECT.
+def decrypt_bytes($key, $blob, $aad) {
+    _requireEnc();
+    return aead_decrypt($key, $blob, $aad);
+}
+
+// encrypt(key, message, aad?) → base64url token string (safe to store/transmit).
+def encrypt($key, $message, $aad) {
+    return base64url_encode(encrypt_bytes($key, $message, $aad));
+}
+
+// decrypt(key, token, aad?) → plaintext byte-list, or null if invalid.
+// Use frombytes(...) to get a string back when the plaintext is text.
+def decrypt($key, $token, $aad) {
+    _requireEnc();
+    return aead_decrypt($key, base64url_decode($token), $aad);
+}
+
+
+// ─── Password hashing (argon2id via libsodium; native, optional) ────────
+// Memory-hard, salted, self-describing. Store the string hash_password returns;
+// verify_password checks a candidate in constant time. Requires libsodium.
+//
+//   $h  = crypto.hash_password($pw);       // "$argon2id$v=19$m=...,t=...,p=..$salt$hash"
+//   $ok = crypto.verify_password($h, $pw); // true / false
+
+// hash_password(password) → encoded argon2id hash string (store this).
+def hash_password($password) {
+    _requireEnc();
+    $h = pwhash($password);
+    if ($h == null) { throw "crypto.hash_password: hashing failed."; }
+    return $h;
+}
+
+// verify_password(encoded, password) → bool. Constant-time comparison inside.
+def verify_password($encoded, $password) {
+    _requireEnc();
+    return pwhash_verify($encoded, $password);
+}
