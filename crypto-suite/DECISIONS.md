@@ -95,3 +95,41 @@ underlying evaluator scope-accumulation separately.
 `if`/calls inside loops. Native-only hot loops sidestep it, so a single `sha256()` stays fast and
 HMAC/HKDF (few calls) remain cheap.
 **Security:** No security impact; a real fix (stretch) also benefits the rest of the language.
+
+---
+
+## Hardening pass (C1–C7) — see HARDENING.md for status
+
+### D10 — Native accelerators with a pure-Bantu fallback (not a rewrite)
+**Decision:** Add byte-identical native (C++) digests (`crypto_native.hpp`) and have the `hash`
+module delegate to them via `has_native(...)`, keeping the pure-Bantu implementations as the
+reference + fallback.
+**Why:** ~10^5x speedup where it matters, without deleting the auditable spec or breaking builds that
+lack the accelerator. `has_native` is probed once, inside try/catch, so the module also runs on an
+older interpreter (graceful degradation).
+**Rejected:** replacing the Bantu code with C++ (loses auditability, "in Bantu"); leaving it pure
+(unusable for files). **Security:** a differential test asserts native == pure on the official
+vectors at every block boundary, so the fast path cannot silently diverge.
+
+### D11 — Encryption/passwords bind libsodium, opt-in at build time
+**Decision:** AEAD (XChaCha20-Poly1305) and argon2id come from libsodium (`crypto_sodium.hpp`),
+compiled only with `BANTU_SODIUM=1` and **statically linked**; the default build has no libsodium
+dependency. This *reverses* D6's "out of scope" — but via a vetted library, never hand-rolled.
+**Why:** these primitives are exactly what apps need, but must not be reimplemented; feature-gating
++ static link keeps existing production deployments byte-for-byte unaffected until they opt in.
+**Security:** random per-message nonce, constant-time tag/verify, memory-hard argon2id, key
+zeroization. `null`/throw on failure — never silent.
+
+### D12 — First-class `bytes` type deferred (C4)
+**Decision:** Do NOT add a `bytes` Value variant in this pass. Achieve the C1 perf win with native
+builtins that read `string`/list directly and a native `hash_file` that keeps large data out of the
+interpreter.
+**Why:** a new Value type touches equality/serialization/OOP switches across the core — too invasive
+to rush into a production interpreter, and unnecessary for the performance goal. Remains a decoupled
+future item (alongside an i64 type and a bytecode VM). **Security:** none; correctness unaffected.
+
+### D13 — CSPRNG fails closed
+**Decision:** `bantuCsprng` returns false rather than ever producing predictable bytes; added
+Windows (`BCryptGenRandom`) and Linux `getrandom(2)` sources.
+**Why:** a silent fallback to a PRNG for keys/salts/nonces is the vulnerability the suite exists to
+avoid. **Security:** this is the single most important control; callers surface the failure.

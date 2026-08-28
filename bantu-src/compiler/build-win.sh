@@ -139,6 +139,7 @@ echo
 echo "── Linking build/bantu.exe ──"
 # -L "$LIB_DIR" finds the .dll.a import libs for sqlite3.dll and libcurl-x64.dll
 # -lws2_32  → Windows Sockets (Winsock2), always static (system lib)
+# -lbcrypt  → CNG (BCryptGenRandom), the Windows CSPRNG used by bantuCsprng
 # -lc++ -lwinpthread → llvm-mingw C++ runtime + threading
 if $CXX "${CPP_FLAGS[@]}" \
         "${OBJECTS[@]}" \
@@ -148,7 +149,8 @@ if $CXX "${CPP_FLAGS[@]}" \
         -L "$LIB_DIR" \
         -l:libsqlite3.dll.a \
         -l:libcurl-x64.dll.a \
-        -lws2_32 2>&1; then
+        -lws2_32 \
+        -lbcrypt 2>&1; then
     echo "[PASS] Linked build/bantu.exe ($(wc -c <build/bantu.exe) bytes)"
 else
     echo "[FAIL] Link failed"
