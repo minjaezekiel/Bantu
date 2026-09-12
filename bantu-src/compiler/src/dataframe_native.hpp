@@ -216,6 +216,45 @@ inline Value elemToValue(const Column& c, size_t i) {
     return Value();
 }
 
+// ── Rendering a column for print() ───────────────────────────────────────────
+// A NATIVE_HANDLE used to stringify to "<column>", so print($col) told you the
+// type and nothing else. Summarization follows NumPy's rule: print every
+// element up to 1000, then three from each end with an ellipsis. Matching a
+// convention people already know beats inventing one, and it keeps print()
+// usable on a five-million-row column.
+inline void reprElem(std::ostringstream& oss, const Column& c, size_t i) {
+    if (!c.valid[i]) { oss << "null"; return; }
+    Value v = elemToValue(c, i);
+    // Quote anything that renders as text (utf8, and the date/datetime/cat
+    // overlays) so ["1", "2"] is distinguishable from [1, 2].
+    if (v.isString()) oss << '"' << v.stringVal << '"';
+    else              oss << v.toString();
+}
+
+inline std::string reprColumn(const Column& c) {
+    const size_t kThreshold = 1000;   // NumPy's default summarization threshold
+    const size_t kEdge      = 3;      // NumPy's default edgeitems
+    std::ostringstream oss;
+    oss << "[";
+    if (c.n <= kThreshold) {
+        for (size_t i = 0; i < c.n; i++) { if (i) oss << ", "; reprElem(oss, c, i); }
+    } else {
+        for (size_t i = 0; i < kEdge; i++) { if (i) oss << ", "; reprElem(oss, c, i); }
+        oss << ", ...";
+        for (size_t i = c.n - kEdge; i < c.n; i++) { oss << ", "; reprElem(oss, c, i); }
+    }
+    oss << "]  (len=" << c.n << ", dtype=" << columnTypeName(c) << ")";
+    return oss.str();
+}
+
+inline std::string reprColumnHandle(const std::shared_ptr<void>& h) {
+    if (!h) return "<column>";
+    return reprColumn(*std::static_pointer_cast<Column>(h));
+}
+
+// Called once at startup, alongside the col_* builtin registration.
+inline void registerColumnRepr() { registerHandleRepr(COLUMN_TAG, &reprColumnHandle); }
+
 // Build a column of `dtype` from a Bantu list. Bantu null elements become nulls.
 inline ColumnPtr makeColumn(const std::vector<Value>& items, DType dtype) {
     auto c = std::make_shared<Column>();

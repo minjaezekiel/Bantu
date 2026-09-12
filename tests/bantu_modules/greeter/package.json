@@ -1,0 +1,7 @@
+{
+  "name": "greeter",
+  "note": "main",
+  "main": "src/hello.b",
+  "version": "1.0.0",
+  "description": "Fixture package for tests/lang_module_test.b"
+}

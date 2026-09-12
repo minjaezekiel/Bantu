@@ -9,6 +9,22 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] `include "<package>"` resolves installed packages** — `bantu add <pkg>` installs into
+  `./bantu_modules/<pkg>/`, but the module resolver had no rule for that directory, so an installed
+  package could only be reached by writing out its full path
+  (`include "./bantu_modules/numba/numba.b" as np;`). A **bare** name now searches
+  `bantu_modules/<name>/` beside the importing file and under the working directory, honouring the
+  package's `package.json` `"main"` and falling back to `<name>.b`, `index.b`, `main.b`. Explicit
+  relative paths are unaffected, so `./x.b` still means exactly what it says.
+
+- **[feature] `print()` shows what a native handle contains** — a `NATIVE_HANDLE` stringified to
+  `"<column>"`, which named the type and nothing else, so the only way to look at an arctic column
+  was to materialize it into a Bantu list first. `Value::toString` now consults a registry of
+  renderers keyed by handle tag, and each native layer registers one for the type it owns.
+  Summarization follows NumPy's convention — every element up to 1000, then three from each end —
+  so printing a five-million-row column is O(1):
+  `print($c)` → `[1, 2, 3]  (len=3, dtype=f64)`.
+
 - **[feature] Progressive Web Apps in `sua` (`sua.pwa`)** — any Bantu web app becomes installable and
   offline-capable from one config call. Modelled on Python's **django-pwa**; the research and design
   notes are in [docs/pwa-research.md](docs/pwa-research.md).
@@ -53,6 +69,33 @@ All notable changes to the Bantu programming language are documented in this fil
   recipient, and degrades to in-app-only when push is unavailable.
 
 ### Fixed
+
+- **[patch] Appending to a list was O(n²); it is now O(1)** — two independent causes, both
+  pre-existing and both reproducible on the shipped release binary.
+  `push` returned the mutated list, and a Bantu list is a `std::vector<Value>` with value semantics
+  where each `Value` is ~190 bytes carrying a string, a vector, a `std::function` and three
+  `shared_ptr`s — so every append deep-copied the whole list. **20,000 pushes took 9,616 ms; they
+  now take 70 ms.** 100,000 went from roughly four minutes to 271 ms — `bantu bench`'s own
+  "list push 100k" could not finish in ten minutes on the release binary and now runs at
+  250 ms/iter. Separately, `len($var)` copied its argument, which made the common
+  `$out[len($out)] = $v` idiom quadratic: **7,027 ms → 58 ms** at 20,000 items. That idiom is used
+  throughout `hash.b` and `crypto.b`, whose pure-Bantu paths were therefore quadratic in input
+  length.
+  Semantics are preserved: `$x = push($x, v)` still returns the list (the parser now records that a
+  call's result is discarded, so only the throwaway case skips the copy), `$l.push(x)` returns the
+  new length as in JavaScript, and every `len()` answer is unchanged including a user-defined `len`
+  shadowing the builtin. Hot paths unmoved — 1M-iteration arithmetic loop 2,336 → 2,186 ms,
+  `fib(24)` 1,906 → 1,941 ms, 50k dict set 171 → 178 ms. Gate:
+  [`tests/lang_list_test.b`](tests/lang_list_test.b).
+
+- **[bug fix] Including the same module twice bound nothing** — the cycle guard returned before the
+  alias was defined, so if two of your files both did `include "arctic" as arctic;`, whichever
+  loaded second was left with an undefined `arctic` and the only clue was a line on stderr. Any
+  application with more than one module hit this. Modules are now cached by canonical path and every
+  later include binds that same namespace object, so one module means one namespace — as in Node. A
+  genuine circular include is reported by name and skipped. `sua.include()` had the same defect in a
+  different shape (a second call returned `{"_cached": true}` instead of the module) and now shares
+  the cache. Gate: [`tests/lang_module_test.b`](tests/lang_module_test.b).
 
 - **[bug fix] Outbound HTTP truncated binary bodies at the first NUL byte** — `CURLOPT_POSTFIELDS`
   was set without `CURLOPT_POSTFIELDSIZE`, so libcurl called `strlen()` on the buffer. An

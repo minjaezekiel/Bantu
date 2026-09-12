@@ -164,6 +164,12 @@ struct ReturnNode : ASTNode {
 struct CallNode : ASTNode {
     std::shared_ptr<ASTNode> callee;
     std::vector<std::shared_ptr<ASTNode>> args;
+    // Set by parseExpressionStatement when the call IS the whole statement, so
+    // its result is thrown away. Only `push` consults it: returning the mutated
+    // list means deep-copying every element, which turns an O(1) append into
+    // O(n) and a loop of appends into O(n^2). Knowing the value is unused lets
+    // push skip the copy while `$x = push($x, v)` still gets its list back.
+    bool resultDiscarded = false;
     CallNode(std::shared_ptr<ASTNode> c, std::vector<std::shared_ptr<ASTNode>> a, int l, int col)
         : ASTNode(l, col), callee(std::move(c)), args(std::move(a)) {}
 };

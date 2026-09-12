@@ -114,6 +114,65 @@ extend($l, [7, 8]);   // [0,1,3,7,8]
 $l.size()             // 5
 ```
 
+**What each form returns.** `append`, `insert`, `extend` and `$l.push(x)` all return the **new
+length**, as in JavaScript. The bare `push($l, x)` returns the **list** when its value is used, so
+the older `$x = push($x, v)` idiom still works:
+
+```bantu
+$l = [1, 2];
+$n = $l.push(3);      // $n = 3 (the new length), $l = [1,2,3]
+$x = [1];
+$x = push($x, 2);     // $x = [1,2]  -- the value IS used, so the list comes back
+push($x, 3);          // a statement: the result is discarded, nothing is copied
+```
+
+That distinction is a performance fix, not a style choice. A Bantu list is copied by value, so
+returning the mutated list from every `push` deep-copied every element — an O(1) append became
+O(n), and building a list in a loop became **O(n²)**. It measured 9,491 ms for 20,000 pushes against
+69 ms for the identical `append`, and 100,000 pushes took about four minutes. Both forms are now
+linear (100,000 pushes ≈ 0.3 s). The gate is [`tests/lang_list_test.b`](../tests/lang_list_test.b).
+
+**`len($var)` no longer copies its argument either.** Bantu lists have value semantics, so passing
+one to a function copies the whole list — and `len` is the one builtin routinely called on the very
+container being built:
+
+```bantu
+while (...) { $out[len($out)] = $v; }    // 20,000 items: 7,027 ms before, 58 ms now
+```
+
+That idiom is used throughout `hash.b` and `crypto.b`, so their pure-Bantu paths were quadratic in
+input length. `len($var)` now reads the length from the real storage. The answer is identical in
+every case, including `len` of a string, a dict (`0`) and a non-container (`0`), and a user-defined
+`len()` still shadows the builtin.
+
+**Passing a big list to any other function still copies it.** This is inherent to the value
+semantics and has not changed: `col($big, "f64")`, `sum($big)` and any user function taking a list
+copy on the way in. For large data, prefer native containers (arctic columns) over Bantu lists.
+
+
+## Modules
+
+```bantu
+include "./routes.b";                 // brings the module's symbols into scope
+include "./controller.b" as ctrl;     // binds a namespace object
+include "numba" as np;                // a BARE name: an installed package
+```
+
+A bare name (no `./`, no slash) searches `bantu_modules/<name>/` beside the importing file and under
+the working directory — where `bantu add <pkg>` installs — honouring the package's `package.json`
+`"main"`, then falling back to `<name>.b`, `index.b`, `main.b`. A path with `./` or `../` always
+means exactly that path. `$BANTU_PATH` is searched last.
+
+**One file, one module.** A module executes once; every later `include` of it binds that same
+namespace object, so two of your files can both `include "arctic" as arctic;` and both get a working
+`arctic`. (Before v1.3.0 the second one silently bound *nothing*.) A genuine circular include —
+where the file is still mid-execution and has exported nothing yet — is reported by name and
+skipped.
+
+**Classes cannot be namespaced**: `new ctrl.Thing()` does not parse. Packages expose factory
+functions instead (`arctic.series(...)`, `np.array(...)`). Class names are a flat global registry,
+so a package should prefix its class names to avoid collisions.
+
 ## File I/O (new — Python style)
 ```bantu
 $f = open("data.txt", "w");    // modes: "r" "w" "a"

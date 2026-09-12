@@ -424,6 +424,13 @@ private:
     std::shared_ptr<ASTNode> parseExpressionStatement() {
         auto expr = parseExpression();
         match(BantuTokenType::SEMICOLON);
+        // The value of a bare expression statement is discarded. Recording that
+        // here -- the one place in the grammar where it is true -- lets the
+        // evaluator skip work whose only purpose is to produce that value.
+        // See CallNode::resultDiscarded.
+        if (auto call = std::dynamic_pointer_cast<CallNode>(expr)) {
+            call->resultDiscarded = true;
+        }
         return expr;
     }
 

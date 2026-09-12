@@ -2528,6 +2528,13 @@ private:
     // Cycle guard: includes already loaded in the current chain
     std::vector<std::string> loadedModules_;
 
+    // The namespace object each fully-loaded module exported, keyed by its
+    // canonical path. A module executes once; every later include of it binds
+    // this same object, which is what makes `include "x" as x` work in two
+    // different files. A path that is in loadedModules_ but absent here is
+    // still executing -- that, and only that, is a genuine circular include.
+    std::unordered_map<std::string, Value> moduleExports_;
+
     // v1.2.2: include depth guard (prevent infinite include chains)
     int includeDepth_ = 0;
     static constexpr int kMaxIncludeDepth = 64;
@@ -3942,7 +3949,18 @@ private:
     //   append(l, x…) · push(l, x…) · pop(l) · insert(l, i, x) · remove(l, i) · extend(l, l2)
     // `argStart` is where the value arguments begin: 1 for function form
     // (arg0 is the list), 0 for method form ($l.push(x) — the list is the receiver).
-    Value listMutator(const std::string& op, Value& lst, CallNode* n, size_t argStart = 1) {
+    // `returnList` exists only for `push`. Returning the mutated list means
+    // deep-copying a std::vector<Value> -- and a Value is a ~190-byte struct
+    // holding a string, a vector, a std::function and three shared_ptrs -- so
+    // an O(1) append became O(n), and building a list in a loop became
+    // O(n^2). Measured: 20,000 `$l.push(x)` took 9,491 ms against 69 ms for
+    // the identical `append($l, x)`, a 137x difference that grows with n.
+    // The bare `push($l, x)` form keeps returning the list, because
+    // `$x = push($x, v)` is a documented idiom (tests/lang_test.b). The method
+    // form `$l.push(x)` returns the new length instead, as in JavaScript --
+    // nothing assigns from it, and it is the form that appears in loops.
+    Value listMutator(const std::string& op, Value& lst, CallNode* n,
+                      size_t argStart = 1, bool returnList = true) {
         std::vector<Value> args;
         for (size_t i = argStart; i < n->args.size(); i++) args.push_back(evalNode(n->args[i]));
         auto& vec = lst.listVal;
@@ -3951,9 +3969,8 @@ private:
             return Value((double)vec.size());
         }
         if (op == "push") {
-            // Same as append, but returns the (mutated) list so the older
-            // `$l = push($l, x)` idiom keeps working correctly.
-            for (auto& a : args) vec.push_back(a);
+            for (auto& a : args) vec.push_back(std::move(a));
+            if (!returnList) return Value((double)vec.size());
             return lst;
         }
         if (op == "pop") {
@@ -3997,7 +4014,39 @@ private:
                 if (!lv || !lv->isList()) {
                     ErrorHandler::throwRuntimeError(fname + "() expects a list variable as its first argument", n->line, n->col);
                 }
-                return listMutator(fname, *lv, n, 1);
+                // `push($l, x);` as a whole statement throws its result away,
+                // so there is no reason to copy the list to produce one.
+                // `$x = push($x, v)` is not a statement, so it still gets the
+                // list. See CallNode::resultDiscarded.
+                return listMutator(fname, *lv, n, 1, /*returnList=*/!n->resultDiscarded);
+            }
+        }
+
+        // len($var) reads the length out of the real storage instead of
+        // copying the value into an argument vector. Passing a list to ANY
+        // function copies it -- Bantu lists have value semantics -- and len()
+        // is the one builtin that routinely appears inside a loop over the
+        // very container it is measuring:
+        //
+        //     while (...) { $out[len($out)] = $v; ... }
+        //
+        // which makes an O(1) append O(n) and the loop O(n^2). Measured:
+        // 20,000 appends written that way took 7,027 ms against 67 ms with a
+        // counter variable. That idiom is used throughout hash.b and crypto.b,
+        // so this is the difference between quadratic and linear hashing.
+        // Behaviour is unchanged -- same answer, no copy.
+        if (auto callVar = dynamic_cast<VariableNode*>(n->callee.get())) {
+            if (callVar->name == "len" && n->args.size() == 1 &&
+                dynamic_cast<VariableNode*>(n->args[0].get())) {
+                // Only when `len` is still the builtin: a user-defined len() wins.
+                Value& fn = env_->getRef("len");
+                if (fn.isNativeFn()) {
+                    Value* lv = resolveLValue(n->args[0].get());
+                    if (lv) {
+                        if (lv->isList())   return Value((double)lv->listVal.size());
+                        if (lv->isString()) return Value((double)lv->stringVal.size());
+                    }
+                }
             }
         }
 
@@ -4009,7 +4058,9 @@ private:
             if (dot->property == "push" || dot->property == "pop") {
                 Value* lv = resolveLValue(dot->object.get());
                 if (lv && lv->isList()) {
-                    return listMutator(dot->property, *lv, n, 0);
+                    // returnList = false: see listMutator. $l.push(x) yields
+                    // the new length, not a copy of the whole list.
+                    return listMutator(dot->property, *lv, n, 0, /*returnList=*/false);
                 }
             }
         }
@@ -5169,6 +5220,11 @@ private:
             // construction + introspection; kernels arrive in Phase 3.
             // Errors from the native layer become plain-language Bantu errors.
             // ════════════════════════════════════════════════════════════
+
+            // Teach print() how to render a column. Without this a handle
+            // stringifies to "<column>", which tells you the type and nothing
+            // about the data.
+            arctic::registerColumnRepr();
 
             // Run a column op, translating any std::exception into a Bantu error.
             auto colGuard = [](const char* where, std::function<Value()> body) -> Value {
@@ -7888,13 +7944,24 @@ private:
                 return Value(std::move(err));
             }
 
-            // Cycle guard
+            // Already fully loaded: hand back the module itself. This used to
+            // return {"_cached": true, "_path": ...}, so a second
+            // sua.include() of the same file gave you a marker dict instead of
+            // the module -- the same defect the `include` statement had.
+            {
+                auto cached = moduleExports_.find(mod.resolvedPath);
+                if (cached != moduleExports_.end()) return cached->second;
+            }
+            // In loadedModules_ with nothing exported yet: a genuine cycle,
+            // still mid-execution, so there is no finished module to return.
             for (const auto& prev : loadedModules_) {
                 if (prev == mod.resolvedPath) {
-                    ObjectMap cached;
-                    cached["_cached"] = Value(true);
-                    cached["_path"] = Value(mod.resolvedPath);
-                    return Value(std::move(cached));
+                    ObjectMap partial;
+                    partial["error"] = Value(std::string(
+                        "circular sua.include of " + mod.resolvedPath +
+                        " -- it is still loading"));
+                    partial["_path"] = Value(mod.resolvedPath);
+                    return Value(std::move(partial));
                 }
             }
             loadedModules_.push_back(mod.resolvedPath);
@@ -7915,7 +7982,12 @@ private:
                 moduleObj[k] = v;
             }
             moduleObj["_path"] = Value(mod.resolvedPath);
-            return Value(std::move(moduleObj));
+            // Share one cache with the `include` statement, so whichever form
+            // loads the file first, every later include of it -- by either
+            // form -- gets that same module object.
+            Value moduleVal(std::move(moduleObj));
+            moduleExports_[mod.resolvedPath] = moduleVal;
+            return moduleVal;
         });
 
         // ════════════════════════════════════════════════════════
@@ -8822,13 +8894,29 @@ private:
             return Value();
         }
 
-        // v1.2.2: cycle guard with clearer diagnostic. Tracks the chain
-        // so the user can see exactly which files caused the cycle.
+        // Already fully loaded: bind the SAME namespace object again rather
+        // than returning early. Before this, the guard below returned before
+        // the alias was ever defined, so if two files both did
+        // `include "arctic" as arctic;` the second one's `arctic` was left
+        // unbound and the only clue was a line on stderr. Re-binding the
+        // cached object gives module-singleton semantics, as in Node.
+        {
+            auto cached = moduleExports_.find(mod.resolvedPath);
+            if (cached != moduleExports_.end()) {
+                bindModule(n, cached->second, mod.resolvedPath, /*reused=*/true);
+                return Value();
+            }
+        }
+
+        // In loadedModules_ but with nothing exported yet means we are inside
+        // that module's own execution: a genuine cycle. There is no finished
+        // namespace to bind, so name the file and carry on.
         for (size_t i = 0; i < loadedModules_.size(); ++i) {
             if (loadedModules_[i] == mod.resolvedPath) {
                 if (!quietMode_) {
-                    std::cerr << "  [INCLUDE] Skipping already-loaded module: "
-                              << mod.resolvedPath << "\n";
+                    std::cerr << "  [INCLUDE] Circular include of "
+                              << mod.resolvedPath
+                              << " -- it is still loading, so nothing is bound here.\n";
                 }
                 return Value();
             }
@@ -8860,24 +8948,35 @@ private:
             moduleObj[k] = v;
         }
 
+        // Cache before binding, so a later include of the same file binds this
+        // very object rather than a copy.
+        Value moduleVal(std::move(moduleObj));
+        moduleExports_[mod.resolvedPath] = moduleVal;
+        bindModule(n, moduleVal, mod.resolvedPath, /*reused=*/false);
+
+        return Value();
+    }
+
+    // Bind a loaded module into the importing scope: its symbols directly, or
+    // the namespace object under an alias.
+    void bindModule(IncludeNode* n, const Value& moduleVal,
+                    const std::string& path, bool reused) {
+        const char* verb = reused ? "Reused " : "Loaded ";
         if (n->alias.empty()) {
-            // Direct include: bring symbols into current scope
-            for (const auto& [k, v] : moduleObj) {
-                env_->define(k, v);
+            if (moduleVal.objectVal) {
+                for (const auto& [k, v] : *moduleVal.objectVal) env_->define(k, v);
             }
             if (!quietMode_) {
-                std::cout << "  [INCLUDE] Loaded " << mod.resolvedPath
-                          << " (" << moduleObj.size() << " symbols)\n";
+                std::cout << "  [INCLUDE] " << verb << path << " ("
+                          << (moduleVal.objectVal ? moduleVal.objectVal->size() : 0)
+                          << " symbols)\n";
             }
         } else {
-            // Namespaced include: bind alias -> module object
-            env_->define(n->alias, Value(std::move(moduleObj)));
+            env_->define(n->alias, moduleVal);
             if (!quietMode_) {
-                std::cout << "  [INCLUDE] Loaded " << mod.resolvedPath
+                std::cout << "  [INCLUDE] " << verb << path
                           << " as '" << n->alias << "'\n";
             }
         }
-
-        return Value();
     }
 };

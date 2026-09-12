@@ -54,6 +54,26 @@ class Value;
 using ObjectMap = BantuOrderedMap<Value>;
 using NativeFn = std::function<Value(std::vector<Value>)>;
 
+// ── NATIVE_HANDLE rendering ──────────────────────────────────────────────────
+// A NATIVE_HANDLE used to stringify to "<column>", so print($col) told you the
+// type and nothing else -- which made an opaque handle genuinely hard to work
+// with, since there was no way to look at the data without materializing it to
+// a list first. A native layer registers a renderer for the tag it owns and
+// print() shows the value.
+//
+// Keyed by tag, so types.hpp needs to know nothing about what any tag means.
+// A plain function pointer (not std::function) keeps this header free of
+// per-tag state and makes the registry trivially constant after startup.
+using HandleReprFn = std::string (*)(const std::shared_ptr<void>&);
+
+inline std::unordered_map<std::string, HandleReprFn>& handleReprRegistry() {
+    static std::unordered_map<std::string, HandleReprFn> r;
+    return r;
+}
+inline void registerHandleRepr(const std::string& tag, HandleReprFn fn) {
+    handleReprRegistry()[tag] = fn;
+}
+
 class Value {
 public:
     enum Type { NUMBER, STRING, BOOL, NULL_VAL, FUNCTION, CLASS_INSTANCE, CLASS_DEF, OBJECT, NATIVE_FN, LIST,
@@ -190,7 +210,17 @@ public:
                 oss << "]";
                 return oss.str();
             }
-            case NATIVE_HANDLE: return "<" + stringVal + ">";   // e.g. "<column>"
+            case NATIVE_HANDLE: {
+                // Render through the owning layer's renderer when one is
+                // registered; fall back to the tag so an unregistered handle
+                // still prints something honest rather than nothing.
+                if (handle) {
+                    const auto& reg = handleReprRegistry();
+                    auto it = reg.find(stringVal);
+                    if (it != reg.end() && it->second) return it->second(handle);
+                }
+                return "<" + stringVal + ">";   // e.g. "<column>"
+            }
         }
         return "null";
     }

@@ -32,16 +32,23 @@ benchmark looping 200k times reports a wrong-but-plausible number and passes.
 - [x] `docs/numba-architecture.md`
 - [x] `numba-suite/ROADMAP.md`, `DECISIONS.md`, `CHANGELOG.md`
 
-## Phase A — Adoption plumbing (first: everything else rides on it)
+## Phase A — Adoption plumbing ✅ (first: everything else rides on it)
 
 These are cross-cutting interpreter fixes, not numba code. Each was latent for every existing
 package, so each fixes `arctic`, `hash`, `crypto`, `uuid`, `random` and `orm` at the same time.
 
 | Item | How | Feature test | Stress test | Status |
 |---|---|---|---|---|
-| `include "numba" as np` resolves after `bantu add` | `module_resolver.hpp`: add `./bantu_modules/<name>/` to the candidate list, honouring `package.json`'s `main` | `tests/lang_module_test.b` | installed + nested + missing + shadowed paths; regression green | [ ] |
-| A repeat `include` binds the alias | `evaluator.hpp` cycle guard: bind the cached module object instead of returning before the alias is defined | `tests/lang_module_test.b` | genuine circular includes still terminate; diamond dependency; 3-deep chain | [ ] |
-| `print($handle)` renders the value | `types.hpp` `Value::toString` + a tag-dispatched repr hook; ndarray and column both | `tests/lang_repr_test.b` | 0-d, empty, 1e7 elements (must truncate, not hang), NaN/±inf, nested depth | [ ] |
+| `include "numba" as np` resolves after `bantu add` | `module_resolver.hpp`: `bantu_modules/<name>/` added to the candidate list, honouring `package.json`'s `main`, then `<name>.b`/`index.b`/`main.b` | ✅ `tests/lang_module_test.b` 13/13 | ✅ manifest `main` in a subdirectory, no-manifest fallback, a `"main"`-lookalike value, explicit relative paths unaffected, missing module | [x] |
+| A repeat `include` binds the alias | modules cached by canonical path; every later include binds that same namespace object (module-singleton, as in Node). `sua.include()` shares the cache | ✅ `tests/lang_module_test.b` | ✅ diamond dependency, both aliases proven to be the same object, genuine cycle terminates and is reported by name | [x] |
+| `print($handle)` renders the value | `types.hpp`: a repr registry keyed by handle tag; arctic registers one for columns (numba's lands in Phase 1) | ✅ `tests/lang_repr_test.b` 17/17 | ✅ empty, single, nulls, utf8 quoting, datetime overlay, 1000/1001 summarization boundary, **100 reprs of a 200k column in 0 ms** | [x] |
+| **[found] `push` was O(n²)** | it returned the mutated list, deep-copying every `Value`. `parseExpressionStatement` now marks a call whose result is discarded, so the copy is skipped; `$x = push($x, v)` still returns the list | ✅ `tests/lang_list_test.b` 23/23 | ✅ 20,000 pushes **9,616 ms → 70 ms**; 100,000 **~4 min → 271 ms**; linear scaling asserted | [x] |
+| **[found] `len($var)` copied its argument** | reads the length from the real storage; a user-defined `len()` still shadows the builtin | ✅ `tests/lang_list_test.b` | ✅ `$out[len($out)] = v` ×20,000 **7,027 ms → 58 ms**; every `len` answer unchanged (list/string/dict/non-container/literal) | [x] |
+
+Both quadratic defects were **pre-existing** — the shipped release binary reproduces them, and could
+not finish `bantu bench`'s own "list push 100k" in ten minutes. Hot paths measured before and after
+against that release on the same machine: 1M arithmetic loop 2,336 → 2,186 ms, `fib(24)`
+1,906 → 1,941 ms, 50k dict set 171 → 178 ms. Full detail in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Phase 1 — `NdArray` core, buffers, zero-copy views
 
