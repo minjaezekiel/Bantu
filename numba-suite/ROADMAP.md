@@ -138,7 +138,14 @@ the way; see `numba-suite/CHANGELOG.md`.
 | Nothing else changed ✅ | — | ″ | strings still concat; `==` on lists/dicts unchanged; `&&`/`\|\|` unchanged; **full existing regression green** | [ ] |
 | **The benchmark gate** ✅ | `benchmarks/hotpath.b` + a paired-ratio harness **with a control group**: the same byte-identical binary measured against itself, to establish the noise floor before claiming anything about the treatment | — | **PASSED.** Control +0.52%/+0.94%, treatment +0.61%/+0.81% — indistinguishable. The floor is ±1.97%, so the ±2% gate can only be answered with a control; without one, +2.66% reads as a regression that does not exist | [ ] |
 
-## Phase 5 — Linear algebra
+## Phase 5 — Linear algebra ✅
+
+`tests/numba_linalg_test.b` **69/69**; regression **75/75**. All three gates pass with room:
+500×500 solve residual **1.24e-14** (gate 1e-10), 200×200 SVD reconstruction **1.97e-13**
+(gate 1e-12), 1000³ matmul **255 ms / 7.8 GFLOP/s** (gate 500 ms / 4 GFLOP/s). QR orthogonality
+7.8e-16, eigh orthogonality 1.1e-15. No defects found — the residual-based test design caught
+nothing because there was nothing to catch.
+
 
 | Item | How | Feature test | Stress test | Status |
 |---|---|---|---|---|

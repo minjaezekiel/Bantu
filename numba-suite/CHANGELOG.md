@@ -548,3 +548,75 @@ Both were mine, both in the first cut, and neither would have been visible witho
   is `0 + 0` for two non-numbers. That is precisely the failure this phase exists to remove, so
   reintroducing it at the edges would have been self-defeating. Non-combinable operands now raise and
   name what arrived.
+
+---
+
+## Phase 5 — Linear algebra ✅
+
+`tests/numba_linalg_test.b` **69/69**; full regression **75/75** (macOS arm64, Apple silicon).
+All hand-written, no BLAS (N-of §3.2).
+
+### What landed
+
+`nd_matmul`, `nd_dot`, `nd_outer`, `nd_trace`, `nd_solve`, `nd_inv`, `nd_det`, `nd_slogdet`,
+`nd_cholesky`, `nd_qr`, `nd_lstsq`, `nd_eigh`, `nd_svd`, `nd_matrix_rank`, `nd_cond`, `nd_pinv`,
+`nd_norm` — each also reachable as a method (`$a.solve($b)`).
+
+### The three phase gates, measured
+
+| gate | required | measured |
+|---|---|---|
+| 500×500 solve residual | < 1e-10 | **1.24e-14** (23 ms) |
+| 200×200 SVD reconstruction | < 1e-12 | **1.97e-13** (253 ms) |
+| 1000³ matmul | ≤ 500 ms / ≥ 4 GFLOP/s | **255–310 ms, 6.5–7.8 GFLOP/s** |
+
+Every other residual came out at machine precision: QR orthogonality `‖QᵀQ − I‖` = **7.8e-16**,
+eigh `‖AV − V diag(w)‖` = **7.1e-15** with `‖VᵀV − I‖` = **1.1e-15**, SVD `‖USVᵀ − A‖` = **2.2e-15**,
+least-squares residual orthogonality `‖Aᵀr‖` = **3.6e-15**.
+
+### Algorithm choices, and what each is defending against
+
+- **Blocked matmul, 64×64 tiles, i-k-j inner order.** The ordering is the gate, not the tiling: the
+  naive i-j-k order strides through B by `cols` on every innermost step, which is a cache miss per
+  element once the matrix leaves L2. Worth more than any amount of unrolling.
+- **LU with partial pivoting**, which yields solve, inv, det, slogdet. Pivoting is not optional —
+  without it a perfectly well-conditioned matrix with a zero in the corner fails outright.
+- **Householder QR, not Gram-Schmidt.** Gram-Schmidt loses orthogonality catastrophically on
+  ill-conditioned input; the measured `‖QᵀQ − I‖` of 7.8e-16 is the property being bought.
+- **`lstsq` through QR, not the normal equations.** Forming `AᵀA` *squares* the condition number and
+  throws away half the available digits.
+- **`eigh` by cyclic Jacobi** — unconditionally convergent, orthogonality to machine precision,
+  slower than tridiagonal QR and bulletproof.
+- **SVD by one-sided Jacobi** — ~120 lines against ~500 for Golub–Kahan, no convergence tuning, and
+  *higher* relative accuracy on small singular values. It costs several sweeps, so it is 3–5× slower
+  than LAPACK and impractical much beyond n ≈ 500–800. That limit is documented, not hidden.
+- **`slogdet` alongside `det`**, because the determinant of a 500×500 overflows long before the
+  matrix stops being interesting.
+
+### Failure is loud, by design
+
+Returning NaN or garbage for a degenerate input is the worst outcome, because it looks like an
+answer. Each of these raises and names what to use instead:
+
+- a singular `solve` or `inv` → suggests `nd_lstsq` / `nd_pinv`
+- a non-positive-definite `cholesky` → says it needs an SPD matrix and points at `nd_solve`
+- a **non-symmetric `eigh`** → names the offending element and both its values, rather than silently
+  symmetrising, which would answer a different question
+- a non-square `solve`/`det`/`cholesky`, a mismatched right-hand side, a mismatched matmul inner
+  dimension → all name both sizes
+- a rank-deficient `lstsq` → points at `nd_pinv` for the minimum-norm solution
+
+### Not shipping, and `docs/numba.md` will say so
+
+General nonsymmetric `eig`: balancing + Hessenberg reduction + Francis double-shift QR + complex
+eigenvalue extraction is research-grade and needs complex arithmetic numba does not have. A fragile
+`eig` is worse than none, and `eigh` already covers covariance matrices, PCA and graph Laplacians.
+Also not shipping: `expm`, `schur`, FFT, sparse.
+
+### Testing approach worth reusing
+
+Linear algebra is tested by **residual**, not against reference numbers. Asserting `solve()` returns
+a particular vector is fragile and proves little; asserting `‖Ax − b‖ < 1e-10` proves the answer
+solves the system and stays meaningful when the pivoting order changes. Likewise `lstsq` is checked
+by the defining property — the residual is orthogonal to every column of A — rather than by comparing
+coefficients.

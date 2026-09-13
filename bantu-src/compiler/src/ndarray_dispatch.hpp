@@ -300,7 +300,11 @@ inline void noteMethod(const char* builtinName, const NativeFn& fn) {
         "cumsum", "cumprod", "cummax", "cummin", "diff",
         "sort", "argsort", "searchsorted", "unique", "bincount", "histogram",
         "take", "put", "compress", "nonzero",
-        "shares_memory", "array_equal", "allclose", "isclose"
+        "shares_memory", "array_equal", "allclose", "isclose",
+        // linear algebra
+        "matmul", "dot", "outer", "trace", "solve", "inv", "det", "slogdet",
+        "cholesky", "qr", "lstsq", "eigh", "svd", "matrix_rank", "cond",
+        "pinv", "norm"
     };
     std::string n = builtinName;
     if (n.rfind("nd_", 0) != 0) return;

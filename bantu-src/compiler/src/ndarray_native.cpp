@@ -14,6 +14,7 @@
 #include "ndarray_ufunc_reg.hpp"
 #include "ndarray_reduce_reg.hpp"
 #include "ndarray_sort_reg.hpp"
+#include "ndarray_linalg_reg.hpp"
 #include "ndarray_dispatch.hpp"
 
 namespace numba {
@@ -952,6 +953,7 @@ void registerBuiltins(const DefineFn& rawDefine) {
     registerUfuncExtras(define);
     registerReductions(define);
     registerSorting(define);
+    registerLinalg(define);
 }
 
 // A scalar, a nested list or an array all become an array, so `nd_add($a, 2)`

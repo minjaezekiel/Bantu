@@ -9,6 +9,20 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] numba does linear algebra** — `matmul`, `solve`, `inv`, `det`, `cholesky`, `qr`,
+  `lstsq`, `eigh`, `svd`, `pinv`, `norm`, `matrix_rank` and `cond`, all written from scratch with no
+  external library. A 500×500 system solves in 23 ms to a residual of 1e-14; a 1000×1000 matrix
+  multiply runs at 7.8 GFLOP/s.
+
+  Degenerate input raises rather than returning something that looks like an answer: a singular
+  matrix points you at `lstsq` or `pinv`, a matrix that is not positive definite says so and suggests
+  `solve`, and `eigh` on a non-symmetric matrix names the element that broke the symmetry instead of
+  quietly symmetrising it and answering a different question.
+
+  Not included, deliberately: eigenvalues of a general non-symmetric matrix. Doing it properly needs
+  complex arithmetic the language does not have, and a fragile version is worse than none — `eigh`
+  already covers covariance matrices, PCA and graph Laplacians.
+
 - **[feature] Arrays work with the ordinary operators** — `$a + $b`, `2 * $a`, `-$a`, `$a > 0.5`,
   `$m[1]`, `$m[1][2] = 99` and `$vals[$vals > 20] = 0` now mean what they look like on a numba array.
   Every one of these paths was previously dead: `$array + 1` read a number field that is always 0 for
