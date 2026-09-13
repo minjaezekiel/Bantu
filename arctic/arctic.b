@@ -48,6 +48,18 @@ $_ARROW_OK = false;
 try { $_ARROW_OK = has_native("arrow"); } catch ($e) { $_ARROW_OK = false; }
 $_native_read_parquet = null;
 $_native_read_feather = null;
+
+// numba is an optional companion, not a dependency: arctic works exactly as
+// before without it, and to_ndarray() is the only thing that needs it. Probed
+// the same way the arrow build is.
+$_NUMBA_OK = false;
+try { $_NUMBA_OK = has_native("ndarray"); } catch ($e) { $_NUMBA_OK = false; }
+def _needNumba() {
+    if (!$_NUMBA_OK) {
+        throw "arctic: this interpreter has no ndarray support, so to_ndarray() is unavailable. "
+            + "Rebuild Bantu, or use to_list() to get a plain Bantu list.";
+    }
+}
 if ($_ARROW_OK) {
     $_native_read_parquet = read_parquet;
     $_native_read_feather = read_feather;
@@ -73,6 +85,44 @@ class Series {
     def get($i)    { return col_get(this.col, $i); }
     def rename($n) { return new Series($n, this.col); }
     def alias($n)  { return new Series($n, this.col); }
+
+    // A numba array over THIS column's own memory -- no copy at all, so it is
+    // O(1) whatever the length. The array is read-only, because arctic
+    // documents columns as immutable, and it holds the column alive, so it can
+    // safely outlive this Series.
+    //
+    // A column with nulls is refused rather than silently becoming NaN: an
+    // ndarray has no null mask, and "no value" and "not a number" are different
+    // facts. fill_null() or drop_nulls() first, deliberately.
+    def to_ndarray() {
+        _needNumba();
+        return nd_from_column(this.col);
+    }
+
+    // maths, on arctic's own native kernels -- so these work without numba and
+    // keep null semantics: a null stays null, while sqrt(-1) is a NaN that is
+    // NOT null, because the value was present.
+    def sqrt()  { return new Series(this.name, col_sqrt(this.col)); }
+    def cbrt()  { return new Series(this.name, col_cbrt(this.col)); }
+    def exp()   { return new Series(this.name, col_exp(this.col)); }
+    def expm1() { return new Series(this.name, col_expm1(this.col)); }
+    def log()   { return new Series(this.name, col_log(this.col)); }
+    def log1p() { return new Series(this.name, col_log1p(this.col)); }
+    def log2()  { return new Series(this.name, col_log2(this.col)); }
+    def log10() { return new Series(this.name, col_log10(this.col)); }
+    def sin()   { return new Series(this.name, col_sin(this.col)); }
+    def cos()   { return new Series(this.name, col_cos(this.col)); }
+    def tan()   { return new Series(this.name, col_tan(this.col)); }
+    def asin()  { return new Series(this.name, col_asin(this.col)); }
+    def acos()  { return new Series(this.name, col_acos(this.col)); }
+    def atan()  { return new Series(this.name, col_atan(this.col)); }
+    def sinh()  { return new Series(this.name, col_sinh(this.col)); }
+    def cosh()  { return new Series(this.name, col_cosh(this.col)); }
+    def tanh()  { return new Series(this.name, col_tanh(this.col)); }
+    def sign()  { return new Series(this.name, col_sign(this.col)); }
+    def floor() { return new Series(this.name, col_floor(this.col)); }
+    def ceil()  { return new Series(this.name, col_ceil(this.col)); }
+    def trunc() { return new Series(this.name, col_trunc(this.col)); }
 
     // internal: pull the native column out of a Series OR pass a scalar through
     def _operand($x) {
@@ -241,6 +291,25 @@ class DataFrame {
 
     def shape()   { return [this.nrows, this.ncols]; }
     def columns() { return this.names; }
+
+    // The whole frame as one (rows, columns) numba matrix, ready for
+    // np.solve / np.lstsq / np.svd. Unlike a Series this COPIES, because the
+    // columns are separate allocations and a matrix has to be one block.
+    //
+    // $cols chooses and orders a subset; without it every column is taken, in
+    // the frame's own order. Every chosen column must be numeric and free of
+    // nulls, and a column that is not says which one it is by name.
+    def to_ndarray($cols) {
+        _needNumba();
+        $want = $cols;
+        if ($want == null) { $want = this.names; }
+        $raw = [];
+        each ($n in $want) {
+            if (!this.has($n)) { throw "arctic: column '" + $n + "' not found"; }
+            $raw[len($raw)] = this.cols[$n];
+        }
+        return nd_from_frame($raw);
+    }
     def width()   { return this.ncols; }
     def height()  { return this.nrows; }
 
@@ -1033,12 +1102,53 @@ def dataframe($data, $dtypes) {
     return new DataFrame($names, $cols);
 }
 
+// from_columns({name: column, ...}) -> DataFrame
+//
+// The counterpart of to_ndarray(): dataframe() builds from Bantu LISTS, which
+// means anything arriving from numba would have to be materialised into a list
+// of 190-byte Values first -- for 200,000 rows that is both slow and pointless,
+// since nd_to_column() already produces exactly the native column a frame is
+// made of. This takes those directly.
+//
+// Every column must be the same length, and a mismatch says which one and by
+// how much rather than producing a frame whose rows do not line up.
+def from_columns($data) {
+    _need();
+    $names = [];
+    $cols = {};
+    $n = -1;
+    each ($k in keys($data)) {
+        $c = $data[$k];
+        if (type($c) == "instance") { $c = $c.col; }
+        // NOT $len: Bantu keeps variables and functions in one namespace with
+        // the `$` stripped, so assigning $len would replace the len() builtin
+        // for the rest of this function and every later len(...) would fail.
+        $rows = col_len($c);
+        if ($n < 0) { $n = $rows; }
+        if ($rows != $n) {
+            throw "arctic: column '" + $k + "' has " + str($rows) + " rows but the first column has "
+                + str($n) + " -- every column of a frame must be the same length";
+        }
+        $names[len($names)] = $k;
+        $cols[$k] = $c;
+    }
+    return new DataFrame($names, $cols);
+}
+
 // series(name, list, dtype?) -> Series
 def series($name, $list, $dtype) {
     _need();
     $dt = $dtype;
     if ($dt == null) { $dt = _inferDtype($list); }
     return new Series($name, col($list, $dt));
+}
+
+// from_column(name, column) -> Series, for a native column such as the one
+// nd_to_column() hands back. `new alias.Class()` does not parse in Bantu, so a
+// factory function is the only way to build one from outside this module.
+def from_column($name, $column) {
+    _need();
+    return new Series($name, $column);
 }
 
 

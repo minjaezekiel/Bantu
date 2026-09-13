@@ -727,3 +727,64 @@ The bridge instead goes through three new primitives on that boundary (`borrowVe
 - **The sua-concurrency and cross-platform gates.** The concurrency design is settled (N18:
   `thread_local` PRNG, atomic limits) but numba has not been run inside `sua_concurrency_test.sh`,
   and Linux/Windows CI has not been *observed* green for this work — only macOS has.
+
+---
+
+## Phase 6 — closing the open rows ✅
+
+`tests/numba_arctic_integration_test.b` **33/33**, `tests/numba_sua_test.sh` **8/8**,
+`tests/numba_arctic_bridge_test.b` **49/49**, `arctic/arctic_test.b` **56/56**.
+
+### `to_ndarray()` and the maths methods on arctic's own types
+
+`Series.to_ndarray()` borrows zero-copy; `DataFrame.to_ndarray($cols)` builds a matrix, optionally
+choosing and ordering a subset. `Series` also gained the 21 transcendental methods over arctic's own
+kernels, so they work **without numba** and keep null semantics.
+
+Two constructors had to be added to make the seam usable at all, and the reason is worth recording:
+`dataframe()` builds from Bantu **lists**, so anything arriving from numba would have to be
+materialised into 200,000 190-byte `Value`s first — slow and pointless, since `nd_to_column()`
+already produces the native column a frame is made of. `from_columns({name: col})` and
+`from_column(name, col)` take those directly. They are factory functions because
+`new alias.Class()` does not parse.
+
+### The sua-concurrency gate — **passed**, 8/8 in one second
+
+numba runs inside 60 concurrent request handlers, each computing a sum of squares only it can know:
+
+| | |
+|---|---|
+| 60 concurrent handlers | **60 correct, 0 wrong, 0 missing** |
+| same seed under concurrency | same draw every time (the `thread_local` PRNG, N18) |
+| different seeds | still differ, so the check above is not vacuous |
+| 10 impossible allocations inside handlers | all caught; **the worker kept serving** |
+| live-byte counter after ~80 requests | **0 → 0 exactly** (the atomic counters, N18) |
+
+### Cross-platform — wired, not observed
+
+`tests/numba_sua_test.sh` and `tests/run_samples.sh` are in **both** CI jobs. Docker is not available
+here and there is no Linux or Windows machine to hand, so **Linux and Windows CI have still not been
+observed green for this work** — only macOS has actually run. Stated rather than assumed.
+
+### Two defects found by the integration test, both serious
+
+- **[bug fix] `nd_lstsq` and `nd_qr` were O(m²) in MEMORY.** `qrFactor` accumulated an explicit
+  m-by-m Q. Least squares is overwhelmingly used on **tall** data — 200,000 rows by 3 columns is an
+  ordinary regression — and an explicit Q for that is 200,000² doubles, **320 GB**. It was not a slow
+  path; it was an instant **SIGKILL**, which is exactly how the integration test died. The reflectors
+  are now stored and applied one at a time, which is O(m·k) and is what LAPACK does for the same
+  reason. A 200,000×3 least squares now runs in **9 ms** and recovers the planted coefficients to
+  four figures.
+
+- **[bug fix] The linear-algebra working storage bypassed the allocation ceiling entirely.** `Mat`
+  used `std::vector`, which allocates straight from the heap, so no linalg routine was ever subject
+  to N17's admission test — the ceiling that exists specifically to stop a process being OOM-killed
+  was reachable around. That is how a 320 GB request reached the OS at all. `Mat` now goes through
+  the same test and raises with the shape it wanted and the limit it broke.
+
+  Worth stating plainly: the ceiling had a hole in it for an entire phase, and the unit suite did not
+  find it because every matrix in it is small. **An integration test at a realistic size found it in
+  one run.**
+
+- **[bug fix] `arctic.from_columns` used `$len` as a variable**, which silently replaced the `len()`
+  builtin — see the language fix below.

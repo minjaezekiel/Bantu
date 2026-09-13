@@ -20,11 +20,32 @@
 namespace numba {
 
 // ── a plain dense matrix, row-major, for the factorisations to chew on ───────
+// Working storage for the factorisations. It goes through the SAME admission
+// test as an ndarray (N17), which it did not originally: std::vector allocates
+// straight from the heap, so a linalg routine could ask the OS for hundreds of
+// gigabytes and be SIGKILLed -- precisely the failure the ceiling exists to
+// prevent, reached through the one path that skipped it. A 200,000x3 least
+// squares did exactly that.
+inline void admitMatrix(size_t r, size_t c, const char* what) {
+    const size_t bytes = checkedMul(checkedMul(r, c, what), sizeof(double), what);
+    const size_t soft = maxBytesRef().load(std::memory_order_relaxed);
+    const size_t live = liveBytesRef().load(std::memory_order_relaxed);
+    if (bytes > soft || live > soft - bytes) {
+        std::ostringstream o;
+        o << what << ": this needs a " << r << "x" << c << " working matrix (" << bytes
+          << " bytes), which is over numba's " << soft << "-byte limit";
+        throw std::runtime_error(o.str());
+    }
+}
+
 struct Mat {
     size_t rows = 0, cols = 0;
     std::vector<double> a;
     Mat() = default;
-    Mat(size_t r, size_t c) : rows(r), cols(c), a(checkedMul(r, c, "matrix") , 0.0) {}
+    Mat(size_t r, size_t c) : rows(r), cols(c) {
+        admitMatrix(r, c, "matrix");
+        a.assign(checkedMul(r, c, "matrix"), 0.0);
+    }
     double&       operator()(size_t i, size_t j)       { return a[i * cols + j]; }
     const double& operator()(size_t i, size_t j) const { return a[i * cols + j]; }
 };
@@ -193,18 +214,29 @@ inline Mat cholesky(const Mat& A, const char* what) {
 // on anything ill-conditioned -- the classic demonstration is that modified
 // Gram-Schmidt on a Hilbert matrix produces a "Q" whose columns are visibly not
 // orthogonal, while Householder stays at machine precision.
+// The reflectors are STORED, not accumulated into an explicit Q.
+//
+// Accumulating Q needs an m-by-m matrix, and least squares is overwhelmingly
+// used on TALL data -- 200,000 rows by 3 columns is an ordinary regression, and
+// an explicit Q for it is 200,000^2 doubles, or 320 GB. That is not a slow path,
+// it is an instant SIGKILL. Keeping the reflectors is O(m*k) instead, and any
+// product with Q or Q-transpose is applied one reflector at a time. It is also
+// what LAPACK does, for the same reason.
 struct QR {
-    Mat QtFull;     // the accumulated reflections, m-by-m
-    Mat R;          // m-by-n, upper triangular in its first n rows
+    Mat R;                              // m-by-n, upper triangular in its top k rows
+    std::vector<std::vector<double>> v; // reflector k, entries k..m-1
+    std::vector<double> vn;             // its squared norm
+    size_t m = 0, n = 0;
 };
 
 inline QR qrFactor(Mat A) {
     const size_t m = A.rows, n = A.cols;
     QR r;
-    r.QtFull = Mat(m, m);
-    for (size_t i = 0; i < m; i++) r.QtFull(i, i) = 1.0;
-
+    r.m = m; r.n = n;
     const size_t steps = std::min(m ? m - 1 : 0, n);
+    r.v.resize(steps);
+    r.vn.assign(steps, 0.0);
+
     std::vector<double> v(m);
     for (size_t k = 0; k < steps; k++) {
         double norm = 0.0;
@@ -215,25 +247,46 @@ inline QR qrFactor(Mat A) {
         const double alpha = (A(k, k) > 0.0) ? -norm : norm;
         for (size_t i = k; i < m; i++) v[i] = A(i, k);
         v[k] -= alpha;
-        double vn = 0.0;
-        for (size_t i = k; i < m; i++) vn += v[i] * v[i];
-        if (vn == 0.0) continue;
+        double vsq = 0.0;
+        for (size_t i = k; i < m; i++) vsq += v[i] * v[i];
+        if (vsq == 0.0) continue;
 
         for (size_t j = k; j < n; j++) {
             double s = 0.0;
             for (size_t i = k; i < m; i++) s += v[i] * A(i, j);
-            s = 2.0 * s / vn;
+            s = 2.0 * s / vsq;
             for (size_t i = k; i < m; i++) A(i, j) -= s * v[i];
         }
-        for (size_t j = 0; j < m; j++) {
-            double s = 0.0;
-            for (size_t i = k; i < m; i++) s += v[i] * r.QtFull(i, j);
-            s = 2.0 * s / vn;
-            for (size_t i = k; i < m; i++) r.QtFull(i, j) -= s * v[i];
-        }
+        r.v[k].assign(v.begin() + (ptrdiff_t)k, v.begin() + (ptrdiff_t)m);
+        r.vn[k] = vsq;
     }
     r.R = std::move(A);
     return r;
+}
+
+// b <- Q^T b, applying the reflectors in order. O(m*k), no m-by-m anything.
+inline void applyQt(const QR& f, std::vector<double>& b) {
+    for (size_t k = 0; k < f.v.size(); k++) {
+        if (f.vn[k] == 0.0) continue;
+        const std::vector<double>& v = f.v[k];
+        double s = 0.0;
+        for (size_t i = 0; i < v.size(); i++) s += v[i] * b[k + i];
+        s = 2.0 * s / f.vn[k];
+        for (size_t i = 0; i < v.size(); i++) b[k + i] -= s * v[i];
+    }
+}
+
+// b <- Q b, applying the reflectors in REVERSE. Used to build the reduced Q
+// one column at a time.
+inline void applyQ(const QR& f, std::vector<double>& b) {
+    for (size_t kk = f.v.size(); kk-- > 0; ) {
+        if (f.vn[kk] == 0.0) continue;
+        const std::vector<double>& v = f.v[kk];
+        double s = 0.0;
+        for (size_t i = 0; i < v.size(); i++) s += v[i] * b[kk + i];
+        s = 2.0 * s / f.vn[kk];
+        for (size_t i = 0; i < v.size(); i++) b[kk + i] -= s * v[i];
+    }
 }
 
 // ── symmetric eigenproblem: cyclic Jacobi ────────────────────────────────────

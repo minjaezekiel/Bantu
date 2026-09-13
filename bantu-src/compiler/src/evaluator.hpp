@@ -4214,7 +4214,41 @@ private:
             return result;
         }
 
-        ErrorHandler::throwRuntimeError("Cannot call non-function value");
+        // Name what was called and what it actually holds. "Cannot call
+        // non-function value" alone gives no clue which of several calls on the
+        // line went wrong, and the commonest cause is invisible: Bantu keeps
+        // variables and functions in ONE namespace with the `$` stripped, so
+        // `$len = 3` replaces the len() builtin for the rest of the scope and
+        // every later len(...) fails here. Saying so turns a twenty-minute hunt
+        // into a one-line fix.
+        {
+            std::string what;
+            if (auto varNode = dynamic_cast<VariableNode*>(n->callee.get())) {
+                what = varNode->name;
+            } else if (auto dotNode = dynamic_cast<DotAccessNode*>(n->callee.get())) {
+                what = dotNode->property;
+            }
+            std::string holds;
+            switch (callee.type) {
+                case Value::NUMBER:   holds = "a number";  break;
+                case Value::STRING:   holds = "a string";  break;
+                case Value::BOOL:     holds = "a boolean"; break;
+                case Value::NULL_VAL: holds = "null";      break;
+                case Value::LIST:     holds = "a list";    break;
+                case Value::OBJECT:   holds = "a dict";    break;
+                default:              holds = "a value that is not callable"; break;
+            }
+            std::string msg;
+            if (what.empty()) msg = "Cannot call " + holds;
+            else {
+                msg = "Cannot call '" + what + "': it holds " + holds + ", not a function";
+                if (callee.type != Value::NULL_VAL) {
+                    msg += ". Note that Bantu keeps variables and functions in one namespace, so "
+                           "assigning $" + what + " replaces any function of that name";
+                }
+            }
+            ErrorHandler::throwRuntimeError(msg, n->line, n->col);
+        }
         return Value();
     }
 

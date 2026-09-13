@@ -9,6 +9,14 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] arctic frames and series convert to numba arrays** — `$series.to_ndarray()` hands the
+  column's own memory to numba without copying it, and `$frame.to_ndarray()` builds a matrix ready
+  for `solve` or `lstsq`, optionally choosing and ordering the columns. Going the other way,
+  `arctic.from_columns({...})` and `arctic.from_column(name, col)` build a frame or a series from
+  native columns directly, so data coming back from numba does not have to be turned into a Bantu
+  list first. `Series` also gained 21 maths methods — `.sqrt()`, `.exp()`, `.log()` and the rest —
+  which work without numba and keep nulls as nulls.
+
 - **[feature] arctic columns and numba arrays convert between each other** — `nd_from_column($c)`
   hands a column's data to numba **without copying it**, so a million-row column becomes an array in
   a millisecond; `nd_to_column($a)` copies back; and `nd_from_frame([$c1, $c2])` turns a set of
@@ -154,6 +162,20 @@ All notable changes to the Bantu programming language are documented in this fil
   recipient, and degrades to in-app-only when push is unavailable.
 
 ### Fixed
+
+- **[bug fix] Least squares on tall data killed the process** — fitting 200,000 rows by 3 columns
+  tried to allocate an intermediate matrix of 200,000 by 200,000, which is 320 GB, and the process
+  was killed outright. Tall data is the normal case for a regression. The same fit now takes 9 ms.
+
+- **[bug fix] numba's linear algebra could allocate past its own memory limit** — the working
+  storage for `solve`, `qr` and the rest allocated directly rather than through the accounting that
+  bounds every other numba allocation, so the limit that exists to stop the process being killed
+  could be reached around. It now raises, naming the matrix size it wanted and the limit it broke.
+
+- **[bug fix] "Cannot call non-function value" now says what went wrong** — it names the thing you
+  tried to call and what it actually holds, and mentions the usual cause: Bantu keeps variables and
+  functions in one namespace, so `$len = 3` replaces the `len()` function for the rest of the scope
+  and every later `len(...)` fails.
 
 - **[bug fix] Keywords could not be used as property names** — `$d.number`, `$d.string`,
   `$d.delete` and `$a.any()` all failed with "Expected property name after '.'", because the parser

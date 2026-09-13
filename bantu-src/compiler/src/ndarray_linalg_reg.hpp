@@ -217,10 +217,17 @@ inline void registerLinalg(const DefineFn& define) {
         const size_t m = A->shape[0], n = A->shape[1];
         QR f = qrFactor(toMat(*A));
         const size_t k = std::min(m, n);
-        // Reduced form: Q is m-by-k, R is k-by-n. QtFull holds Q transpose.
+        // Reduced form: Q is m-by-k, R is k-by-n. Q is built one column at a
+        // time by applying the stored reflectors to a unit vector -- never as
+        // an m-by-m matrix, which for a tall input would be enormous.
         Mat Q(m, k), R(k, n);
-        for (size_t i = 0; i < m; i++)
-            for (size_t j = 0; j < k; j++) Q(i, j) = f.QtFull(j, i);
+        std::vector<double> e(m);
+        for (size_t j = 0; j < k; j++) {
+            std::fill(e.begin(), e.end(), 0.0);
+            e[j] = 1.0;
+            applyQ(f, e);
+            for (size_t i = 0; i < m; i++) Q(i, j) = e[i];
+        }
         for (size_t i = 0; i < k; i++)
             for (size_t j = 0; j < n; j++) R(i, j) = (j >= i) ? f.R(i, j) : 0.0;
         std::vector<Value> pair = { wrap(fromMat(Q, "nd_qr")), wrap(fromMat(R, "nd_qr")) };
@@ -241,15 +248,11 @@ inline void registerLinalg(const DefineFn& define) {
         // SQUARES the condition number, which throws away half the available
         // digits on anything even mildly ill-conditioned.
         QR f = qrFactor(toMat(*A));
-        std::vector<double> qtb(m, 0.0);
-        std::vector<double> b(m);
+        std::vector<double> qtb(m);
         size_t k = 0;
-        forEachIndex(*B, [&](size_t o, size_t) { b[k++] = getAsDouble(*B, o); });
-        for (size_t i = 0; i < m; i++) {
-            double s = 0.0;
-            for (size_t j = 0; j < m; j++) s += f.QtFull(i, j) * b[j];
-            qtb[i] = s;
-        }
+        forEachIndex(*B, [&](size_t o, size_t) { qtb[k++] = getAsDouble(*B, o); });
+        // Q^T b by applying the reflectors, not by multiplying an m-by-m Q.
+        applyQt(f, qtb);
         const size_t r = std::min(m, n);
         std::vector<double> x(n, 0.0);
         for (size_t i = r; i-- > 0; ) {

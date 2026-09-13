@@ -170,8 +170,15 @@ buffer identity and by outliving its source), `nd_to_column` (copy, structurally
 (column-major then a transposed view, feeding straight into `nd_lstsq`). `tests/numba_arctic_bridge_test.b`
 **49/49**.
 
-**Still open: `arctic.b`'s `to_ndarray()` convenience wrapper, the sua-concurrency gate, and
-cross-platform CI observation (only macOS has been run).**
+**Closed since:** `arctic.b`'s `to_ndarray()` on both `Series` and `DataFrame` (plus `from_columns`
+/ `from_column`, and 21 transcendental methods on `Series`); the **sua-concurrency gate**
+(`tests/numba_sua_test.sh` **8/8** — 60 concurrent handlers all correct, per-thread seeds, impossible
+allocations caught with the worker still serving, live bytes exactly 0 → 0); and an
+end-to-end integration suite (`tests/numba_arctic_integration_test.b` **33/33**) that found two
+serious defects the unit suites could not.
+
+**Still open: cross-platform CI has been wired into both jobs but not OBSERVED — no Linux or Windows
+machine and no Docker here, so only macOS has actually run.**
 
 
 | Item | How | Feature test | Stress test | Status |
