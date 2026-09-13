@@ -214,6 +214,33 @@ private:
             value += source_[pos_];
             advance();
         }
+        // Scientific notation. Without this, str(0.000012345678) produces
+        // "1.23457e-05" and Bantu cannot read its own output back: the lexer
+        // stopped at the 'e', so `$y = 1.23457e-05;` became the number 1.23457
+        // followed by an identifier `e`, and the error was the baffling
+        // "Undefined variable: e". The JSON parser already accepted exponents,
+        // so the two halves of the language disagreed.
+        //
+        // Only consume the 'e' when what follows really is an exponent --
+        // digits, optionally signed. Otherwise `2e` must keep lexing as the
+        // number 2 followed by the identifier `e`, exactly as it does today.
+        if (pos_ < source_.size() && (source_[pos_] == 'e' || source_[pos_] == 'E')) {
+            size_t look = pos_ + 1;
+            if (look < source_.size() && (source_[look] == '+' || source_[look] == '-')) look++;
+            if (look < source_.size() && std::isdigit(static_cast<unsigned char>(source_[look]))) {
+                value += source_[pos_];
+                advance();                                   // the e/E
+                if (source_[pos_] == '+' || source_[pos_] == '-') {
+                    value += source_[pos_];
+                    advance();                               // the sign
+                }
+                while (pos_ < source_.size() &&
+                       std::isdigit(static_cast<unsigned char>(source_[pos_]))) {
+                    value += source_[pos_];
+                    advance();
+                }
+            }
+        }
         return Token(BantuTokenType::NUMBER, value, startLine, startCol);
     }
 

@@ -11,6 +11,7 @@
 
 #include "ndarray_native.hpp"
 #include "ndarray_api.hpp"
+#include "ndarray_ufunc_reg.hpp"
 
 namespace numba {
 
@@ -292,7 +293,12 @@ void registerBuiltins(const DefineFn& define) {
     // genuinely uninitialized.
     define("nd_empty", [](std::vector<Value> a) -> Value {
         needArgs(a, 1, "nd_empty(shape, dtype?)");
-        return wrap(makeArray(shapeFrom(a[0], "nd_empty"), dtypeArg(a, 1, DType::F64), "nd_empty"));
+        // Genuinely uninitialised (N20). It memset like everything else until
+        // now, which made the name a lie and made nd_empty exactly as slow as
+        // nd_zeros -- for a buffer whose whole purpose is to be overwritten,
+        // as every ufunc `out=` destination is.
+        return wrap(makeArray(shapeFrom(a[0], "nd_empty"), dtypeArg(a, 1, DType::F64),
+                              "nd_empty", false));
     });
 
     auto filled = [](const std::vector<Value>& a, double v, const char* what) -> Value {
@@ -921,6 +927,36 @@ void registerBuiltins(const DefineFn& define) {
         }
         return wrap(makeView(x, shape, st, (size_t)off, "nd_slice"));
     });
+
+    registerUfuncs(define);
+    registerUfuncExtras(define);
+}
+
+// A scalar, a nested list or an array all become an array, so `nd_add($a, 2)`
+// works without the caller wrapping the 2 first. A number becomes a 0-d array,
+// which broadcasts against anything.
+Value toArrayValue(const Value& v, const char* what) {
+    if (isArray(v)) return v;
+    if (v.isNumber() || v.isBool()) {
+        auto out = makeArray({}, v.isBool() ? DType::BOOL : DType::F64, what);
+        setFromDouble(*out, 0, v.isBool() ? (v.boolVal ? 1.0 : 0.0) : v.numberVal);
+        return wrap(out);
+    }
+    if (v.isList()) {
+        std::vector<size_t> shape;
+        inferShape(v, shape, 0);
+        checkRectangular(v, shape, 0);
+        bool allBool = true, allInt = true, any = false;
+        inferDType(v, allBool, allInt, any);
+        DType dt = DType::F64;
+        if (any) dt = allBool ? DType::BOOL : (allInt ? DType::I64 : DType::F64);
+        auto out = makeArray(shape, dt, what);
+        size_t k = 0;
+        fillNested(v, *out, k);
+        return wrap(out);
+    }
+    throw std::runtime_error(std::string(what) +
+        ": expected an array, a number or a list (got " + v.toString() + ")");
 }
 
 } // namespace numba

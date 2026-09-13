@@ -295,3 +295,90 @@ reusing the same extent walk as the view check, and the aliasing test Phase 2's 
 
 Byte accounting is the more precise instrument: RSS is noisy enough that a small genuine leak hides
 inside normal allocator variation, whereas the live counter must return to baseline exactly.
+
+---
+
+## Phase 2 — Broadcasting and element-wise ufuncs ✅
+
+Feature suite `tests/numba_ufunc_test.b` **111/111**; `tests/numba_array_test.b` **130/130**;
+stress `tests/numba_stress.sh` **19/19**; full regression **69/69** (macOS arm64, Apple silicon).
+
+### What landed
+
+- **[feature]** NumPy broadcasting: right-aligned shapes, stretched axes get stride 0 and copy
+  nothing. Failures name the axis and both extents —
+  `nd_add: shapes [3,4] and [5,4] cannot be broadcast together (axis 0: 3 vs 5)`.
+- **[feature]** The three-tier kernel loop. Tier 0 is one flat `__restrict` pointer loop (confirmed
+  vectorized: NEON width 2 × interleave 2, the maximum for f64); tier 2 **coalesces dimensions
+  first**, so a contiguous (1000,10000) operation collapses back into one flat loop — measured
+  19 ms against 13 ms for the equivalent 1-D call, versus the 2–3× loss coalescing exists to avoid.
+- **[feature]** ~55 ufuncs: full arithmetic, floor-division and modulo, 29 transcendentals, six
+  comparisons, boolean logic, three predicates, `nd_where`, `nd_clip`, `nd_isclose`, `nd_allclose`,
+  `nd_array_equal`, `nd_broadcast_shapes`. Scalars and plain Bantu lists are accepted as operands
+  without wrapping: `nd_add($a, 2)` works.
+- **[feature]** Optional `out=` on every ufunc, with three gates before a single element is written:
+  `requireWritable` (a `broadcast_to` destination **raises**), an exact shape match (`out` is not
+  itself broadcast), and aliasing. The **exact** overlap `nd_add($a,$b,$a)` runs in place at full
+  speed; any other overlap computes into a temporary and copies back, so a partially-overlapping
+  `out=` gives the same answer as the non-aliased call rather than garbage.
+- **[feature]** `nd_empty` is now genuinely uninitialised (N20): **0 ms vs 43 ms** for 10M f64. Its
+  DoS bound comes from the live-byte accounting, which counts bytes whether or not they are touched.
+
+### Semantics worth knowing
+
+Integer division and modulo **floor**, as in Python and NumPy, not C: `-7 // 2` is `-4`. Integer
+division by zero **raises** rather than trapping — it is `SIGFPE` on x86, a process kill, not an
+error. Float division by zero is *not* an error: IEEE says ±inf and that is the right answer.
+`nd_minimum`/`nd_maximum` propagate NaN, like NumPy's rather than C's `fmin`. `nd_rint` is
+half-to-even. `/` always produces f64. `bool + bool` is i64, because `true + true` is 2.
+
+### Performance
+
+| | before | after |
+|---|---|---|
+| 10M `nd_add` | 22 ms — 10.6 GB/s | **13 ms — 18.0 GB/s** |
+| 10M `nd_sqrt` | 23 ms | **12 ms** |
+| 10M `nd_greater` | 30 ms | **14 ms** |
+| 10M `nd_exp` | — | 65 ms (scalar libm, as predicted) |
+
+A hand-written standalone C++ loop doing identical work on the same machine takes **13.37 ms**, so
+numba is within 3% of the kernel's own ceiling and **single-core bandwidth is now the wall**.
+
+### Defects found and fixed
+
+Three, all in this phase's own code, all found by measurement rather than review:
+
+- **[bug fix]** **Predicates returned garbage on integer arrays.** `nd_isfinite(nd([1], "i64"))` was
+  **false**. `Kind::COMPARE` let them promote to the integer path, where these ops have no meaningful
+  kernel — they ran a stub returning 0. A predicate asks a question only a float can answer, so it
+  now computes in f64 whatever it is handed (`Kind::PREDICATE`).
+- **[bug fix]** **Logical ops rounded floats instead of testing truthiness.** `0.4 and true` was
+  **false** while `0.6 and true` was **true** — `llround`, not truth. Logic computed in `BOOL`, which
+  converted f64 operands by rounding. It now computes in the promoted type, so `!= 0` is evaluated
+  exactly.
+- **[perf]** **The kernel dispatch defeated its own vectorization.** The ufunc table declared its
+  kernels as *function pointers*, so every operation decayed to one type and `tier0` had a single
+  shared instantiation calling through an opaque pointer once per element. `-Rpass=loop-vectorize`
+  reported 26 vectorized loops while the one that mattered was an indirect call — which is why the
+  check that found it was a comparison against a standalone loop, not the compiler's own report.
+  Declaring the parameters `auto` gives each operation its own inlined loop: **1.69×**.
+
+### Measurements that changed the plan
+
+- **Non-temporal stores were rejected on measurement.** The literature's 1.40–1.42× on STREAM Triad
+  is an x86 result; on Apple silicon NT stores were **slower** at both DRAM-resident (13.86 vs
+  13.42 ms) and cache-resident (0.1319 vs 0.1125 ms) sizes. Recorded rather than shipped.
+- **The "≥ 10 GB/s effective" gate was replaced with per-platform targets** (N22), and the Apple
+  figure corrected: 20 GB/s was a guess, and one core cannot reach it here.
+- **Threading is deferred to Phase 3+** with the justification now measured rather than assumed: a
+  thread pool has to be designed against sua's per-connection threads, the same interaction that
+  forced N18.
+
+### Stress
+
+| | result |
+|---|---|
+| 100,000 in-place `nd_add($a,$b,$a)` | live-byte drift **0 bytes** — the exact-overlap path allocates no temporary |
+| 60,000 rejected ufunc calls (bad shape, read-only `out`, wrong-size `out`) | all raised; drift **0 bytes** |
+| 10M `nd_add` / `nd_sqrt` | 13 ms / 12 ms |
+| `nd_empty` vs `nd_zeros`, 10M f64 | 0 ms vs 43 ms |

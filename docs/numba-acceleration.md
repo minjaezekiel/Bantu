@@ -5,9 +5,14 @@ cost, and what the current design must not preclude. Written before the Phase 2 
 of the findings change Phase 2's design and one changes a Phase 2 *gate*.
 
 **The conclusion up front, because it is the opposite of the intuitive answer:** a GPU would make
-numba's headline operation **slower**, not faster, and the speed that is actually available — roughly
-2× on the ordinary `$c = $a + $b` case — is in memory-system work that needs no new dependency at all.
-GPU earns its place only in Phase 5 linear algebra, and only as an optional backend.
+numba's headline operation **slower**, not faster. GPU earns its place only in Phase 5 linear algebra,
+and only as an optional backend.
+
+**And the second conclusion, which only measurement produced:** of the three memory-system techniques
+the literature recommends, the one predicted to win biggest (non-temporal stores, §3.1) **lost** on
+this hardware, while a 1.69× gain was sitting in numba's own kernel dispatch (§3.3a) where no
+published technique would have pointed. After that fix numba matches a hand-written standalone C++
+loop to within 3%, which means single-core is now the ceiling and further gains need threads.
 
 ---
 
@@ -96,7 +101,7 @@ speculative generality for a feature deliberately deferred.
 
 ## 3. Where the speed actually is
 
-### 3.1 Non-temporal stores — the single largest win, and free
+### 3.1 Non-temporal stores — predicted to be the largest win; measured a loss
 
 When a kernel writes `c[i]`, the CPU first *reads* the cache line containing `c[i]` from DRAM so it
 can own it for modification — a **read-for-ownership**. For `c = a + b` that is a third stream of
@@ -107,11 +112,10 @@ predicts a 1.33× speedup on a triad from dropping four streams to three; the **
 STREAM Triad is **1.40–1.42×**, better than predicted because memory-subsystem efficiency itself
 improves with fewer concurrent streams.
 
-That is a ~40% improvement on numba's single most common operation, needing no dependency and no new
-runtime — `_mm256_stream_pd` on x86-64, `stnp` on AArch64, or `__builtin_nontemporal_store` which
-both GCC and Clang provide portably.
+On paper that is a ~40% improvement on numba's single most common operation, needing no dependency —
+`_mm256_stream_pd` on x86-64, `stnp` on AArch64, or `__builtin_nontemporal_store` in Clang.
 
-The caveats are real and must be encoded, not assumed away:
+The caveats are real, and the first of them is what the measurement below turns out to hinge on:
 - **Only for destinations that do not fit in cache.** For a small array the RFO is free (the line is
   already resident) and bypassing the cache throws away a value the next operation wants. Needs a
   size threshold, tuned, not guessed.
@@ -119,8 +123,23 @@ The caveats are real and must be encoded, not assumed away:
   is slower than an ordinary store. This means tier-0 of the kernel loop only.
 - **Requires a fence** (`_mm_sfence`) before the result is read by other code.
 
-**Recommendation: Phase 2, tier-0 loop only, above a measured threshold, with the scalar path kept
-for everything else.**
+**Measured on Apple M-series, and the answer is no.** An identical 10M-element `c = a + b`, plain
+stores against `__builtin_nontemporal_store`:
+
+| | 10M (DRAM-resident) | 200k (cache-resident) |
+|---|---|---|
+| plain stores | **13.42 ms** | **0.1125 ms** |
+| non-temporal stores | 13.86 ms | 0.1319 ms |
+
+NT stores are *slower* at both sizes. The 1.40–1.42× figure above is real but it is an **x86**
+result: on Intel the RFO stream is a quarter of triad traffic and eliminating it pays. Apple silicon's
+memory controller evidently already handles streaming writes, so `stnp` buys nothing and gives up
+cache locality for it.
+
+**Recommendation: not adopted.** This is exactly why the rule was "measure it, do not assume it" —
+the research predicted a 40% win and the machine says otherwise. Worth re-measuring on x86 before
+concluding it is useless everywhere, but it must never be enabled on a platform where it has not been
+measured, and it is not worth a platform-specific code path for a win that may be zero.
 
 ### 3.2 Huge pages
 
@@ -174,8 +193,44 @@ Two hard requirements if it lands:
   64 × N workers. This is exactly the interaction that made `thread_local` the right choice for the
   PRNG, and it needs the same care.
 
-**Recommendation: prototype in Phase 2, gate on measurement, and fix the roadmap's bandwidth target
-to be per-platform in the meantime.**
+**Measured, and single-core is now the wall.** After fixing the dispatch defect below, numba's
+10M `nd_add` runs at **13 ms / 18.0 GB/s**, against **13.37 ms / 17.5 GB/s** for a hand-written
+standalone C++ loop doing exactly the same work on the same machine. numba is at the single-core
+ceiling: there is no remaining overhead to remove, and every further gain has to come from more
+cores. That also means the "Apple silicon ≥ 20 GB/s" target was set from a guess and is
+**unreachable on one core**; the roadmap gate is corrected to match the measurement.
+
+**Recommendation: not implemented in Phase 2.** The measurement justifies it, but a thread pool has
+to be designed against sua's per-connection threads — numba inside 64 concurrent handlers must not
+spawn 64 × N workers — which is the same interaction that forced N18. That deserves its own design
+pass rather than being appended to a phase that is otherwise complete.
+
+### 3.3a The dispatch defect this uncovered
+
+Worth recording because it was invisible without the comparison against a standalone loop. The ufunc
+table originally declared its kernels as **function pointers**:
+
+```cpp
+auto bin = [&](const char* name, Kind k,
+               double (*fd)(double, double), int64_t (*fi)(int64_t, int64_t)) { ... };
+```
+
+That parameter type forces every operation to decay to one type, so `tier0` got a **single shared
+instantiation** calling through an opaque pointer once per element — which can neither inline nor
+vectorize. Changing the parameters to `auto` keeps each operation's own type, so each gets its own
+inlined, vectorized loop:
+
+| | before | after |
+|---|---|---|
+| 10M `nd_add` | 22 ms (10.6 GB/s) | **13 ms (18.0 GB/s)** |
+| 10M `nd_sqrt` | 23 ms | **12 ms** |
+| 10M `nd_greater` | 30 ms | **14 ms** |
+
+A 1.69× regression hiding behind a keyword. The lesson for later phases: `-Rpass=loop-vectorize`
+reporting "vectorized loop" is **not** sufficient evidence that the hot path vectorized — it listed 26
+vectorized loops while the one that mattered was an indirect call. What found it was comparing
+against a standalone loop doing identical work, and that comparison belongs in the benchmark suite
+permanently.
 
 ### 3.4 A free-list for buffers
 
@@ -243,9 +298,10 @@ about to be written.
 | item | phase | why |
 |---|---|---|
 | Page-align large allocations | 2 | serves NT stores, huge pages, and any future zero-copy Metal — one constant |
-| Non-temporal stores in tier 0 | 2 | measured 1.40–1.42× on the most common operation, no dependency |
-| `std::thread` parallel tier 0 | 2 | one core cannot saturate DRAM; the current gate may be unreachable without it |
-| Revise the "≥ 10 GB/s effective" gate to be per-platform | 2 | it encodes an assumption about single-core bandwidth that does not hold everywhere |
+| ~~Non-temporal stores in tier 0~~ | — | **rejected on measurement**: slower at both DRAM and cache-resident size on Apple silicon (§3.1) |
+| ~~Generic kernel dispatch~~ | **done in 2** | function-pointer parameters blocked inlining; 1.69× recovered (§3.3a) |
+| `std::thread` parallel tier 0 | 3+ | single-core ceiling now confirmed reached; needs a design pass against sua's threads |
+| Revise the bandwidth gate to be per-platform | **done in 2** | the flat target encoded a guess about single-core bandwidth |
 | `madvise(MADV_HUGEPAGE)` above a threshold | 2 | measure; plausible, not proven, for streaming patterns |
 | True uninitialised `nd_empty` | 2 | `out=` and every ufunc result; accounting still bounds it |
 | Buffer free list | 2–3 | after `out=`, which removes most of the temporaries |

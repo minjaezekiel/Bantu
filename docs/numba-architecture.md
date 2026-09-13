@@ -354,6 +354,61 @@ add Cephes-style reduce-and-polynomial `exp`/`log`/`sin`/`cos`, which auto-vecto
 are branch-free. That lands only behind a differential gate asserting ≤ 1 ULP against libm across a
 dense sample of the domain including denormals, ±inf, NaN and the overflow boundaries.
 
+### 4.6 Promotion, and what each op computes in
+
+One rule, applied everywhere: **`bool → i64 → f64`**. On top of that, the operation itself can force
+the compute type:
+
+| ops | compute dtype | result dtype |
+|---|---|---|
+| `+ - * // %` and `minimum`/`maximum`/`abs`/`sign` | `promote(a, b)` | same |
+| `/`, `power`, every transcendental, `hypot`, `atan2` | **always f64** | f64 |
+| `== != < <= > >=` | `promote(a, b)` | **bool** |
+| `logical_and/or/xor/not`, `isnan/isinf/isfinite` | — | **bool** |
+
+Two consequences worth stating rather than discovering:
+
+- **`i64 ⊕ i64` stays exact for `+ - * // %`.** Computing integers through `double` would silently
+  round above 2^53, and a library whose integer arithmetic is approximate is not one you can index
+  with. This is why the kernels carry an `int64_t` path and not just a `double` one.
+- **`/` always produces f64**, so `nd_divide` on two i64 arrays gives f64 — as in NumPy and Python 3,
+  and unlike C. `floor_divide` is the integer-preserving one.
+
+Integer division and modulo by zero **raise**, rather than trapping (`SIGFPE` on x86 for the integer
+case, which is a process kill, not an error). Float division by zero follows IEEE and yields ±inf,
+which is the correct answer and must not be turned into an error.
+
+### 4.7 `out=`, aliasing, and why the safe case is worth detecting
+
+Every binary ufunc takes an optional trailing `out`. It exists for one reason: `$a.add($b).mul(2)`
+on 10M f64 holds three live 80 MB buffers, and `out=` is what lets a loop run in constant memory.
+
+Three gates, in order, before a single element is written:
+
+1. **`requireWritable(out)`** — so a `broadcast_to` result used as `out=` raises rather than writing
+   through stride 0 repeatedly (§7). This is the rule that made the read-only flag worth having.
+2. **Shape must equal the broadcast result exactly.** `out` is not itself broadcast: a destination
+   smaller than the result would silently discard, and one larger would leave stale elements.
+3. **Aliasing.** If `out` shares a buffer with either input, computing in place can read an element
+   that has already been overwritten — which is not a crash but a *wrong answer*, the worst failure
+   mode available.
+
+The general answer to (3) is NumPy's: compute into a temporary, then copy into `out`. But the common
+case is the one people actually write —
+
+```bantu
+np.add($a, $b, $a);      // accumulate into $a
+```
+
+— and it is **safe**, because an element-wise op reads and writes the same index. So the test is not
+"do they overlap" but "do they overlap *exactly*": same buffer, same offset, same strides, same
+shape. That case runs in place at full speed; every other overlap takes the temporary. Being
+conservative in the other direction — always copying — would make the one idiom `out=` exists for the
+one idiom that allocates.
+
+`nd_shares_memory` (N19) is the overlap test, deliberately conservative like `np.may_share_memory`:
+a false positive costs one defensive copy, a false negative costs a wrong answer.
+
 ---
 
 ## 5. The Bantu-facing design

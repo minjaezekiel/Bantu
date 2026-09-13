@@ -236,7 +236,10 @@ struct Buffer {
     // column's storage is wrapped zero-copy. Null for buffers we allocated.
     std::shared_ptr<void> keepalive;
 
-    explicit Buffer(size_t bytes) : nbytes(bytes) {
+    // `zero` is false only for nd_empty, whose contract is explicitly
+    // "uninitialised" -- see the memset comment below for why every other
+    // allocation touches its pages (N20).
+    explicit Buffer(size_t bytes, bool zero = true) : nbytes(bytes) {
         const size_t soft = maxBytesRef().load(std::memory_order_relaxed);
         if (bytes > soft) {
             const size_t hard = hardMaxBytesRef().load(std::memory_order_relaxed);
@@ -285,8 +288,12 @@ struct Buffer {
         // arrives instead of a catchable error, and the ceiling above stops
         // bounding anything real. Touching every page here is what converts a
         // deferred kill into an exception a Bantu try/catch can handle. It costs
-        // 47 ms per 10M f64, and that is the price of deterministic failure.
-        std::memset(data, 0, bytes ? bytes : 64);
+        // ~40 ms per 10M f64, and that is the price of deterministic failure.
+        //
+        // nd_empty is the one exception, and it is safe because the DoS bound
+        // comes from the live-byte accounting above, which counts the bytes
+        // whether or not they are touched.
+        if (zero) std::memset(data, 0, bytes ? bytes : 64);
     }
     Buffer(void* p, size_t bytes, std::shared_ptr<void> owner)
         : data(p), nbytes(bytes), owned(false), keepalive(std::move(owner)) {}
@@ -365,15 +372,17 @@ inline std::vector<ptrdiff_t> cStrides(const std::vector<size_t>& shape) {
     return s;
 }
 
-// A fresh, zero-filled, C-contiguous array.
-inline ArrayPtr makeArray(const std::vector<size_t>& shape, DType dt, const char* what) {
+// A fresh, C-contiguous array -- zero-filled unless `zero` is false, which only
+// nd_empty passes.
+inline ArrayPtr makeArray(const std::vector<size_t>& shape, DType dt, const char* what,
+                          bool zero = true) {
     auto a = std::make_shared<NdArray>();
     a->dtype   = dt;
     a->shape   = shape;
     a->strides = cStrides(shape);
     const size_t n     = shapeProduct(shape, what);
     const size_t bytes = checkedMul(n, itemsize(dt), what);
-    a->buf = std::make_shared<Buffer>(bytes);
+    a->buf = std::make_shared<Buffer>(bytes, zero);
     return a;
 }
 

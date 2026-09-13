@@ -78,19 +78,28 @@ One correction made during the work: `nd_is_view` first asked only "do I cover t
 which a transposed view does — so it reported a transpose as an independent array. It now asks
 whether the buffer is shared, which is the question a user actually has.
 
-## Phase 2 — Broadcasting and element-wise ufuncs
+## Phase 2 — Broadcasting and element-wise ufuncs ✅
+
+Feature suite `tests/numba_ufunc_test.b` **111/111**; stress **19/19**; full regression **69/69**.
+10M `nd_add` at **13 ms / 18.0 GB/s**, within 3% of a hand-written standalone C++ loop on the same
+machine — single-core bandwidth is the wall. Three defects found by measurement and fixed: predicates
+returned garbage on i64 arrays, logical ops rounded floats instead of testing truthiness, and the
+kernel dispatch declared its ops as function pointers, defeating inlining and vectorization (1.69×
+recovered). Non-temporal stores were **rejected on measurement** — the literature's 1.40× is an x86
+result and they are slower here. See `numba-suite/CHANGELOG.md` and `docs/numba-acceleration.md`.
+
 
 | Item | How | Feature test | Stress test | Status |
 |---|---|---|---|---|
-| Broadcasting | right-aligned shape rule; stretched axes get **stride 0**; errors name the axis and both extents | `tests/numba_ufunc_test.b` | ~30 shape pairs incl. every failure case with its expected message | [ ] |
-| The 3-tier loop | tier 0 flat `__restrict`; tier 1 splat; tier 2 **coalesce dims** then an N-d odometer with the branch hoisted out of the inner loop | ″ | 4-D strided ops; `out=` views forcing tier 2 | [ ] |
-| ~45 ufuncs + comparisons + boolean logic + `out=` | promotion `bool → i64 → f64`; i64 exact for `+ - * // %` | ″ | differential vs pure Bantu on 100k, max rel err < 1e-15; denormals, ±inf, NaN, overflow boundaries | [ ] |
-| **Aliasing and writability** | overlap by buffer identity + element extent → copy (NumPy behaviour) | ″ | `nd_add($a,$a,$a)`; `out=` on a partially overlapping view; **writes through a `broadcast_to` result raise** | [ ] |
-| Performance | — | — | **10M `nd_add`, effective GB/s reported alongside ms, machine recorded. PER-PLATFORM target, not a flat 10 GB/s** — see N22: one core sustains ~10 concurrent L1 misses, capping a single thread near 8.1 GB/s at a 79 ns memory latency, so the flat figure was unreachable by construction on a high-latency cloud vCPU. Apple silicon ≥ 20 GB/s; x86 desktop ≥ 10 GB/s; shared vCPU ≥ 5 GB/s single-threaded, or ≥ 10 GB/s with the `std::thread` tier-0 if it lands | [ ] |
-| Memory-system work (N22, `docs/numba-acceleration.md`) | page-align large buffers; non-temporal stores in tier 0 above a measured threshold; `madvise(MADV_HUGEPAGE)`; prototype a fixed-size `std::thread` parallel-for | — | NT stores measured against the scalar path on cache-resident **and** DRAM-resident sizes (they *lose* when the destination fits in cache); the thread pool must not multiply against sua's per-connection threads | [ ] |
-| `out=` honours the safety gates | every destination through `requireWritable()` + `nd_shares_memory()` | `broadcast_to` as `out=` **raises**; an `out=` overlapping an input is copied or refused, never garbage | aliasing fuzzed across offset/stride/flip combinations | [ ] |
-| `nd_empty` genuinely uninitialised (N20) | skip the `memset` for it alone; live-byte accounting still bounds it | contents unspecified but shape/dtype/strides correct | allocation of 10M `nd_empty` is **not** charged 40 ms of page-touching | [ ] |
-| Vectorization actually happened | `-O3` per-file override + CI grep of `-fopt-info-vec-optimized` | — | tier-0 loops present in the log on **both** Linux GCC and macOS Clang | [ ] |
+| Broadcasting ✅ | right-aligned shape rule; stretched axes get **stride 0**; errors name the axis and both extents | `tests/numba_ufunc_test.b` | ~30 shape pairs incl. every failure case with its expected message | [ ] |
+| The 3-tier loop ✅ | tier 0 flat `__restrict`; tier 1 splat; tier 2 **coalesce dims** then an N-d odometer with the branch hoisted out of the inner loop | ″ | 4-D strided ops; `out=` views forcing tier 2 | [ ] |
+| ~55 ufuncs + comparisons + boolean logic + `out=` ✅ | promotion `bool → i64 → f64`; i64 exact for `+ - * // %` | ″ | differential vs pure Bantu on 100k, max rel err < 1e-15; denormals, ±inf, NaN, overflow boundaries | [ ] |
+| **Aliasing and writability** ✅ | overlap by buffer identity + element extent → copy (NumPy behaviour) | ″ | `nd_add($a,$a,$a)`; `out=` on a partially overlapping view; **writes through a `broadcast_to` result raise** | [ ] |
+| Performance ✅ | — | — | **MEASURED: 13 ms / 18.0 GB/s on Apple M-series, vs 13.37 ms for a standalone C++ loop.** PER-PLATFORM target, not a flat 10 GB/s** — see N22: one core sustains ~10 concurrent L1 misses, capping a single thread near 8.1 GB/s at a 79 ns memory latency, so the flat figure was unreachable by construction on a high-latency cloud vCPU. Apple silicon ≥ 15 GB/s (20 was a guess; one core measured at 17.5 GB/s for the bare loop); x86 desktop ≥ 10 GB/s; shared vCPU ≥ 5 GB/s single-threaded, or ≥ 10 GB/s with the `std::thread` tier-0 if it lands | [ ] |
+| Memory-system work (N22) — **NT stores measured and rejected**; threading deferred to Phase 3+ with the ceiling now confirmed reached; page-alignment and huge pages still open | page-align large buffers; `madvise(MADV_HUGEPAGE)`; a fixed-size `std::thread` parallel-for designed against sua's per-connection threads | — | NT stores measured against the scalar path on cache-resident **and** DRAM-resident sizes (they *lose* when the destination fits in cache); the thread pool must not multiply against sua's per-connection threads | [ ] |
+| `out=` honours the safety gates ✅ | every destination through `requireWritable()` + `nd_shares_memory()` | `broadcast_to` as `out=` **raises**; an `out=` overlapping an input is copied or refused, never garbage | aliasing fuzzed across offset/stride/flip combinations | [ ] |
+| `nd_empty` genuinely uninitialised (N20) ✅ | skip the `memset` for it alone; live-byte accounting still bounds it | contents unspecified but shape/dtype/strides correct | allocation of 10M `nd_empty` is **not** charged 40 ms of page-touching | [ ] |
+| Vectorization actually happened ✅ | `-O3` per-file override + CI grep of `-fopt-info-vec-optimized` | — | tier-0 loops present in the log on **both** Linux GCC and macOS Clang | [ ] |
 
 ## Phase 3 — Reductions with `axis`, scans, sorting, indexing
 

@@ -152,6 +152,55 @@ writefile("$TMP/account", str(\$afterLoop) + "," + str(\$afterFail) + "," +
 \$s = nd_slice(\$big, [[0, 10000000, 2]]);
 \$sms = clock() - \$t0;
 writefile("$TMP/timing", str(\$alloc) + "," + str(\$vms) + "," + str(\$sms) + "," + str(nd_size(\$s)));
+
+// ── 6. ufuncs at scale, and the out= aliasing gate under repetition ──────
+\$u = nd_random_uniform([10000000], 0, 1);
+\$v = nd_random_uniform([10000000], 0, 1);
+\$w = nd_empty([10000000], null);
+nd_add(\$u, \$v, \$w);                       // warm
+\$t0 = clock();
+nd_add(\$u, \$v, \$w);
+\$addMs = clock() - \$t0;
+\$t0 = clock();
+nd_sqrt(\$u, \$w);
+\$sqrtMs = clock() - \$t0;
+
+// nd_empty must NOT pay for touching pages it is about to overwrite (N20).
+\$t0 = clock();
+\$e = nd_empty([10000000], null);
+\$emptyMs = clock() - \$t0;
+\$t0 = clock();
+\$z = nd_zeros([10000000], null);
+\$zeroMs = clock() - \$t0;
+\$e = 0; \$z = 0;
+
+// 100,000 ufunc calls with out= must not leak: each one runs the aliasing
+// gate, and the exact-overlap path must NOT quietly allocate a temporary.
+\$small = nd_random_uniform([64], 0, 1);
+\$acc   = nd_zeros([64], null);
+// Baseline AFTER the operands exist: they are legitimately live, so counting
+// them as drift would measure scope rather than leakage.
+\$baseU = nd_live_bytes();
+\$i = 0;
+while (\$i < 100000) {
+    nd_add(\$acc, \$small, \$acc);          // the exact-overlap in-place idiom
+    \$i = \$i + 1;
+}
+\$driftU = nd_live_bytes() - \$baseU;
+
+// Every shape-mismatched call must raise rather than corrupt, 60,000 times.
+\$badRaised = 0;
+\$i = 0;
+while (\$i < 20000) {
+    try { nd_add(nd_zeros([3], null), nd_zeros([4], null), null); } catch (\$e2) { \$badRaised = \$badRaised + 1; }
+    try { nd_add(\$small, \$small, nd_broadcast_to(nd([0], null), [64])); } catch (\$e2) { \$badRaised = \$badRaised + 1; }
+    try { nd_add(\$small, \$small, nd_zeros([9], null)); } catch (\$e2) { \$badRaised = \$badRaised + 1; }
+    \$i = \$i + 1;
+}
+\$driftB = nd_live_bytes() - \$baseU;
+writefile("$TMP/ufunc", str(\$addMs) + "," + str(\$sqrtMs) + "," + str(\$driftU) + "," +
+                        str(\$badRaised) + "," + str(\$driftB) + "," +
+                        str(\$emptyMs) + "," + str(\$zeroMs));
 writefile("$TMP/done", "1");
 BEOF
 
@@ -217,6 +266,28 @@ check "$([ "$ALLOC" -lt 300 ] && echo 1 || echo 0)" "10M-element allocation unde
 check "$([ "$VMS" -lt 50 ] && echo 1 || echo 0)"    "a view of 10M elements is free (no copy)"
 check "$([ "$SMS" -lt 50 ] && echo 1 || echo 0)"    "a strided slice of 10M elements is free too"
 check "$([ "$SSIZE" = "5000000" ] && echo 1 || echo 0)" "and the slice has the right length"
+
+echo ""
+echo "-- ufuncs at scale --"
+IFS=, read -r ADDMS SQRTMS DRIFTU BADRAISED DRIFTB EMPTYMS ZEROMS < "$TMP/ufunc"
+# 10M f64 add moves 3 x 80MB. Reported as GB/s so the number is comparable
+# across machines; the threshold is deliberately per-platform (N22), because a
+# single core sustains only ~10 concurrent L1 misses and cannot saturate DRAM.
+echo "        10M nd_add ${ADDMS}ms, nd_sqrt ${SQRTMS}ms"
+check "$([ "$ADDMS" -lt 120 ] && echo 1 || echo 0)" \
+      "10M nd_add under 120ms (>= 2 GB/s effective even on a slow shared vCPU)"
+check "$([ "$SQRTMS" -lt 200 ] && echo 1 || echo 0)" "10M nd_sqrt under 200ms"
+echo "        nd_empty ${EMPTYMS}ms vs nd_zeros ${ZEROMS}ms for 10M f64"
+check "$([ "$EMPTYMS" -le "$ZEROMS" ] && echo 1 || echo 0)" \
+      "nd_empty does not pay to touch pages it is about to overwrite (N20)"
+echo "        100,000 in-place nd_add(a,b,a): live-byte drift ${DRIFTU}B"
+check "$([ "$DRIFTU" = "0" ] && echo 1 || echo 0)" \
+      "the exact-overlap out= path allocates NO temporary, 100,000 times"
+echo "        ${BADRAISED} rejected ufunc calls; drift ${DRIFTB}B"
+check "$([ "$BADRAISED" = "60000" ] && echo 1 || echo 0)" \
+      "every one of 60,000 bad ufunc calls raised (shape, read-only out, wrong-size out)"
+check "$([ "$DRIFTB" = "0" ] && echo 1 || echo 0)" \
+      "and none of them leaked a partially-built result"
 
 wait "$PID" 2>/dev/null
 echo ""

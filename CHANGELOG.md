@@ -9,6 +9,14 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] numba can do arithmetic** — element-wise operations across ~55 functions: arithmetic,
+  29 transcendentals, comparisons, boolean logic, `nd_where`, `nd_clip`, `nd_isclose` and
+  `nd_allclose`. Shapes broadcast the way NumPy's do, so a `(2,3)` array and a `(3,)` row combine
+  without copying anything, and a mismatch names the axis and both extents rather than saying only
+  "shape mismatch". Scalars and ordinary Bantu lists work as operands directly — `nd_add($a, 2)`.
+  Every function takes an optional destination, which is what lets a loop over large arrays run in
+  constant memory instead of allocating a new 80 MB result each iteration.
+
 - **[feature] numba's allocation limit is enforceable by whoever runs the process** —
   `BANTU_ND_MAX_BYTES` sets a hard ceiling on the memory numba may hold, read once at startup.
   `nd_max_bytes(n)` can lower a program's own limit but never raise it past that, so an operator
@@ -82,6 +90,14 @@ All notable changes to the Bantu programming language are documented in this fil
   recipient, and degrades to in-app-only when push is unavailable.
 
 ### Fixed
+
+- **[bug fix] Bantu could not read the numbers it prints** — `str(0.000012345678)` produces
+  `"1.23457e-05"`, but writing that back into a program failed with `Undefined variable: e`, because
+  the lexer stopped at the `e` and read the rest as an identifier. Scientific notation now lexes
+  (`1e3`, `1E3`, `2.5e2`, `1e-3`, `1e+3`), so anything `str()` emits can be read back. The JSON
+  parser accepted exponents all along, so the two halves of the language had disagreed about what a
+  number is. A variable named `e` still works, and `2.5.round()` still parses — the exponent is only
+  consumed when digits actually follow.
 
 - **[bug fix] numba array slicing accepted arguments that were not numbers** — `nd_slice` read the
   numeric field of whatever `Value` it was given, which is `0` for a list, a string or null, so
