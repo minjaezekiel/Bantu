@@ -12,6 +12,8 @@
 #include "ndarray_native.hpp"
 #include "ndarray_api.hpp"
 #include "ndarray_ufunc_reg.hpp"
+#include "ndarray_reduce_reg.hpp"
+#include "ndarray_sort_reg.hpp"
 
 namespace numba {
 
@@ -575,6 +577,16 @@ void registerBuiltins(const DefineFn& define) {
                                      a[2].toString() + ")");
         }
         const double v = a[2].isBool() ? (a[2].boolVal ? 1.0 : 0.0) : a[2].numberVal;
+        // NaN and +-inf have no integer representation, and the conversion is
+        // silent: llround(NaN) is INT64_MIN and (int64_t)inf is 0 -- the second
+        // being worse, because 0 looks like a real answer. NumPy raises here
+        // for the same reason. bool is left alone: NaN is truthy, which is a
+        // defensible answer and also NumPy's.
+        if (x->dtype == DType::I64 && (std::isnan(v) || std::isinf(v))) {
+            throw std::runtime_error("nd_set: cannot store " + a[2].toString() +
+                " in an i64 array -- it has no integer representation. Use an f64 array, "
+                "or nd_astype(a, \"f64\") first");
+        }
         const size_t flat = (x->ndim() == 0) ? x->offset
                                              : flatOffset(*x, indexList(a[1], *x, "nd_set"));
         setFromDouble(*x, flat, v);
@@ -930,6 +942,8 @@ void registerBuiltins(const DefineFn& define) {
 
     registerUfuncs(define);
     registerUfuncExtras(define);
+    registerReductions(define);
+    registerSorting(define);
 }
 
 // A scalar, a nested list or an array all become an array, so `nd_add($a, 2)`

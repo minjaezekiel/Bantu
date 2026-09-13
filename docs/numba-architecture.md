@@ -409,6 +409,69 @@ one idiom that allocates.
 `nd_shares_memory` (N19) is the overlap test, deliberately conservative like `np.may_share_memory`:
 a false positive costs one defensive copy, a false negative costs a wrong answer.
 
+### 4.8 Reductions: the axis plan
+
+A reduction splits the input's axes into two groups and walks them separately:
+
+- **outer** — the axes that survive. One odometer step per output element.
+- **inner** — the axes being reduced. A full sweep per output element.
+
+`axis` accepts null (reduce everything, giving a 0-d array), a number, or a list. Negative axes count
+from the end. `keepdims` leaves the reduced axes in the shape as extent 1, which is what makes the
+result broadcast back against the input — the single most useful thing about it, and the reason it is
+not an afterthought:
+
+```bantu
+$centred = np.subtract($m, np.mean($m, 1, true));   // keepdims makes this line work
+```
+
+The inner axes are **coalesced** before the sweep, exactly as in §4.2. That matters more here than
+for ufuncs: reducing the last axis of a C-contiguous array, or reducing everything, collapses to a
+single stride-1 run, which is what lets the accurate-summation fast path below apply at all.
+
+**Empty slices return the operation's identity, not an error**: `sum` → 0, `prod` → 1, `any` → false,
+`all` → true. `min`/`max`/`argmin`/`argmax` of an empty slice **raise**, because there is no identity
+and returning 0 or ±inf would be a silently wrong answer.
+
+### 4.9 Accuracy is a correctness property, not a quality-of-implementation detail
+
+A naive accumulator loses roughly `n · eps` relative accuracy. Summing 10M copies of `0.1` that is
+~2e-12 — and people *will* diff numba against NumPy, which does pairwise. So the gate is a real one:
+**relative error below 1e-12 for that sum**, which a naive loop fails by construction.
+
+`sum` and `mean` use **binary-tree (pairwise) accumulation**, carried like a binary counter:
+
+```
+add(v):  c = count++;  k = 0
+         while (c & 1) { v += partial[k];  c >>= 1;  k++ }
+         partial[k] = v
+total(): sum of partial[k] for every set bit k of count
+```
+
+After `n` elements, each set bit `k` of `n` holds the sum of a block of exactly `2^k` values, so the
+error grows as `log n` rather than `n`, and — unlike a recursive formulation — it works for a
+**strided** walk in one pass with `O(log n)` state. The contiguous path feeds it 128-element blocks
+summed with unrolled accumulators, so the fast case keeps the vectorized loop and the accurate
+structure at once.
+
+`var` and `std` use **Welford**, one pass. Two-pass is marginally more accurate but reads the data
+twice, and these operations are bandwidth-bound (§4.3) — a second pass is a 2× cost for a difference
+that does not show up against the 1e-12 gate.
+
+### 4.10 Sorting and NaN
+
+`sort` and `argsort` operate along one axis, last by default. **NaN sorts to the end**, matching
+NumPy — not because it is principled, but because `<` is false for every NaN comparison, so *some*
+rule has to be imposed and users already know that one. `argsort` is **stable**, so equal elements
+keep their input order and the result is reproducible run to run.
+
+### 4.11 Indexing
+
+`take`/`put` address along one axis; boolean masks go through `compress` and `nonzero`. Out-of-range
+indices **raise**, naming the axis, its extent and the offending value. NumPy's negative-index
+wrapping is supported — `-1` is the last element — but a mask whose length does not match its axis is
+an error rather than a silent truncation, which is where NumPy itself is unhelpfully permissive.
+
 ---
 
 ## 5. The Bantu-facing design

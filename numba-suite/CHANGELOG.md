@@ -382,3 +382,83 @@ Three, all in this phase's own code, all found by measurement rather than review
 | 60,000 rejected ufunc calls (bad shape, read-only `out`, wrong-size `out`) | all raised; drift **0 bytes** |
 | 10M `nd_add` / `nd_sqrt` | 13 ms / 12 ms |
 | `nd_empty` vs `nd_zeros`, 10M f64 | 0 ms vs 43 ms |
+
+---
+
+## Phase 3 — Reductions, scans, sorting, indexing ✅
+
+Feature suite `tests/numba_reduce_test.b` **137/137**; stress `tests/numba_stress.sh` **26/26**;
+full regression **71/71** (macOS arm64).
+
+### What landed
+
+- **[feature]** 20 reductions with `axis` (null / a number / a list, negatives counting from the end)
+  and `keepdims`: `sum prod mean var std min max ptp argmin argmax any all count_nonzero median
+  quantile` plus `nansum nanmean nanmin nanmax`.
+- **[feature]** Scans — `cumsum cumprod cummax cummin diff` — along any axis, flattening when no axis
+  is given.
+- **[feature]** Sorting and search: `sort`, `argsort` (**stable**), `searchsorted` with a `side`,
+  `unique`, `bincount` with `minlength`, `histogram` with an optional range.
+- **[feature]** Fancy and boolean indexing: `take` (per-axis, negative indices allowed), `put`
+  (in place, honouring `requireWritable`), `compress`, `nonzero`.
+
+### Accuracy — the gate that a naive implementation fails by construction
+
+`sum`/`mean` use binary-tree accumulation carried like a binary counter, so error grows as `log n`
+rather than `n`, and — unlike a recursive formulation — it works for a **strided** walk in one pass
+with `O(log n)` state. The contiguous path feeds it 128-element blocks summed with eight unrolled
+accumulators, keeping the vectorized loop and the accurate structure at once.
+
+| | |
+|---|---|
+| sum of 10M copies of `0.1`, relative error | **2.33e-16** |
+| the gate | < 1e-12 |
+| what a naive accumulator loses (`n·eps`) | ~2e-12 — it fails this by design |
+
+`var`/`std` use Welford, one pass, which survives a 1e9 offset that destroys the textbook
+sum-of-squares formula (asserted).
+
+### Semantics worth knowing
+
+Empty slices return the operation's **identity** where one exists — `sum` → 0, `prod` → 1, `any` →
+false, `all` → true — and `min`/`max`/`argmin`/`argmax` of an empty slice **raise**, because there is
+no identity and returning 0 or ±inf would be a silently wrong answer. `mean` of nothing is NaN, as in
+NumPy. Reductions **propagate** NaN; the `nan*` forms skip it, and an all-NaN slice gives NaN rather
+than 0. NaN **sorts last**, matching NumPy — some rule must be imposed since every comparison with
+NaN is false. `argsort` is stable, so ties keep input order and results are reproducible.
+
+### Performance
+
+| | measured | roadmap target |
+|---|---|---|
+| 10M `nd_sum` | **4 ms** | ≤ 12 ms |
+| 1M `nd_argsort` | 142 ms | ≤ 80 ms — **missed** |
+
+`nd_argsort` is honestly over target. It materialises the lane into a `double` buffer and an index
+buffer before `std::stable_sort`, which is two allocations and an indirection per comparison;
+`col_argsort` does 73 ms on a typed array without that. Not chased here because the roadmap's 80 ms
+came from a different data path, and the fix (a typed direct-on-buffer sort) belongs with the same
+work that would parallelise it. Recorded rather than quietly re-baselined.
+
+### Defect found and fixed
+
+- **[bug fix]** **Storing NaN or ±infinity in an integer array corrupted it silently.**
+  `nd_set(nd([1,2],"i64"), 0, NaN)` wrote **INT64_MIN**, and storing infinity wrote **0** — the second
+  being worse, because 0 looks like a real answer rather than obvious garbage. Neither value has an
+  integer representation, and the conversion happened without a word. `nd_set` now raises, naming the
+  fix (`nd_astype(a, "f64")`); NumPy raises for the same reason. `bool` is deliberately left alone —
+  NaN is truthy there, which is defensible and also NumPy's behaviour.
+
+  Worth recording *why* this was easy to hit: Bantu has a single number type, so `nd([1.0, 2.0])`
+  infers **i64** — `1.0` and `1` are the same `Value` and numba cannot tell them apart. Anything that
+  will hold a NaN has to ask for `"f64"` explicitly. That is a documented consequence of the language,
+  not a numba choice, but it is the reason the silent corruption was reachable from ordinary code.
+
+### Stress
+
+| | result |
+|---|---|
+| 10M `nd_sum` accuracy at scale | relative error **2.33e-16** |
+| 1M `argsort`, permutation applied to the input | reproduces `nd_sort` **exactly** |
+| 1M already-sorted / reverse-sorted / all-equal | all three sort correctly |
+| 40,000 bad reduction and indexing calls | all raised; live-byte drift **0** |

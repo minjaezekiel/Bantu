@@ -201,6 +201,56 @@ while (\$i < 20000) {
 writefile("$TMP/ufunc", str(\$addMs) + "," + str(\$sqrtMs) + "," + str(\$driftU) + "," +
                         str(\$badRaised) + "," + str(\$driftB) + "," +
                         str(\$emptyMs) + "," + str(\$zeroMs));
+
+// ── 7. reductions, scans, sorting at scale ──────────────────────────────
+\$t0 = clock();
+\$sm = nd_get(nd_sum(\$u, null, null), []);
+\$sumMs = clock() - \$t0;
+
+// Accuracy at scale, which is the whole reason for pairwise accumulation:
+// a naive accumulator loses about n*eps, ~2e-12 at ten million elements.
+\$tenth = nd_full([10000000], 0.1, null);
+\$exact = nd_get(nd_sum(\$tenth, null, null), []);
+\$relerr = (\$exact - 1000000.0) / 1000000.0;
+if (\$relerr < 0) { \$relerr = 0 - \$relerr; }
+\$tenth = 0;
+
+\$mid = nd_random_uniform([1000000], 0, 1);
+\$t0 = clock();
+\$as = nd_argsort(\$mid, null);
+\$argMs = clock() - \$t0;
+// The permutation must actually sort: applying it reproduces nd_sort's output.
+\$sortOk = nd_array_equal(nd_take(\$mid, \$as, null), nd_sort(\$mid, null));
+
+// Degenerate inputs at scale: already sorted, reverse sorted, all equal.
+\$asc  = nd_arange(0, 1000000, null);
+\$desc = nd_flip(\$asc, null);
+\$same = nd_full([1000000], 7, null);
+\$degenOk = 0;
+if (nd_array_equal(nd_sort(\$asc, null), \$asc))            { \$degenOk = \$degenOk + 1; }
+if (nd_array_equal(nd_sort(\$desc, null), \$asc))           { \$degenOk = \$degenOk + 1; }
+if (nd_array_equal(nd_sort(\$same, null), \$same))          { \$degenOk = \$degenOk + 1; }
+\$asc = 0; \$desc = 0; \$same = 0; \$as = 0; \$mid = 0;
+
+// 40,000 bad reduction and indexing calls: every one raises, nothing leaks.
+\$small2 = nd_arange(0, 16, null);
+// Baseline AFTER every operand exists. Anything allocated between the baseline
+// and the measurement is legitimately live and would read as drift -- this is
+// the third time that has caught a check in this file.
+\$baseR = nd_live_bytes();
+\$redBad = 0;
+\$i = 0;
+while (\$i < 10000) {
+    try { nd_min(nd_zeros([0], null), null, null); } catch (\$e3) { \$redBad = \$redBad + 1; }
+    try { nd_sum(\$small2, 5, null); }               catch (\$e3) { \$redBad = \$redBad + 1; }
+    try { nd_take(\$small2, nd([99], null), null); } catch (\$e3) { \$redBad = \$redBad + 1; }
+    try { nd_compress(nd_zeros([3], null), \$small2); } catch (\$e3) { \$redBad = \$redBad + 1; }
+    \$i = \$i + 1;
+}
+\$driftR = nd_live_bytes() - \$baseR;
+writefile("$TMP/reduce", str(\$sumMs) + "," + str(\$relerr) + "," + str(\$argMs) + "," +
+                         str(\$sortOk) + "," + str(\$degenOk) + "," + str(\$redBad) + "," +
+                         str(\$driftR));
 writefile("$TMP/done", "1");
 BEOF
 
@@ -288,6 +338,25 @@ check "$([ "$BADRAISED" = "60000" ] && echo 1 || echo 0)" \
       "every one of 60,000 bad ufunc calls raised (shape, read-only out, wrong-size out)"
 check "$([ "$DRIFTB" = "0" ] && echo 1 || echo 0)" \
       "and none of them leaked a partially-built result"
+
+echo ""
+echo "-- reductions, scans and sorting at scale --"
+IFS=, read -r SUMMS RELERR ARGMS SORTOK DEGENOK REDBAD DRIFTR < "$TMP/reduce"
+echo "        10M nd_sum ${SUMMS}ms; 1M nd_argsort ${ARGMS}ms"
+check "$([ "$SUMMS" -lt 150 ] && echo 1 || echo 0)" "10M nd_sum under 150ms"
+check "$([ "$ARGMS" -lt 2000 ] && echo 1 || echo 0)" "1M nd_argsort under 2000ms"
+echo "        10M x 0.1 relative error: ${RELERR}"
+# A naive accumulator lands near 2e-12 here, so this threshold is a real gate.
+check "$(awk -v e="$RELERR" 'BEGIN{print (e < 1e-12) ? 1 : 0}')" \
+      "pairwise summation holds 10M x 0.1 under 1e-12 (naive fails by construction)"
+check "$([ "$SORTOK" = "true" ] && echo 1 || echo 0)" \
+      "argsort's permutation on 1M elements reproduces sort's output exactly"
+check "$([ "$DEGENOK" = "3" ] && echo 1 || echo 0)" \
+      "1M already-sorted, reverse-sorted and all-equal inputs all sort correctly"
+echo "        ${REDBAD} rejected reduction/indexing calls; drift ${DRIFTR}B"
+check "$([ "$REDBAD" = "40000" ] && echo 1 || echo 0)" \
+      "every one of 40,000 bad reduction and indexing calls raised"
+check "$([ "$DRIFTR" = "0" ] && echo 1 || echo 0)" "and none of them leaked"
 
 wait "$PID" 2>/dev/null
 echo ""

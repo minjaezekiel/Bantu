@@ -101,16 +101,24 @@ result and they are slower here. See `numba-suite/CHANGELOG.md` and `docs/numba-
 | `nd_empty` genuinely uninitialised (N20) ✅ | skip the `memset` for it alone; live-byte accounting still bounds it | contents unspecified but shape/dtype/strides correct | allocation of 10M `nd_empty` is **not** charged 40 ms of page-touching | [ ] |
 | Vectorization actually happened ✅ | `-O3` per-file override + CI grep of `-fopt-info-vec-optimized` | — | tier-0 loops present in the log on **both** Linux GCC and macOS Clang | [ ] |
 
-## Phase 3 — Reductions with `axis`, scans, sorting, indexing
+## Phase 3 — Reductions with `axis`, scans, sorting, indexing ✅
+
+`tests/numba_reduce_test.b` **137/137**; stress **26/26**; regression **71/71**. The accuracy gate
+came out at **2.33e-16** relative for 10M copies of `0.1`, against the 1e-12 threshold a naive
+accumulator fails by construction. 10M `nd_sum` at **4 ms** (target 12). One target missed honestly:
+1M `nd_argsort` at **142 ms** against 80 — see `numba-suite/CHANGELOG.md` for why it is recorded
+rather than re-baselined. One defect found and fixed: storing NaN or infinity in an i64 array wrote
+INT64_MIN and 0 respectively, silently.
+
 
 | Item | How | Feature test | Stress test | Status |
 |---|---|---|---|---|
-| Reductions with `axis`/`keepdims` | `axis` accepts null / number / list | `tests/numba_reduce_test.b` | every axis and axis-pair of a (7,5,3) array vs embedded NumPy reference values | [ ] |
-| **Accuracy** | pairwise summation for `sum`/`mean`; Welford for `var`/`std` | ″ | **sum of 10M copies of 0.1 → rel err < 1e-12** (a naive accumulator fails this by design) | [ ] |
-| Scans, `diff`, `nan*` variants | `cumsum/cumprod/cummax/cummin` | ″ | all-NaN slices; empty axes | [ ] |
-| Sorting and search | `sort/argsort/partition/argpartition/searchsorted/unique/unique_counts/bincount/histogram` | ″ | 10M sort; already-sorted and reverse-sorted; all-equal; NaN ordering | [ ] |
-| Fancy and boolean indexing | `take/put/mask/compress/nonzero/where` | ″ | out-of-range indices **raise**; empty masks; a mask of the wrong length | [ ] |
-| Performance | — | — | 10M `nd_sum` ≤ 12 ms; 1M `nd_argsort` ≤ 80 ms (`col_argsort` does 73 ms) | [ ] |
+| Reductions with `axis`/`keepdims` ✅ | `axis` accepts null / number / list | `tests/numba_reduce_test.b` | every axis and axis-pair of a (7,5,3) array vs embedded NumPy reference values | [ ] |
+| **Accuracy** ✅ **2.33e-16** | pairwise summation for `sum`/`mean`; Welford for `var`/`std` | ″ | **sum of 10M copies of 0.1 → rel err < 1e-12** (a naive accumulator fails this by design) | [ ] |
+| Scans, `diff`, `nan*` variants ✅ | `cumsum/cumprod/cummax/cummin` | ″ | all-NaN slices; empty axes | [ ] |
+| Sorting and search ✅ | `sort/argsort/partition/argpartition/searchsorted/unique/unique_counts/bincount/histogram` | ″ | 10M sort; already-sorted and reverse-sorted; all-equal; NaN ordering | [ ] |
+| Fancy and boolean indexing ✅ | `take/put/mask/compress/nonzero/where` | ″ | out-of-range indices **raise**; empty masks; a mask of the wrong length | [ ] |
+| Performance — `nd_sum` ✅, `nd_argsort` ⚠ | — | — | 10M `nd_sum` **4 ms** (target 12) ✅; 1M `nd_argsort` **142 ms** against a target of 80 — **missed**, recorded not re-baselined: it materialises a double buffer plus an index buffer before `std::stable_sort`, where `col_argsort`'s 73 ms is a typed direct-on-buffer sort. The fix belongs with the work that would parallelise it | [ ] |
 
 ## Phase 4 — Interpreter operator / index / dot dispatch  *(a language change)*
 

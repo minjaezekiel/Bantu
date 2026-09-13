@@ -9,6 +9,18 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] numba summarises data** — 20 reductions (`sum`, `mean`, `std`, `var`, `min`, `max`,
+  `median`, `quantile`, `argmin`, `argmax`, `any`, `all`, the `nan*` forms and more), each taking an
+  axis — one, several, or all — and an optional `keepdims` that leaves the reduced axis as length 1
+  so the result broadcasts straight back against the input. Plus running totals (`cumsum`,
+  `cumprod`, `cummax`, `cummin`, `diff`), sorting (`sort`, `argsort`, `searchsorted`, `unique`,
+  `bincount`, `histogram`) and indexing (`take`, `put`, `compress`, `nonzero`).
+
+  Summing is accurate, not merely fast: adding ten million copies of `0.1` comes out with a relative
+  error of 2e-16, where an ordinary running total would drift by about 2e-12. Empty input returns the
+  operation's identity where there is one — nothing sums to 0 and nothing multiplies to 1 — while
+  `min` of nothing raises, because any answer would be a wrong one.
+
 - **[feature] numba can do arithmetic** — element-wise operations across ~55 functions: arithmetic,
   29 transcendentals, comparisons, boolean logic, `nd_where`, `nd_clip`, `nd_isclose` and
   `nd_allclose`. Shapes broadcast the way NumPy's do, so a `(2,3)` array and a `(3,)` row combine
@@ -90,6 +102,13 @@ All notable changes to the Bantu programming language are documented in this fil
   recipient, and degrades to in-app-only when push is unavailable.
 
 ### Fixed
+
+- **[bug fix] Storing NaN or infinity in an integer array corrupted it silently** — writing NaN into
+  an `i64` numba array stored `-9223372036854775808`, and writing infinity stored `0`, which is worse
+  because it looks like a real answer. Neither has an integer representation, and nothing said so. It
+  now raises and names the fix. Note that Bantu has a single number type, so `nd([1.0, 2.0])` creates
+  an **integer** array — `1.0` and `1` are the same value — which is why this was reachable from
+  ordinary-looking code. Ask for `"f64"` explicitly when an array needs to hold NaN.
 
 - **[bug fix] Bantu could not read the numbers it prints** — `str(0.000012345678)` produces
   `"1.23457e-05"`, but writing that back into a program failed with `Undefined variable: e`, because
