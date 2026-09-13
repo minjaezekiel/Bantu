@@ -26,7 +26,8 @@ its path, or serves it over `sua.server` and prints the URL. That is a real limi
 the docs rather than worked around.
 
 **It is not** a raster library until B6. Anti-aliased rasterisation means touching every pixel; a
-1000×1000 image is a million pixels at ~1 µs per interpreted operation, which is minutes per figure.
+1000×1000 image is a million pixels at ~0.38 µs per interpreted operation, which is still most of a
+minute per figure.
 That half cannot be pure Bantu and is designed as a native backend below (§10).
 
 ---
@@ -39,7 +40,7 @@ because **the work is proportional to the number of drawn elements, not the numb
 
 A chart is a few hundred SVG elements. A 100,000-point line is *one* `<polyline>`. An 800×600 figure
 has perhaps 20 ticks, 40 tick labels, 5 text items, a legend and a handful of paths. At the
-interpreter's measured ~1 µs per operation, a few thousand operations is a few milliseconds. The
+interpreter's measured ~0.38 µs per operation, a few thousand operations is around a millisecond. The
 interpreter is fast enough for the object model, the layout, the scales and the tick algorithm.
 
 **But it is not fast enough for the naive way of building the output string**, and that is the one
@@ -82,7 +83,16 @@ total length, so the whole build becomes O(n) with a single allocation of the fi
 
 This is a language fix, not a bplot fix. It benefits every Bantu program that assembles text —
 HTML templating in `sua`, CSV writing, log formatting — and it closes an asymmetry (`split` without
-`join`) that was always a gap. It lands in **B0**.
+`join`) that was always a gap. It landed in **B0**.
+
+> **Update, after B0.** This section originally went on to reject fixing `+` itself, on the grounds
+> that it would need a rope or a refcounted builder inside `Value`. That was wrong, and the fix
+> landed too: when the result of `x + y` is assigned straight back to `x`, the old value is dead and
+> can be appended to in place — a peephole in `evalAssign`, no change to `Value`, and what CPython
+> does. **`$s = $s + $part` is now linear**, 6,752 ms → **23 ms** at 40,000 appends. `join` remains
+> the right idiom when the pieces are already a list, and it is what bplot uses; but a user who
+> reaches for `+=` no longer falls off a cliff. See
+> [`interpreter-performance.md`](interpreter-performance.md) §3.
 
 ### 2.3 Fix two — path simplification, which is the *real* answer
 
@@ -258,7 +268,7 @@ Ticks are computed from the *view* limits, and view limits are computed from the
 5% margin (matplotlib's default), then rounded outward to tick boundaries when the user has not set
 limits explicitly. Log scales locate ticks at decades, with minor ticks at 2..9 × decade.
 
-**Computing data limits over 100,000 points must not be a Bantu loop** (100k × ~1 µs = ~100 ms per
+**Computing data limits over 100,000 points must not be a Bantu loop** (100k × ~0.38 µs = ~38 ms per
 axis). It is one native call: `max($list)` / `min($list)` over a list (B0 makes them accept one), or
 `nd_max` / `nd_min` when the data is already a numba array (B4). NaN is skipped for limits — the
 limit routine filters explicitly rather than relying on `max`, because the *language* `max`
@@ -423,7 +433,7 @@ which `jet` famously does not; `jet` is not shipped.
 | | SVG (B1–B5) | raster (B6) |
 |---|---|---|
 | work per figure | proportional to **elements** (~10³) | proportional to **pixels** (~10⁶) |
-| at ~1 µs per interpreted op | milliseconds | **minutes** |
+| at ~0.38 µs per interpreted op | ~1 ms | **most of a minute** |
 | verdict | pure Bantu | must be native |
 
 B6 adds `bp_*` primitives: a scanline anti-aliased polygon rasteriser, stroke-to-path conversion, and

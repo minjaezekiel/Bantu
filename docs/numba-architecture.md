@@ -520,7 +520,8 @@ Value evalBinaryOp(BinaryOpNode* n) {
 ```
 
 The added work in the common path is one integer compare and one well-predicted branch — roughly
-0.3–1 ns, against a measured ~1 µs per interpreted loop iteration. That is 0.03–0.1%, below the
+0.3-1 ns, against a measured ~0.38 us per interpreted loop iteration (~1 us when this was written;
+see docs/interpreter-performance.md). That is still around 0.1%, below the
 benchmark noise floor. For scale: constructing the returned `Value` is already far more expensive,
 because it default-constructs a `std::string`, a `std::vector<Value>`, a `std::function` and three
 `shared_ptr`s on every arithmetic result.

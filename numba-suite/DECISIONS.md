@@ -10,8 +10,10 @@ Full reasoning with measurements lives in [`docs/numba-architecture.md`](../docs
 ### N1 — Native atoms + pure-Bantu library (arctic's A1, reapplied)
 **Decision:** Add native *primitives* (an `NdArray` type, `nd_*` kernels); write `numba` (the API,
 defaults, composed helpers) in pure Bantu on top.
-**Why:** the interpreter costs ~1 µs per element (1M-iteration loop: 196 ms built-in harness,
-1,169 ms pure Bantu) and a `Value` is ~190 bytes carrying a string, a vector, a `std::function` and
+**Why:** the interpreter costs ~0.38 µs per element (1M-iteration loop, measured on an i7-9750H:
+383 ms pure Bantu, down from 2,119 ms before the dispatch fix of
+[`docs/interpreter-performance.md`](../docs/interpreter-performance.md) -- which does not change
+this conclusion, since NumPy-class is ~10 ns per element, forty times faster still) and a `Value` is ~190 bytes carrying a string, a vector, a `std::function` and
 three `shared_ptr`s at once. Any element loop written in Bantu is a toy. This is the split arctic
 already proved in production.
 **Rejected:** a pure-Bantu ndarray (unusable); a full native library with no Bantu layer (not

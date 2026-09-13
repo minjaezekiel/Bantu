@@ -40,6 +40,27 @@ public:
         return Value();
     }
 
+    // The slot `assign()` would write to -- but only if it ALREADY exists
+    // within the window assign() searches, which is this scope up to and
+    // including the nearest function boundary. Never creates a binding, and
+    // refuses a const so the caller falls back and assign() raises as usual.
+    //
+    // Exists so that `$s = $s + …` can append into the string in place without
+    // guessing where assign() would have put the result. Resolving it any other
+    // way would be subtly wrong: getRef() walks the WHOLE chain, so inside a
+    // function it would find and mutate a global that assign() would instead
+    // have shadowed with a new local.
+    Value* existingAssignSlot(const std::string& name) {
+        Environment* e = this;
+        while (true) {
+            auto it = e->variables.find(name);
+            if (it != e->variables.end())
+                return e->constNames.count(name) ? nullptr : &it->second;
+            if (e->functionScope || !e->parent) return nullptr;
+            e = e->parent.get();
+        }
+    }
+
     // Like getRef, but reports a missing name instead of raising. One walk of
     // the scope chain answers both "is it there?" and "where is it?" —
     // has() followed by getRef() walks it twice, which is measurable on a path

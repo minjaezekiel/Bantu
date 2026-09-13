@@ -2551,7 +2551,75 @@ private:
     Value evalNode(std::shared_ptr<ASTNode>& node) {
         if (!node) return Value();
 
-        // Dispatch by dynamic cast
+        // ── Dispatch ────────────────────────────────────────────────────
+        // One byte load and one jump table. This used to be the chain of 38
+        // dynamic_casts kept below as the default: arm -- which a profile of a
+        // 20M-iteration arithmetic loop measured at **79.6% of all interpreter
+        // time**, four times everything else in the process combined. A failing
+        // dynamic_cast is a hierarchy walk inside libc++abi, not a comparison,
+        // and the chain was ordered by when each node type was added rather
+        // than by how often it runs: every CallNode paid for nineteen failed
+        // searches before reaching its own arm.
+        //
+        // Ordering here is irrelevant -- that is the point. Adding a node type
+        // costs nothing at run time, and omitting its case is a compiler
+        // warning (-Wswitch on an unhandled enumerator) where omitting a line
+        // from the old chain was silent.
+        //
+        // See docs/interpreter-performance.md. NODE() is a static_cast in a
+        // normal build and a checked one under -DBANTU_CHECK_NODEKIND.
+        #define NODE(K, T) nodeExact<NodeKind::K, T>(node.get())
+        switch (node->kind) {
+            case NodeKind::Number:      return evalNumber(NODE(Number, NumberNode));
+            case NodeKind::String:      return evalString(NODE(String, StringNode));
+            case NodeKind::Bool:        return evalBool(NODE(Bool, BoolNode));
+            case NodeKind::Null:        return Value();
+            case NodeKind::List:        return evalList(NODE(List, ListNode));
+            case NodeKind::Dict:        return evalDict(NODE(Dict, DictNode));
+            case NodeKind::Variable:    return evalVariable(NODE(Variable, VariableNode));
+            case NodeKind::VarDecl:     return evalVarDecl(NODE(VarDecl, VarDeclNode));
+            case NodeKind::Assign:      return evalAssign(NODE(Assign, AssignNode));
+            case NodeKind::IndexAssign: return evalIndexAssign(NODE(IndexAssign, IndexAssignNode));
+            case NodeKind::DictAssign:  return evalDictAssign(NODE(DictAssign, DictAssignNode));
+            case NodeKind::BinaryOp:    return evalBinaryOp(NODE(BinaryOp, BinaryOpNode));
+            case NodeKind::UnaryOp:     return evalUnaryOp(NODE(UnaryOp, UnaryOpNode));
+            case NodeKind::If:          return evalIf(NODE(If, IfNode));
+            case NodeKind::While:       return evalWhile(NODE(While, WhileNode));
+            case NodeKind::For:         return evalFor(NODE(For, ForNode));
+            case NodeKind::Each:        return evalEach(NODE(Each, EachNode));
+            case NodeKind::FuncDecl:    return evalFuncDecl(NODE(FuncDecl, FuncDeclNode));
+            case NodeKind::Return:      return evalReturn(NODE(Return, ReturnNode));
+            case NodeKind::Call:        return evalCall(NODE(Call, CallNode));
+            case NodeKind::DotAccess:   return evalDotAccess(NODE(DotAccess, DotAccessNode));
+            case NodeKind::IndexAccess: return evalIndexAccess(NODE(IndexAccess, IndexAccessNode));
+            case NodeKind::TryCatch:    return evalTryCatch(NODE(TryCatch, TryCatchNode));
+            case NodeKind::Break:       throw BreakSignal{};
+            case NodeKind::Continue:    throw ContinueSignal{};
+            case NodeKind::Throw:       return evalThrow(NODE(Throw, ThrowNode));
+            case NodeKind::Switch:      return evalSwitch(NODE(Switch, SwitchNode));
+            case NodeKind::ClassDecl:   return evalClassDecl(NODE(ClassDecl, ClassDeclNode));
+            case NodeKind::Super:       return evalSuper(NODE(Super, SuperNode));
+            case NodeKind::Print:       return evalPrint(NODE(Print, PrintNode));
+            case NodeKind::Channel:     return evalChannel(NODE(Channel, ChannelNode));
+            case NodeKind::Broadcast:   return evalBroadcast(NODE(Broadcast, BroadcastNode));
+            case NodeKind::Stream:      return evalStream(NODE(Stream, StreamNode));
+            case NodeKind::Stun:        return evalStun(NODE(Stun, StunNode));
+            case NodeKind::Relay:       return evalRelay(NODE(Relay, RelayNode));
+            case NodeKind::Signal:      return evalSignal(NODE(Signal, SignalNode));
+            case NodeKind::Connect:     return evalConnect(NODE(Connect, ConnectNode));
+            case NodeKind::Include:     return evalInclude(NODE(Include, IncludeNode));
+            // BlockNode is declared but never constructed -- the parser inlines
+            // statement lists. It reached `return Value()` through the old
+            // chain and still does, by the same route.
+            case NodeKind::Block:       break;
+        }
+        #undef NODE
+
+        // The original chain, retained deliberately. Nothing routes here today;
+        // it exists so that a node type added without a case above evaluates
+        // correctly -- slowly, but correctly -- instead of falling through to
+        // null. A fix that can only fail to accelerate is worth more than one
+        // that can fail.
         if (auto n = dynamic_cast<NumberNode*>(node.get()))    return evalNumber(n);
         if (auto n = dynamic_cast<StringNode*>(node.get()))    return evalString(n);
         if (auto n = dynamic_cast<BoolNode*>(node.get()))      return evalBool(n);
@@ -2641,11 +2709,188 @@ private:
         return val;
     }
 
+    // ── Appending to a string in place ──────────────────────────────────
+    //
+    // [found] `$s = $s + $part` is O(n^2). Every + builds a fresh std::string
+    // holding a copy of the whole accumulated left operand, so building a
+    // 1.16 MB document out of 40,000 pieces moves ~23 GB and takes 6,752 ms.
+    // join() gave Bantu a linear way to build a string; it did not make the
+    // quadratic way stop being quadratic, and the quadratic way is the one
+    // people write.
+    //
+    // The fix is CPython's (unicode_concatenate in ceval.c, since 2.4, and the
+    // reason "string concatenation is quadratic in Python" is folklore rather
+    // than fact): when the result of x + y is assigned straight back to x, x's
+    // old value is dead the moment the assignment lands, so it can be appended
+    // to in place instead of copied.
+    //
+    // The parser has already arranged for this to cover both spellings --
+    // `$s += $x` desugars to exactly AssignNode(s, BinaryOp(PLUS, Var(s), x)).
+    // Walking the left spine covers `$s = $s + $a + $b` too, since + is
+    // left-associative and the leftmost leaf of the chain is the accumulator.
+    //
+    // Every operand is fully evaluated BEFORE anything is appended, which is
+    // what makes `$s = $s + $s` and `$s = $s + f()` (where f touches $s)
+    // correct. Lists and dicts are untouched: this fires only when the target
+    // currently holds a STRING and every piece stringifies.
+    //
+    // Returns false when the shape does not match, and the ordinary path runs.
+    // Can evaluating this subtree rebind a plain variable in the CURRENT scope?
+    //
+    // Only an assignment can, and only one written literally here: a function
+    // called from inside the expression assigns into its own scope, because
+    // Environment::assign stops at the nearest function boundary, so it cannot
+    // reach our slot. An anonymous function appearing as an operand is merely
+    // constructed, not run.
+    //
+    // The whitelist is deliberate: anything not named here answers "yes, it
+    // might", so a node type added later declines the optimisation instead of
+    // silently invalidating its premise.
+    static bool mayRebindLocal(ASTNode* n) {
+        if (!n) return false;
+        switch (n->kind) {
+            case NodeKind::Number: case NodeKind::String: case NodeKind::Bool:
+            case NodeKind::Null:   case NodeKind::Variable:
+            case NodeKind::FuncDecl:                       // constructed, not called
+                return false;
+            case NodeKind::BinaryOp: {
+                auto* b = nodeAs<BinaryOpNode>(n);
+                return mayRebindLocal(b->left.get()) || mayRebindLocal(b->right.get());
+            }
+            case NodeKind::UnaryOp:
+                return mayRebindLocal(nodeAs<UnaryOpNode>(n)->operand.get());
+            case NodeKind::DotAccess:
+                return mayRebindLocal(nodeAs<DotAccessNode>(n)->object.get());
+            case NodeKind::IndexAccess: {
+                auto* ix = nodeAs<IndexAccessNode>(n);
+                return mayRebindLocal(ix->object.get()) || mayRebindLocal(ix->index.get());
+            }
+            case NodeKind::List: {
+                for (auto& e : nodeAs<ListNode>(n)->elements)
+                    if (mayRebindLocal(e.get())) return true;
+                return false;
+            }
+            case NodeKind::Dict: {
+                for (auto& kv : nodeAs<DictNode>(n)->pairs)
+                    if (mayRebindLocal(kv.second.get())) return true;
+                return false;
+            }
+            case NodeKind::Call: {
+                auto* c = nodeAs<CallNode>(n);
+                if (mayRebindLocal(c->callee.get())) return true;
+                for (auto& a : c->args) if (mayRebindLocal(a.get())) return true;
+                return false;
+            }
+            default:
+                return true;
+        }
+    }
+
+    // The purely syntactic half of the test, computed once per site and cached
+    // on the node as a piece count: is this `$x = $x + …`, with operands that
+    // cannot rebind $x? Every `$i = $i + 1` in every loop runs this, so after
+    // the first visit it must be a byte load and nothing more.
+    signed char appendShapeOf(AssignNode* n) {
+        if (n->appendShape >= 0) return n->appendShape;
+
+        BinaryOpNode* top = nodeIf<BinaryOpNode>(n->value.get());
+        if (!top || top->op != BantuTokenType::PLUS) return n->appendShape = 0;
+
+        // `$s + $a + $b` parses as ((s + a) + b): walk the left spine, which is
+        // where the accumulator sits, counting the right operands.
+        int count = 0;
+        BinaryOpNode* cur = top;
+        while (true) {
+            if (++count > 100) return n->appendShape = 0;   // keep it in a signed char
+            if (mayRebindLocal(cur->right.get())) return n->appendShape = 0;
+            BinaryOpNode* nextLeft = nodeIf<BinaryOpNode>(cur->left.get());
+            if (!nextLeft || nextLeft->op != BantuTokenType::PLUS) break;
+            cur = nextLeft;
+        }
+        VariableNode* leaf = nodeIf<VariableNode>(cur->left.get());
+        if (!leaf || leaf->name != n->name) return n->appendShape = 0;
+        return n->appendShape = (signed char)count;
+    }
+
+    // Append one evaluated operand the way evalBinaryOp's PLUS arm would: with
+    // a string on either side it is toString() on both, for every operand type.
+    static void appendOne(std::string& acc, const Value& v) {
+        if (v.isString()) acc += v.stringVal;
+        else              acc += v.toString();
+    }
+
     Value evalAssign(AssignNode* n) {
+        // ── Appending to a string in place ──────────────────────────────
+        //
+        // [found] `$s = $s + $part` is O(n^2). Every + builds a fresh string
+        // holding a copy of the whole accumulated left operand, so assembling
+        // a 1.16 MB document out of 40,000 pieces moves ~23 GB and took
+        // 6,752 ms. join() gave Bantu a linear way to build a string; it did
+        // not make the quadratic way stop being quadratic, and the quadratic
+        // way is the one people write.
+        //
+        // The fix is CPython's (unicode_concatenate in ceval.c, since 2.4,
+        // and the reason "string concatenation is quadratic in Python" is
+        // folklore rather than fact): when the result of x + y is assigned
+        // straight back to x, x's old value is dead the moment the assignment
+        // lands, so it can be appended to rather than copied.
+        //
+        // `$s += $x` is covered for free -- the parser desugars it into
+        // exactly this shape -- and so is `$s = $s + $a + $b`, because + is
+        // left-associative and the accumulator is the leftmost leaf.
+        //
+        // `slot` is resolved ONCE and reused by the ordinary path below, so a
+        // non-string target (`$i = $i + 1`) pays nothing: this lookup replaces
+        // the one Environment::assign would have done rather than adding to
+        // it. Holding it across evaluation is safe because appendShapeOf has
+        // already proved no operand can rebind the name, unordered_map keeps
+        // element addresses stable across insertion, and nothing in the
+        // interpreter ever erases a binding.
+        Value* slot = nullptr;
+        signed char pieces = appendShapeOf(n);
+        if (pieces > 0) {
+            slot = env_->existingAssignSlot(n->name);
+            if (slot && slot->isString()) {
+                std::string& acc = slot->stringVal;
+                if (pieces == 1) {
+                    // Nearly every append is this shape, and it allocates
+                    // nothing: one operand, one Value, one append.
+                    Value v = evalNode(nodeAs<BinaryOpNode>(n->value.get())->right);
+                    appendOne(acc, v);
+                } else {
+                    // Every operand is evaluated before a single byte is
+                    // appended, which is what makes `$s = $s + $s` read the
+                    // old value rather than the buffer being written.
+                    std::vector<Value> vals;
+                    vals.reserve((size_t)pieces);
+                    BinaryOpNode* cur = nodeAs<BinaryOpNode>(n->value.get());
+                    while (true) {
+                        vals.push_back(evalNode(cur->right));
+                        BinaryOpNode* nx = nodeIf<BinaryOpNode>(cur->left.get());
+                        if (!nx || nx->op != BantuTokenType::PLUS) break;
+                        cur = nx;
+                    }
+                    // Collected right-to-left down the spine; applied in the
+                    // order the operators are written.
+                    size_t extra = 0;
+                    for (const Value& v : vals) extra += v.isString() ? v.stringVal.size() : 8;
+                    size_t need = acc.size() + extra;
+                    if (need > acc.capacity()) acc.reserve(std::max(need, acc.capacity() * 2));
+                    for (size_t i = vals.size(); i-- > 0; ) appendOne(acc, vals[i]);
+                }
+                // Returning the value would copy the whole accumulated string,
+                // leaving a discarded statement O(n^2) -- the very thing this
+                // exists to fix. parseExpressionStatement marks the statements
+                // whose value nobody reads.
+                return n->resultDiscarded ? Value() : *slot;
+            }
+        }
+
         Value val = evalNode(n->value);
         // Function-local assignment: resolve up to the enclosing function
         // boundary only, else define locally. Prevents a callee from clobbering
         // a caller's/global's variable of the same name (e.g. a loop counter).
+        if (slot) { *slot = std::move(val); return *slot; }   // the slot assign() would have found
         env_->assign(n->name, val);
         return val;
     }
@@ -2714,7 +2959,7 @@ private:
                 obj.listVal.resize(i + 1, Value(0.0));
             }
             obj.listVal[i] = val;
-            if (auto varNode = dynamic_cast<VariableNode*>(n->object.get())) {
+            if (auto varNode = nodeIf<VariableNode>(n->object.get())) {
                 env_->set(varNode->name, obj);
             }
             return val;
@@ -2723,7 +2968,7 @@ private:
         if (obj.isObject()) {
             std::string key = idx.toString();
             (*obj.objectVal)[key] = val;
-            if (auto varNode = dynamic_cast<VariableNode*>(n->object.get())) {
+            if (auto varNode = nodeIf<VariableNode>(n->object.get())) {
                 env_->set(varNode->name, obj);
             }
             return val;
@@ -2745,7 +2990,7 @@ private:
 
         if (obj.isObject()) {
             (*obj.objectVal)[n->key] = val;
-            if (auto varNode = dynamic_cast<VariableNode*>(n->object.get())) {
+            if (auto varNode = nodeIf<VariableNode>(n->object.get())) {
                 env_->set(varNode->name, obj);
             }
             return val;
@@ -3993,11 +4238,11 @@ private:
     // mutable Value*, or nullptr if the node isn't a valid lvalue. Powers the
     // in-place list mutators below.
     Value* resolveLValue(ASTNode* node) {
-        if (auto v = dynamic_cast<VariableNode*>(node)) {
+        if (auto v = nodeIf<VariableNode>(node)) {
             if (env_->has(v->name)) return &env_->getRef(v->name);
             return nullptr;
         }
-        if (auto idx = dynamic_cast<IndexAccessNode*>(node)) {
+        if (auto idx = nodeIf<IndexAccessNode>(node)) {
             Value* base = resolveLValue(idx->object.get());
             if (!base) return nullptr;
             Value key = evalNode(idx->index);
@@ -4009,7 +4254,7 @@ private:
             if (base->isObject()) return &(*base->objectVal)[key.toString()];
             return nullptr;
         }
-        if (auto dot = dynamic_cast<DotAccessNode*>(node)) {
+        if (auto dot = nodeIf<DotAccessNode>(node)) {
             Value* base = resolveLValue(dot->object.get());
             if (base && base->isObject()) return &(*base->objectVal)[dot->property];
             // A class instance stores its fields by value, so return a pointer to
@@ -4083,7 +4328,7 @@ private:
         // In-place list mutators (append/push/pop/insert/remove/extend). Resolved
         // here because a native builtin only receives args by value and could not
         // mutate the caller's list. A user-defined function of the same name wins.
-        if (auto callVar = dynamic_cast<VariableNode*>(n->callee.get())) {
+        if (auto callVar = nodeIf<VariableNode>(n->callee.get())) {
             const std::string& fname = callVar->name;
             if (!env_->has(fname) && !n->args.empty() &&
                 (fname == "append" || fname == "push" || fname == "pop" || fname == "insert" ||
@@ -4113,9 +4358,9 @@ private:
         // counter variable. That idiom is used throughout hash.b and crypto.b,
         // so this is the difference between quadratic and linear hashing.
         // Behaviour is unchanged -- same answer, no copy.
-        if (auto callVar = dynamic_cast<VariableNode*>(n->callee.get())) {
+        if (auto callVar = nodeIf<VariableNode>(n->callee.get())) {
             if (callVar->name == "len" && n->args.size() == 1 &&
-                dynamic_cast<VariableNode*>(n->args[0].get())) {
+                nodeIf<VariableNode>(n->args[0].get())) {
                 // Only when `len` is still the builtin: a user-defined len() wins.
                 Value& fn = env_->getRef("len");
                 if (fn.isNativeFn()) {
@@ -4132,7 +4377,7 @@ private:
         // evalDotAccess only ever sees a COPY of the list, so these are resolved
         // against the real storage here. If the receiver isn't an addressable
         // list (e.g. a literal), we fall through to the value-copy methods.
-        if (auto dot = dynamic_cast<DotAccessNode*>(n->callee.get())) {
+        if (auto dot = nodeIf<DotAccessNode>(n->callee.get())) {
             if (dot->property == "push" || dot->property == "pop") {
                 Value* lv = resolveLValue(dot->object.get());
                 if (lv && lv->isList()) {
@@ -4144,7 +4389,7 @@ private:
         }
 
         // Check for 'new ClassName()' pattern
-        if (auto varNode = dynamic_cast<VariableNode*>(n->callee.get())) {
+        if (auto varNode = nodeIf<VariableNode>(n->callee.get())) {
             // Check if it's preceded by 'new' keyword (handled via variable lookup)
             // OR if the variable is a class definition
             if (env_->has(varNode->name)) {
@@ -4224,9 +4469,9 @@ private:
         // into a one-line fix.
         {
             std::string what;
-            if (auto varNode = dynamic_cast<VariableNode*>(n->callee.get())) {
+            if (auto varNode = nodeIf<VariableNode>(n->callee.get())) {
                 what = varNode->name;
-            } else if (auto dotNode = dynamic_cast<DotAccessNode*>(n->callee.get())) {
+            } else if (auto dotNode = nodeIf<DotAccessNode>(n->callee.get())) {
                 what = dotNode->property;
             }
             std::string holds;
@@ -4491,16 +4736,16 @@ private:
     // it would quietly insert a null every time you looked up a key that was
     // not there. borrowLValue uses find() and reports failure instead.
     static bool borrowableIndex(ASTNode* node) {
-        return dynamic_cast<VariableNode*>(node) || dynamic_cast<NumberNode*>(node) ||
-               dynamic_cast<StringNode*>(node);
+        return nodeIf<VariableNode>(node) || nodeIf<NumberNode>(node) ||
+               nodeIf<StringNode>(node);
     }
 
     Value* borrowLValue(ASTNode* node) {
-        if (auto v = dynamic_cast<VariableNode*>(node)) {
+        if (auto v = nodeIf<VariableNode>(node)) {
             if (!env_->has(v->name)) return nullptr;   // the caller reports it, with a position
             return &env_->getRef(v->name);
         }
-        if (auto ia = dynamic_cast<IndexAccessNode*>(node)) {
+        if (auto ia = nodeIf<IndexAccessNode>(node)) {
             if (!borrowableIndex(ia->index.get())) return nullptr;
             Value* base = borrowLValue(ia->object.get());
             if (!base) return nullptr;
@@ -4529,7 +4774,7 @@ private:
         Value* base = nullptr;
         Value  idx;
 
-        if (auto v = dynamic_cast<VariableNode*>(n->object.get())) {
+        if (auto v = nodeIf<VariableNode>(n->object.get())) {
             // The overwhelmingly common shape: $a[...]. One cast, one walk of
             // the scope chain, no copy -- strictly less work than evaluating
             // the variable into a temporary, which is what this replaces.
@@ -4728,7 +4973,7 @@ private:
         currentClassName_ = n->name;
 
         for (auto& member : n->body) {
-            if (auto funcNode = dynamic_cast<FuncDeclNode*>(member.get())) {
+            if (auto funcNode = nodeIf<FuncDeclNode>(member.get())) {
                 // Register method on the class definition
                 auto fn = std::make_shared<BantuFunction>(funcNode->name, funcNode->params, funcNode->body, env_);
                 classDef->addMethod(funcNode->name, Value(std::move(fn)));

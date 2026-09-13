@@ -431,6 +431,8 @@ private:
         // See CallNode::resultDiscarded.
         if (auto call = std::dynamic_pointer_cast<CallNode>(expr)) {
             call->resultDiscarded = true;
+        } else if (auto asn = std::dynamic_pointer_cast<AssignNode>(expr)) {
+            asn->resultDiscarded = true;
         }
         return expr;
     }
@@ -456,15 +458,15 @@ private:
 
         if (match(BantuTokenType::EQUALS)) {
             auto value = parseAssignment();
-            if (auto varNode = dynamic_cast<VariableNode*>(expr.get())) {
+            if (auto varNode = nodeIf<VariableNode>(expr.get())) {
                 return std::make_shared<AssignNode>(varNode->name, std::move(value), expr->line, expr->col);
             }
             // Handle $arr[$idx] = value
-            if (auto idxNode = dynamic_cast<IndexAccessNode*>(expr.get())) {
+            if (auto idxNode = nodeIf<IndexAccessNode>(expr.get())) {
                 return std::make_shared<IndexAssignNode>(std::move(idxNode->object), std::move(idxNode->index), std::move(value), expr->line, expr->col);
             }
             // Handle $dict["key"] = value
-            if (auto dotNode = dynamic_cast<DotAccessNode*>(expr.get())) {
+            if (auto dotNode = nodeIf<DotAccessNode>(expr.get())) {
                 return std::make_shared<DictAssignNode>(std::move(dotNode->object), dotNode->property, std::move(value), expr->line, expr->col);
             }
             ErrorHandler::throwSyntaxError("Invalid assignment target", expr->line, expr->col);
@@ -486,19 +488,19 @@ private:
             auto value = parseAssignment();
 
             // Target: simple variable — $x op= v
-            if (auto varNode = dynamic_cast<VariableNode*>(expr.get())) {
+            if (auto varNode = nodeIf<VariableNode>(expr.get())) {
                 auto read = std::make_shared<VariableNode>(varNode->name, varNode->line, varNode->col);
                 auto binOp = std::make_shared<BinaryOpNode>(baseOp, read, std::move(value), expr->line, expr->col);
                 return std::make_shared<AssignNode>(varNode->name, std::move(binOp), expr->line, expr->col);
             }
             // Target: list/dict index — $a[i] op= v
-            if (auto idxNode = dynamic_cast<IndexAccessNode*>(expr.get())) {
+            if (auto idxNode = nodeIf<IndexAccessNode>(expr.get())) {
                 auto read = std::make_shared<IndexAccessNode>(idxNode->object, idxNode->index, expr->line, expr->col);
                 auto binOp = std::make_shared<BinaryOpNode>(baseOp, read, std::move(value), expr->line, expr->col);
                 return std::make_shared<IndexAssignNode>(idxNode->object, idxNode->index, std::move(binOp), expr->line, expr->col);
             }
             // Target: object property — $o.k op= v
-            if (auto dotNode = dynamic_cast<DotAccessNode*>(expr.get())) {
+            if (auto dotNode = nodeIf<DotAccessNode>(expr.get())) {
                 auto read = std::make_shared<DotAccessNode>(dotNode->object, dotNode->property, expr->line, expr->col);
                 auto binOp = std::make_shared<BinaryOpNode>(baseOp, read, std::move(value), expr->line, expr->col);
                 return std::make_shared<DictAssignNode>(dotNode->object, dotNode->property, std::move(binOp), expr->line, expr->col);

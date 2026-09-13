@@ -14,7 +14,8 @@ Full reasoning with measurements lives in [`docs/bplot-architecture.md`](../docs
 **Decision:** the object model, scales, ticking, layout, colours and the **SVG backend** are 100%
 pure Bantu. Only the raster backend is native.
 **Why:** the work in a vector chart is proportional to the number of *drawn elements* (~10³), not to
-the number of data points. At the interpreter's measured ~1 µs per operation that is milliseconds.
+the number of data points. At the interpreter's measured ~0.38 µs per operation that is around a
+millisecond.
 Rasterisation is proportional to *pixels* (~10⁶ for a modest figure), which is minutes — a difference
 of three orders of magnitude, and the line falls exactly between the two backends.
 **Rejected:** a native core for B1 — it would put the tick algorithm, layout and colour handling,
@@ -22,17 +23,28 @@ the parts that change most often, behind a C++ rebuild.
 **Implication:** bplot works on any Bantu build. `savefig("x.png")` is the only thing that needs a
 capability probe.
 
-### BP2 — Build output with `join`, never with `+=`
-**Decision:** artists push strings onto a list; the document is assembled by one `join`.
-`join(list, sep)` is added to the language in B0.
-**Why:** measured, repeated string concatenation is **O(n²)** — 20,000 appends take 1,116 ms and
-40,000 take 6,752 ms, a 6.05× cost for 2× the work, because each `+` copies the whole accumulated
-string. A 100k-element figure would take upwards of forty seconds.
-**Rejected:** making `+` on strings amortised — that needs a rope or a refcounted builder inside
-`Value`, a far larger change to the hottest type in the interpreter, for a problem `join` solves in
-twenty lines.
-**Implication:** `split` finally has its inverse, and every Bantu program that assembles text —
-`sua` HTML, CSV writing, log formatting — gets the same fix.
+### BP2 — Build output with `join`; `+=` is no longer a trap either
+**Decision:** artists push strings onto a list and the document is assembled by one `join`.
+`join(list, sep)` was added to the language in B0.
+**Why:** measured, repeated string concatenation was **O(n²)** — 20,000 appends 1,116 ms and 40,000
+appends 6,752 ms, a 6.05× cost for 2× the work, because each `+` copied the whole accumulated string.
+A 100k-element figure would have taken upwards of forty seconds.
+
+**SUPERSEDED IN PART, and the original reasoning was wrong.** This decision rejected "making `+` on
+strings amortised" on the grounds that it "needs a rope or a refcounted builder inside `Value`, a far
+larger change to the hottest type in the interpreter". That was the wrong conclusion: it needs
+neither. When the result of `x + y` is assigned straight back to `x`, `x`'s old value is dead, so it
+can be appended to in place — a peephole in `evalAssign`, no change to `Value`'s representation, and
+what CPython has done since 2.4. **`$s = $s + $part` and `$s += $part` are now linear**: 40,000
+appends 6,752 ms → **23 ms**, and 200,000 appends 112 ms. See
+[`docs/interpreter-performance.md`](../docs/interpreter-performance.md) §3.
+
+**What still stands:** `join` is not redundant. It is the right idiom when the pieces are already a
+list, it needs no peephole to fire, and it does not depend on the accumulator being a plain local
+variable — `$fig.parts` accumulated through a field takes a different node type and does not get the
+in-place path. bplot keeps building through a list and joining once.
+**Implication:** `split` finally has its inverse, and every Bantu program that assembles text — `sua`
+HTML, CSV writing, log formatting — got both fixes, whichever idiom it already used.
 
 ### BP3 — Path simplification is on by default
 **Decision:** a polyline is reduced, before emission, to at most four vertices per pixel column

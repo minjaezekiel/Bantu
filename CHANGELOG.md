@@ -7,6 +7,47 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ## [Unreleased]
 
+### Changed
+
+- **[perf] The interpreter is 4–6× faster** — and not for the reason anyone expected. A profile of a
+  20-million-iteration arithmetic loop put **`dynamic_cast` at 79.6 % of all interpreter time**:
+  `evalNode` dispatched by trying each of 38 node types in turn, in the order they had been added, so
+  every function call paid for nineteen failed hierarchy searches before reaching its own arm. `Value`'s
+  192-byte size, the allocator and the environment's string hashing — the costs previously blamed for
+  Bantu's speed — came to 20 % between them.
+
+  Dispatch is now a tag on the node and a `switch`: O(1), and the same cost for the 39th node type as
+  for the 1st.
+
+  | | before | after | |
+  |---|---|---|---|
+  | 1M arithmetic while loop | 2,574 ms | **448 ms** | **5.7×** |
+  | 1M comparison loop | 2,436 ms | **539 ms** | **4.5×** |
+  | 500k unary negation | 1,171 ms | **200 ms** | **5.9×** |
+  | 200k list index read | 575 ms | **101 ms** | **5.7×** |
+  | 100k list index write | 213 ms | **41 ms** | **5.2×** |
+  | 50k dict set | 178 ms | **45 ms** | **4.0×** |
+  | `fib(24)` recursive | 1,910 ms | **1,535 ms** | 1.24× |
+
+  Recursion gains least because a call is dominated by building an environment and copying arguments,
+  not by dispatch. Measured on an i7-9750H, best-of across both A/B orderings. The full profile, the
+  alternatives considered, and how a wrong tag is made a *compile* error rather than undefined
+  behaviour are in [`docs/interpreter-performance.md`](docs/interpreter-performance.md).
+
+- **[perf] `$s = $s + $part` and `$s += $part` are linear** — they were O(n²), because every `+` built
+  a fresh string holding a copy of everything accumulated so far. Assembling 1.16 MB out of 40,000
+  pieces moved ~23 GB and took **6,752 ms**; it now takes **23 ms**, and 200,000 appends take 112 ms.
+
+  When the result of `x + y` is assigned straight back to `x`, `x`'s old value is dead the moment the
+  assignment lands, so it is appended to rather than copied — the same fix CPython has had since 2.4.
+  `join()` is still the right idiom when the pieces are already a list; the difference is that
+  reaching for the obvious `+=` no longer falls off a cliff.
+
+  Semantics are unchanged, and `tests/lang_perf_test.b` is mostly about proving it: an assignment
+  inside a function still creates a local rather than mutating a global, `$t = $s` still keeps its own
+  copy, `$s = $s + $s` still reads the old value, `const` still raises, and numbers, lists, dicts and
+  native handles still take the ordinary operator path.
+
 ### Added
 
 - **[feature] Scalar maths** — the language had `abs ceil cos floor log max min pow round sin sqrt
@@ -26,6 +67,12 @@ All notable changes to the Bantu programming language are documented in this fil
   and joining once takes **147 ms + 7 ms**, and is linear rather than quadratic.
 
 ### Fixed
+
+- **[bug fix] `benchmarks/bench.b` called `sua.clock()`, which does not exist** — so it raised on its
+  first benchmark, `benchmarks/run.sh` has been failing, and the numbers published in
+  `benchmarks/results.md` and `benchmarks/README.md` came from a script that no longer ran. It now
+  uses the global `clock()`, which already returns milliseconds — the `* 1000.0` it applied was wrong
+  as well.
 
 - **[bug fix] `max(1, 2, 9)` answered 2** — `max` and `min` read only their first two arguments and
   silently ignored the rest, in every shipped build. Both are now variadic, and a single list

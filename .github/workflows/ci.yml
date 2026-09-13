@@ -31,7 +31,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libcurl4-openssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libcurl4-openssl-dev libffi-dev
 
       - name: Build
         run: bash bantu-src/compiler/build.sh
@@ -50,6 +50,36 @@ jobs:
           grep -q 'event loop: epoll' /tmp/probe.log || {
             echo "::error::expected the epoll backend on Linux"; exit 1; }
           pkill -f /tmp/probe.b || true
+
+      - name: AST tag check — dispatch is a static_cast, so prove the tags
+        run: |
+          # evalNode dispatches on ASTNode::kind with a static_cast, which is
+          # what makes it a jump table instead of 38 dynamic_casts (measured at
+          # 79.6% of all interpreter time before the change). A case label that
+          # did not match its node type would be undefined behaviour -- it is a
+          # compile error, because nodeExact<K,T> static_asserts T::kKind == K,
+          # but this build verifies the other half at run time: every cast is
+          # checked against RTTI and aborts naming both types.
+          # See docs/interpreter-performance.md.
+          set -e
+          mkdir -p /tmp/chk
+          for s in lexer parser ast types function class ndarray_native evaluator main; do
+            g++ -std=c++17 -O1 -pthread -I bantu-src/compiler/src \
+                -DBANTU_FFI -DBANTU_CHECK_NODEKIND \
+                -c bantu-src/compiler/src/$s.cpp -o /tmp/chk/$s.o
+          done
+          g++ -std=c++17 -O1 -pthread /tmp/chk/*.o -o /tmp/bantu-checked \
+              -lsqlite3 -l:libcurl.so.4 -lffi -ldl -lpthread
+          fail=0
+          for t in tests/*.b; do
+            [ "$t" = "tests/const_bad.b" ] && continue
+            out=$(/tmp/bantu-checked "$t" 2>&1 || true)
+            if echo "$out" | grep -q 'AST tag mismatch'; then
+              echo "::error::$t -- $(echo "$out" | grep 'AST tag mismatch' | head -1)"; fail=1
+            fi
+          done
+          [ $fail -eq 0 ] && echo "  ok    every AST tag matched its type"
+          exit $fail
 
       - name: Language and library suites
         run: |
