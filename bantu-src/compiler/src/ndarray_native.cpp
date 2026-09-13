@@ -14,6 +14,7 @@
 #include "ndarray_ufunc_reg.hpp"
 #include "ndarray_reduce_reg.hpp"
 #include "ndarray_sort_reg.hpp"
+#include "ndarray_dispatch.hpp"
 
 namespace numba {
 
@@ -203,7 +204,14 @@ std::string reprArray(const NdArray& a) {
 // Registration
 // ═════════════════════════════════════════════════════════════════════════════
 
-void registerBuiltins(const DefineFn& define) {
+void registerBuiltins(const DefineFn& rawDefine) {
+    // Every builtin is also remembered under its short name, so `$a.sum()` and
+    // `nd_sum($a)` are the same NativeFn rather than two implementations.
+    DefineFn define = [&rawDefine](const char* name, NativeFn fn) {
+        noteMethod(name, fn);
+        rawDefine(name, std::move(fn));
+    };
+
     // print($a) renders the array rather than "<ndarray>".
     registerHandleRepr(NDARRAY_TAG, &reprArrayHandle);
 
@@ -971,6 +979,21 @@ Value toArrayValue(const Value& v, const char* what) {
     }
     throw std::runtime_error(std::string(what) +
         ": expected an array, a number or a list (got " + v.toString() + ")");
+}
+
+// ── the dispatch entry points evaluator.hpp calls ────────────────────────────
+bool dispatchBinary(Op op, const Value& l, const Value& r, Value& out) {
+    return dispatchBinaryImpl(op, l, r, out);
+}
+bool dispatchNegate(const Value& v, Value& out) { return dispatchNegateImpl(v, out); }
+bool dispatchIndex(const Value& obj, const Value& idx, Value& out) {
+    return dispatchIndexImpl(obj, idx, out);
+}
+bool dispatchIndexAssign(const Value& obj, const Value& idx, const Value& val) {
+    return dispatchIndexAssignImpl(obj, idx, val);
+}
+bool dispatchMethod(const Value& obj, const std::string& name, Value& out) {
+    return dispatchMethodImpl(obj, name, out);
 }
 
 } // namespace numba

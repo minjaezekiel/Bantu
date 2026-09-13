@@ -9,6 +9,21 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] Arrays work with the ordinary operators** — `$a + $b`, `2 * $a`, `-$a`, `$a > 0.5`,
+  `$m[1]`, `$m[1][2] = 99` and `$vals[$vals > 20] = 0` now mean what they look like on a numba array.
+  Every one of these paths was previously dead: `$array + 1` read a number field that is always 0 for
+  a handle and silently produced `1`, indexing returned null, and index assignment threw. Methods are
+  available too — `$x.multiply($x).add($x).sum()` — bound to the same functions the `nd_*` builtins
+  use, so the two spellings cannot drift apart.
+
+  Two deliberate choices. `$m[1]` on a 2-D array is a **view**, so writing to it changes the
+  original — the opposite of a nested list, and worth knowing. And `==` stays an identity comparison
+  rather than becoming element-wise, so `if ($a == $b)` keeps meaning what it says; `nd_array_equal`
+  and `nd_allclose` are the element-wise forms.
+
+  Nothing else moved: strings still concatenate, `==` on lists and dicts is still structural, `&&`
+  and `||` are unchanged, and the interpreter's hot paths measured within the noise floor.
+
 - **[feature] numba summarises data** — 20 reductions (`sum`, `mean`, `std`, `var`, `min`, `max`,
   `median`, `quantile`, `argmin`, `argmax`, `any`, `all`, the `nan*` forms and more), each taking an
   axis — one, several, or all — and an optional `keepdims` that leaves the reduced axis as length 1
@@ -102,6 +117,9 @@ All notable changes to the Bantu programming language are documented in this fil
   recipient, and degrades to in-app-only when push is unavailable.
 
 ### Fixed
+
+- **[bug fix] An array combined with null or a dict silently produced 0** — falling through to
+  numeric addition of two non-numbers. It now raises and says what arrived.
 
 - **[bug fix] Storing NaN or infinity in an integer array corrupted it silently** — writing NaN into
   an `i64` numba array stored `-9223372036854775808`, and writing infinity stored `0`, which is worse

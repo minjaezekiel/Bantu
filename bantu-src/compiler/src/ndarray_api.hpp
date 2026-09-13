@@ -25,4 +25,34 @@ using DefineFn = std::function<void(const char* name, NativeFn fn)>;
 // render an array. Called once, from Evaluator::registerBuiltins.
 void registerBuiltins(const DefineFn& define);
 
+// ── operator dispatch (Phase 4) ──────────────────────────────────────────────
+// Four small additive arms in the evaluator make a raw array handle the
+// user-facing object, so `$a + $b` and `$m[1][2] = 9` mean what they look like.
+//
+// Every one of these paths is DEAD today: `$handle + 1` reads numberVal, which
+// is always 0 for a handle, and silently yields 1; `$handle[i]` returns null;
+// `$handle[i] = v` throws. There is exactly one other handle tag in existence
+// ("column") and arctic never puts a column in an arithmetic expression, so
+// nothing that works today changes behaviour.
+//
+// Its own enum rather than BantuTokenType: this header is deliberately the only
+// thing evaluator.hpp sees of numba, and it should not drag in the token
+// definitions. The evaluator maps its token to one of these.
+enum class Op : int {
+    Add, Sub, Mul, Div, Mod,
+    Eq, Ne, Lt, Le, Gt, Ge
+};
+
+// Each returns true when it handled the case; false means "not mine, carry on
+// with the existing behaviour". Returning false rather than throwing is what
+// keeps the change additive.
+bool dispatchBinary(Op op, const Value& l, const Value& r, Value& out);
+bool dispatchNegate(const Value& v, Value& out);
+bool dispatchIndex(const Value& obj, const Value& idx, Value& out);
+bool dispatchIndexAssign(const Value& obj, const Value& idx, const Value& val);
+
+// `$a.sum()`, `$a.shape()` and friends: returns a bound callable. Chaining
+// works from here even before the operators land, and on any older build.
+bool dispatchMethod(const Value& obj, const std::string& name, Value& out);
+
 } // namespace numba

@@ -120,14 +120,23 @@ INT64_MIN and 0 respectively, silently.
 | Fancy and boolean indexing ✅ | `take/put/mask/compress/nonzero/where` | ″ | out-of-range indices **raise**; empty masks; a mask of the wrong length | [ ] |
 | Performance — `nd_sum` ✅, `nd_argsort` ⚠ | — | — | 10M `nd_sum` **4 ms** (target 12) ✅; 1M `nd_argsort` **142 ms** against a target of 80 — **missed**, recorded not re-baselined: it materialises a double buffer plus an index buffer before `std::stable_sort`, where `col_argsort`'s 73 ms is a typed direct-on-buffer sort. The fix belongs with the work that would parallelise it | [ ] |
 
-## Phase 4 — Interpreter operator / index / dot dispatch  *(a language change)*
+## Phase 4 — Interpreter operator / index / dot dispatch ✅  *(a language change)*
+
+`tests/lang_native_ops_test.b` **102/102**; regression **73/73**. The ±2% benchmark gate **passes**,
+but establishing that took a control group: a **byte-identical binary measured against itself**
+swings up to ±1.97%, so the gate sits at this harness's noise floor and the naive before/after
+readings (+13.2%, then +2.66%) were never signal. Final paired-ratio measurement against that
+control: arithmetic +0.61% vs a +0.52% control, list index +0.81% vs a +0.94% control — i.e.
+indistinguishable from zero. Two placement defects and one silent-zero defect found and fixed along
+the way; see `numba-suite/CHANGELOG.md`.
+
 
 | Item | How | Feature test | Stress test | Status |
 |---|---|---|---|---|
-| `$a + $b`, `2 * $a`, `-$a`, `$a > 0.5` | one predicted branch at the top of `evalBinaryOp`/`evalUnaryOp`, falling through to the existing switch | `tests/lang_native_ops_test.b` | mixed handle/number/string/list/dict/null operands in every position | [ ] |
-| `$a[$mask]`, `$m[1]` is a view, `$m[1][2] = 9` writes through | arms in `evalIndexAccess` / `evalIndexAssign` | ″ | chained subscripts; negative indices; out-of-range **raises** | [ ] |
-| Nothing else changed | — | ″ | strings still concat; `==` on lists/dicts unchanged; `&&`/`\|\|` unchanged; **full existing regression green** | [ ] |
-| **The benchmark gate** | `benchmarks/run.sh`, 5 iterations, before and after | — | 1M arithmetic loop within **±2%**; both numbers in the CHANGELOG | [ ] |
+| `$a + $b`, `2 * $a`, `-$a`, `$a > 0.5` ✅ | one predicted branch at the top of `evalBinaryOp`/`evalUnaryOp`, falling through to the existing switch | `tests/lang_native_ops_test.b` | mixed handle/number/string/list/dict/null operands in every position | [ ] |
+| `$a[$mask]`, `$m[1]` is a view, `$m[1][2] = 9` writes through ✅ | arms in `evalIndexAccess` / `evalIndexAssign` | ″ | chained subscripts; negative indices; out-of-range **raises** | [ ] |
+| Nothing else changed ✅ | — | ″ | strings still concat; `==` on lists/dicts unchanged; `&&`/`\|\|` unchanged; **full existing regression green** | [ ] |
+| **The benchmark gate** ✅ | `benchmarks/hotpath.b` + a paired-ratio harness **with a control group**: the same byte-identical binary measured against itself, to establish the noise floor before claiming anything about the treatment | — | **PASSED.** Control +0.52%/+0.94%, treatment +0.61%/+0.81% — indistinguishable. The floor is ±1.97%, so the ±2% gate can only be answered with a control; without one, +2.66% reads as a regression that does not exist | [ ] |
 
 ## Phase 5 — Linear algebra
 

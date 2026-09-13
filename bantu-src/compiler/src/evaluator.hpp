@@ -2675,12 +2675,33 @@ private:
                 (*base->objectVal)[idx.toString()] = val;
                 return val;
             }
+            // $a[i] = v on an array. After the list and dict cases so neither
+            // pays for it. A handle has REFERENCE semantics, so unlike a list
+            // this needs no write-back -- the "copy" is a shared_ptr to the same
+            // buffer. Previously this threw "Cannot index-assign to this type".
+            if (base->type == Value::NATIVE_HANDLE) {
+                try {
+                    if (numba::dispatchIndexAssign(*base, idx, val)) return val;
+                } catch (const std::exception& e) {
+                    ErrorHandler::throwRuntimeError(e.what(), n->line, n->col);
+                    return Value();
+                }
+            }
             // resolvable but not indexable → fall through to the error/slow path
         }
 
         // Slow path: evaluate expression and update
         Value obj = evalNode(n->object);
         Value idx = evalNode(n->index);
+
+        if (obj.type == Value::NATIVE_HANDLE) {
+            try {
+                if (numba::dispatchIndexAssign(obj, idx, val)) return val;
+            } catch (const std::exception& e) {
+                ErrorHandler::throwRuntimeError(e.what(), n->line, n->col);
+                return Value();
+            }
+        }
 
         if (obj.isList()) {
             int i = (int)idx.numberVal;
@@ -2737,9 +2758,52 @@ private:
     // OPERATOR EVALUATION
     // ════════════════════════════════════════════════════════════
 
+    // Map a token to numba's operator enum. Kept here so ndarray_api.hpp never
+    // has to see the token definitions.
+    static bool numbaOpOf(BantuTokenType t, numba::Op& op) {
+        switch (t) {
+            case BantuTokenType::PLUS:             op = numba::Op::Add; return true;
+            case BantuTokenType::MINUS:            op = numba::Op::Sub; return true;
+            case BantuTokenType::MULTIPLY:         op = numba::Op::Mul; return true;
+            case BantuTokenType::DIVIDE:           op = numba::Op::Div; return true;
+            case BantuTokenType::MODULO:           op = numba::Op::Mod; return true;
+            case BantuTokenType::GREATERTHAN:      op = numba::Op::Gt;  return true;
+            case BantuTokenType::LESSTHAN:         op = numba::Op::Lt;  return true;
+            case BantuTokenType::GREATERTHANEQUAL: op = numba::Op::Ge;  return true;
+            case BantuTokenType::LESSTHANEQUAL:    op = numba::Op::Le;  return true;
+            default: return false;
+        }
+    }
+
     Value evalBinaryOp(BinaryOpNode* n) {
         Value left = evalNode(n->left);
         Value right = evalNode(n->right);
+
+        // Fast reject. Two plain numbers is overwhelmingly the common case, and
+        // this is one predictable branch on a byte already in L1. When it does
+        // fire we fall THROUGH to the switch below, so string +, ==/!= on any
+        // type and &&/|| are untouched.
+        //
+        // Every path this opens was previously DEAD: `$handle + 1` read
+        // numberVal, which is always 0 for a handle, and silently produced 1.
+        // NUMBER is 0 in Value::Type, so `both are numbers` is a single OR
+        // against zero: one compare and one well-predicted branch, rather than
+        // two short-circuited compares. Measured: the two-compare form cost
+        // 2.66% on a 1M arithmetic loop, over the phase's 2% budget.
+        if (__builtin_expect(((int)left.type | (int)right.type) != (int)Value::NUMBER, 0)) {
+            if (left.type == Value::NATIVE_HANDLE || right.type == Value::NATIVE_HANDLE) {
+                numba::Op nop;
+                if (numbaOpOf(n->op, nop)) {
+                    Value out;
+                    try {
+                        if (numba::dispatchBinary(nop, left, right, out)) return out;
+                    } catch (const std::exception& e) {
+                        ErrorHandler::throwRuntimeError(e.what(), n->line, n->col);
+                        return Value();
+                    }
+                }
+            }
+        }
 
         switch (n->op) {
             case BantuTokenType::PLUS:
@@ -2788,7 +2852,19 @@ private:
         Value operand = evalNode(n->operand);
         switch (n->op) {
             case BantuTokenType::NOT: return Value(!operand.isTruthy());
-            case BantuTokenType::MINUS: return Value(-operand.numberVal);
+            case BantuTokenType::MINUS:
+                // -$a on an array negates element-wise. Previously this read
+                // numberVal and produced -0 for any handle.
+                if (__builtin_expect(operand.type == Value::NATIVE_HANDLE, 0)) {
+                    Value out;
+                    try {
+                        if (numba::dispatchNegate(operand, out)) return out;
+                    } catch (const std::exception& e) {
+                        ErrorHandler::throwRuntimeError(e.what(), n->line, n->col);
+                        return Value();
+                    }
+                }
+                return Value(-operand.numberVal);
             default: return Value();
         }
     }
@@ -4149,6 +4225,18 @@ private:
     Value evalDotAccess(DotAccessNode* n) {
         Value obj = evalNode(n->object);
 
+        // $a.sum() on an array. The chaining form, which works with or without
+        // operator dispatch and on any older build -- every method is bound to
+        // the SAME NativeFn the nd_* builtin uses, so the two cannot drift.
+        // Direct precedent in this file: dict pseudo-methods below, and number
+        // pseudo-methods (.floor(), .round()). Checked before the class and
+        // dict branches only because a handle is neither, and the check is a
+        // single compare on a byte already loaded.
+        if (obj.type == Value::NATIVE_HANDLE) {
+            Value out;
+            if (numba::dispatchMethod(obj, n->property, out)) return out;
+        }
+
         // Class instance
         if (obj.isClassInstance()) {
             Value prop = obj.classInstanceVal->getProperty(n->property);
@@ -4357,6 +4445,21 @@ private:
             int i = (int)idx.numberVal;
             if (i >= 0 && i < (int)obj.stringVal.size()) return Value(std::string(1, obj.stringVal[i]));
             return Value();
+        }
+
+        // $a[i] on an array. Deliberately LAST: a handle is not a list, a dict
+        // or a string, so putting this check first made every ordinary list
+        // index pay for it -- measured at 2.31%, over the phase's 2% budget.
+        // Down here the common paths are untouched and this one is still free,
+        // because it replaces a fall-through that returned null.
+        if (obj.type == Value::NATIVE_HANDLE) {
+            Value out;
+            try {
+                if (numba::dispatchIndex(obj, idx, out)) return out;
+            } catch (const std::exception& e) {
+                ErrorHandler::throwRuntimeError(e.what(), n->line, n->col);
+                return Value();
+            }
         }
 
         return Value();

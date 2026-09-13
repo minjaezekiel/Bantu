@@ -462,3 +462,89 @@ work that would parallelise it. Recorded rather than quietly re-baselined.
 | 1M `argsort`, permutation applied to the input | reproduces `nd_sort` **exactly** |
 | 1M already-sorted / reverse-sorted / all-equal | all three sort correctly |
 | 40,000 bad reduction and indexing calls | all raised; live-byte drift **0** |
+
+---
+
+## Phase 4 — Interpreter operator / index / method dispatch ✅
+
+A **language change**. `tests/lang_native_ops_test.b` **102/102**; full regression **73/73**.
+
+### What landed
+
+Five additive arms in the evaluator, each filling in a path that was **dead**:
+
+| site | before | now |
+|---|---|---|
+| `evalBinaryOp` | `$handle + 1` read `numberVal` (always 0) → silently `1` | `+ - * / %` and `< <= > >=` element-wise |
+| `evalUnaryOp` | `-$handle` → `-0` | element-wise negation |
+| `evalIndexAccess` | fell through → `null` | element, view, mask select, or gather |
+| `evalIndexAssign` | threw "Cannot index-assign to this type" | element, row, or masked write |
+| `evalDotAccess` | fell through → `null` | `$a.sum()`, bound to the same `NativeFn` as `nd_sum` |
+
+```bantu
+$y = ($x * $x) + $x;        // was: 0
+$m[1][2] = 99;              // was: "Cannot index-assign to this type"
+$vals[$vals > 20] = 0;      // was: null
+$x.multiply($x).add($x).sum();
+```
+
+`$m[1]` on a 2-d array returns a **view**, which is what makes `$m[1][2] = 99` write through to the
+base. Handles have reference semantics; lists do not. Both are asserted side by side.
+
+### Two deliberate asymmetries
+
+- **`==` and `!=` stay identity comparisons**, not element-wise. `if ($a == $b)` is written
+  constantly, and an element-wise result would silently turn it into "is this array non-empty and
+  all-truthy". NumPy made the other choice and then had to make `if arr:` raise; Bantu has no such
+  escape hatch. `nd_array_equal` and `nd_allclose` are the explicit forms.
+- **`+` with a string concatenates**, following the language's own rule that `5 + "x"` is `"5x"`, so
+  `print("a: " + $a)` works. Every *other* non-combinable operand raises.
+
+### The benchmark gate, and what measuring it actually took
+
+The gate is ±2% on the interpreter's hot paths. Reaching a defensible answer needed three attempts,
+and the first two were wrong in instructive ways:
+
+1. **Sequential before/after runs: unusable.** The first post-change run showed +13.2%, and re-running
+   the *same binary* gave 2942 / 2685 / 2690 ms. The first measurement was an artifact of the build
+   that had just finished.
+2. **Interleaved A/B: still unusable.** It reported +2.66% and +3.15% — but also moved `fib` and
+   string concatenation, which these arms do not touch. That was the tell.
+3. **A control group settled it.** Running a **byte-identical binary against itself** showed swings of
+   up to ±1.97% and a 2.6–4.4% spread across runs. **The ±2% gate sits at this harness's noise
+   floor**, so the earlier numbers were never signal. (The build is deterministic — two builds of
+   identical source are byte-identical — so linking was not the cause.)
+
+Final measurement: 4× longer loops, 10 paired rounds, median of per-round ratios, against a control:
+
+| | control (identical binaries) | treatment (before → after) |
+|---|---|---|
+| 4M arithmetic loop | +0.52% | **+0.61%** |
+| 1.5M list index read | +0.94% | **+0.81%** |
+
+The treatment is indistinguishable from the control — `idxr` is *below* its own control — so the
+dispatch costs **less than the measurement floor**. Gate passes, on evidence rather than assumption.
+
+The control group is the part worth keeping. Without it, "+2.66%" looks like a real regression and
+would have sent the next person optimising something that was never slow.
+
+### Two placement defects found by that measurement
+
+Both were mine, both in the first cut, and neither would have been visible without the A/B:
+
+- **`evalIndexAssign` evaluated `n->object` twice.** The new arm called `evalNode(n->object)` at the
+  top while the existing code evaluated it again below — so `f()[0] = 1` would have called `f`
+  twice, and every list write paid for an extra evaluation. Hooked into the two places the object is
+  *already* evaluated instead.
+- **The index and dot checks sat in front of the common paths.** A handle is not a list, a dict or a
+  string, so checking for one first made every ordinary list index pay. Moved after those cases,
+  where the check replaces a fall-through and costs nothing. The binary-operator check was also
+  narrowed from two short-circuited compares to a single OR against zero, exploiting `NUMBER == 0`.
+
+### Defect fixed
+
+- **[bug fix]** An array combined with `null`, a dict or a class instance **silently produced 0** —
+  the dispatch declined, and the evaluator fell through to `left.numberVal + right.numberVal`, which
+  is `0 + 0` for two non-numbers. That is precisely the failure this phase exists to remove, so
+  reintroducing it at the edges would have been self-defeating. Non-combinable operands now raise and
+  name what arrived.
