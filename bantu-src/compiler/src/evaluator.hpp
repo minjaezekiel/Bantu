@@ -2786,6 +2786,115 @@ private:
         }
     }
 
+    // Does this expression name the same storage location as that one?
+    // `$o.parts = $o.parts + …` only qualifies if both `$o.parts` are the same
+    // `$o.parts`. Restricted to the forms whose identity is decidable from the
+    // syntax alone -- a variable, a field of one, an element at a fixed or
+    // named index.
+    static bool sameLValue(ASTNode* a, ASTNode* b) {
+        if (!a || !b || a->kind != b->kind) return false;
+        switch (a->kind) {
+            case NodeKind::Variable:
+                return nodeAs<VariableNode>(a)->name == nodeAs<VariableNode>(b)->name;
+            case NodeKind::DotAccess: {
+                auto* x = nodeAs<DotAccessNode>(a);
+                auto* y = nodeAs<DotAccessNode>(b);
+                return x->property == y->property && sameLValue(x->object.get(), y->object.get());
+            }
+            case NodeKind::IndexAccess: {
+                auto* x = nodeAs<IndexAccessNode>(a);
+                auto* y = nodeAs<IndexAccessNode>(b);
+                if (!sameLValue(x->object.get(), y->object.get())) return false;
+                ASTNode* i = x->index.get();
+                ASTNode* j = y->index.get();
+                if (!i || !j || i->kind != j->kind) return false;
+                if (i->kind == NodeKind::Number)
+                    return nodeAs<NumberNode>(i)->value == nodeAs<NumberNode>(j)->value;
+                if (i->kind == NodeKind::String)
+                    return nodeAs<StringNode>(i)->value == nodeAs<StringNode>(j)->value;
+                if (i->kind == NodeKind::Variable)
+                    return nodeAs<VariableNode>(i)->name == nodeAs<VariableNode>(j)->name;
+                return false;   // a computed index may not be the same index twice
+            }
+            default: return false;
+        }
+    }
+
+    // Can this expression run ANY user code?
+    //
+    // The plain-variable append only needs "no operand can rebind this local",
+    // because Environment::assign stops at the function boundary so a callee
+    // cannot reach a caller's binding. A field or element target has no such
+    // protection: dicts and lists are reachable through references, so a callee
+    // holding the same object can replace the very string being appended to.
+    // For those targets the bar is therefore absolute -- nothing may run.
+    static bool isPureExpr(ASTNode* n) {
+        if (!n) return true;
+        switch (n->kind) {
+            case NodeKind::Number: case NodeKind::String:
+            case NodeKind::Bool:   case NodeKind::Null:
+            case NodeKind::Variable:
+                return true;
+            case NodeKind::BinaryOp: {
+                auto* b = nodeAs<BinaryOpNode>(n);
+                return isPureExpr(b->left.get()) && isPureExpr(b->right.get());
+            }
+            case NodeKind::UnaryOp:
+                return isPureExpr(nodeAs<UnaryOpNode>(n)->operand.get());
+            case NodeKind::DotAccess:
+                return isPureExpr(nodeAs<DotAccessNode>(n)->object.get());
+            case NodeKind::IndexAccess: {
+                auto* ix = nodeAs<IndexAccessNode>(n);
+                return isPureExpr(ix->object.get()) && isPureExpr(ix->index.get());
+            }
+            default: return false;
+        }
+    }
+
+    // Is `value` the chain `<target> + p1 + p2 …`? Returns the piece count, or 0.
+    // `+` is left-associative, so the accumulator is the leftmost leaf.
+    int appendChainShape(ASTNode* value, ASTNode* target) {
+        BinaryOpNode* top = nodeIf<BinaryOpNode>(value);
+        if (!top || top->op != BantuTokenType::PLUS) return 0;
+        int count = 0;
+        BinaryOpNode* cur = top;
+        while (true) {
+            if (++count > 100) return 0;              // keep it inside a signed char
+            if (!isPureExpr(cur->right.get())) return 0;
+            BinaryOpNode* nx = nodeIf<BinaryOpNode>(cur->left.get());
+            if (!nx || nx->op != BantuTokenType::PLUS) break;
+            cur = nx;
+        }
+        return sameLValue(cur->left.get(), target) ? count : 0;
+    }
+
+    // Evaluate the chain's operands, then append them all. Shared by the three
+    // assignment forms; `acc` is the target's own buffer.
+    void appendChain(std::string& acc, BinaryOpNode* top, int pieces) {
+        if (pieces == 1) {                            // nearly all of them: no container
+            Value v = evalNode(top->right);
+            appendOne(acc, v);
+            return;
+        }
+        // Every operand is evaluated before a single byte is appended, so
+        // `$s = $s + $s` reads the old value rather than the buffer being written.
+        std::vector<Value> vals;
+        vals.reserve((size_t)pieces);
+        BinaryOpNode* cur = top;
+        while (true) {
+            vals.push_back(evalNode(cur->right));
+            BinaryOpNode* nx = nodeIf<BinaryOpNode>(cur->left.get());
+            if (!nx || nx->op != BantuTokenType::PLUS) break;
+            cur = nx;
+        }
+        size_t extra = 0;
+        for (const Value& v : vals) extra += v.isString() ? v.stringVal.size() : 8;
+        size_t need = acc.size() + extra;
+        if (need > acc.capacity()) acc.reserve(std::max(need, acc.capacity() * 2));
+        // Collected right-to-left down the spine; applied in written order.
+        for (size_t i = vals.size(); i-- > 0; ) appendOne(acc, vals[i]);
+    }
+
     // The purely syntactic half of the test, computed once per site and cached
     // on the node as a piece count: is this `$x = $x + …`, with operands that
     // cannot rebind $x? Every `$i = $i + 1` in every loop runs this, so after
@@ -2896,6 +3005,34 @@ private:
     }
 
     Value evalIndexAssign(IndexAssignNode* n) {
+        // `$a[$i] = $a[$i] + …` and `$d["k"] += …`, for the same reason as
+        // evalDictAssign above. The index must be a literal or a variable for
+        // the two spellings to be provably the same element (sameLValue).
+        if (n->appendShape != 0) {
+            if (n->appendShape < 0) {
+                IndexAccessNode probe(n->object, n->index, n->line, n->col);
+                n->appendShape = (signed char)appendChainShape(n->value.get(), &probe);
+            }
+            if (n->appendShape > 0) {
+                if (Value* base = resolveLValue(n->object.get())) {
+                    Value idx = evalNode(n->index);
+                    Value* slot = nullptr;
+                    if (base->isList() && idx.isNumber()) {
+                        long long i = (long long)idx.numberVal;
+                        if (i >= 0 && i < (long long)base->listVal.size())
+                            slot = &base->listVal[(size_t)i];
+                    } else if (base->isObject() && base->objectVal) {
+                        slot = &(*base->objectVal)[idx.toString()];
+                    }
+                    if (slot && slot->isString()) {
+                        appendChain(slot->stringVal, nodeAs<BinaryOpNode>(n->value.get()),
+                                    n->appendShape);
+                        return n->resultDiscarded ? Value() : *slot;
+                    }
+                }
+            }
+        }
+
         Value val = evalNode(n->value);
 
         // Preferred path: resolve the container to its real storage location and
@@ -2979,6 +3116,33 @@ private:
     }
 
     Value evalDictAssign(DictAssignNode* n) {
+        // `$o.parts = $o.parts + …` appends in place, as the plain-variable
+        // form does. Without this, accumulating through a FIELD stayed O(n^2)
+        // while the identical code accumulating into a local was linear -- the
+        // same operation, 64x apart, which is not a defensible thing for a
+        // language to do. Operands must be pure here (isPureExpr): a callee
+        // holding this same dict could otherwise replace the string underneath
+        // the append, which the plain-variable case is structurally safe from.
+        if (n->appendShape != 0) {
+            if (n->appendShape < 0) {
+                DotAccessNode probe(n->object, n->key, n->line, n->col);
+                n->appendShape = (signed char)appendChainShape(n->value.get(), &probe);
+            }
+            if (n->appendShape > 0) {
+                if (Value* base = resolveLValue(n->object.get())) {
+                    Value* slot = nullptr;
+                    if (base->isObject() && base->objectVal) slot = &(*base->objectVal)[n->key];
+                    else if (base->isClassInstance() && base->classInstanceVal)
+                        slot = &base->classInstanceVal->properties[n->key];
+                    if (slot && slot->isString()) {
+                        appendChain(slot->stringVal, nodeAs<BinaryOpNode>(n->value.get()),
+                                    n->appendShape);
+                        return n->resultDiscarded ? Value() : *slot;
+                    }
+                }
+            }
+        }
+
         Value obj = evalNode(n->object);
         Value val = evalNode(n->value);
 

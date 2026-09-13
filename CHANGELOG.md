@@ -43,10 +43,18 @@ All notable changes to the Bantu programming language are documented in this fil
   `join()` is still the right idiom when the pieces are already a list; the difference is that
   reaching for the obvious `+=` no longer falls off a cliff.
 
+  This covers fields and elements too — `$fig.parts += $x`, `$a[$i] += $x`, `$this.buf = $this.buf +
+  $x` — which matters because accumulating through a field is what object-oriented code actually
+  does. Left out, it would have been **64× slower than the identical code accumulating into a local**
+  (1,413 ms against 22 ms for 40,000 appends); it now matches at 18 ms.
+
   Semantics are unchanged, and `tests/lang_perf_test.b` is mostly about proving it: an assignment
   inside a function still creates a local rather than mutating a global, `$t = $s` still keeps its own
   copy, `$s = $s + $s` still reads the old value, `const` still raises, and numbers, lists, dicts and
-  native handles still take the ordinary operator path.
+  native handles still take the ordinary operator path. A field target is held to a stricter rule
+  than a local — no operand may run code at all — because a callee holding the same dict can replace
+  the string being appended to, where Bantu's function-local assignment makes that impossible for a
+  plain variable.
 
 ### Added
 

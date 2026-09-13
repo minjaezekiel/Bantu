@@ -433,6 +433,10 @@ private:
             call->resultDiscarded = true;
         } else if (auto asn = std::dynamic_pointer_cast<AssignNode>(expr)) {
             asn->resultDiscarded = true;
+        } else if (auto ixa = std::dynamic_pointer_cast<IndexAssignNode>(expr)) {
+            ixa->resultDiscarded = true;
+        } else if (auto dca = std::dynamic_pointer_cast<DictAssignNode>(expr)) {
+            dca->resultDiscarded = true;
         }
         return expr;
     }

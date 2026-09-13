@@ -332,6 +332,10 @@ struct IndexAssignNode : ASTNodeK<NodeKind::IndexAssign> {
     std::shared_ptr<ASTNode> value;
     IndexAssignNode(std::shared_ptr<ASTNode> o, std::shared_ptr<ASTNode> i, std::shared_ptr<ASTNode> v, int l, int c)
         : ASTNodeK(l, c), object(std::move(o)), index(std::move(i)), value(std::move(v)) {}
+
+    // Memo for evalAssign's in-place-append test -- see AssignNode::appendShape.
+    signed char appendShape = -1;
+    bool resultDiscarded = false;
 };
 
 struct DictAssignNode : ASTNodeK<NodeKind::DictAssign> {
@@ -340,6 +344,10 @@ struct DictAssignNode : ASTNodeK<NodeKind::DictAssign> {
     std::shared_ptr<ASTNode> value;
     DictAssignNode(std::shared_ptr<ASTNode> o, const std::string& k, std::shared_ptr<ASTNode> v, int l, int c)
         : ASTNodeK(l, c), object(std::move(o)), key(k), value(std::move(v)) {}
+
+    // Memo for evalAssign's in-place-append test -- see AssignNode::appendShape.
+    signed char appendShape = -1;
+    bool resultDiscarded = false;
 };
 
 // ─── Try-Catch ───

@@ -215,6 +215,26 @@ Walking the left spine means `$s = $s + $a + $b + $c` is handled too, not just t
 | `$s` is a number | the peephole checks the live type and declines; numeric `+` is untouched |
 | `$s` is `const` | assignment raises as it always did, before any append |
 
+### Fields and elements, not just locals
+
+`$fig.parts += $x` and `$a[$i] += $x` are different node types (`DictAssignNode`, `IndexAssignNode`)
+and were not covered by the first version of this. That left the language 64× apart on two spellings
+of the same operation — 40,000 appends into a local took 22 ms and into a dict field 1,413 ms — which
+is not a defensible thing for a language to do, especially since accumulating into a field is what
+object-oriented code does. Both now take the same path, at 18 ms.
+
+They are held to a **stricter** rule than a local, and the difference is the interesting part. For
+`$s = $s + f()`, no `f` can touch `$s`: `Environment::assign` stops at the nearest function boundary,
+so a callee assigning to `$s` creates its own local. A *field* has no such protection — dicts, lists
+and class instances are reachable through references, so a callee holding the same object can replace
+the very string being appended to. For those targets the bar is therefore absolute: **no operand may
+run any code at all** (`isPureExpr` — literals, variables, arithmetic and field reads, nothing else).
+An impure operand declines the fast path and takes the ordinary one, evaluated exactly once, which a
+test asserts by counting the calls.
+
+Identity is decided syntactically (`sameLValue`): `$o.a.b`, `$a[3]` and `$a[$i]` qualify, a computed
+index like `$a[f()]` does not, because it may not name the same element twice.
+
 **Why not a rope, or a copy-on-write string?** A rope (Boehm–Atkinson–Plass) makes concatenation
 O(1) but makes indexing, comparison and every C-string boundary slower and more complicated, and
 there are 94 sites in the tree that touch `stringVal` directly. Copy-on-write with an append-when-

@@ -184,14 +184,75 @@ eq($v, "uw", "a used assignment yields the new value");
 eq($u, "uw", "and the target holds it");
 
 print("");
-print("-- containers are unaffected --");
+print("-- and the same append works through a field or an element --");
+// These are different node types (DictAssign, IndexAssign). Until they were
+// given the same treatment, accumulating into `$fig.parts` stayed O(n^2) while
+// the identical code accumulating into a local was linear -- the same
+// operation, 64x apart, which is not a defensible thing for a language to do.
 $d = {"k": "v"};
 $d.k = $d.k + "2";
-eq($d["k"], "v2", "a dict field appends (a different node type entirely)");
+eq($d["k"], "v2", "a dict field appends");
+$d.k += "3";
+eq($d["k"], "v23", "and so does += on a field");
 $arr = ["a", "b"];
 $arr[0] = $arr[0] + "!";
-eq($arr[0], "a!", "and so does a list element");
+eq($arr[0], "a!", "a list element appends");
+$arr[0] += "?";
+eq($arr[0], "a!?", "and += on an element");
 eq($arr[1], "b", "without touching its neighbour");
+$bykey = {"k": "v"};
+$bykey["k"] = $bykey["k"] + "!";
+eq($bykey["k"], "v!", "a dict entry by key");
+$two = {"p": "aa", "q": "bb"};
+$two.p = $two.q + "Z";
+eq($two.p, "bbZ", "a DIFFERENT field on the right is read, not appended to");
+eq($two.q, "bb", "and that field is untouched");
+$deep = {"in": {"s": "1"}};
+$deep.in.s = $deep.in.s + "2";
+eq($deep.in.s, "12", "a nested field");
+$srcd = {"s": "keep"};
+$cpd = $srcd.s;
+$srcd.s = $srcd.s + "-more";
+eq($cpd, "keep", "a value copied out of a field beforehand is untouched");
+class PerfAcc { def init() { $this.buf = ""; } def add($x) { $this.buf = $this.buf + $x; } }
+def mkAcc() { return new PerfAcc(); }
+$acc = mkAcc();
+$acc.add("p"); $acc.add("q");
+eq($acc.buf, "pq", "a class-instance field accumulates across method calls");
+$num = {"n": 1};
+$num.n = $num.n + 2;
+eq($num.n, 3, "a numeric field still takes the ordinary operator path");
+
+// A field target can be reached by a callee through the shared dict, unlike a
+// local, so an operand that can run code must make the append DECLINE -- and
+// declining must not evaluate that operand twice.
+$sideCalls = {"n": 0};
+def sideEffect() { $sideCalls.n = $sideCalls.n + 1; return "S"; }
+$imp = {"s": "x"};
+$imp.s = $imp.s + sideEffect();
+eq($imp.s, "xS", "an operand that can run code still produces the right answer");
+eq($sideCalls.n, 1, "and is evaluated exactly once, not twice");
+
+print("");
+print("-- a field accumulator is linear too --");
+$fragf = "0123456789";
+$fld = {"buf": ""};
+$t0 = clock();
+$i = 0;
+while ($i < 50000) { $fld.buf = $fld.buf + $fragf; $i = $i + 1; }
+$tf50k = clock() - $t0;
+eq(len($fld.buf), 500000, "50,000 appends into a field");
+$fld.buf = "";
+$fld2 = {"buf": ""};
+$t0 = clock();
+$i = 0;
+while ($i < 100000) { $fld2.buf += $fragf; $i = $i + 1; }
+$tf100k = clock() - $t0;
+eq(len($fld2.buf), 1000000, "100,000 appends into a field, via +=");
+$fld2.buf = "";
+ok($tf100k <= max(3 * $tf50k, 100),
+   "a field accumulator is linear as well  (it was 64x slower than a local)");
+print("          50k " + str($tf50k) + " ms, 100k " + str($tf100k) + " ms");
 
 // ── Linearity ───────────────────────────────────────────────────────────
 print("");
