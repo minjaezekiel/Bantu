@@ -1,0 +1,6 @@
+{
+  "name": "numba",
+  "version": "1.0.0",
+  "main": "numba.b",
+  "description": "Numerical Bantu — NumPy-class arrays: n-dimensional and strided, with zero-copy views so reshape, transpose and slice cost nothing at any size; NumPy broadcasting; ~55 element-wise functions with an optional destination so loops run in constant memory; reductions over any axis with keepdims, using pairwise summation (10M values summed to 2e-16 relative error) and Welford variance; scans, sorting, searching, histograms, fancy and boolean indexing; and linear algebra written from scratch — matmul at 7.8 GFLOP/s, solve, inv, det, Cholesky, Householder QR, least squares, Jacobi eigh and SVD. Operators work directly ($a + $b, $m[1][2] = 9) and methods chain. Built on the native nd_* primitives."
+}

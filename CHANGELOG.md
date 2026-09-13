@@ -9,6 +9,18 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] numba is installable** — `bantu add numba`, then `include "numba" as np;`.
+  `numba/numba.b` is the public API in plain Bantu, with sensible defaults the raw builtins cannot
+  have (`np.arange(0, 10)` rather than `nd_arange(0, 10, null)`), plus composed helpers built from
+  the same pieces: `polyfit`, `polyval`, `interp`, `gradient`, `cov`, `corrcoef`, `meshgrid`,
+  `moving_average` and `trapz`. `np.help()` lists the API and `np.info($a)` describes an array.
+  Documented in `docs/numba.md`, with four runnable programs in `samples/numba/`.
+
+- **[feature] Samples are executed by CI** — `tests/run_samples.sh` runs every program under
+  `samples/` and every package smoke test, and fails the build if one errors. Documentation rots
+  silently: an example that stopped working still looks right in the docs, and the first person to
+  find out is a new user in their first five minutes.
+
 - **[feature] numba does linear algebra** — `matmul`, `solve`, `inv`, `det`, `cholesky`, `qr`,
   `lstsq`, `eigh`, `svd`, `pinv`, `norm`, `matrix_rank` and `cond`, all written from scratch with no
   external library. A 500×500 system solves in 23 ms to a residual of 1e-14; a 1000×1000 matrix
@@ -131,6 +143,16 @@ All notable changes to the Bantu programming language are documented in this fil
   recipient, and degrades to in-app-only when push is unavailable.
 
 ### Fixed
+
+- **[bug fix] Keywords could not be used as property names** — `$d.number`, `$d.string`,
+  `$d.delete` and `$a.any()` all failed with "Expected property name after '.'", because the parser
+  kept a hand-written list of which keywords were allowed after a dot and it was incomplete. Any
+  word now works there, which is safe because a property name can only follow a dot. Latent for
+  anyone whose dict happened to use one of those keys.
+
+- **[bug fix] `samples/blogsite` called a database method that does not exist** — `sua.sqlite.open`
+  is the API; the sample said `connect`. Broken for long enough that the shipped release reproduces
+  it.
 
 - **[bug fix] An array combined with null or a dict silently produced 0** — falling through to
   numeric addition of two non-numbers. It now raises and says what arrived.

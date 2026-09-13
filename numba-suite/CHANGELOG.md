@@ -620,3 +620,80 @@ a particular vector is fragile and proves little; asserting `‖Ax − b‖ < 1e
 solves the system and stays meaningful when the pivoting order changes. Likewise `lstsq` is checked
 by the defining property — the residual is orthogonal to every column of A — rather than by comparing
 coefficients.
+
+---
+
+## Phase 6 — The package, the docs, the gallery ✅ (partial)
+
+`tests/numba_pkg_test.b` **51/51**; `numba/numba_test.b` **12/12**; `tests/run_samples.sh`
+**21/21**. What shipped, and what did not, is stated plainly at the end.
+
+### The façade — why it exists at all
+
+`numba/numba.b` is the public API; the `nd_*` builtins are plumbing. The reason is not tidiness:
+**the façade can have optional arguments and a raw builtin cannot.** Bantu binds a missing argument
+to null, so `np.arange(0, 10)` works here while `nd_arange` needs an explicit trailing `null`. Half
+of `numba_pkg_test.b` asserts exactly those defaults, because a wrapper that forgets one is a
+wrapper that does nothing.
+
+### Composed helpers, built from the atoms
+
+`polyfit`, `polyval`, `interp`, `gradient`, `cov`, `corrcoef`, `meshgrid`, `moving_average`,
+`trapz` — none needed a new kernel. Each is checked against a value workable by hand:
+
+- `polyfit` goes through `lstsq` (hence QR), because a Vandermonde matrix is already
+  ill-conditioned and the normal equations would square that.
+- `polyval` uses Horner's rule.
+- `interp` **clamps** outside the range rather than extrapolating — silently extrapolating is how
+  people get nonsense far from their data.
+- `corrcoef` of a constant series returns **NaN**, not 0: 0 would claim "no relationship" when the
+  truth is "the question is meaningless".
+- `meshgrid` returns copies rather than broadcast views, because a grid is something people expect
+  to be able to write to.
+
+### Package, docs, gallery
+
+- `numba/{numba.b, numba_test.b, package.json}` — **verified end to end**: `bantu publish ./numba`,
+  then `bantu add numba` in a clean temporary project, then `include "numba" as np;` by **bare
+  name**, then `$a.sum()` and `$a + $a`. That bare include is the Phase A resolver fix paying off.
+- `docs/numba.md` — quickstart, tour, real measured numbers, the safety model, "things worth knowing
+  before you hit them", and a blunt list of what is deliberately absent.
+- `samples/numba/` — four runnable programs: quickstart, a linear fit with R², a 200×200 solve
+  checked by residual, and a large-array walkthrough showing `out=` holding memory flat.
+- `tests/run_samples.sh`, wired into **both** CI jobs — every sample is executed, not merely
+  written. Exiting 0 is not enough: a sample that printed an error and carried on would pass, so the
+  runner also greps the output for `[error]`/`[fatal]`.
+
+### Defects found and fixed
+
+- **[bug fix] `any` could not be used as a property name.** It is a reserved *type* keyword, so
+  `$a.any()` failed with "Expected property name after '.'" — and so did a dict key called `number`,
+  `string` or `delete`, latent for anyone whose data used one of those names. The parser had a
+  **hand-maintained list** of keywords permitted after a dot, and it was necessarily incomplete. It
+  now accepts anything that lexes as a bare word, which is safe because a property name can only
+  follow a dot and is therefore never ambiguous with a keyword.
+
+  The façade function still has to be `np.anyof` — `def any(...)` does not parse — but
+  `nd_any($a, ...)` and `$a.any()` both work, and `docs/numba.md` says so.
+
+- **[bug fix] `samples/blogsite/db.b` called `sua.sqlite.connect()`**, which does not exist — the
+  API is `open()`. The sample had been broken long enough that the **shipped release binary
+  reproduces it**. Exactly the rot `run_samples.sh` now exists to prevent; it was found within
+  minutes of the runner being written.
+
+- **[fix] `run_samples.sh` skips `*/server.b`** by name, with the reason stated: those bind a port
+  and block forever, and several also need a database CI does not have. Without the skip the runner
+  hangs the build rather than failing it.
+
+### Not done, and not pretended otherwise
+
+Three Phase 6 rows remain open, and they are integration work rather than numba work:
+
+- **the arctic bridge** (`nd_from_column` zero-copy borrow, `nd_to_column`, `nd_from_frame`, and
+  `arctic.b`'s `to_ndarray()` behind `has_native("ndarray")`)
+- **arctic's ~15 transcendental `col_*` kernels**
+- **the sua-concurrency and cross-platform gates** — the concurrency design is already settled
+  (N18: `thread_local` PRNG, atomic limits) but running numba inside `sua_concurrency_test.sh` has
+  not been done, and Linux/Windows CI has not been observed green for this work.
+
+These are listed in `ROADMAP.md` as open rather than ticked.

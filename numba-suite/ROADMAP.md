@@ -154,14 +154,26 @@ nothing because there was nothing to catch.
 | Cholesky, QR, `lstsq`, `pinv`, `norm`, `trace`, `cond` | Householder QR | ″ | non-SPD input to `cholesky` raises; rank-deficient `lstsq` | [ ] |
 | `svd` (one-sided Jacobi), `eigh` (cyclic Jacobi) | N13 | ″ | SVD reconstruction 200×200 **< 1e-12**; `eigh` orthogonality ‖VᵀV−I‖ and ‖AV−VΛ‖ **< 1e-12**; ill-conditioned inputs | [ ] |
 
-## Phase 6 — The package, the arctic bridge, the docs
+## Phase 6 — The package, the arctic bridge, the docs — PARTIAL
+
+Done: the façade and its composed helpers (`tests/numba_pkg_test.b` **51/51**), the package
+(`bantu publish` → `bantu add` → bare `include "numba" as np` **verified end to end in a clean
+project**), `docs/numba.md`, `samples/numba/` and `tests/run_samples.sh` wired into both CI jobs.
+Two defects fixed: `any` and other keywords could not be used as property names (latent for any dict
+with a key called `number`/`string`/`delete`), and `samples/blogsite/db.b` called a `sua.sqlite`
+method that does not exist — broken on the shipped release, found within minutes of writing the
+sample runner.
+
+**Still open: the arctic bridge, arctic's transcendental `col_*` kernels, the sua-concurrency gate
+and cross-platform CI observation.**
+
 
 | Item | How | Feature test | Stress test | Status |
 |---|---|---|---|---|
-| Composed helpers | `polyfit/polyval`, `interp`, `gradient`, `cov/corrcoef`, `meshgrid`, moving average — pure Bantu | `tests/numba_pkg_test.b` | degenerate fits; single-point interp | [ ] |
+| Composed helpers ✅ | `polyfit/polyval`, `interp`, `gradient`, `cov/corrcoef`, `meshgrid`, moving average — pure Bantu | `tests/numba_pkg_test.b` | degenerate fits; single-point interp | [ ] |
 | arctic transcendentals | ~15 `col_sqrt/exp/log/…` natively, on the existing `unaryOp` shape with null propagation | `tests/arctic_transcendental_test.b` | nulls propagate; domain errors → NaN not crash | [ ] |
 | The bridge | `nd_from_column` (zero-copy borrow), `nd_to_column` (copy), `nd_from_frame` (F-contiguous); `arctic.b` `to_ndarray()` behind `has_native("ndarray")` | `tests/numba_arctic_bridge_test.b` | round-trip exact; borrow **provably zero-copy via `nd_base_id`**; a column with nulls is refused by name; the borrowed array outliving the column | [ ] |
-| Package, docs, gallery | `numba/{numba.b, numba_test.b, package.json}`, `docs/numba.md`, `samples/numba/`, `tests/run_samples.sh` | — | **every documented example and every sample executed by CI**; `bantu add numba` then `include "numba" as np` works from a clean project | [ ] |
+| Package, docs, gallery ✅ | `numba/{numba.b, numba_test.b, package.json}`, `docs/numba.md`, `samples/numba/`, `tests/run_samples.sh` | — | **every documented example and every sample executed by CI**; `bantu add numba` then `include "numba" as np` works from a clean project | [ ] |
 | Concurrency | — | — | numba called inside a sua handler under `sua_concurrency_test.sh`; a big allocation inside a handler **raises rather than OOM-killing the worker** | [ ] |
 | Cross-platform | — | — | CI green on Linux, macOS **and** Windows | [ ] |
 

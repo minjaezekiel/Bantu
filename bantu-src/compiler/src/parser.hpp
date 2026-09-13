@@ -1,4 +1,5 @@
 #pragma once
+#include <cctype>
 /**
  * Bantu Language - Recursive Descent Parser
  * Transforms token stream into AST
@@ -621,9 +622,28 @@ private:
                         case BantuTokenType::FROM:
                             propName = advance().value;
                             break;
-                        default:
+                        default: {
+                            // Anything that LOOKS like a bare word is a legal
+                            // property name, whatever the lexer classified it
+                            // as. The explicit list above was maintained by
+                            // hand and was necessarily incomplete: `any` is a
+                            // type keyword, so `$a.any()` failed with "Expected
+                            // property name after '.'", and so did a dict key
+                            // called "number", "string" or "delete" -- latent
+                            // for anyone whose data happened to use one of
+                            // those names. A property name is never ambiguous
+                            // with a keyword, because it can only follow a dot.
+                            const std::string& v = tok.value;
+                            bool wordLike = !v.empty() &&
+                                (std::isalpha(static_cast<unsigned char>(v[0])) || v[0] == '_');
+                            for (size_t ci = 1; wordLike && ci < v.size(); ci++) {
+                                if (!std::isalnum(static_cast<unsigned char>(v[ci])) && v[ci] != '_')
+                                    wordLike = false;
+                            }
+                            if (wordLike) { propName = advance().value; break; }
                             ErrorHandler::throwSyntaxError("Expected property name after '.'", tok.line, tok.col);
                             break;
+                        }
                     }
                 }
                 expr = std::make_shared<DotAccessNode>(std::move(expr), propName, current().line, current().col);
