@@ -52,8 +52,18 @@ against that release on the same machine: 1M arithmetic loop 2,336 → 2,186 ms,
 
 ## Phase 1 — `NdArray` core, buffers, zero-copy views ✅
 
-Feature suite `tests/numba_array_test.b` **108/108**; stress suite `tests/numba_stress.sh` **9/9**;
-full regression green across 42 suites.
+Feature suite `tests/numba_array_test.b` **127/127**; stress suite `tests/numba_stress.sh` **13/13**;
+full regression green (34 `tests/` suites, 31 package-local, plus the `const_bad` linter negative).
+
+**Phase 1.1 hardening ✅** — a review of the three claimed safety properties probed each on a real
+build instead of reasoning about it, and found the allocation ceiling did **not** hold: it was
+per-allocation, so twelve 200 MB arrays sat live against a 2 GiB limit with no error. Fixed with
+live-byte accounting plus a `BANTU_ND_MAX_BYTES` hard ceiling script cannot raise (N17). Also found
+and fixed: `makeView` validated nothing (N19), `nd_slice` never type-checked its arguments and
+wrapped `stride * step` to 0 via signed overflow — producing a stride-0 axis on a *writable* array
+(N19) — and the limit and PRNG were process-global while sua runs handlers on detached threads (N18).
+Read-only propagation was re-verified across every view- and copy-producing builtin and **held**.
+See `docs/numba-security.md`.
 
 | Item | How | Feature test | Stress test | Status |
 |---|---|---|---|---|
@@ -76,7 +86,10 @@ whether the buffer is shared, which is the question a user actually has.
 | The 3-tier loop | tier 0 flat `__restrict`; tier 1 splat; tier 2 **coalesce dims** then an N-d odometer with the branch hoisted out of the inner loop | ″ | 4-D strided ops; `out=` views forcing tier 2 | [ ] |
 | ~45 ufuncs + comparisons + boolean logic + `out=` | promotion `bool → i64 → f64`; i64 exact for `+ - * // %` | ″ | differential vs pure Bantu on 100k, max rel err < 1e-15; denormals, ±inf, NaN, overflow boundaries | [ ] |
 | **Aliasing and writability** | overlap by buffer identity + element extent → copy (NumPy behaviour) | ″ | `nd_add($a,$a,$a)`; `out=` on a partially overlapping view; **writes through a `broadcast_to` result raise** | [ ] |
-| Performance | — | — | **10M `nd_add` ≥ 10 GB/s effective**, reported as GB/s (portable) alongside ms; machine recorded | [ ] |
+| Performance | — | — | **10M `nd_add`, effective GB/s reported alongside ms, machine recorded. PER-PLATFORM target, not a flat 10 GB/s** — see N22: one core sustains ~10 concurrent L1 misses, capping a single thread near 8.1 GB/s at a 79 ns memory latency, so the flat figure was unreachable by construction on a high-latency cloud vCPU. Apple silicon ≥ 20 GB/s; x86 desktop ≥ 10 GB/s; shared vCPU ≥ 5 GB/s single-threaded, or ≥ 10 GB/s with the `std::thread` tier-0 if it lands | [ ] |
+| Memory-system work (N22, `docs/numba-acceleration.md`) | page-align large buffers; non-temporal stores in tier 0 above a measured threshold; `madvise(MADV_HUGEPAGE)`; prototype a fixed-size `std::thread` parallel-for | — | NT stores measured against the scalar path on cache-resident **and** DRAM-resident sizes (they *lose* when the destination fits in cache); the thread pool must not multiply against sua's per-connection threads | [ ] |
+| `out=` honours the safety gates | every destination through `requireWritable()` + `nd_shares_memory()` | `broadcast_to` as `out=` **raises**; an `out=` overlapping an input is copied or refused, never garbage | aliasing fuzzed across offset/stride/flip combinations | [ ] |
+| `nd_empty` genuinely uninitialised (N20) | skip the `memset` for it alone; live-byte accounting still bounds it | contents unspecified but shape/dtype/strides correct | allocation of 10M `nd_empty` is **not** charged 40 ms of page-touching | [ ] |
 | Vectorization actually happened | `-O3` per-file override + CI grep of `-fopt-info-vec-optimized` | — | tier-0 loops present in the log on **both** Linux GCC and macOS Clang | [ ] |
 
 ## Phase 3 — Reductions with `axis`, scans, sorting, indexing

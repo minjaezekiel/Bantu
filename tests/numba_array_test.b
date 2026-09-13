@@ -260,6 +260,91 @@ raises(def() { nd_shape(42); }, "expected an array",
    "passing a non-array where an array is required is refused");
 
 print("");
+print("-- nd_slice validates its arguments --");
+// Every one of these silently succeeded before. The step case is the pointed
+// one: 8 * -2^62 wrapped (signed overflow is undefined behaviour, so the result
+// is not merely wrong) and produced a stride-0 axis on an array still marked
+// WRITABLE -- precisely the state nd_broadcast_to exists to refuse.
+$sm = nd_reshape(nd_arange(0, 32, null), [4, 8]);
+raises(def() { nd_slice($sm, [[null, null, -4611686018427387904], null]); }, "finite whole number",
+   "a step past 2^53 is refused at the argument, before any conversion");
+raises(def() { nd_slice($sm, [[null, null, 2305843009213693952], null]); }, "finite whole number",
+   "and the same in the positive direction");
+// A step small enough to be a legal argument can still overflow the stride
+// product on a wide axis: 2048 * 2^53 = 2^64. That is the case checkedMulSigned
+// exists for, and it has to stay reachable or the guard is untested.
+$wide = nd_reshape(nd_zeros([4096], null), [2, 2048]);
+raises(def() { nd_slice($wide, [[null, null, 9007199254740992], null]); },
+   "stride arithmetic overflows",
+   "a legal step that overflows stride * step is caught by the signed check");
+raises(def() { nd_slice($sm, [[pow(10, 300), null, null], null]); }, "finite whole number",
+   "a start too large for the conversion is refused, not clamped to empty");
+raises(def() { nd_slice($sm, [[[1, 2], null, null], null]); }, "must be a number",
+   "a list where an index belongs is refused, not read as 0");
+raises(def() { nd_slice($sm, [["x", null, null], null]); }, "must be a number",
+   "and so is a string");
+eq(nd_size(nd_slice($sm, [[null, null, -1], null])), 32, "a plain reversing step still works");
+
+print("");
+print("-- the allocation ceiling bounds TOTAL live bytes, not just one call --");
+// A per-allocation limit does not bound a loop, and a loop is how a request
+// handler actually exhausts a server: twelve 200 MB arrays held at once were
+// measured sailing past a 2 GiB per-call ceiling without an error.
+// Arrays from earlier sections are still in scope, so every assertion here is a
+// DELTA against what is already held rather than an absolute.
+$base = nd_live_bytes();
+$held = nd_zeros([10000000], null);
+eq(nd_live_bytes() - $base, 80000000, "a live 80 MB array is accounted");
+$held = 0;
+eq(nd_live_bytes() - $base, 0, "and the bytes come back when it is dropped");
+
+$prev = nd_max_bytes(null);
+nd_max_bytes(104857600);                              // 100 MB
+$keep = [];
+$i = 0;
+while ($i < 10) {
+    try { $keep[len($keep)] = nd_zeros([2500000], null); } catch ($e) { }   // 20 MB each
+    $i = $i + 1;
+}
+ok(len($keep) <= 5, "a loop cannot exceed the ceiling in aggregate (held " +
+   str(len($keep)) + " x 20MB under 100MB)");
+$keep = [];
+eq(nd_live_bytes() - $base, 0, "dropping them all returns every byte");
+
+// A failed allocation that forgot to return its accounted bytes would slowly
+// brick numba, and nothing would say why -- worse than having no limit.
+$i = 0;
+while ($i < 2000) {
+    try { nd_zeros([10000000], null); } catch ($e) { }
+    $i = $i + 1;
+}
+eq(nd_live_bytes() - $base, 0, "2000 refused allocations leak no accounted bytes");
+nd_max_bytes($prev);
+
+raises(def() { nd_max_bytes(1099511627776); }, "hard ceiling",
+   "script cannot raise its own limit past BANTU_ND_MAX_BYTES");
+ok(nd_max_bytes(null) == $prev, "and the ceiling is unchanged after the attempt");
+// Casting a double past SIZE_MAX to size_t is undefined, so it is bounded
+// before the cast rather than after.
+raises(def() { nd_max_bytes(pow(10, 300)); }, "not representable",
+   "a ceiling too large to represent is refused before the conversion");
+raises(def() { nd_max_bytes(64); }, "at least 1024",
+   "an absurdly small ceiling is refused");
+ok(nd_max_bytes(null) == $prev, "and neither attempt moved the ceiling");
+
+print("");
+print("-- nd_shares_memory answers the aliasing question out= will need --");
+$sm2 = nd_reshape(nd_arange(0, 12, null), [3, 4]);
+ok(nd_shares_memory($sm2, nd_T($sm2)), "a view shares memory with its base");
+ok(nd_shares_memory($sm2, $sm2), "an array shares memory with itself");
+ok(!nd_shares_memory($sm2, nd_copy($sm2)), "a copy does not");
+ok(!nd_shares_memory(nd_slice($sm2, [[0, 1, null], null]),
+                     nd_slice($sm2, [[2, 3, null], null])),
+   "two disjoint rows of one buffer do not");
+ok(nd_shares_memory(nd_slice($sm2, [[0, 1, null], null]), $sm2),
+   "but a row does share with the whole");
+
+print("");
 print("-- boundaries that are legal, not errors --");
 eq(nd_size(nd_zeros([0], null)), 0, "a zero-length array is fine");
 eq(str(nd_shape(nd_zeros([0], null))), "[0]", "and keeps its shape");

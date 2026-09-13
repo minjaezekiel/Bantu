@@ -204,6 +204,10 @@ void registerBuiltins(const DefineFn& define) {
     // print($a) renders the array rather than "<ndarray>".
     registerHandleRepr(NDARRAY_TAG, &reprArrayHandle);
 
+    // Read BANTU_ND_MAX_BYTES once, here, before any script line runs and so
+    // before sua has spawned a connection thread.
+    initLimits();
+
     // ── the allocation ceiling ───────────────────────────────────────────────
     define("nd_max_bytes", [](std::vector<Value> a) -> Value {
         if (!a.empty() && !a[0].isNull()) {
@@ -211,9 +215,41 @@ void registerBuiltins(const DefineFn& define) {
             if (!a[0].isNumber() || d < 1024 || std::isnan(d) || std::isinf(d)) {
                 throw std::runtime_error("nd_max_bytes: expected a byte count of at least 1024");
             }
-            maxBytesRef() = (size_t)d;
+            // Converting a double larger than SIZE_MAX to size_t is undefined,
+            // so bound it before the cast. 2^53 bytes is 9 PB -- past any real
+            // ceiling, and the point where a double stops being exact anyway.
+            if (d > 9007199254740992.0) {
+                throw std::runtime_error("nd_max_bytes: a ceiling above 2^53 bytes is not "
+                                         "representable exactly");
+            }
+            // The ratchet (N17): script may lower the ceiling for itself, never
+            // raise it past what the operator set in BANTU_ND_MAX_BYTES. A limit
+            // the untrusted side can raise is documentation, not a control.
+            const size_t want = (size_t)d;
+            const size_t hard = hardMaxBytesRef().load(std::memory_order_relaxed);
+            if (want > hard) {
+                std::ostringstream o;
+                o << "nd_max_bytes: " << want << " exceeds the hard ceiling of " << hard
+                  << " set by BANTU_ND_MAX_BYTES; a script cannot raise its own limit";
+                throw std::runtime_error(o.str());
+            }
+            maxBytesRef().store(want, std::memory_order_relaxed);
         }
-        return Value((double)maxBytesRef());
+        return Value((double)maxBytesRef().load(std::memory_order_relaxed));
+    });
+
+    // Bytes held by live arrays right now — the number the ceiling is actually
+    // tested against, so it has to be inspectable or the limit is unexplainable.
+    define("nd_live_bytes", [](std::vector<Value>) -> Value {
+        return Value((double)liveBytesRef().load(std::memory_order_relaxed));
+    });
+
+    // nd_shares_memory(a, b) — do these two address any of the same memory?
+    // Conservative like np.may_share_memory: overlapping extents count as
+    // sharing even where the stride patterns would never actually collide.
+    define("nd_shares_memory", [](std::vector<Value> a) -> Value {
+        needArgs(a, 2, "nd_shares_memory(a, b)");
+        return Value(sharesMemory(*asArray(a[0]), *asArray(a[1])));
     });
 
     // ── creation ─────────────────────────────────────────────────────────────
@@ -527,12 +563,7 @@ void registerBuiltins(const DefineFn& define) {
     define("nd_set", [indexList](std::vector<Value> a) -> Value {
         needArgs(a, 3, "nd_set(array, index, value)");
         auto x = asArray(a[0]);
-        if (!x->writable) {
-            throw std::runtime_error("nd_set: this array is read-only. A broadcast view has a "
-                                     "stride of 0 on its stretched axes, so writing through it "
-                                     "would silently hit the same element many times -- copy it "
-                                     "first with nd_copy()");
-        }
+        requireWritable(*x, "nd_set");
         if (!a[2].isNumber() && !a[2].isBool()) {
             throw std::runtime_error("nd_set: the value must be a number or a boolean (got " +
                                      a[2].toString() + ")");
@@ -807,7 +838,7 @@ void registerBuiltins(const DefineFn& define) {
                     std::to_string(want) + ")");
             }
         }
-        auto v = makeView(x, to, st, x->offset);
+        auto v = makeView(x, to, st, x->offset, "nd_broadcast_to");
         v->writable = false;
         return wrap(v);
     });
@@ -835,16 +866,37 @@ void registerBuiltins(const DefineFn& define) {
             }
             const std::vector<Value>& s = specs[d].listVal;
             const ptrdiff_t extent = (ptrdiff_t)x->shape[d];
-            ptrdiff_t step = (s.size() > 2 && !s[2].isNull()) ? (ptrdiff_t)std::llround(s[2].numberVal) : 1;
+            // Each of start/stop/step used to be read straight off .numberVal,
+            // which is 0 for a list, a string or null -- so nd_slice silently
+            // accepted [[1,2], null, null] as an index -- and then pushed
+            // through llround, which is undefined outside long long's range.
+            // sliceArg answers both: it is a number, and it is small enough that
+            // the conversion and the later stride multiply are defined.
+            auto sliceArg = [&](size_t i, ptrdiff_t dflt) -> ptrdiff_t {
+                if (s.size() <= i || s[i].isNull()) return dflt;
+                static const char* kPart[3] = {"start", "stop", "step"};
+                if (!s[i].isNumber()) {
+                    throw std::runtime_error(std::string("nd_slice: ") + kPart[i] + " on axis " +
+                        std::to_string(d) + " must be a number (got " + s[i].toString() + ")");
+                }
+                const double v = s[i].numberVal;
+                if (std::isnan(v) || std::isinf(v) || std::fabs(v) > 9007199254740992.0) {
+                    throw std::runtime_error(std::string("nd_slice: ") + kPart[i] + " on axis " +
+                        std::to_string(d) + " must be a finite whole number (got " +
+                        s[i].toString() + ")");
+                }
+                return (ptrdiff_t)std::llround(v);
+            };
+            const ptrdiff_t step = sliceArg(2, 1);
             if (step == 0) throw std::runtime_error("nd_slice: step cannot be zero on axis " +
                                                     std::to_string(d));
             ptrdiff_t start, stop;
             if (step > 0) {
-                start = (s.size() > 0 && !s[0].isNull()) ? (ptrdiff_t)std::llround(s[0].numberVal) : 0;
-                stop  = (s.size() > 1 && !s[1].isNull()) ? (ptrdiff_t)std::llround(s[1].numberVal) : extent;
+                start = sliceArg(0, 0);
+                stop  = sliceArg(1, extent);
             } else {
-                start = (s.size() > 0 && !s[0].isNull()) ? (ptrdiff_t)std::llround(s[0].numberVal) : extent - 1;
-                stop  = (s.size() > 1 && !s[1].isNull()) ? (ptrdiff_t)std::llround(s[1].numberVal) : -1 - extent;
+                start = sliceArg(0, extent - 1);
+                stop  = sliceArg(1, -1 - extent);
             }
             if (start < 0) start += extent;
             if (stop < 0 && !(step < 0 && stop == -1 - extent)) stop += extent;
@@ -859,11 +911,15 @@ void registerBuiltins(const DefineFn& define) {
                 stop  = std::max<ptrdiff_t>(stop, -1);
                 count = (start > stop) ? (start - stop + (-step) - 1) / (-step) : 0;
             }
-            off += start * st[d];
+            // Both of these are user-influenced products on a signed type, where
+            // overflow is undefined rather than merely wrong. A step near -2^62
+            // on a stride-8 axis was measured wrapping `st[d] * step` to 0,
+            // producing a stride-0 axis on an array still marked writable.
+            off += checkedMulSigned(start, st[d], "nd_slice");
             shape[d] = (size_t)count;
-            st[d]    = st[d] * step;
+            st[d]    = checkedMulSigned(st[d], step, "nd_slice");
         }
-        return wrap(makeView(x, shape, st, (size_t)off));
+        return wrap(makeView(x, shape, st, (size_t)off, "nd_slice"));
     });
 }
 

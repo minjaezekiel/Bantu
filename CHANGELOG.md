@@ -9,6 +9,19 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] numba's allocation limit is enforceable by whoever runs the process** —
+  `BANTU_ND_MAX_BYTES` sets a hard ceiling on the memory numba may hold, read once at startup.
+  `nd_max_bytes(n)` can lower a program's own limit but never raise it past that, so an operator
+  running untrusted Bantu can cap it and a script cannot opt out. The limit now bounds **total live
+  bytes**, not one allocation at a time, because a loop is how a request handler actually exhausts a
+  server. `nd_live_bytes()` reports what is currently held. A malformed env value keeps the default
+  rather than silently disabling the limit.
+
+- **[feature] `nd_shares_memory(a, b)`** — whether two arrays address any of the same memory, the
+  question you need before writing into one while reading the other. Conservative in the same way as
+  NumPy's `may_share_memory`: overlapping extents count as sharing even where the stride patterns
+  would never actually collide.
+
 - **[feature] `include "<package>"` resolves installed packages** — `bantu add <pkg>` installs into
   `./bantu_modules/<pkg>/`, but the module resolver had no rule for that directory, so an installed
   package could only be reached by writing out its full path
@@ -69,6 +82,30 @@ All notable changes to the Bantu programming language are documented in this fil
   recipient, and degrades to in-app-only when push is unavailable.
 
 ### Fixed
+
+- **[bug fix] numba array slicing accepted arguments that were not numbers** — `nd_slice` read the
+  numeric field of whatever `Value` it was given, which is `0` for a list, a string or null, so
+  `nd_slice($m, [[[1,2], null, null], null])` was silently treated as index `0` instead of being
+  rejected. Very large bounds were then converted in a way that is undefined outside the integer
+  range, so a start of `1e300` quietly produced an empty array rather than an error. Every argument
+  is now type-checked and bounded, and the message names the axis and which part was wrong.
+
+- **[bug fix] A slice step could corrupt an array's strides through signed overflow** — on an array
+  whose axis stride was 8, a step near `-2^62` overflowed `stride * step` and wrapped it to **0**,
+  producing an array with a zero stride that was still marked writable. That is the exact state
+  broadcast views are made read-only to prevent, and signed overflow is undefined behaviour rather
+  than merely a wrong number. Both products are now checked.
+
+- **[bug fix] numba's random stream and memory limit were shared across sua requests** — sua runs
+  each connection's handler on its own thread, and both were process-wide. `nd_seed()` in one
+  request therefore changed the random numbers every other in-flight request received — the same
+  problem numba carries its own generator to avoid — and concurrent updates to the limit were a data
+  race. The generator is now per-thread and the counters are atomic. Each thread seeds its own
+  stream.
+
+- **[bug fix] numba error messages repeated the builtin's name** — errors read
+  `nd_slice: nd_slice: step cannot be zero on axis 0`, because the wrapper prefixed the name onto
+  messages that already carried it.
 
 - **[patch] Appending to a list was O(n²); it is now O(1)** — two independent causes, both
   pre-existing and both reproducible on the shipped release binary.

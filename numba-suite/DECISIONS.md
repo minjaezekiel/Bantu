@@ -173,3 +173,98 @@ package left the second with an **unbound alias** and only a stderr line, which 
 hits. Both were latent for every existing package (`arctic`, `hash`, `crypto`, `uuid`, `random`,
 `orm`), so fixing them fixes all of them.
 **Implication:** these land in Phase A, before any numba code, because everything else rides on them.
+
+### N17 — The allocation ceiling bounds total live bytes, and script cannot raise it
+**Decision:** two numbers, not one. A **hard** ceiling read once at startup from
+`BANTU_ND_MAX_BYTES`, and a **soft** ceiling that `nd_max_bytes()` may only move *downward* from it.
+Admission is tested against `live + requested`, not the request alone, with live bytes tracked in an
+atomic counter incremented in the `Buffer` constructor and decremented in its destructor.
+**Why:** the Phase 1 ceiling was per-allocation, which does not bound a loop — twelve 200 MB arrays
+were measured held simultaneously against a 2 GiB per-call limit, with no error. A loop is how a
+request handler actually exhausts a server, so the per-call limit missed the case it existed for.
+And a limit the untrusted side can raise for itself (`nd_max_bytes(1e18)`) is a guard against
+mistakes, not against hostile input.
+**Precedent:** CPython's answer to CVE-2020-10735 has exactly this shape — `PYTHONINTMAXSTRDIGITS`
+plus `-X int_max_str_digits` owned by the operator, and `sys.set_int_max_str_digits()` for the
+program. The env var is the half that a script cannot reach.
+**Implication:** the error message must distinguish "you can raise this" from "the operator capped
+this", or it advises a fix that cannot work. A failed allocation must return its accounted bytes
+before unwinding — accounted-but-never-freed is worse than no limit, because the process slowly
+refuses everything and nothing says why. Gated by a stress assertion that live bytes return to
+baseline **exactly**, which RSS is far too noisy to show.
+
+### N18 — Process-global mutable state is a bug, because sua handlers are threads
+**Decision:** the allocation counters are `std::atomic`; the PRNG is `thread_local`.
+**Why:** sua accepts a connection and runs its Bantu handler on a detached `std::thread`
+(`server.hpp:863`), so every numba global is touched concurrently. A plain `size_t` limit is a data
+race, which is undefined behaviour rather than a stale read. Worse, a shared PRNG means `nd_seed()`
+in one request silently reshapes every other in-flight request's random arrays — which is the exact
+objection that made numba carry its own stream instead of using the global `random()`, one level up.
+**Implication:** each thread seeds its own stream, and `nd_seed` documents that. numba is the first
+thing in the tree to put *mutable* process-global state behind a builtin, so it is the first to
+expose that sua's threading model and the interpreter's globals were never reconciled; anything else
+adding a global will hit the same wall.
+
+### N19 — The view extent invariant lives in `makeView`, not in its callers
+**Decision:** `makeView` validates that every element the shape and strides can address lies inside
+the buffer, and `nd_slice`'s user-supplied arithmetic uses a checked **signed** multiply.
+**Why:** `makeView` validated nothing — it trusted caller-supplied shape, strides and offset. That
+survived Phase 1 only because seven view constructors each derived strides from a valid parent, i.e.
+the invariant held by construction rather than by checking, and phases 2–5 add many more. It was
+already wrong: `nd_slice` never type-checked `start`/`stop`/`step`, so `[[1,2], null, null]` was read
+as index 0, and a step of -2^62 on a stride-8 axis wrapped `stride * step` to **0** — manufacturing a
+stride-0 axis on an array still marked writable, which is precisely the state `broadcast_to` refuses
+to produce. Signed overflow is undefined behaviour, so unlike the unsigned case it cannot be detected
+after the fact.
+**Precedent:** NumPy's `PyArray_CheckStrides`, and NumPy's own `as_strided` documentation — get
+strides wrong and "array elements can point to invalid memory and can corrupt results or crash your
+program."
+**Implication:** `nd_as_strided` is **deliberately never shipped**. Not exposing it is what keeps
+every stride in the system numba-derived, which is what makes this invariant maintainable at all.
+The same extent walk backs `nd_shares_memory`, which Phase 2's `out=` needs for aliasing.
+
+### N20 — The `memset` in `Buffer` is load-bearing; do not switch to `calloc`
+**Decision:** allocation touches every page at the point of allocation. `nd_empty` is the single
+exception and gets its DoS bound from N17's accounting instead.
+**Why:** under Linux's default overcommit a large `posix_memalign` or `calloc` succeeds without
+committing a page — `calloc` serves large blocks from kernel zero pages — so the memory is charged
+only when a kernel touches it. The ceiling's bookkeeping would say everything is fine and the OOM
+killer would arrive later, mid-kernel, with no exception for a Bantu `try/catch` and a dead worker
+inside a sua handler. The `memset` converts a deferred uncatchable kill into an error raised on the
+line that caused it. It costs ~40 ms per 10M f64, which is the price of deterministic failure.
+**Implication:** this is the obvious performance "fix" (NumPy splits `npy_alloc_cache` from
+`npy_alloc_cache_zero` exactly this way), so it is recorded at the `memset` itself,
+in `docs/numba-security.md` §2 and in `docs/numba-acceleration.md` §4.
+
+### N21 — No GPU backend before Phase 7, and never for ufuncs
+**Decision:** no CUDA/Metal/ROCm/SYCL backend in phases 1–6. Revisit only for Phase 5 linear algebra,
+only on a measured wall, and then as an explicit residency model (`nd_to_device`/`nd_to_host`) behind
+a capability flag — never as a transparent accelerator.
+**Why:** `c = a + b` has an arithmetic intensity of 0.042 flop/byte and is DRAM-bandwidth-bound. A
+discrete GPU must first move the data across PCIe at ~25 GB/s against host DRAM at 50–200 GB/s, so
+the transfer alone costs more than doing the whole operation on the CPU. GPUs pay only when data
+stays *resident* across many kernels, which is a different programming model — it is why CuPy has a
+separate array type rather than making NumPy faster, and why CuPy tells users not to bother below
+~10k elements. On top of that, a GPU dependency is the `BANTU_BLAS` objection several times over:
+it would gate *speed*, not capability, so the same program would run several times slower on the
+binary users download.
+**Implication:** the one accommodation taken now is **page alignment for large buffers**, which costs
+one constant and serves non-temporal stores, huge pages, and a possible future zero-copy `MTLBuffer`
+(`newBufferWithBytesNoCopy` requires page-aligned memory) all at once. `Buffer` already separates
+ownership from array metadata, which is the seam a device allocation would use; it does **not** get a
+speculative `device` enum today. Full analysis in `docs/numba-acceleration.md`.
+
+### N22 — One core cannot saturate DRAM, so the Phase 2 bandwidth gate is per-platform
+**Decision:** the roadmap's "10M `nd_add` ≥ 10 GB/s effective" becomes a per-platform target, and a
+`std::thread` parallel tier-0 is prototyped in Phase 2 rather than assumed unnecessary.
+**Why:** `docs/numba-architecture.md` §3 concluded that threading was "not needed for the headline
+op" because it is bandwidth- rather than ALU-bound. The premise is right; the conclusion does not
+follow. A single core sustains only ~10 concurrent L1 misses, capping one thread near
+`10 × 64 B / latency` — about **8.1 GB/s** at a 79 ns memory latency. Bandwidth-bound means you need
+enough cores to fill the memory pipeline, then no more. Single-threaded passes the gate comfortably
+on Apple silicon and plausibly cannot reach it on a high-latency shared cloud vCPU, which is the
+machine the Linux binary actually runs on.
+**Why not OpenMP:** it links `libgomp` — a new runtime dependency needing `brew install libomp` for
+every contributor. `std::thread` is already used in the tree (`server.hpp`), so a small fixed-size
+pool adds nothing. It must be threshold-gated (thread wake-up is microseconds) and must not multiply
+against sua's per-connection threads, the same interaction that forced N18.

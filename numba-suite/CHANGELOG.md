@@ -203,3 +203,95 @@ out of scope.
 everything else stays at `-O2` (N11). Verified in the generated CMake rules:
 `ndarray_native.cpp.o_OPTIONS = -O3;-ftree-vectorize`. The CI grep of `-fopt-info-vec-optimized`
 belongs to Phase 2, where the tier-0 kernel loops it would check actually exist.
+
+---
+
+## Phase 1.1 — Memory-safety hardening ✅
+
+Prompted by a review of the three safety properties Phase 1 claimed. Each was probed on a real build
+rather than reasoned about, which is the only reason the second one was caught: **it did not hold.**
+All five gate tiers green — `tests/numba_array_test.b` **127/127**, `tests/numba_stress.sh`
+**13/13**, 34 `tests/` suites plus 31 package-local suites, macOS arm64.
+
+### The claim that was false
+
+- **[bug fix]** The allocation ceiling was **per allocation**, so it did not bound a loop — and a
+  loop is how a request handler actually exhausts a server, which was the stated reason for having a
+  ceiling. Measured: **twelve 200 MB arrays held simultaneously against a 2 GiB limit, no error.**
+  Admission is now tested against `live + requested`, with live bytes in an atomic counter
+  incremented in the `Buffer` constructor and decremented in its destructor (N17). The same probe
+  now admits 10 and refuses the 11th.
+- **[feature]** A **hard ceiling** from `BANTU_ND_MAX_BYTES`, read once at startup, that
+  `nd_max_bytes()` can only move *downward* from. A limit the untrusted side can raise for itself is
+  a guard against mistakes, not against hostile input — the shape CPython settled on for
+  CVE-2020-10735. The error message distinguishes "raise it with `nd_max_bytes(n)`" from "set by
+  `BANTU_ND_MAX_BYTES`, which script cannot raise", so it never advises a fix that cannot work.
+  A malformed env value keeps the default rather than disabling the limit or forbidding everything.
+- **[feature]** `nd_live_bytes()` — the number admission is tested against, exposed, because an
+  unexplainable limit is an unusable one.
+
+### The claim that held, checked properly
+
+- **[test]** Read-only propagation was verified across **every** builtin that takes an array and
+  returns one, not just `nd_set`. The two that hand back a *writable* array from a read-only base
+  (`nd_reshape`, `nd_ravel` on non-contiguous input) were checked by buffer identity rather than by
+  reading the code: `nd_base_id` differs and a write through the result leaves the source at 0. They
+  copy, and a copy of a read-only array is legitimately writable — matching NumPy's own rule. No
+  change needed.
+- **[feature]** Enforcement moved into one `requireWritable()` gate, because `writable` was checked
+  in exactly one place while Phase 2's `out=` and Phase 3's `nd_put` are three more chances to forget.
+
+### Defects found while verifying
+
+- **[bug fix]** **`makeView` validated nothing** — it trusted caller-supplied shape, strides and
+  offset. It now checks that every addressable element lies inside the buffer (N19), in the one
+  chokepoint every view passes through, because "remember to check" does not survive phases 2–5
+  adding view constructors. NumPy's analogue is `PyArray_CheckStrides`.
+- **[bug fix]** **`nd_slice` never type-checked `start`/`stop`/`step`.** It read `.numberVal` off any
+  `Value` — which is 0 for a list, a string or null — so `nd_slice($m, [[[1,2], null, null], null])`
+  was silently accepted as index 0. It then pushed the result through `llround`, undefined outside
+  `long long`'s range, so a start of `1e300` silently produced an empty array instead of an error.
+- **[bug fix]** **Signed overflow in stride arithmetic.** On a `(4,8)` array, a step of `-2^62`
+  wrapped `strides[0] * step` to **0**, producing a **stride-0 axis on an array still marked
+  writable** — precisely the state `nd_broadcast_to` exists to refuse. It was contained only because
+  the count computation clamped the extent to 1. That is luck, not design. `checkedMulSigned` on
+  `__builtin_mul_overflow` now guards both products, and the guard is reachable and tested: a legal
+  step of `2^53` on a stride-2048 axis still overflows and raises.
+- **[bug fix]** **A data race, and a reproducibility bug, from process-global state.** sua runs each
+  connection's Bantu handler on a detached `std::thread` (`server.hpp:863`), so the limit and the
+  PRNG were shared across concurrent requests. The counters are now `std::atomic` and the `Rng` is
+  `thread_local` (N18) — a shared stream meant `nd_seed()` in one request silently reshaped every
+  other in-flight request's arrays, which is the same objection that made numba carry its own PRNG
+  instead of using global `random()`, one level up.
+- **[bug fix]** Error messages read `nd_slice: nd_slice: ...` — the wrapper prefixed the builtin name
+  unconditionally onto messages that already carried it. Fixed once at the wrapper, covering all 27.
+
+### Deliberately not changed
+
+- **[perf]** `checkedMul` keeps the division form for unsigned products. `__builtin_mul_overflow` is
+  one `mul` plus `jo` against a 20–40 cycle divide, but this runs once per array creation against an
+  allocation measured in tens of milliseconds, and it is portable to MSVC with no `#ifdef`. The
+  signed version is a different matter and does use the builtin — signed overflow is UB, so it
+  cannot be detected after the fact.
+- **[docs]** The `memset` in `Buffer` is **load-bearing** and is now documented as such in three
+  places (N20). Switching it to `calloc` — the obvious optimisation, and what NumPy does — would
+  serve large blocks from kernel zero pages under Linux overcommit, so nothing is committed until a
+  kernel touches it: the ceiling would stop bounding real memory and a catchable error would become
+  a deferred OOM kill inside a request handler.
+
+### New builtins
+
+`nd_live_bytes()`, `nd_shares_memory(a, b)` — the latter conservative like `np.may_share_memory`,
+reusing the same extent walk as the view check, and the aliasing test Phase 2's `out=` needs.
+
+### Stress
+
+| | result |
+|---|---|
+| 50,000 arrays + view chains | live-byte drift **0 bytes**, exactly |
+| 20,000 refused allocations | live-byte drift **0 bytes** (a drift here slowly bricks numba) |
+| hoarding loop under a 100 MB ceiling | held **100 MB**, then returned every byte |
+| 200,000 arrays / 200,000 view chains / 180,000 bad calls | RSS +12 KB / +28 KB / +60 KB |
+
+Byte accounting is the more precise instrument: RSS is noisy enough that a small genuine leak hides
+inside normal allocator variation, whereas the live counter must return to baseline exactly.

@@ -96,6 +96,51 @@ mark("m4");
 nd_set(\$chk, [2, 3], 42);
 writefile("$TMP/final", str(nd_get(\$chk, [2,3])) + "," + str(nd_size(\$chk)));
 
+// ── 4b. byte accounting is EXACT, which RSS can never show ───────────────
+// RSS is noisy: the allocator keeps freed pages, so a small genuine leak hides
+// inside normal variation. nd_live_bytes() is the number the ceiling is
+// actually tested against, so it must return to its baseline exactly -- if it
+// drifts upward, numba slowly refuses to allocate and nothing says why.
+\$baseline = nd_live_bytes();
+\$i = 0;
+while (\$i < 50000) {
+    \$t = nd_zeros([64], null);
+    \$u = nd_T(nd_reshape(\$t, [8, 8]));
+    \$i = \$i + 1;
+}
+// The last iteration's array is still bound to \$t/\$u, and it is accounted
+// because it is genuinely still live. Release it, or the check measures scope
+// rather than leakage.
+\$t = 0;
+\$u = 0;
+\$afterLoop = nd_live_bytes() - \$baseline;
+
+// Failed allocations must return their accounted bytes on the way out.
+\$i = 0;
+while (\$i < 20000) {
+    try { nd_zeros([1000000000000000], null); } catch (\$e) { }
+    \$i = \$i + 1;
+}
+\$afterFail = nd_live_bytes() - \$baseline;
+
+// The ceiling must bound a hostile LOOP, not just one call. This is the case a
+// per-allocation limit misses entirely, and it is how a request handler
+// actually exhausts a server.
+\$prevCap = nd_max_bytes(null);
+nd_max_bytes(104857600);                       // 100 MB
+\$hoard = [];
+\$i = 0;
+while (\$i < 200) {
+    try { \$hoard[len(\$hoard)] = nd_zeros([1250000], null); } catch (\$e) { }  // 10 MB
+    \$i = \$i + 1;
+}
+\$heldMB = len(\$hoard) * 10;
+\$hoard = [];
+nd_max_bytes(\$prevCap);
+\$afterHoard = nd_live_bytes() - \$baseline;
+writefile("$TMP/account", str(\$afterLoop) + "," + str(\$afterFail) + "," +
+                          str(\$heldMB) + "," + str(\$afterHoard));
+
 // ── 5. timing at 10M ─────────────────────────────────────────────────────
 \$t0 = clock();
 \$big = nd_zeros([10000000], null);
@@ -153,6 +198,18 @@ if [ ! -f "$TMP/done" ]; then bad "the script did not finish"; cat "$TMP/out.log
 FINAL=$(cat "$TMP/final")
 check "$([ "$FINAL" = "42,12" ] && echo 1 || echo 0)" \
       "arrays still behave correctly after the whole run (got $FINAL)"
+
+IFS=, read -r ACCT_LOOP ACCT_FAIL HELD_MB ACCT_HOARD < "$TMP/account"
+echo "        live-byte drift: ${ACCT_LOOP}B over 50,000 arrays+views, ${ACCT_FAIL}B over 20,000 failures"
+check "$([ "$ACCT_LOOP" = "0" ] && echo 1 || echo 0)" \
+      "byte accounting returns to its baseline EXACTLY after 50,000 arrays"
+check "$([ "$ACCT_FAIL" = "0" ] && echo 1 || echo 0)" \
+      "and after 20,000 refused allocations (a drift here slowly bricks numba)"
+echo "        a hoarding loop under a 100MB ceiling held ${HELD_MB}MB"
+check "$([ "$HELD_MB" -le 100 ] && echo 1 || echo 0)" \
+      "the ceiling bounds a LOOP in aggregate, not just one allocation"
+check "$([ "$ACCT_HOARD" = "0" ] && echo 1 || echo 0)" \
+      "and every hoarded byte comes back when the arrays are dropped"
 
 IFS=, read -r ALLOC VMS SMS SSIZE < "$TMP/timing"
 echo "        10M f64: allocate ${ALLOC}ms, reshape+transpose ${VMS}ms, strided slice ${SMS}ms"

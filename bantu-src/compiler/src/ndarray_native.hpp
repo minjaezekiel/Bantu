@@ -29,6 +29,8 @@
 #include "types.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstddef>
@@ -86,17 +88,74 @@ inline DType promote(DType a, DType b) {
 // ── allocation limits ────────────────────────────────────────────────────────
 // A single bad argument must not be able to take the process down. This matters
 // most when numba runs inside a sua request handler, where the process is a
-// server: nd_zeros([1e15]) has to raise, not OOM-kill the worker (N15). The
-// ceiling is generous by default and adjustable from Bantu via nd_max_bytes().
-inline size_t& maxBytesRef() {
-    static size_t cap = (size_t)2 * 1024 * 1024 * 1024;   // 2 GiB
+// server: nd_zeros([1e15]) has to raise, not OOM-kill the worker (N15).
+//
+// TWO numbers, not one, because they answer different questions (N17):
+//
+//   the HARD ceiling  — set once at startup from BANTU_ND_MAX_BYTES, by whoever
+//                       runs the process. Script code can never raise past it.
+//   the SOFT ceiling  — what nd_max_bytes() moves, and only ever DOWNWARD from
+//                       the hard one. A limit a script can raise for itself is a
+//                       guard against mistakes, not against hostile input; the
+//                       ratchet is what makes it an actual control. This is the
+//                       shape CPython settled on for the same class of problem
+//                       (CVE-2020-10735): an env var the operator owns plus a
+//                       runtime setter that cannot exceed it.
+//
+// Both are atomic because sua runs each connection's Bantu handler on its own
+// detached std::thread (server.hpp), so these are touched concurrently. A plain
+// size_t here is a data race, which is undefined behaviour and not merely a
+// stale read.
+inline std::atomic<size_t>& hardMaxBytesRef() {
+    static std::atomic<size_t> cap{0};   // 0 until initLimits() runs
     return cap;
+}
+inline std::atomic<size_t>& maxBytesRef() {
+    static std::atomic<size_t> cap{(size_t)2 * 1024 * 1024 * 1024};   // 2 GiB
+    return cap;
+}
+
+// Bytes currently held by live Buffers. The ceiling above is PER ALLOCATION,
+// which does not bound a loop: twelve 200 MB arrays held at once were measured
+// sailing past a 2 GiB per-call limit without an error, and a loop is how a
+// request handler actually exhausts a server. So admission is tested against
+// live + requested, and the counter is decremented in ~Buffer.
+inline std::atomic<size_t>& liveBytesRef() {
+    static std::atomic<size_t> live{0};
+    return live;
+}
+
+// Read BANTU_ND_MAX_BYTES once. Called from registerBuiltins, so it happens
+// before any script line runs and therefore before any thread exists.
+inline void initLimits() {
+    size_t hard = (size_t)8 * 1024 * 1024 * 1024;   // 8 GiB unless told otherwise
+    if (const char* env = std::getenv("BANTU_ND_MAX_BYTES")) {
+        errno = 0;
+        char* end = nullptr;
+        const unsigned long long v = std::strtoull(env, &end, 10);
+        // Anything unparseable leaves the default in place rather than becoming
+        // zero -- a typo in a deployment env var must not silently disable the
+        // limit, nor silently forbid every allocation. 0 means "no operator cap",
+        // which lifts the ratchet but does NOT by itself raise the soft ceiling:
+        // the program still has to ask for more with nd_max_bytes().
+        if (end != env && errno == 0) hard = (v == 0) ? SIZE_MAX : (size_t)v;
+    }
+    hardMaxBytesRef().store(hard, std::memory_order_relaxed);
+    if (maxBytesRef().load(std::memory_order_relaxed) > hard) {
+        maxBytesRef().store(hard, std::memory_order_relaxed);
+    }
 }
 
 // Multiply with overflow detection. shape [2^22, 2^22, 2^22] silently wraps to
 // a small number under plain multiplication, which would allocate a tiny buffer
 // that every later kernel writes past -- a heap overflow reachable from one
 // line of user script.
+//
+// The division form is kept deliberately. __builtin_mul_overflow is one `mul`
+// plus `jo` against a 20-40 cycle divide, but this runs ONCE per array creation
+// against an allocation measured at 47 ms for 10M elements, and compilers
+// commonly lower this form to comparisons anyway. It is portable to MSVC with
+// no #ifdef, which the signed version below cannot be.
 inline size_t checkedMul(size_t a, size_t b, const char* what) {
     if (a == 0 || b == 0) return 0;
     if (a > SIZE_MAX / b) {
@@ -104,6 +163,31 @@ inline size_t checkedMul(size_t a, size_t b, const char* what) {
                                  "to describe, let alone allocate)");
     }
     return a * b;
+}
+
+// The SIGNED counterpart, for stride arithmetic. This one is not a style
+// preference: signed overflow is undefined behaviour, so it cannot be detected
+// after the fact by inspecting the result the way the unsigned form can. It was
+// reachable -- nd_slice with a step near -2^62 on a stride-8 axis wrapped
+// `stride * step` to 0, manufacturing a stride-0 axis on an array still marked
+// writable, which is exactly the state broadcast_to refuses to produce.
+inline bool mulOverflows(ptrdiff_t a, ptrdiff_t b, ptrdiff_t* out) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_mul_overflow(a, b, out);
+#else
+    if (a == 0 || b == 0) { *out = 0; return false; }
+    const ptrdiff_t r = a * b;                 // MSVC: wraps, no UB trap available
+    if (r / b != a) return true;
+    *out = r;
+    return false;
+#endif
+}
+inline ptrdiff_t checkedMulSigned(ptrdiff_t a, ptrdiff_t b, const char* what) {
+    ptrdiff_t r = 0;
+    if (mulOverflows(a, b, &r)) {
+        throw std::runtime_error(std::string(what) + ": stride arithmetic overflows");
+    }
+    return r;
 }
 
 inline size_t shapeProduct(const std::vector<size_t>& shape, const char* what) {
@@ -153,23 +237,66 @@ struct Buffer {
     std::shared_ptr<void> keepalive;
 
     explicit Buffer(size_t bytes) : nbytes(bytes) {
-        if (bytes > maxBytesRef()) {
+        const size_t soft = maxBytesRef().load(std::memory_order_relaxed);
+        if (bytes > soft) {
+            const size_t hard = hardMaxBytesRef().load(std::memory_order_relaxed);
             std::ostringstream o;
-            o << "allocation of " << bytes << " bytes exceeds the limit of "
-              << maxBytesRef() << " (raise it with nd_max_bytes(n) if you meant it)";
+            o << "allocation of " << bytes << " bytes exceeds the limit of " << soft;
+            // Only advise nd_max_bytes() when it could actually help. Telling a
+            // user to raise a ceiling the operator has capped sends them round a
+            // loop that cannot terminate.
+            if (soft < hard) o << " (raise it with nd_max_bytes(n) if you meant it)";
+            else o << " set by BANTU_ND_MAX_BYTES, which script cannot raise";
             throw std::runtime_error(o.str());
         }
+        // The per-allocation check above does not bound a LOOP, so admission is
+        // also tested against everything currently live. compare_exchange rather
+        // than fetch_add: two threads must not both observe room and both take
+        // it (sua runs handlers on concurrent threads).
+        size_t live = liveBytesRef().load(std::memory_order_relaxed);
+        for (;;) {
+            if (live > soft - bytes) {   // soft >= bytes, checked above: cannot wrap
+                std::ostringstream o;
+                o << "allocating " << bytes << " bytes would put numba over its "
+                  << soft << "-byte limit (" << live << " already held by live arrays)";
+                throw std::runtime_error(o.str());
+            }
+            if (liveBytesRef().compare_exchange_weak(live, live + bytes,
+                                                     std::memory_order_relaxed)) break;
+        }
+
         // 64-byte alignment lets the contiguous kernels vectorize without a
         // scalar peel prologue, and keeps two arrays off the same cache line.
         data = alignedAlloc64(bytes);
-        if (!data) throw std::runtime_error("out of memory allocating " +
-                                            std::to_string(bytes) + " bytes");
+        if (!data) {
+            // Give the bytes back before unwinding. An accounted-but-never-freed
+            // allocation is worse than no limit at all, because the process
+            // slowly refuses to allocate anything and nothing says why.
+            liveBytesRef().fetch_sub(bytes, std::memory_order_relaxed);
+            throw std::runtime_error("out of memory allocating " +
+                                     std::to_string(bytes) + " bytes");
+        }
+
+        // LOAD-BEARING, not just zero-initialization. Do not "optimize" this
+        // into calloc (docs/numba-acceleration.md §4): Linux overcommit means a
+        // large posix_memalign succeeds without committing a page, and calloc
+        // would serve it from mmap'd zero pages, so nothing is charged to this
+        // process until a kernel touches it -- at which point the OOM killer
+        // arrives instead of a catchable error, and the ceiling above stops
+        // bounding anything real. Touching every page here is what converts a
+        // deferred kill into an exception a Bantu try/catch can handle. It costs
+        // 47 ms per 10M f64, and that is the price of deterministic failure.
         std::memset(data, 0, bytes ? bytes : 64);
     }
     Buffer(void* p, size_t bytes, std::shared_ptr<void> owner)
         : data(p), nbytes(bytes), owned(false), keepalive(std::move(owner)) {}
 
-    ~Buffer() { if (owned && data) alignedFree64(data); }
+    ~Buffer() {
+        if (owned && data) {
+            alignedFree64(data);
+            liveBytesRef().fetch_sub(nbytes, std::memory_order_relaxed);
+        }
+    }
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
 };
@@ -250,12 +377,51 @@ inline ArrayPtr makeArray(const std::vector<size_t>& shape, DType dt, const char
     return a;
 }
 
+// Every element this array can address must lie inside its buffer.
+//
+// This is the one invariant that makes the whole view system safe, and it lives
+// here -- in the single chokepoint every view passes through -- rather than in
+// each of the callers, because there is no version of "remember to check" that
+// survives phases 2 through 5 adding view constructors. NumPy's analogue is
+// PyArray_CheckStrides, and NumPy's own as_strided documentation is the argument
+// for having one: get strides wrong and "array elements can point to invalid
+// memory and can corrupt results or crash your program".
+//
+// Cost is ndim integer operations once per view construction, against kernels
+// that then touch millions of elements.
+inline void checkExtent(const NdArray& v, const char* what) {
+    if (!v.buf) throw std::runtime_error(std::string(what) + ": view has no buffer");
+    // Walk to the lowest and highest element offsets the shape can reach. A
+    // negative stride (a flipped view) runs downward from the offset, so the two
+    // ends must be tracked separately rather than assuming offset is the base.
+    ptrdiff_t lo = (ptrdiff_t)v.offset, hi = (ptrdiff_t)v.offset;
+    for (size_t d = 0; d < v.shape.size(); d++) {
+        if (v.shape[d] == 0) return;              // empty: addresses nothing at all
+        const ptrdiff_t span =
+            checkedMulSigned((ptrdiff_t)(v.shape[d] - 1), v.strides[d], what);
+        if (span < 0) lo += span; else hi += span;
+    }
+    const size_t item  = itemsize(v.dtype);
+    const size_t limit = v.buf->nbytes / item;    // capacity in ELEMENTS
+    if (lo < 0 || (size_t)hi >= limit) {
+        std::ostringstream o;
+        o << what << ": this view would reach elements " << lo << ".." << hi
+          << " of a buffer holding " << limit;
+        throw std::runtime_error(o.str());
+    }
+}
+
 // A view sharing `base`'s buffer. Views inherit writability: a read-only base
 // can never yield a writable view.
 inline ArrayPtr makeView(const ArrayPtr& base,
                          std::vector<size_t> shape,
                          std::vector<ptrdiff_t> strides,
-                         size_t offset) {
+                         size_t offset,
+                         const char* what = "view") {
+    if (shape.size() != strides.size()) {
+        throw std::runtime_error(std::string(what) + ": " + std::to_string(shape.size()) +
+            " dimensions but " + std::to_string(strides.size()) + " strides");
+    }
     auto v = std::make_shared<NdArray>();
     v->buf      = base->buf;
     v->dtype    = base->dtype;
@@ -263,7 +429,44 @@ inline ArrayPtr makeView(const ArrayPtr& base,
     v->shape    = std::move(shape);
     v->strides  = std::move(strides);
     v->writable = base->writable;
+    checkExtent(*v, what);
     return v;
+}
+
+// Do two arrays address any of the same memory? Same question np.shares_memory
+// answers, and the reason checkExtent's lo/hi walk is factored the way it is:
+// Phase 2's `out=` needs exactly this to decide whether a destination overlaps
+// an input, which otherwise produces garbage rather than an error.
+inline bool extentRange(const NdArray& v, ptrdiff_t& lo, ptrdiff_t& hi) {
+    lo = hi = (ptrdiff_t)v.offset;
+    for (size_t d = 0; d < v.shape.size(); d++) {
+        if (v.shape[d] == 0) return false;                    // addresses nothing
+        ptrdiff_t span = 0;
+        if (mulOverflows((ptrdiff_t)(v.shape[d] - 1), v.strides[d], &span)) return false;
+        if (span < 0) lo += span; else hi += span;
+    }
+    return true;
+}
+inline bool sharesMemory(const NdArray& a, const NdArray& b) {
+    if (!a.buf || !b.buf || a.buf.get() != b.buf.get()) return false;
+    ptrdiff_t alo, ahi, blo, bhi;
+    if (!extentRange(a, alo, ahi) || !extentRange(b, blo, bhi)) return false;
+    // Conservative, like np.may_share_memory: overlapping bounding ranges count
+    // as sharing even when the two stride patterns would never collide. A false
+    // positive costs a defensive copy; a false negative costs a wrong answer.
+    return alo <= bhi && blo <= ahi;
+}
+
+// The single gate on every write path. `writable` was enforced in exactly one
+// place (nd_set) when phases 2 and 3 were about to add `out=`, nd_put and
+// boolean-mask assignment -- three more chances to forget.
+inline void requireWritable(const NdArray& a, const char* what) {
+    if (!a.writable) {
+        throw std::runtime_error(std::string(what) +
+            ": this array is read-only. Broadcast views repeat one element along a "
+            "stretched axis, so writing to them would hit the same memory many times "
+            "-- use nd_copy() to get a writable array with the same values");
+    }
 }
 
 // ── Value glue ───────────────────────────────────────────────────────────────
@@ -408,8 +611,15 @@ struct Rng {
     double uniform() { return (double)(next() >> 11) * (1.0 / 9007199254740992.0); }
 };
 
+// thread_local, not a process-wide singleton (N18). sua runs each connection's
+// Bantu handler on its own detached std::thread (server.hpp), so a shared stream
+// means nd_seed() in one request silently reshapes every other request's random
+// arrays -- which is the exact objection that made numba carry its own PRNG
+// instead of using the global random() in the first place, just one level up. It
+// also removes a data race on the state, which is UB rather than merely untidy.
+// The cost is that each thread must seed for itself; nd_seed says so.
 inline Rng& rng() {
-    static Rng r = [] { Rng x; x.seed(0x2545F4914F6CDD1DULL); return x; }();
+    static thread_local Rng r = [] { Rng x; x.seed(0x2545F4914F6CDD1DULL); return x; }();
     return r;
 }
 

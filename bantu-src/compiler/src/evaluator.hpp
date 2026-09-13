@@ -5247,7 +5247,17 @@ private:
                     [where, fn](std::vector<Value> args) -> Value {
                         try { return fn(std::move(args)); }
                         catch (const std::exception& e) {
-                            ErrorHandler::throwError(where + ": " + e.what(), 0, 0,
+                            // Most kernel messages already name the builtin, so
+                            // that a message raised from a shared helper says
+                            // which call produced it. Prefixing unconditionally
+                            // gave "nd_slice: nd_slice: ...".
+                            std::string msg = e.what();
+                            const std::string pfx = where + ": ";
+                            if (msg.size() < pfx.size() ||
+                                msg.compare(0, pfx.size(), pfx) != 0) {
+                                msg = pfx + msg;
+                            }
+                            ErrorHandler::throwError(msg, 0, 0,
                                                      ErrorHandler::RUNTIME_ERROR);
                         }
                         return Value();
