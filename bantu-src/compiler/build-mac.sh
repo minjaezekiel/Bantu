@@ -26,8 +26,21 @@ die() {
 
 compile_one() {
     local src="$1" obj="$2"; shift 2
+    # The numba kernels are the one translation unit built at -O3; everything
+    # else stays at -O2. This is not a micro-optimization: the production Linux
+    # binary is built in ubuntu:22.04, and GCC 11 does not enable
+    # -ftree-loop-vectorize at -O2 (GCC 12 does), while Apple Clang does. Without
+    # the override a kernel benchmarked here would get NEON and the same kernel
+    # in the shipped Linux binary would get a scalar loop. Kept identical on both
+    # platforms so a number measured on one means something on the other.
+    # (Unquoted on purpose: an empty array under `set -u` is an error in the
+    # bash 3.2 that macOS ships. These flags contain no spaces.)
+    local extra=""
+    case "$src" in
+        */ndarray_native.cpp) extra="-O3 -ftree-vectorize" ;;
+    esac
     section "Compiling $src"
-    if g++ "${CPP_FLAGS[@]}" -Wall -c "$src" -o "$obj" "$@" 2>&1; then
+    if g++ "${CPP_FLAGS[@]}" $extra -Wall -c "$src" -o "$obj" "$@" 2>&1; then
         pass "$src -> $obj ($(wc -c <"$obj") bytes)"
         return 0
     else
@@ -57,6 +70,7 @@ SOURCES=(
     src/types.cpp
     src/function.cpp
     src/class.cpp
+    src/ndarray_native.cpp
     src/evaluator.cpp
     src/main.cpp
 )

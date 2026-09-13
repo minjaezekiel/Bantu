@@ -50,16 +50,23 @@ not finish `bantu bench`'s own "list push 100k" in ten minutes. Hot paths measur
 against that release on the same machine: 1M arithmetic loop 2,336 → 2,186 ms, `fib(24)`
 1,906 → 1,941 ms, 50k dict set 171 → 178 ms. Full detail in [`CHANGELOG.md`](CHANGELOG.md).
 
-## Phase 1 — `NdArray` core, buffers, zero-copy views
+## Phase 1 — `NdArray` core, buffers, zero-copy views ✅
+
+Feature suite `tests/numba_array_test.b` **108/108**; stress suite `tests/numba_stress.sh` **9/9**;
+full regression green across 42 suites.
 
 | Item | How | Feature test | Stress test | Status |
 |---|---|---|---|---|
-| `NdArray`, `Buffer`, handle tag `"ndarray"`, `has_native("ndarray")` | new `ndarray_native.{hpp,cpp}` + `ndarray_api.hpp`; registered in all four build files | `tests/numba_array_test.b` | — | [ ] |
-| Creation, introspection, astype/copy/ascontiguous | `nd`, `nd_zeros/ones/full/empty(_like)`, `nd_arange/linspace/eye/identity/diag`, `nd_random_*`, `nd_seed` | ″ | `nd_zeros([10000000])` alloc+free < 100 ms | [ ] |
-| Shape ops as **views** | `nd_reshape/transpose/T/ravel/swapaxes/moveaxis/expand_dims/squeeze/slice/broadcast_to/flip/split` | ″ | **zero-copy proof:** `nd_base_id($m) == nd_base_id(nd_T($m))`, and a write through the transposed view is visible in the base | [ ] |
-| **Security: shape-product overflow + allocation ceiling** | checked multiplication everywhere; configurable cap, default ~2 GB | ″ | `nd_zeros([2^22,2^22,2^22])` **raises**; `nd_zeros([1e15])` **raises**; every creation builtin fed negative / zero / null / NaN / wrong-type / wrong-arity args raises **catchably, never a crash** | [ ] |
-| Lifetime | `shared_ptr` RAII; a view keeps its base alive | ″ | 200k arrays created and dropped → **RSS delta < 5 MB**; a view outliving its base | [ ] |
-| `np.help()`, `np.info($a)` | `numba/numba.b` | ″ | — | [ ] |
+| `NdArray`, `Buffer`, handle tag `"ndarray"`, `has_native("ndarray")` | `ndarray_native.{hpp,cpp}` + `ndarray_api.hpp`; registered in all four build files, that TU alone at `-O3 -ftree-vectorize` (verified in the generated CMake rules) | ✅ | — | [x] |
+| Creation, introspection, astype/copy/ascontiguous, `print()` repr | 35 `nd_*` builtins; own xoshiro256++ stream so results are reproducible and independent of `random()` | ✅ | ✅ `nd_zeros([10000000])` in **47 ms** (gate 300 ms) | [x] |
+| Shape ops as **views** | `nd_reshape/transpose/T/ravel/flatten/swapaxes/moveaxis/expand_dims/squeeze/slice/broadcast_to/flip` | ✅ | ✅ **zero-copy proved two ways** — `nd_base_id` compares the real buffer address, and a write through one handle is read through another. reshape+transpose of 10M: **0 ms**; strided slice: **0 ms** | [x] |
+| **Security: shape-product overflow + allocation ceiling** | checked multiplication for every product; ceiling default 2 GiB, `nd_max_bytes(n)`; `broadcast_to` is `writable=false`; every index bounds-checked with the axis and extent named | ✅ 19 adversarial cases, each also asserting the message names what was wrong | ✅ **180,000 bad calls all raised catchably**, RSS +80 KB, process correct afterwards | [x] |
+| Lifetime | `shared_ptr` RAII; a view keeps its base alive | ✅ a slice returned from a function whose base went out of scope still reads correctly | ✅ 200k arrays **RSS +8 KB**; 200k view chains **RSS +24 KB** | [x] |
+| `np.help()`, `np.info($a)` | deferred to Phase 6 with the rest of the `numba.b` façade | — | — | [~] |
+
+One correction made during the work: `nd_is_view` first asked only "do I cover the whole buffer?",
+which a transposed view does — so it reported a transpose as an independent array. It now asks
+whether the buffer is shared, which is the question a user actually has.
 
 ## Phase 2 — Broadcasting and element-wise ufuncs
 

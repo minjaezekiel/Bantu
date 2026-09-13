@@ -87,7 +87,8 @@ jobs:
                    tests/sua_suspend_test.sh \
                    tests/sua_memory_test.sh \
                    tests/sua_timeout_test.sh \
-                   tests/sua_workers_test.sh; do
+                   tests/sua_workers_test.sh \
+                   tests/numba_stress.sh; do
             echo "── $s ──"
             if out=$(bash "$s" 2>&1); then
               echo "$out"; echo "  ok    $s"
@@ -166,7 +167,8 @@ jobs:
           for s in tests/event_loop_test.sh tests/sua_ws_security_test.sh \
                    tests/sua_pwa_http_test.sh tests/sua_suspend_test.sh \
                    tests/sua_memory_test.sh tests/sua_timeout_test.sh \
-                   tests/sua_workers_test.sh; do
+                   tests/sua_workers_test.sh \
+                   tests/numba_stress.sh; do
             if out=$(bash "$s" 2>&1); then
               echo "$out"
             else

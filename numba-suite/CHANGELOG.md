@@ -131,3 +131,75 @@ against the shipped release on the same machine. No regression:
 fixtures under `tests/fixtures/` and two fixture packages under `tests/bantu_modules/`. All three
 are picked up automatically by CI's `tests/*.b` glob, which is shallow and so does not reach the
 fixture directories.
+
+---
+
+## Phase 1 — `NdArray` core, buffers, zero-copy views ✅
+
+All five gate tiers green: 42 suites on macOS arm64 (24 `.b` including the `const_bad` negative, 7
+package-local, 10 shell), with `tests/numba_array_test.b` at **108/108** and
+`tests/numba_stress.sh` at **9/9**.
+
+### What landed
+
+- **[feature]** `ndarray_native.hpp` (the implementation), `ndarray_native.cpp` (the single TU that
+  includes it), `ndarray_api.hpp` (all `evaluator.hpp` sees). Handle tag `"ndarray"`;
+  `has_native("ndarray")` reports it.
+- **[feature]** 35 `nd_*` builtins: creation (`nd`, `nd_zeros/ones/full/empty` and their `_like`
+  forms, `nd_arange`, `nd_linspace`, `nd_eye`, `nd_identity`, `nd_seed`,
+  `nd_random_uniform/normal/int`), introspection (`nd_shape/ndim/size/dtype/strides/itemsize/
+  nbytes/writable/is_contiguous/is_view/base_id`), shape operations (`nd_reshape`,
+  `nd_transpose`, `nd_T`, `nd_ravel`, `nd_flatten`, `nd_swapaxes`, `nd_moveaxis`,
+  `nd_expand_dims`, `nd_squeeze`, `nd_slice`, `nd_broadcast_to`, `nd_flip`), element access
+  (`nd_get`, `nd_set`, `nd_to_list`), casts (`nd_copy`, `nd_astype`, `nd_ascontiguous`) and the
+  allocation ceiling (`nd_max_bytes`).
+- **[feature]** `print($a)` renders arrays through the Phase A repr registry, with NumPy's
+  summarization rule and a `shape=[3,4] dtype=i64` tail.
+- **[feature]** Reproducible randomness on numba's own xoshiro256++ stream, seeded explicitly —
+  deliberately *not* the global `random()`, because a shared stream means an unrelated `random()`
+  call elsewhere in a program silently changes your matrix.
+
+### Zero-copy views, proven rather than asserted
+
+`reshape`, `transpose`, `T`, `ravel`, `slice`, `flip` and `broadcast_to` all return a new `NdArray`
+sharing the base's `Buffer`. The tests prove it two ways: `nd_base_id()` compares the actual buffer
+address, and a write through one handle is read back through another. A view keeps its base alive
+through the `shared_ptr`, which is checked by returning a slice from a function whose base has gone
+out of scope.
+
+- 10M-element allocation: **47 ms**. `reshape` + `transpose` of it: **0 ms**. Strided slice: **0 ms**.
+- `nd_is_view` had to be corrected during the work: it first asked only "do I cover the whole
+  buffer?", which a transposed view does — so it called a transpose an independent array. It now
+  asks whether the buffer is shared, which is the question a user actually has.
+
+### Security, gated from this phase
+
+- **Shape-product overflow.** `nd_zeros([2^22, 2^22, 2^22])` wraps `size_t` to a small number under
+  plain multiplication, allocating a tiny buffer that every later kernel writes past — a heap
+  overflow reachable from one line of script. Every product uses checked multiplication and raises.
+- **Allocation ceiling.** Default 2 GiB, adjustable with `nd_max_bytes(n)`. `nd_zeros([1e15])`
+  raises instead of OOM-killing the process, which matters most when numba runs inside a sua handler.
+- **Stride-0 writes.** `broadcast_to` returns `writable = false`; `nd_set` through it raises with an
+  explanation rather than silently hitting one element repeatedly.
+- **Bounds.** Every index is checked against its own axis, and the message names the axis, its
+  extent and the offending value.
+- Every builtin is wrapped so a bad argument raises a **catchable Bantu error naming the builtin**.
+  19 adversarial cases are asserted individually, each also checking the message mentions the thing
+  that was wrong.
+
+### Stress
+
+| | result |
+|---|---|
+| 200,000 arrays created and dropped | RSS **+8 KB** |
+| 200,000 view chains (reshape → transpose → slice), base dropped each time | RSS **+24 KB** |
+| 180,000 deliberately-bad calls | all 180,000 raised catchably; RSS +80 KB; process correct afterwards |
+| 10M f64 allocate / view / strided slice | 47 ms / 0 ms / 0 ms |
+
+### Build
+
+`src/ndarray_native.cpp` registered in all four build files (`build.sh`, `build-mac.sh`,
+`build-win.sh`, `CMakeLists.txt`), each compiling **that TU alone at `-O3 -ftree-vectorize`** while
+everything else stays at `-O2` (N11). Verified in the generated CMake rules:
+`ndarray_native.cpp.o_OPTIONS = -O3;-ftree-vectorize`. The CI grep of `-fopt-info-vec-optimized`
+belongs to Phase 2, where the tier-0 kernel loops it would check actually exist.

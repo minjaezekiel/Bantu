@@ -18,6 +18,7 @@
 #include "crypto_sodium.hpp"    // optional libsodium AEAD + argon2id (feature-gated)
 #include "dataframe_native.hpp" // native column primitives for the arctic data-science suite
 #include "dataframe_arrow.hpp"  // Parquet + Feather/Arrow-IPC I/O (opt-in: -DBANTU_ARROW)
+#include "ndarray_api.hpp"      // numba n-dimensional arrays (implementation in ndarray_native.cpp)
 #include "mime_types.hpp"       // extension -> Content-Type for the static file server
 #include "event_loop.hpp"       // kqueue/epoll/poll readiness loop for the sua server
 #include "worker_pool.hpp"      // SO_REUSEPORT workers + the cross-worker broadcast bus
@@ -5118,8 +5119,9 @@ private:
                 static const std::set<std::string> kNatives = {
                     "md5","sha1","sha224","sha256","sha384","sha512",
                     "hmac_sha256","hash_file",
-                    "col",  // arctic native column primitives + kernels
-                    "pwa"   // sua.pwa: manifest / service worker / offline
+                    "col",     // arctic native column primitives + kernels
+                    "ndarray", // numba n-dimensional arrays + kernels
+                    "pwa"      // sua.pwa: manifest / service worker / offline
 #ifdef BANTU_ARROW
                     ,"arrow"  // Parquet + Feather/Arrow-IPC I/O (opt-in build)
 #endif
@@ -5225,6 +5227,32 @@ private:
             // stringifies to "<column>", which tells you the type and nothing
             // about the data.
             arctic::registerColumnRepr();
+
+            // ════════════════════════════════════════════════════════════
+            // NUMBA N-DIMENSIONAL ARRAYS (`nd_*`)
+            // ------------------------------------------------------------
+            // The atoms the pure-Bantu `numba` library composes: a typed
+            // n-d array over a refcounted buffer, with zero-copy views.
+            // The implementation lives in its own translation unit so it
+            // can be compiled at -O3 while the rest of the interpreter
+            // stays at -O2 (see ndarray_native.hpp for why that matters).
+            //
+            // One wrapper for all of them: any std::exception from the
+            // native layer becomes a catchable Bantu error naming the
+            // builtin, so a bad argument can never kill the process.
+            // ════════════════════════════════════════════════════════════
+            numba::registerBuiltins([this](const char* name, NativeFn fn) {
+                std::string where = name;
+                env_->define(name, makeNative(
+                    [where, fn](std::vector<Value> args) -> Value {
+                        try { return fn(std::move(args)); }
+                        catch (const std::exception& e) {
+                            ErrorHandler::throwError(where + ": " + e.what(), 0, 0,
+                                                     ErrorHandler::RUNTIME_ERROR);
+                        }
+                        return Value();
+                    }));
+            });
 
             // Run a column op, translating any std::exception into a Bantu error.
             auto colGuard = [](const char* where, std::function<Value()> body) -> Value {
