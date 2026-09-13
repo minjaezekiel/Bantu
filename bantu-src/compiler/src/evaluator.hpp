@@ -7,6 +7,7 @@
  */
 
 #include <list>
+#include <limits>   // infinity()/quiet_NaN() for the INF and NAN constants
 #include "types.hpp"
 #include "ast.hpp"
 #include "environment.hpp"
@@ -4458,26 +4459,123 @@ private:
         return Value();
     }
 
+    // ── Borrowing, and why list indexing needed it ──────────────────────
+    //
+    // [found] `$a[$i]` was O(n) in the length of $a, so every loop over a list
+    // was O(n^2). evalNode returns a Value BY VALUE, and a Value holding a list
+    // owns its elements inline -- a 20,000-element list is 20,000 structs of
+    // ~190 bytes, each carrying a std::string, a std::vector, a std::function
+    // and three shared_ptrs. Reading one element deep-copied all of them.
+    // Measured on an i7-9750H before the fix: 10,000 reads 1,919 ms, 20,000
+    // reads 8,093 ms -- 4.2x the time for 2x the work, and 405 us to read one
+    // element out of a 20,000-element list.
+    //
+    // Dicts and class instances never had this problem: they hold a shared_ptr,
+    // so copying their Value is a refcount bump (which is also why they have
+    // reference semantics and lists do not). Lists are the only inline
+    // container, so lists are the only thing this fixes.
+    //
+    // borrowLValue returns a pointer to the LIVE Value an expression names, or
+    // nullptr when the expression is not borrowable. It recurses through index
+    // chains ($m[1][2]) but ONLY when the index expression is a literal or a
+    // variable. That restriction is what makes it safe: returning nullptr
+    // half-way sends the caller down the copying path, which re-evaluates the
+    // index expressions, and re-evaluating a call would run it twice. A literal
+    // or a variable has no side effects, so evaluating it twice cannot be
+    // observed. Anything else falls back to exactly the behaviour it had.
+    //
+    // This is deliberately NOT resolveLValue, which exists a few hundred lines
+    // below for the assignment paths. resolveLValue addresses a slot to write
+    // to, so its dict branch is `(*objectVal)[key]`, which CREATES the entry if
+    // it is missing -- correct for `$d["new"] = 1`, and wrong for a read, where
+    // it would quietly insert a null every time you looked up a key that was
+    // not there. borrowLValue uses find() and reports failure instead.
+    static bool borrowableIndex(ASTNode* node) {
+        return dynamic_cast<VariableNode*>(node) || dynamic_cast<NumberNode*>(node) ||
+               dynamic_cast<StringNode*>(node);
+    }
+
+    Value* borrowLValue(ASTNode* node) {
+        if (auto v = dynamic_cast<VariableNode*>(node)) {
+            if (!env_->has(v->name)) return nullptr;   // the caller reports it, with a position
+            return &env_->getRef(v->name);
+        }
+        if (auto ia = dynamic_cast<IndexAccessNode*>(node)) {
+            if (!borrowableIndex(ia->index.get())) return nullptr;
+            Value* base = borrowLValue(ia->object.get());
+            if (!base) return nullptr;
+            Value idx = evalNode(ia->index);
+            if (base->isList() && idx.isNumber()) {
+                long long i = (long long)idx.numberVal;
+                if (i < 0 || i >= (long long)base->listVal.size()) return nullptr;
+                return &base->listVal[(size_t)i];
+            }
+            if (base->isObject() && idx.isString() && base->objectVal) {
+                auto it = base->objectVal->find(idx.stringVal);
+                if (it == base->objectVal->end()) return nullptr;
+                return &it->second;
+            }
+            return nullptr;
+        }
+        return nullptr;
+    }
+
     Value evalIndexAccess(IndexAccessNode* n) {
-        Value obj = evalNode(n->object);
-        Value idx = evalNode(n->index);
+        // `base` points at the container to read from -- the LIVE one when we
+        // can reach it, a temporary otherwise. Reading through a pointer is
+        // what removes the copy; everything below is the same logic it always
+        // was, reading from *base rather than from a copy of it.
+        Value  held;                 // storage for the cannot-borrow case only
+        Value* base = nullptr;
+        Value  idx;
 
-        if (obj.isList() && idx.isNumber()) {
-            int i = (int)idx.numberVal;
-            if (i >= 0 && i < (int)obj.listVal.size()) return obj.listVal[i];
-            ErrorHandler::throwRuntimeError("Index out of bounds: " + std::to_string(i));
+        if (auto v = dynamic_cast<VariableNode*>(n->object.get())) {
+            // The overwhelmingly common shape: $a[...]. One cast, one walk of
+            // the scope chain, no copy -- strictly less work than evaluating
+            // the variable into a temporary, which is what this replaces.
+            // Nothing is evaluated speculatively, so the index may be anything.
+            //
+            // The index is evaluated BEFORE the borrow, not after: $a[f()] can
+            // run arbitrary code, and a pointer into a scope must not be held
+            // across it. (unordered_map keeps element addresses stable across
+            // a rehash, so this is belt and braces -- but a borrow taken after
+            // every side effect cannot be wrong, and one taken before it needs
+            // an argument.)
+            idx = evalNode(n->index);
+            base = env_->tryGetRef(v->name);
+            if (!base) { held = evalNode(n->object); base = &held; }  // reports the name, with a position
+        } else if (borrowableIndex(n->index.get()) &&
+                   (base = borrowLValue(n->object.get())) != nullptr) {
+            // A chain: $m[1][2], $d["a"][0]. borrowLValue evaluated the inner
+            // index expressions, and the guard above restricted them to
+            // literals and variables -- so nothing here has a side effect that
+            // could invalidate the borrow, and re-evaluating them on the
+            // fallback path cannot be observed either.
+            idx = evalNode(n->index);
+        } else {
+            held = evalNode(n->object);
+            base = &held;
+            idx = evalNode(n->index);
+        }
+
+        if (base->isList() && idx.isNumber()) {
+            long long i = (long long)idx.numberVal;
+            if (i >= 0 && i < (long long)base->listVal.size()) return base->listVal[(size_t)i];
+            ErrorHandler::throwRuntimeError("Index out of bounds: " + std::to_string(i),
+                                            n->line, n->col);
             return Value();
         }
 
-        if (obj.isObject() && idx.isString()) {
-            auto it = obj.objectVal->find(idx.stringVal);
-            if (it != obj.objectVal->end()) return it->second;
+        if (base->isObject() && idx.isString() && base->objectVal) {
+            auto it = base->objectVal->find(idx.stringVal);
+            if (it != base->objectVal->end()) return it->second;
             return Value();
         }
 
-        if (obj.isString() && idx.isNumber()) {
-            int i = (int)idx.numberVal;
-            if (i >= 0 && i < (int)obj.stringVal.size()) return Value(std::string(1, obj.stringVal[i]));
+        if (base->isString() && idx.isNumber()) {
+            long long i = (long long)idx.numberVal;
+            if (i >= 0 && i < (long long)base->stringVal.size())
+                return Value(std::string(1, base->stringVal[(size_t)i]));
             return Value();
         }
 
@@ -4486,10 +4584,10 @@ private:
         // index pay for it -- measured at 2.31%, over the phase's 2% budget.
         // Down here the common paths are untouched and this one is still free,
         // because it replaces a fall-through that returned null.
-        if (obj.type == Value::NATIVE_HANDLE) {
+        if (base->type == Value::NATIVE_HANDLE) {
             Value out;
             try {
-                if (numba::dispatchIndex(obj, idx, out)) return out;
+                if (numba::dispatchIndex(*base, idx, out)) return out;
             } catch (const std::exception& e) {
                 ErrorHandler::throwRuntimeError(e.what(), n->line, n->col);
                 return Value();
@@ -4797,6 +4895,197 @@ private:
     }
 
     // ════════════════════════════════════════════════════════════
+    // SCALAR MATHS
+    // ════════════════════════════════════════════════════════════
+    //
+    // The language shipped with abs ceil cos floor log max min pow round sin
+    // sqrt tan random and nothing else -- no exp, no atan2, no asin/acos, no
+    // log10, no PI. You could not draw a pie slice, place a log-scale tick or
+    // compute the angle of an arrowhead without writing the series yourself.
+    //
+    // Three properties every function below has, and the older ones do not:
+    //
+    //   1. A non-number argument RAISES, naming the argument and its type.
+    //      sqrt("hello") answers 0 today; exp("hello") says so.
+    //   2. Domain and range behaviour is IEEE 754's, taken straight from libm,
+    //      including the ones people trip over: acos(2) is NaN rather than an
+    //      error, log(0) is -inf, and NaN propagates through everything.
+    //   3. NaN propagates through min/max. A primitive must not silently
+    //      discard a value it was handed; NumPy makes the same split between
+    //      max and nanmax. Callers that want to skip NaN filter first.
+
+    static const char* typeNameOf(const Value& v) {
+        switch (v.type) {
+            case Value::NUMBER: return "number";
+            case Value::STRING: return "string";
+            case Value::BOOL:   return "bool";
+            case Value::NULL_VAL: return "null";
+            case Value::FUNCTION: case Value::NATIVE_FN: return "function";
+            case Value::OBJECT: return "dict";
+            case Value::LIST:   return "list";
+            case Value::CLASS_INSTANCE: return "instance";
+            case Value::CLASS_DEF: return "class";
+            case Value::NATIVE_HANDLE: return "native handle";
+        }
+        return "unknown";
+    }
+
+    // One argument, one double, one message that says what to do about it.
+    static double mathArg(const std::vector<Value>& a, size_t i, const char* who, int arity) {
+        if (a.size() <= i) {
+            ErrorHandler::throwError(std::string(who) + "() needs " + std::to_string(arity) +
+                (arity == 1 ? " argument, got " : " arguments, got ") + std::to_string(a.size()),
+                0, 0, ErrorHandler::RUNTIME_ERROR);
+        }
+        if (!a[i].isNumber()) {
+            ErrorHandler::throwError(std::string(who) + "(): argument " + std::to_string(i + 1) +
+                " must be a number, got " + typeNameOf(a[i]),
+                0, 0, ErrorHandler::RUNTIME_ERROR);
+        }
+        return a[i].numberVal;
+    }
+
+    void registerScalarMath() {
+        // ── Constants ──────────────────────────────────────────────────
+        // Bare identifiers resolve to globals, so PI and $PI both work.
+        // They live in the same namespace as everything else, which means
+        // $PI = 3 replaces the constant for the rest of your program -- the
+        // same one-namespace rule that lets $len = 3 destroy len(). E is the
+        // likeliest name to be shadowed by accident; that is documented
+        // rather than worked around.
+        env_->define("PI",  Value(3.14159265358979323846));
+        env_->define("TAU", Value(6.28318530717958647692));
+        env_->define("E",   Value(2.71828182845904523536));
+        env_->define("INF", Value(std::numeric_limits<double>::infinity()));
+        env_->define("NAN", Value(std::numeric_limits<double>::quiet_NaN()));
+
+        // ── One argument ───────────────────────────────────────────────
+        struct Fn1 { const char* name; double (*fn)(double); };
+        static const Fn1 kFn1[] = {
+            {"exp",    [](double x) { return std::exp(x); }},
+            {"expm1",  [](double x) { return std::expm1(x); }},   // accurate near 0
+            {"log1p",  [](double x) { return std::log1p(x); }},   // accurate near 0
+            {"log2",   [](double x) { return std::log2(x); }},
+            {"log10",  [](double x) { return std::log10(x); }},
+            {"cbrt",   [](double x) { return std::cbrt(x); }},    // defined for negatives, unlike pow(x,1/3)
+            {"asin",   [](double x) { return std::asin(x); }},
+            {"acos",   [](double x) { return std::acos(x); }},
+            {"atan",   [](double x) { return std::atan(x); }},
+            {"sinh",   [](double x) { return std::sinh(x); }},
+            {"cosh",   [](double x) { return std::cosh(x); }},
+            {"tanh",   [](double x) { return std::tanh(x); }},
+            {"asinh",  [](double x) { return std::asinh(x); }},
+            {"acosh",  [](double x) { return std::acosh(x); }},
+            {"atanh",  [](double x) { return std::atanh(x); }},
+            {"trunc",  [](double x) { return std::trunc(x); }},
+            // NaN propagates, matching NumPy's sign(). arctic's col_sign
+            // predates this and answers 0 for NaN; that difference is
+            // documented rather than changed under a shipped library.
+            {"sign",   [](double x) { return std::isnan(x) ? x : (double)((x > 0) - (x < 0)); }},
+            {"degrees",[](double x) { return x * (180.0 / 3.14159265358979323846); }},
+            {"radians",[](double x) { return x * (3.14159265358979323846 / 180.0); }},
+        };
+        for (const Fn1& m : kFn1) {
+            const char* nm = m.name;
+            double (*fn)(double) = m.fn;
+            env_->define(nm, makeNative([nm, fn](std::vector<Value> a) -> Value {
+                return Value(fn(mathArg(a, 0, nm, 1)));
+            }));
+        }
+
+        // ── Two arguments ──────────────────────────────────────────────
+        struct Fn2 { const char* name; double (*fn)(double, double); };
+        static const Fn2 kFn2[] = {
+            // atan2 is the one that matters: it knows which quadrant the point
+            // is in, which atan(y/x) cannot, and it is defined at x == 0.
+            {"atan2",   [](double y, double x) { return std::atan2(y, x); }},
+            // hypot avoids the overflow of sqrt(x*x + y*y) -- hypot(1e200,1e200)
+            // is finite, the naive form is inf.
+            {"hypot",   [](double x, double y) { return std::hypot(x, y); }},
+            {"fmod",    [](double x, double y) { return std::fmod(x, y); }},
+            {"copysign",[](double x, double y) { return std::copysign(x, y); }},
+        };
+        for (const Fn2& m : kFn2) {
+            const char* nm = m.name;
+            double (*fn)(double, double) = m.fn;
+            env_->define(nm, makeNative([nm, fn](std::vector<Value> a) -> Value {
+                double x = mathArg(a, 0, nm, 2);
+                double y = mathArg(a, 1, nm, 2);
+                return Value(fn(x, y));
+            }));
+        }
+
+        // ── Predicates ─────────────────────────────────────────────────
+        // These values were always producible -- log(0) is -inf, sqrt(-1) is
+        // nan, pow(10,400) is inf -- and until now there was no way to TEST
+        // for one. Plotting real data without them means emitting a NaN
+        // coordinate, which browsers render as nothing at all.
+        struct Pred { const char* name; bool (*fn)(double); };
+        static const Pred kPred[] = {
+            {"isnan",    [](double x) { return (bool)std::isnan(x); }},
+            {"isinf",    [](double x) { return (bool)std::isinf(x); }},
+            {"isfinite", [](double x) { return (bool)std::isfinite(x); }},
+        };
+        for (const Pred& m : kPred) {
+            const char* nm = m.name;
+            bool (*fn)(double) = m.fn;
+            env_->define(nm, makeNative([nm, fn](std::vector<Value> a) -> Value {
+                return Value(fn(mathArg(a, 0, nm, 1)));
+            }));
+        }
+
+        // clamp(x, lo, hi) — used constantly for colour channels and
+        // coordinates. lo > hi is a caller bug, not a value to guess at.
+        env_->define("clamp", makeNative([](std::vector<Value> a) -> Value {
+            double x  = mathArg(a, 0, "clamp", 3);
+            double lo = mathArg(a, 1, "clamp", 3);
+            double hi = mathArg(a, 2, "clamp", 3);
+            if (lo > hi) {
+                ErrorHandler::throwError("clamp(): lower bound " + Value(lo).toString() +
+                    " is above upper bound " + Value(hi).toString(), 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            if (std::isnan(x)) return Value(x);
+            return Value(x < lo ? lo : (x > hi ? hi : x));
+        }));
+    }
+
+    // max/min, variadic and list-aware.
+    //
+    // [found] max(1, 2, 9) answered 2. The old bodies read args[0] and args[1]
+    // and ignored everything after -- a silently wrong answer, which is the
+    // failure mode worth caring about. Two-argument calls are unchanged.
+    //
+    // A single list argument is reduced over it, which is what makes computing
+    // the limits of a 100,000-point series one native call instead of a
+    // 100,000-iteration Bantu loop (~100 ms at ~1 us per interpreted step).
+    static Value minmax(const std::vector<Value>& a, bool wantMax) {
+        const char* who = wantMax ? "max" : "min";
+        const std::vector<Value>* items = &a;
+        if (a.size() == 1 && a[0].isList()) items = &a[0].listVal;
+
+        if (items->empty()) {
+            ErrorHandler::throwError(std::string(who) + "() needs at least one number" +
+                (a.size() == 1 ? " -- the list given was empty" : ""),
+                0, 0, ErrorHandler::RUNTIME_ERROR);
+        }
+        double best = 0.0;
+        for (size_t i = 0; i < items->size(); ++i) {
+            const Value& v = (*items)[i];
+            if (!v.isNumber()) {
+                ErrorHandler::throwError(std::string(who) + "(): element " + std::to_string(i + 1) +
+                    " must be a number, got " + typeNameOf(v), 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            double x = v.numberVal;
+            // NaN propagates: once one is seen the answer is NaN, and the
+            // comparisons below would otherwise silently drop it.
+            if (std::isnan(x)) return Value(x);
+            if (i == 0) best = x;
+            else if (wantMax ? (x > best) : (x < best)) best = x;
+        }
+        return Value(best);
+    }
+
+    // ════════════════════════════════════════════════════════════
     // BUILT-IN REGISTRATION
     // ════════════════════════════════════════════════════════════
 
@@ -4890,6 +5179,14 @@ private:
             std::uniform_int_distribution<long long> dist(0, (long long)args[0].numberVal);
             return Value((double)dist(rng));
         }));
+
+        // ── Scalar maths ────────────────────────────────────────────────
+        // The maths builtins above (abs, sqrt, sin, log, ...) read
+        // args[0].numberVal blind, so sqrt("hello") quietly answers 0. Those
+        // stay as they are -- they are shipped behaviour -- but everything
+        // added here validates, because a wrong number that looks plausible
+        // is worse than a stop that names the problem.
+        registerScalarMath();
 
         env_->define("str", makeNative([](std::vector<Value> args) -> Value {
             if (args.empty()) return Value(std::string(""));
@@ -6349,14 +6646,14 @@ private:
             return Value((double)ms.count());
         }));
 
+        // Variadic, and list-aware: max(1,2,9) is 9 (it used to be 2) and
+        // max($points) walks the list natively. See minmax() above.
         env_->define("max", makeNative([](std::vector<Value> args) -> Value {
-            if (args.size() < 2) return args.empty() ? Value(0.0) : args[0];
-            return Value(std::max(args[0].numberVal, args[1].numberVal));
+            return minmax(args, true);
         }));
 
         env_->define("min", makeNative([](std::vector<Value> args) -> Value {
-            if (args.size() < 2) return args.empty() ? Value(0.0) : args[0];
-            return Value(std::min(args[0].numberVal, args[1].numberVal));
+            return minmax(args, false);
         }));
 
         // env(name) — read a process environment variable.
@@ -6397,6 +6694,46 @@ private:
             }
             out.push_back(Value(s.substr(start)));
             return Value(std::move(out));
+        }));
+
+        // join(list [, sep]) — the inverse of split(), and the reason it was
+        // added: building a string with `$s = $s + part` in a loop is O(n^2),
+        // because every + copies the whole accumulated string. Measured on an
+        // i7-9750H: 20,000 appends 1,116 ms, 40,000 appends 6,752 ms -- 6.05x
+        // the time for 2x the work. Pushing onto a list and joining once is a
+        // single pass over the parts with one allocation of the final size.
+        //
+        // Non-string elements are stringified as print() would, so
+        // join([1, 2, 3], ",") is "1,2,3". A missing separator means "".
+        env_->define("join", makeNative([](std::vector<Value> a) -> Value {
+            if (a.empty()) return Value(std::string(""));
+            if (!a[0].isList()) {
+                ErrorHandler::throwError(std::string("join(): first argument must be a list, got ") +
+                    typeNameOf(a[0]), 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            std::string sep;
+            if (a.size() > 1 && !a[1].isNull()) {
+                if (!a[1].isString()) {
+                    ErrorHandler::throwError(std::string("join(): separator must be a string, got ") +
+                        typeNameOf(a[1]), 0, 0, ErrorHandler::RUNTIME_ERROR);
+                }
+                sep = a[1].stringVal;
+            }
+            const std::vector<Value>& L = a[0].listVal;
+            if (L.empty()) return Value(std::string(""));
+            // Exact for the all-strings case, which is the one that matters
+            // (SVG fragments, HTML, CSV rows); a small pad covers the rest,
+            // and the string grows amortised if the pad is short.
+            size_t total = sep.size() * (L.size() - 1);
+            for (const Value& v : L) if (v.isString()) total += v.stringVal.size();
+            std::string out;
+            out.reserve(total + L.size() * 4);
+            for (size_t i = 0; i < L.size(); ++i) {
+                if (i) out += sep;
+                if (L[i].isString()) out += L[i].stringVal;
+                else                 out += L[i].toString();
+            }
+            return Value(out);
         }));
 
         // trim(s) — strip whitespace from both ends.

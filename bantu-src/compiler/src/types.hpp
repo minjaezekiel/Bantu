@@ -172,7 +172,15 @@ public:
     std::string toString() const {
         switch (type) {
             case NUMBER: {
-                if (numberVal == std::floor(numberVal) && !std::isinf(numberVal)) {
+                // Integral doubles print without a fractional part -- but only when
+                // they actually FIT in a long long. Converting a floating-point value
+                // outside the destination integer range is undefined behaviour
+                // (ISO C++ [conv.fpint]), and on x86-64 and ARM64 it saturates to
+                // INT64_MIN, so str(1e21) used to print "-9223372036854775808".
+                // 9.2e18 is safely below 2^63 (9.223372036854775808e18); past it we
+                // fall through to the stream, which prints 1e+21 correctly.
+                if (numberVal == std::floor(numberVal) && !std::isinf(numberVal) &&
+                    std::fabs(numberVal) < 9.2e18) {
                     return std::to_string((long long)numberVal);
                 }
                 std::ostringstream oss;

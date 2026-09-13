@@ -40,6 +40,18 @@ public:
         return Value();
     }
 
+    // Like getRef, but reports a missing name instead of raising. One walk of
+    // the scope chain answers both "is it there?" and "where is it?" —
+    // has() followed by getRef() walks it twice, which is measurable on a path
+    // as hot as `$a[$i]`.
+    Value* tryGetRef(const std::string& name) {
+        for (Environment* e = this; e; e = e->parent.get()) {
+            auto it = e->variables.find(name);
+            if (it != e->variables.end()) return &it->second;
+        }
+        return nullptr;
+    }
+
     Value& getRef(const std::string& name) {
         auto it = variables.find(name);
         if (it != variables.end()) return it->second;

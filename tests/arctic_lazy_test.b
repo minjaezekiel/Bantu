@@ -72,10 +72,10 @@ writefile("/tmp/arctic_lazy.csv", $csv);
 $scan = arctic.scan_csv("/tmp/arctic_lazy.csv", null)
               .filter("amount > 1000")
               .select(["region", "amount"]);
-$exp = $scan.explain();
-ok(contains($exp, "project="), "explain shows projection pushdown");
-ok(contains($exp, "amount"), "projected set includes filter/select cols");
-ok(!contains($exp, "project=[name"), "unused 'name' not first in projection");
+$explain = $scan.explain();
+ok(contains($explain, "project="), "explain shows projection pushdown");
+ok(contains($explain, "amount"), "projected set includes filter/select cols");
+ok(!contains($explain, "project=[name"), "unused 'name' not first in projection");
 $res = $scan.collect();
 eq(str($res.columns()), "[region, amount]", "collect returns projected columns");
 eq($res.height(), 2, "collect filtered to 2 rows");

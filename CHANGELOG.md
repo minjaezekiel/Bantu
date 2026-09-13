@@ -9,6 +9,55 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] Scalar maths** — the language had `abs ceil cos floor log max min pow round sin sqrt
+  tan random` and nothing else. It now also has the constants `PI TAU E INF NAN` and the functions
+  `exp expm1 log1p log2 log10 cbrt asin acos atan atan2 hypot sinh cosh tanh asinh acosh atanh trunc
+  sign fmod copysign degrees radians clamp isnan isinf isfinite`. Domain behaviour is IEEE 754's —
+  `acos(2)` is `NaN` rather than an error, `log(0)` is `-inf`, NaN propagates — and a non-number
+  argument raises a catchable error naming the argument and its type.
+
+  `isnan`, `isinf` and `isfinite` close a real gap: these values were always *producible* — `log(0)`
+  is `-inf`, `sqrt(-1)` is `nan`, `pow(10, 400)` is `inf` — and there was no way to test for one.
+
+- **[feature] `join(list [, sep])`** — the inverse of `split()`, which has existed since v1.0 while
+  its counterpart never did. That mattered more than it sounds: without `join`, the only way to build
+  a string in a loop was `$s = $s + $part`, and that is **O(n²)** — every `+` copies the whole
+  accumulated string. Forty thousand appends took **6,752 ms**; collecting the same parts with `push`
+  and joining once takes **147 ms + 7 ms**, and is linear rather than quadratic.
+
+### Fixed
+
+- **[bug fix] `max(1, 2, 9)` answered 2** — `max` and `min` read only their first two arguments and
+  silently ignored the rest, in every shipped build. Both are now variadic, and a single list
+  argument is reduced over it, so `max($points)` takes the range of a 100,000-element list in 13 ms
+  instead of a 100,000-iteration loop. The two-argument form is unchanged. NaN propagates
+  (`max(1, NAN, 3)` is `NaN`), matching NumPy's `max` as against its separate `nanmax`, because a
+  primitive should not silently discard a value it was handed.
+
+- **[bug fix] `$a[$i]` copied the entire list to read one element** — evaluation returns values by
+  value and a list owns its elements inline, so reading one element out of a 20,000-element list
+  deep-copied all 20,000, each a ~190-byte struct carrying a string, a vector, a `std::function` and
+  three `shared_ptr`s. **Every loop over a list in every Bantu program was quadratic.** Indexing now
+  borrows a pointer to the live container instead.
+
+  | | before | after |
+  |---|---|---|
+  | 10,000 reads | 1,919 ms | **26 ms** |
+  | 20,000 reads | 8,093 ms | **52 ms** |
+  | 100,000 reads | ~3.4 min (extrapolated) | **282 ms** |
+
+  Nothing about list semantics changed — `$b = $a;` is still a copy — and a read of a missing dict
+  key still does not create it. Dicts and class instances never had this problem: they hold a
+  `shared_ptr`, which is also why they have reference semantics and lists do not.
+
+- **[bug fix] `str(1e21)` answered `"-9223372036854775808"`** — any integral double was cast to
+  `long long`, and converting a floating-point value outside the destination integer range is
+  undefined behaviour; it saturates to `INT64_MIN` on x86-64 and ARM64. Reachable from
+  `pow(10, 21)`, and from any numba reduction whose total exceeds 2⁶³. It now prints `1e+21`, and
+  `num(str($x))` round-trips at every magnitude.
+
+### Added
+
 - **[feature] arctic frames and series convert to numba arrays** — `$series.to_ndarray()` hands the
   column's own memory to numba without copying it, and `$frame.to_ndarray()` builds a matrix ready
   for `solve` or `lstsq`, optionally choosing and ordering the columns. Going the other way,

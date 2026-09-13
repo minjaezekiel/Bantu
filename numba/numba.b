@@ -24,11 +24,15 @@
 // ════════════════════════════════════════════════════════════════════════
 
 // ── constants ────────────────────────────────────────────────────────────
-$PI  = 3.141592653589793;
-$E   = 2.718281828459045;
-$TAU = 6.283185307179586;
-$INF = nd_get(nd_divide(nd([1.0], "f64"), nd([0.0], "f64"), null), [0]);
-$NAN = nd_get(nd_divide(nd([0.0], "f64"), nd([0.0], "f64"), null), [0]);
+// Re-exported from the language so np.PI and PI are the same number rather
+// than two copies that could drift. INF and NAN used to be built here by
+// dividing a one-element array, which meant importing numba allocated two
+// arrays before it did anything; they are language constants now.
+$PI  = PI;
+$E   = E;
+$TAU = TAU;
+$INF = INF;
+$NAN = NAN;
 
 def available() { return has_native("ndarray"); }
 

@@ -150,6 +150,112 @@ semantics and has not changed: `col($big, "f64")`, `sum($big)` and any user func
 copy on the way in. For large data, prefer native containers (arctic columns) over Bantu lists.
 
 
+## Scalar maths (new)
+
+The language shipped with `abs ceil cos floor log max min pow round sin sqrt tan random`
+and nothing else — no `exp`, no `atan2`, no `asin`/`acos`, no `log10`, no `PI`.
+
+### Constants
+```bantu
+PI      // 3.141592653589793     — also reachable as $PI
+TAU     // 6.283185307179586     — 2*PI
+E       // 2.718281828459045
+INF     // positive infinity
+NAN     // a quiet NaN
+```
+These live in the same namespace as everything else, so `$PI = 3;` replaces the constant
+for the rest of your program — the same rule that lets `$len = 3;` destroy `len()`.
+`E` is the likeliest to be shadowed by accident.
+
+### Functions
+```bantu
+exp($x)      expm1($x)    log1p($x)    log2($x)     log10($x)    cbrt($x)
+asin($x)     acos($x)     atan($x)     atan2($y,$x) hypot($x,$y)
+sinh($x)     cosh($x)     tanh($x)     asinh($x)    acosh($x)    atanh($x)
+trunc($x)    sign($x)     fmod($x,$y)  copysign($x,$y)
+degrees($x)  radians($x)  clamp($x,$lo,$hi)
+isnan($x)    isinf($x)    isfinite($x)
+```
+
+Three that are not just conveniences:
+
+- **`atan2($y, $x)`** knows which quadrant the point is in, which `atan($y/$x)` cannot,
+  and it is defined at `$x == 0`.
+- **`hypot($x, $y)`** does not overflow: `hypot(1e200, 1e200)` is finite where
+  `sqrt($x*$x + $y*$y)` is `inf`.
+- **`isnan` / `isinf` / `isfinite`** — the language could always *produce* these values
+  (`log(0)` is `-inf`, `sqrt(-1)` is `nan`, `pow(10,400)` is `inf`) but until now there
+  was no way to test for one.
+
+Domain and range behaviour is IEEE 754's: `acos(2)` is `NaN` rather than an error, `log(0)`
+is `-inf`, and NaN propagates. A **non-number argument raises** a catchable error naming the
+argument and its type — unlike the older maths builtins, where `sqrt("hello")` quietly
+answers `0`.
+
+### max / min are variadic and list-aware (fixed)
+```bantu
+max(1, 2, 9)        // 9   — answered 2 before this fix
+min(5, 4, 1)        // 1   — answered 4
+max([3, 17, 5])     // 17  — a single list argument is reduced over
+```
+`max` and `min` read only their first two arguments and silently ignored the rest.
+A single list argument now walks the list natively, which is how you take the range of a
+100,000-point series in 13 ms instead of a 100,000-iteration loop.
+
+**NaN propagates** — `max(1, NAN, 3)` is `NaN`, matching NumPy's `max` (as opposed to its
+separate `nanmax`). A primitive should not silently discard a value it was handed; filter
+first if you want NaN skipped.
+
+## Strings
+
+### join (new)
+```bantu
+join(["a", "b", "c"], "-")   // "a-b-c"
+join([1, 2, 3], ",")         // "1,2,3"   — non-strings stringify as print would
+join(["a", "b"])             // "ab"      — a missing separator means ""
+```
+
+`split()` has existed since v1.0 and its inverse never did, which mattered more than it
+sounds: without `join`, the only way to build a string in a loop was `$s = $s + $part`,
+and that is **O(n²)** — every `+` copies the whole accumulated string.
+
+```bantu
+// Don't: 40,000 appends take 6,752 ms
+$s = "";
+$i = 0;
+while ($i < 40000) { $s = $s + $part; $i = $i + 1; }
+
+// Do: the same 40,000 parts take 147 ms to collect and 13 ms to join
+$parts = [];
+$i = 0;
+while ($i < 40000) { push($parts, $part); $i = $i + 1; }
+$s = join($parts, "");
+```
+
+### str() past 2^63 (fixed)
+`str(1e21)` answered `"-9223372036854775808"`. Any integral double was cast to `long long`,
+and converting a floating-point value outside the destination integer range is undefined
+behaviour — it saturates to `INT64_MIN` on x86-64 and ARM64. It now prints `1e+21`, and
+`num(str($x))` round-trips at every magnitude.
+
+## Performance
+
+### List indexing is no longer O(n) (fixed)
+`$a[$i]` copied the **entire list** to read one element out of the copy, because a `Value`
+holding a list owns its elements inline and evaluation returns values by value. Every loop
+over a list was therefore quadratic.
+
+| | before | after |
+|---|---|---|
+| 10,000 reads | 1,919 ms | **26 ms** |
+| 20,000 reads | 8,093 ms | **52 ms** |
+| 100,000 reads | — | **282 ms** |
+
+Measured on an i7-9750H. The old cost grew 4.2× for a 2× workload; the new one is linear.
+Dicts and class instances never had this problem — they hold a `shared_ptr`, which is also
+why they have reference semantics and lists do not. Nothing about list semantics changed:
+`$b = $a;` is still a copy.
+
 ## Modules
 
 ```bantu
