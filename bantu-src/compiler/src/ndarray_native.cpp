@@ -998,4 +998,49 @@ bool dispatchMethod(const Value& obj, const std::string& name, Value& out) {
     return dispatchMethodImpl(obj, name, out);
 }
 
+// ── the arctic bridge ────────────────────────────────────────────────────────
+Value borrowVector(void* data, size_t n, int dtype, std::shared_ptr<void> owner) {
+    const DType dt = (dtype == BORROW_I64)  ? DType::I64
+                   : (dtype == BORROW_BOOL) ? DType::BOOL
+                                            : DType::F64;
+    auto a = std::make_shared<NdArray>();
+    a->dtype   = dt;
+    a->shape   = { n };
+    a->strides = { 1 };
+    // The Buffer BORROWS: owned = false, so its destructor frees nothing, and
+    // keepalive holds the real owner for as long as any view survives.
+    a->buf = std::make_shared<Buffer>(data, checkedMul(n, itemsize(dt), "borrow"),
+                                      std::move(owner));
+    a->writable = false;
+    return wrap(a);
+}
+
+bool exportVector(const Value& v, std::vector<double>& out, int& dtype) {
+    if (!isArray(v)) return false;
+    ArrayPtr x = asArray(v);
+    if (x->ndim() != 1) return false;
+    dtype = (x->dtype == DType::I64)  ? BORROW_I64
+          : (x->dtype == DType::BOOL) ? BORROW_BOOL
+                                      : BORROW_F64;
+    out.clear();
+    out.reserve(x->size());
+    const NdArray& X = *x;
+    forEachIndex(X, [&](size_t o, size_t) { out.push_back(getAsDouble(X, o)); });
+    return true;
+}
+
+Value buildMatrix(const std::vector<std::vector<double>>& columns) {
+    const size_t ncols = columns.size();
+    const size_t rows  = ncols ? columns[0].size() : 0;
+    ArrayPtr out = makeArray({ ncols, rows }, DType::F64, "nd_from_frame");
+    double* p = static_cast<double*>(out->buf->data);
+    for (size_t j = 0; j < ncols; j++) {
+        if (!columns[j].empty())
+            std::memcpy(p + j * rows, columns[j].data(), rows * sizeof(double));
+    }
+    // Transposed into (rows, columns), the orientation every linear-algebra
+    // routine expects. A view, so the transpose itself costs nothing.
+    return wrap(makeView(out, { rows, ncols }, { 1, (ptrdiff_t)rows }, 0, "nd_from_frame"));
+}
+
 } // namespace numba

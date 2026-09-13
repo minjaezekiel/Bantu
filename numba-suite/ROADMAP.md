@@ -164,15 +164,21 @@ with a key called `number`/`string`/`delete`), and `samples/blogsite/db.b` calle
 method that does not exist — broken on the shipped release, found within minutes of writing the
 sample runner.
 
-**Still open: the arctic bridge, arctic's transcendental `col_*` kernels, the sua-concurrency gate
-and cross-platform CI observation.**
+Also done: **arctic's 21 transcendental `col_*` kernels** (native, preserving the null/NaN
+distinction numba cannot express) and **the bridge** — `nd_from_column` (zero-copy borrow, proved by
+buffer identity and by outliving its source), `nd_to_column` (copy, structurally), `nd_from_frame`
+(column-major then a transposed view, feeding straight into `nd_lstsq`). `tests/numba_arctic_bridge_test.b`
+**49/49**.
+
+**Still open: `arctic.b`'s `to_ndarray()` convenience wrapper, the sua-concurrency gate, and
+cross-platform CI observation (only macOS has been run).**
 
 
 | Item | How | Feature test | Stress test | Status |
 |---|---|---|---|---|
 | Composed helpers ✅ | `polyfit/polyval`, `interp`, `gradient`, `cov/corrcoef`, `meshgrid`, moving average — pure Bantu | `tests/numba_pkg_test.b` | degenerate fits; single-point interp | [ ] |
-| arctic transcendentals | ~15 `col_sqrt/exp/log/…` natively, on the existing `unaryOp` shape with null propagation | `tests/arctic_transcendental_test.b` | nulls propagate; domain errors → NaN not crash | [ ] |
-| The bridge | `nd_from_column` (zero-copy borrow), `nd_to_column` (copy), `nd_from_frame` (F-contiguous); `arctic.b` `to_ndarray()` behind `has_native("ndarray")` | `tests/numba_arctic_bridge_test.b` | round-trip exact; borrow **provably zero-copy via `nd_base_id`**; a column with nulls is refused by name; the borrowed array outliving the column | [ ] |
+| arctic transcendentals ✅ | ~15 `col_sqrt/exp/log/…` natively, on the existing `unaryOp` shape with null propagation | `tests/arctic_transcendental_test.b` | nulls propagate; domain errors → NaN not crash | [ ] |
+| The bridge ✅ | `nd_from_column` (zero-copy borrow), `nd_to_column` (copy), `nd_from_frame` (F-contiguous); `arctic.b` `to_ndarray()` behind `has_native("ndarray")` | `tests/numba_arctic_bridge_test.b` | round-trip exact; borrow **provably zero-copy via `nd_base_id`**; a column with nulls is refused by name; the borrowed array outliving the column | [ ] |
 | Package, docs, gallery ✅ | `numba/{numba.b, numba_test.b, package.json}`, `docs/numba.md`, `samples/numba/`, `tests/run_samples.sh` | — | **every documented example and every sample executed by CI**; `bantu add numba` then `include "numba" as np` works from a clean project | [ ] |
 | Concurrency | — | — | numba called inside a sua handler under `sua_concurrency_test.sh`; a big allocation inside a handler **raises rather than OOM-killing the worker** | [ ] |
 | Cross-platform | — | — | CI green on Linux, macOS **and** Windows | [ ] |

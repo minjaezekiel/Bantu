@@ -623,7 +623,7 @@ coefficients.
 
 ---
 
-## Phase 6 — The package, the docs, the gallery ✅ (partial)
+## Phase 6 — The package, the docs, the gallery, the arctic bridge ✅ (partial)
 
 `tests/numba_pkg_test.b` **51/51**; `numba/numba_test.b` **12/12**; `tests/run_samples.sh`
 **21/21**. What shipped, and what did not, is stated plainly at the end.
@@ -685,15 +685,45 @@ wrapper that does nothing.
   and block forever, and several also need a database CI does not have. Without the skip the runner
   hangs the build rather than failing it.
 
+### The arctic bridge and arctic's transcendentals
+
+`tests/numba_arctic_bridge_test.b` **49/49**.
+
+**21 transcendental `col_*` kernels** — `sqrt cbrt exp expm1 log log1p log2 log10 sin cos tan asin
+acos atan sinh cosh tanh sign floor ceil trunc` — written **natively rather than delegated to
+numba**. Delegating would make `series.sqrt()` require a numba-capable build, and it would lose the
+distinction arctic exists to keep: **null is not NaN**. The null mask passes straight through, so a
+null stays null; a *domain* error (`sqrt(-1)`) yields NaN and stays non-null, because the value was
+present and the function simply has no real answer there. Both are asserted.
+
+**The bridge, and why it is asymmetric.** Column → array is a genuine **zero-copy borrow**: the
+array points at the column's own vector storage and holds the `ColumnPtr` alive, so it may outlive
+the variable the column was bound to — asserted by returning a borrow from a function whose source
+went out of scope. Array → column is a **copy**, because a `Column` stores `std::vector`, which owns
+its allocation; there is no portable way to adopt a foreign pointer. That asymmetry is structural,
+not an oversight, and the test asserts it directly by mutating the array and checking the column did
+not change.
+
+Preconditions are refused **by name**: a column with nulls says how many and what to do about it, a
+utf8 column says why it cannot become numeric, a semantic overlay (datetime/date/categorical) says
+what to convert first, and a frame with mismatched lengths names both. NaN → null on the way back is
+**opt-in**, because doing it silently would erase the difference between "no value" and "not a
+number".
+
+Borrowing a 1,000,000-row column is **O(1)** and measured under 50 ms; `nd_from_frame` assembles
+column-major and hands back a transposed **view**, so each source column is one contiguous run
+rather than a strided scatter, and the result feeds straight into `nd_lstsq`.
+
+**Keeping the wall standing.** `evaluator.hpp` sees only `ndarray_api.hpp`, so the glue could not
+reach numba's internals — the first attempt did and would not compile, which is the boundary working.
+The bridge instead goes through three new primitives on that boundary (`borrowVector`,
+`exportVector`, `buildMatrix`) expressed in plain C++ types, so `dataframe_native.hpp` and
+`ndarray_native.hpp` still never include each other.
+
 ### Not done, and not pretended otherwise
 
-Three Phase 6 rows remain open, and they are integration work rather than numba work:
-
-- **the arctic bridge** (`nd_from_column` zero-copy borrow, `nd_to_column`, `nd_from_frame`, and
-  `arctic.b`'s `to_ndarray()` behind `has_native("ndarray")`)
-- **arctic's ~15 transcendental `col_*` kernels**
-- **the sua-concurrency and cross-platform gates** — the concurrency design is already settled
-  (N18: `thread_local` PRNG, atomic limits) but running numba inside `sua_concurrency_test.sh` has
-  not been done, and Linux/Windows CI has not been observed green for this work.
-
-These are listed in `ROADMAP.md` as open rather than ticked.
+- **`arctic.b`'s `to_ndarray()` method** behind `has_native("ndarray")` — the builtins exist and are
+  tested; the pure-Bantu convenience wrapper on `Series`/`DataFrame` is not written.
+- **The sua-concurrency and cross-platform gates.** The concurrency design is settled (N18:
+  `thread_local` PRNG, atomic limits) but numba has not been run inside `sua_concurrency_test.sh`,
+  and Linux/Windows CI has not been *observed* green for this work — only macOS has.

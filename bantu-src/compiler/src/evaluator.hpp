@@ -5344,6 +5344,154 @@ private:
             // native layer becomes a catchable Bantu error naming the
             // builtin, so a bad argument can never kill the process.
             // ════════════════════════════════════════════════════════════
+            // ── the arctic bridge ───────────────────────────────────────
+            // This is the one place that legitimately sees both namespaces, so
+            // the glue lives here and dataframe_native.hpp and
+            // ndarray_native.hpp never include each other. It works through the
+            // three primitives in ndarray_api.hpp rather than numba's internals,
+            // which is what keeps that wall standing.
+            //
+            // Column -> NdArray is a genuine ZERO-COPY borrow: the array points
+            // at the column's own vector storage and holds the ColumnPtr alive,
+            // so it may outlive the variable the column was bound to. It is
+            // read-only, because arctic documents columns as immutable and
+            // honouring that costs nothing.
+            env_->define("nd_from_column", makeNative([](std::vector<Value> a) -> Value {
+                if (a.empty() || !arctic::isColumn(a[0])) {
+                    ErrorHandler::throwError("nd_from_column: expected an arctic column", 0, 0,
+                                             ErrorHandler::RUNTIME_ERROR);
+                    return Value();
+                }
+                arctic::ColumnPtr c = arctic::asColumn(a[0]);
+                // Every precondition is reported BY NAME: "cannot convert" with
+                // no reason is a permanent support burden.
+                const size_t nulls = arctic::nullCount(*c);
+                if (nulls > 0) {
+                    ErrorHandler::throwError("nd_from_column: the column has " +
+                        std::to_string(nulls) + " nulls and an ndarray has no null mask -- use "
+                        "arctic's fill_null() or drop_nulls() first", 0, 0,
+                        ErrorHandler::RUNTIME_ERROR);
+                    return Value();
+                }
+                if (c->logical != arctic::Logical::NONE) {
+                    ErrorHandler::throwError("nd_from_column: this column carries a datetime, date "
+                        "or categorical overlay that an ndarray cannot represent -- convert it to "
+                        "a plain numeric column first", 0, 0, ErrorHandler::RUNTIME_ERROR);
+                    return Value();
+                }
+                void* data = nullptr;
+                int dt = numba::BORROW_F64;
+                if (c->dtype == arctic::DType::F64)       { data = (void*)c->f64.data(); dt = numba::BORROW_F64; }
+                else if (c->dtype == arctic::DType::I64)  { data = (void*)c->i64.data(); dt = numba::BORROW_I64; }
+                else if (c->dtype == arctic::DType::BOOL) { data = (void*)c->b.data();   dt = numba::BORROW_BOOL; }
+                else {
+                    ErrorHandler::throwError("nd_from_column: only f64, i64 and bool columns can "
+                        "become arrays (a utf8 column has no numeric equivalent)", 0, 0,
+                        ErrorHandler::RUNTIME_ERROR);
+                    return Value();
+                }
+                try {
+                    return numba::borrowVector(data, c->n, dt,
+                                               std::static_pointer_cast<void>(c));
+                } catch (const std::exception& e) {
+                    ErrorHandler::throwError(std::string("nd_from_column: ") + e.what(), 0, 0,
+                                             ErrorHandler::RUNTIME_ERROR);
+                    return Value();
+                }
+            }));
+
+            // NdArray -> Column is a COPY. A Column stores std::vector, which
+            // owns its allocation, so there is no portable way to adopt a
+            // foreign pointer: the asymmetry is structural, not an oversight.
+            env_->define("nd_to_column", makeNative([](std::vector<Value> a) -> Value {
+                std::vector<double> vals;
+                int dt = numba::BORROW_F64;
+                if (a.empty() || !numba::exportVector(a[0], vals, dt)) {
+                    ErrorHandler::throwError("nd_to_column: expected a 1-dimensional ndarray -- a "
+                        "column is a single series of values", 0, 0, ErrorHandler::RUNTIME_ERROR);
+                    return Value();
+                }
+                auto c = std::make_shared<arctic::Column>();
+                c->n = vals.size();
+                c->valid.assign(c->n, 1);
+                if (dt == numba::BORROW_I64) {
+                    c->dtype = arctic::DType::I64;
+                    c->i64.resize(c->n);
+                    for (size_t i = 0; i < c->n; i++) c->i64[i] = (int64_t)vals[i];
+                } else if (dt == numba::BORROW_BOOL) {
+                    c->dtype = arctic::DType::BOOL;
+                    c->b.resize(c->n);
+                    for (size_t i = 0; i < c->n; i++) c->b[i] = vals[i] != 0.0 ? 1 : 0;
+                } else {
+                    c->dtype = arctic::DType::F64;
+                    c->f64 = vals;
+                    // NaN -> null is OPT-IN. Doing it silently would erase the
+                    // difference between "no value" and "not a number", which is
+                    // exactly the information arctic exists to keep.
+                    if (a.size() > 1 && a[1].isTruthy()) {
+                        for (size_t i = 0; i < c->n; i++)
+                            if (std::isnan(c->f64[i])) c->valid[i] = 0;
+                    }
+                }
+                return arctic::wrap(c);
+            }));
+
+            // A list of equal-length columns becomes a (rows, columns) array --
+            // the most-wanted bridge, frame to linear algebra.
+            env_->define("nd_from_frame", makeNative([](std::vector<Value> a) -> Value {
+                if (a.empty() || !a[0].isList() || a[0].listVal.empty()) {
+                    ErrorHandler::throwError("nd_from_frame: expected a non-empty list of columns",
+                                             0, 0, ErrorHandler::RUNTIME_ERROR);
+                    return Value();
+                }
+                const std::vector<Value>& cols = a[0].listVal;
+                std::vector<std::vector<double>> data;
+                size_t rows = 0;
+                for (size_t j = 0; j < cols.size(); j++) {
+                    if (!arctic::isColumn(cols[j])) {
+                        ErrorHandler::throwError("nd_from_frame: entry " + std::to_string(j) +
+                            " is not a column", 0, 0, ErrorHandler::RUNTIME_ERROR);
+                        return Value();
+                    }
+                    arctic::ColumnPtr c = arctic::asColumn(cols[j]);
+                    if (j == 0) rows = c->n;
+                    else if (c->n != rows) {
+                        ErrorHandler::throwError("nd_from_frame: column " + std::to_string(j) +
+                            " has " + std::to_string(c->n) + " rows but column 0 has " +
+                            std::to_string(rows) + " -- every column must be the same length",
+                            0, 0, ErrorHandler::RUNTIME_ERROR);
+                        return Value();
+                    }
+                    if (arctic::nullCount(*c) > 0) {
+                        ErrorHandler::throwError("nd_from_frame: column " + std::to_string(j) +
+                            " has nulls and an ndarray has no null mask", 0, 0,
+                            ErrorHandler::RUNTIME_ERROR);
+                        return Value();
+                    }
+                    std::vector<double> v(c->n);
+                    for (size_t i = 0; i < c->n; i++) {
+                        switch (c->dtype) {
+                            case arctic::DType::F64:  v[i] = c->f64[i]; break;
+                            case arctic::DType::I64:  v[i] = (double)c->i64[i]; break;
+                            case arctic::DType::BOOL: v[i] = c->b[i] ? 1.0 : 0.0; break;
+                            default:
+                                ErrorHandler::throwError("nd_from_frame: column " +
+                                    std::to_string(j) + " is not numeric", 0, 0,
+                                    ErrorHandler::RUNTIME_ERROR);
+                                return Value();
+                        }
+                    }
+                    data.push_back(std::move(v));
+                }
+                try {
+                    return numba::buildMatrix(data);
+                } catch (const std::exception& e) {
+                    ErrorHandler::throwError(std::string("nd_from_frame: ") + e.what(), 0, 0,
+                                             ErrorHandler::RUNTIME_ERROR);
+                    return Value();
+                }
+            }));
+
             numba::registerBuiltins([this](const char* name, NativeFn fn) {
                 std::string where = name;
                 env_->define(name, makeNative(
@@ -5659,6 +5807,47 @@ private:
             env_->define("col_neg", makeNative([colGuard](std::vector<Value> a) -> Value {
                 return colGuard("col_neg", [&]() -> Value { return arctic::wrap(arctic::unaryOp(a[0], false)); });
             }));
+            // ── transcendentals ─────────────────────────────────────────
+            // Native, not delegated to numba: delegating would make
+            // series.sqrt() require a numba-capable build, and would lose the
+            // null/NaN distinction arctic maintains and numba does not.
+            {
+                struct MathFn { const char* name; double (*fn)(double); };
+                static const MathFn kMath[] = {
+                    {"col_sqrt",  [](double x) { return std::sqrt(x); }},
+                    {"col_cbrt",  [](double x) { return std::cbrt(x); }},
+                    {"col_exp",   [](double x) { return std::exp(x); }},
+                    {"col_expm1", [](double x) { return std::expm1(x); }},
+                    {"col_log",   [](double x) { return std::log(x); }},
+                    {"col_log1p", [](double x) { return std::log1p(x); }},
+                    {"col_log2",  [](double x) { return std::log2(x); }},
+                    {"col_log10", [](double x) { return std::log10(x); }},
+                    {"col_sin",   [](double x) { return std::sin(x); }},
+                    {"col_cos",   [](double x) { return std::cos(x); }},
+                    {"col_tan",   [](double x) { return std::tan(x); }},
+                    {"col_asin",  [](double x) { return std::asin(x); }},
+                    {"col_acos",  [](double x) { return std::acos(x); }},
+                    {"col_atan",  [](double x) { return std::atan(x); }},
+                    {"col_sinh",  [](double x) { return std::sinh(x); }},
+                    {"col_cosh",  [](double x) { return std::cosh(x); }},
+                    {"col_tanh",  [](double x) { return std::tanh(x); }},
+                    {"col_sign",  [](double x) { return (double)((x > 0) - (x < 0)); }},
+                    {"col_floor", [](double x) { return std::floor(x); }},
+                    {"col_ceil",  [](double x) { return std::ceil(x); }},
+                    {"col_trunc", [](double x) { return std::trunc(x); }},
+                };
+                for (const MathFn& m : kMath) {
+                    const char* nm = m.name;
+                    double (*fn)(double) = m.fn;
+                    env_->define(nm, makeNative([colGuard, nm, fn](std::vector<Value> a) -> Value {
+                        return colGuard(nm, [&]() -> Value {
+                            if (a.empty()) throw std::runtime_error("expected a column");
+                            return arctic::wrap(arctic::mathOp(a[0], fn, nm));
+                        });
+                    }));
+                }
+            }
+
             env_->define("col_abs", makeNative([colGuard](std::vector<Value> a) -> Value {
                 return colGuard("col_abs", [&]() -> Value { return arctic::wrap(arctic::unaryOp(a[0], true)); });
             }));

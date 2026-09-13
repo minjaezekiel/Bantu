@@ -665,6 +665,42 @@ inline ColumnPtr unaryOp(const Value& A, bool absolute) {
     return o;
 }
 
+// Transcendentals, on the same shape as unaryOp above.
+//
+// Written natively rather than delegated to numba on purpose: delegating would
+// make `series.sqrt()` require a numba-capable build, and it would lose null
+// semantics -- arctic distinguishes "null" from "NaN", and numba has only NaN.
+// The null mask passes straight through, so a null stays null rather than
+// becoming a NaN that later arithmetic would silently propagate.
+//
+// A domain error (sqrt of a negative, log of zero) yields NaN, which is what
+// IEEE says and what every other column library does. It is NOT turned into a
+// null: the value was present, the function simply has no real answer there,
+// and conflating the two would lose information.
+inline ColumnPtr mathOp(const Value& A, double (*fn)(double), const char* what) {
+    NumOperand a = numOperand(A);
+    if (!a.isCol) throw std::runtime_error(std::string(what) + ": expected a column");
+    const Column& c = *a.col;
+    auto o = std::make_shared<Column>();
+    o->n = c.n;
+    o->valid = c.valid;                  // nulls propagate untouched
+    o->dtype = DType::F64;               // every one of these produces f64
+    o->f64.resize(c.n);
+    for (size_t i = 0; i < c.n; i++) {
+        double v;
+        switch (c.dtype) {
+            case DType::I64:  v = (double)c.i64[i]; break;
+            case DType::BOOL: v = c.b[i] ? 1.0 : 0.0; break;
+            case DType::F64:  v = c.f64[i]; break;
+            default:
+                throw std::runtime_error(std::string(what) +
+                    ": expected a numeric column");
+        }
+        o->f64[i] = fn(v);
+    }
+    return o;
+}
+
 enum class Cmp { GT, GE, LT, LE, EQ, NE };
 
 // Elementwise comparison → bool column (null where either side is null).

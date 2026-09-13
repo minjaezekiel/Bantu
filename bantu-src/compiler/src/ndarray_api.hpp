@@ -16,6 +16,8 @@
 
 #include "types.hpp"
 #include <functional>
+#include <memory>
+#include <vector>
 
 namespace numba {
 
@@ -54,5 +56,28 @@ bool dispatchIndexAssign(const Value& obj, const Value& idx, const Value& val);
 // `$a.sum()`, `$a.shape()` and friends: returns a bound callable. Chaining
 // works from here even before the operators land, and on any older build.
 bool dispatchMethod(const Value& obj, const std::string& name, Value& out);
+
+// ── the arctic bridge (Phase 6) ──────────────────────────────────────────────
+// The glue lives in evaluator.hpp -- the one place that legitimately sees both
+// namespaces -- so dataframe_native.hpp and ndarray_native.hpp never include
+// each other. That means the glue cannot touch numba's internals either, which
+// is why these three exist: they are the entire surface the bridge needs,
+// expressed in plain C++ types.
+enum BorrowDType { BORROW_F64 = 0, BORROW_I64 = 1, BORROW_BOOL = 2 };
+
+// Wrap foreign memory as a read-only 1-D array WITHOUT copying. `owner` is held
+// for the array's whole life, so the borrowed storage cannot be freed while a
+// view of it survives -- the array may outlive the variable it came from.
+// Read-only because arctic documents its columns as immutable.
+Value borrowVector(void* data, size_t n, int dtype, std::shared_ptr<void> owner);
+
+// Copy a 1-D array out as doubles. Returns false if `v` is not a 1-D array.
+// `dtype` comes back as one of the BorrowDType codes.
+bool exportVector(const Value& v, std::vector<double>& out, int& dtype);
+
+// Build a (rows, columns) f64 array from per-column data. Assembled
+// column-major and handed back transposed, so each source column is one
+// contiguous run rather than a strided scatter.
+Value buildMatrix(const std::vector<std::vector<double>>& columns);
 
 } // namespace numba

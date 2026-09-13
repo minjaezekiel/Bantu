@@ -9,6 +9,17 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] arctic columns and numba arrays convert between each other** — `nd_from_column($c)`
+  hands a column's data to numba **without copying it**, so a million-row column becomes an array in
+  a millisecond; `nd_to_column($a)` copies back; and `nd_from_frame([$c1, $c2])` turns a set of
+  columns into a matrix ready for `nd_solve` or `nd_lstsq`. A column with nulls is refused rather
+  than quietly turned into NaN — arctic distinguishes "no value" from "not a number" and an array
+  cannot — and converting NaN back into null is something you ask for explicitly.
+
+- **[feature] arctic gained 21 maths functions** — `col_sqrt`, `col_exp`, `col_log`, `col_sin` and
+  the rest. Nulls pass through as nulls. A domain error such as `col_sqrt(-1)` gives NaN and stays
+  non-null, because the value was there; the function simply has no real answer for it.
+
 - **[feature] numba is installable** — `bantu add numba`, then `include "numba" as np;`.
   `numba/numba.b` is the public API in plain Bantu, with sensible defaults the raw builtins cannot
   have (`np.arange(0, 10)` rather than `nd_arange(0, 10, null)`), plus composed helpers built from
