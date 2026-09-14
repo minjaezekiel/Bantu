@@ -7,6 +7,38 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ## [Unreleased]
 
+### Added
+
+- **[feature] bplot — data visualisation, in the shape of matplotlib** — 100% pure Bantu, emitting
+  SVG. A chart is three lines:
+
+  ```bantu
+  include "bplot" as plt;
+  plt.plot([1, 2, 3], [2, 4, 9]);
+  plt.savefig("chart.svg");
+  ```
+
+  `plot` `scatter` `bar` `barh`; `title` `xlabel` `ylabel` `legend` `grid` `xlim` `ylim`; `savefig`
+  `show` `to_svg` `clf` `help`. Underneath is a Figure/Axes/Artist model over a swappable backend —
+  matplotlib's own layering, which is what let it change output targets for twenty years without
+  breaking its API — and the objects appear nowhere in the quickstart. `x` and `y` accept a Bantu
+  list, a numba ndarray or an arctic column.
+
+  **Ticking matches matplotlib's `MaxNLocator`**, verified against its own choices on twelve ranges
+  including negatives, `1e-9` and `1e9`. **NaN breaks a line into segments** rather than emitting
+  `points="NaN,12 …"`, which every browser renders as nothing at all with no error anywhere. **Path
+  simplification** bounds the output by the canvas rather than the data: a 100,000-point line is one
+  polyline of 26 KB against 1.4 MB unsimplified, a 54× reduction, rendered in 1.1 s.
+
+  **Security.** SVG is not an image format the way PNG is — it is XML that browsers execute, and
+  `sua` already serves `image/svg+xml`, so a chart title taken from a request parameter is a stored
+  XSS. Every text node and attribute value is escaped at the point of emission, with **no opt-out and
+  no raw-SVG hatch**; control bytes are stripped rather than escaped, because they are not
+  representable in XML 1.0 at all and one of them turns the chart into a blank page; and colours are
+  validated against a shape rather than interpolated into an attribute. That makes injection
+  *through bplot* impossible, but it cannot make SVG stop being executable — if you serve charts
+  built from untrusted data, serve them from a separate origin or under a strict CSP.
+
 ### Changed
 
 - **[perf] The interpreter is 4–6× faster** — and not for the reason anyone expected. A profile of a

@@ -1,0 +1,6 @@
+{
+  "name": "bplot",
+  "version": "1.0.0",
+  "main": "bplot.b",
+  "description": "Data visualisation for Bantu, in the shape of matplotlib — 100% pure Bantu, emitting SVG. plot, scatter, bar and barh; titles, axis labels, legends, grids and explicit limits; nice-number ticking that matches matplotlib's own MaxNLocator choices; a Figure/Axes/Artist object model over a swappable backend, with a stateful plt.* API over it so a chart is three lines. NaN breaks a line into segments rather than silently emptying the chart, and path simplification bounds the output by the canvas rather than by the data — a 100,000-point line is one polyline of 26 KB. Every text node and attribute is escaped at the point of emission, with no raw-SVG hatch, because SVG is an executable document format and sua serves image/svg+xml. Accepts Bantu lists, numba ndarrays and arctic columns."
+}

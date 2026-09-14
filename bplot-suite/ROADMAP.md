@@ -51,25 +51,47 @@ including domain edges, ±inf and NaN; full existing regression green (these tou
 
 ---
 
-## Phase B1 — The core: Figure, Axes, scales, ticks, the SVG backend
+## Phase B1 — The core: Figure, Axes, scales, ticks, the SVG backend ✅
 
-- [ ] `BPlotFigure` / `BPlotAxes` / `BPlotLine` / `BPlotText` / `BPlotSvg`, factory functions
-- [ ] the four coordinate spaces and the single y-flip at the backend boundary
-- [ ] linear scale, `MaxNLocator` ticking, `_fmt` and the scientific/engineering formatters
-- [ ] the SVG backend: nine primitives, mandatory escaping, `<clipPath>` per Axes
-- [ ] path simplification (BP3)
-- [ ] `plot` `scatter` `bar` `barh`; `xlabel` `ylabel` `title` `legend` `grid` `xlim` `ylim`
-- [ ] `savefig`, `show`, `plt.help()`
-- [ ] `tests/bplot_core_test.b`, `tests/bplot_stress.sh`
+- [x] `BPlotFigure` / `BPlotAxes` / `BPlotSvg`, reached through `figure()` — `new alias.Class()`
+      does not parse across a module boundary
+- [x] the coordinate spaces, with the y flip in exactly one place (`coefY`'s sign)
+- [x] linear scale, `MaxNLocator` ticking, `_fmt`
+- [x] the SVG backend: `rect` `line` `circle` `polyline` `text` `group` `clip`, mandatory escaping,
+      one `<clipPath>` per axes
+- [x] path simplification (BP3)
+- [x] `plot` `scatter` `bar` `barh`; `title` `xlabel` `ylabel` `legend` `grid` `xlim` `ylim`
+- [x] `savefig`, `show`, `clf`, `to_svg`, `plt.help()`
+- [x] `bplot/{bplot.b, bplot_test.b, package.json}`, `samples/bplot/`
+- [x] `tests/bplot_core_test.b` (149), `tests/bplot_stress.sh` (20), both in CI
 
-**Gate:** emitted SVG parses as well-formed XML; golden-file comparison; ticking matches
-matplotlib's choices across ~20 ranges including negatives, tiny and huge spans.
-**Stress:** a 100k-point line (with and without simplification, both wall-clock gated); empty series;
-a single point; all-equal values; NaN and ±inf in the data; a title of
-`</text><script>alert(1)</script>` — each renders or raises clearly, and **never emits malformed
-SVG**.
+| gate | result |
+|---|---|
+| emitted SVG parses as well-formed XML | ✅ **19 documents**, every degenerate and hostile case, checked with a real XML parser |
+| ticking matches matplotlib's own choices | ✅ 12 ranges asserted exactly, incl. negatives, 1e-9 and 1e9 |
+| the top tick is not lost to drift | ✅ ticks computed as `k × step`, not accumulated |
+| escaping has no opt-out | ✅ `</text><script>` in title, both axis labels and a legend entry |
+| control bytes | ✅ stripped, so the document still parses |
+| unicode | ✅ survives intact |
+| NaN / ±inf | ✅ never reach a coordinate in any document; NaN splits the line into runs |
+| 100k-point line | ✅ **1,136 ms**, one polyline, **25,782 bytes** against 1,386,925 unsimplified (**54×**) |
+| repetition | ✅ 2,000 figures built and dropped |
+| empty / single point / all-equal / all-NaN | ✅ each renders; none emits malformed SVG |
+| bad input | ✅ mismatched lengths, null, wrong type, zero size, inverted limits, `.png` — all raise, naming the problem |
+| full regression | ✅ 37 `.b` suites, 13 `.sh` suites |
 
----
+**Two defects found while building it**, both of them Bantu's documented landmines biting their own
+author:
+- **Module-level state does not survive assignment from inside a function.** `$_CUR = figure()` in
+  `gcf()` created a function-*local*, so every call built a new figure and the chart came out empty.
+  The current figure lives in a dict now — dicts are reference-semantic, so writing through a field
+  mutates the object every caller can see.
+- **A list passed to a function is a copy.** `_emitCol($out, …)` pushed into a copy and the caller
+  saw nothing, so path simplification silently produced no points and a 20,000-point line rendered
+  as no line at all. The helper returns its points and the caller `extend`s.
+
+**Deferred from B1 with a reason:** `tight_layout` uses the embedded Helvetica metrics but belongs
+with subplots (B3), so gutters are fixed for now; the metrics table is in and used for legend boxes.
 
 ## Phase B2 — The chart types
 

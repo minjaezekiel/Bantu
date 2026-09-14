@@ -201,3 +201,91 @@ bplot features, so all four are fixed here rather than worked around.
 - **Cross-platform.** macOS only, as for every numba phase. CI runs Linux and Windows jobs and they
   pick up `tests/*.b` automatically, but no Linux or Windows machine and no Docker is available here,
   so **CI has not been observed**. Stated rather than assumed.
+
+---
+
+## Phase B1 — Figure, Axes, scales, ticks, the SVG backend
+
+- **[feature] `bplot`** — a matplotlib-shaped plotting library, 100% pure Bantu, emitting SVG.
+  `plot` `scatter` `bar` `barh`; `title` `xlabel` `ylabel` `legend` `grid` `xlim` `ylim`; `savefig`
+  `show` `to_svg` `clf` `help`. A `BPlotFigure` / `BPlotAxes` / `BPlotSvg` object model with the
+  stateful `plt.*` API over it, so a chart is three lines and the objects appear nowhere in the
+  quickstart. Accepts a Bantu list, a numba ndarray or an arctic column anywhere a sequence is
+  expected.
+
+- **[feature] Ticking matches matplotlib's `MaxNLocator`** — candidate steps
+  `[1, 2, 2.5, 5, 10] × 10^k`, verified against matplotlib's own choices on twelve ranges including
+  negatives, `1e-9` and `1e9`. Ticks are computed as `k × step` rather than accumulated, because
+  accumulation drops the *final* tick on ranges like 0–1 by 0.1 — and the top tick is the one a
+  reader looks for. The epsilon is relative, not absolute.
+
+- **[feature] Path simplification, on by default (BP3)** — at most four vertices per pixel column
+  (first, last, min-y, max-y), which preserves spikes where naive decimation drops them. A
+  100,000-point line: **25,782 bytes against 1,386,925 unsimplified, a 54× reduction**, still one
+  `<polyline>`.
+
+- **[feature] Escaping with no opt-out and no raw-SVG hatch (BP7)** — every text node and attribute
+  value is escaped at the point of emission; `&` first, so nothing is double-escaped. Control bytes
+  below 0x20 other than tab/LF/CR are **stripped**, not escaped, because they are not representable
+  in XML 1.0 at all and a single one turns the chart into a parse error — a blank page with nothing
+  in any log. Colours are validated against a shape (`#rgb`, `#rrggbb`, `[r,g,b]`, a named colour)
+  rather than interpolated, since an attribute is the second-favourite SVG injection point after a
+  text node.
+
+- **[feature] NaN breaks the line; infinities are clipped (BP9)** — untreated, a NaN coordinate emits
+  `points="NaN,12 …"`, which every browser renders as **nothing at all**. A run containing NaN is
+  emitted as several polylines split at the gaps, so the valid segments draw and the gap is visible
+  as a gap.
+
+### Solved defects
+
+Both are Bantu's own documented landmines, found by biting their author.
+
+- **[bug fix] Module-level state did not survive assignment from inside a function.**
+  `$_CUR = figure()` inside `gcf()` created a function-**local** — `Environment::assign` stops at the
+  nearest function boundary — so the module binding never changed, every call built a new figure, and
+  `plt.plot(); plt.savefig()` wrote a chart containing only a background rectangle. The current
+  figure now lives in a dict: dicts are reference-semantic, so writing through a field mutates the
+  object every caller can see.
+
+- **[bug fix] Path simplification silently produced nothing.** `_emitCol($out, …)` pushed into a list
+  it had been passed, and **a Bantu list passed to a function is a copy** — value semantics, unlike a
+  dict or a class instance — so the caller saw an empty list and a 20,000-point line rendered as no
+  line at all. The helper returns its points and the caller `extend`s the real list.
+
+### Measured
+
+> Intel Core i7-9750H @ 2.60 GHz, macOS 15.7.9, `build-mac.sh` (`-O2`).
+
+| | |
+|---|---|
+| 100,000-point line, render only | **1,136 ms** |
+| — output, simplified | **25,782 bytes** |
+| — output, simplification off | 1,386,925 bytes |
+| 2,000 figures built and dropped | no failure |
+| a four-point chart with title, labels, grid and legend | 4,070 bytes, 41 elements |
+
+The 100k figure was **3,218 ms** before the transform was hoisted out of the per-point loop:
+mapping data to pixels went through `$ax.px()` / `$ax.py()`, which is 200,000 method calls. Both axes
+reduce to `pixel = value × a + b`, so the coefficients are computed once per axis and the loop
+multiply-adds inline — **2.8× faster, byte-identical output**. `px()` and `py()` are defined in terms
+of the same coefficients, so there is still one formula and the y flip still has exactly one home.
+
+This is the honest shape of the cost: **drawing** a 100k-point line is one polyline, but **ingesting**
+100,000 points is 100,000 interpreted loop iterations. B4's numba path is where that stops being
+true.
+
+### Tests
+
+- **[test]** `tests/bplot_core_test.b` — **149 assertions**: `_fmt` against exact strings (it is the
+  formatter, so its output is the contract), twelve tick ranges, escaping including an
+  already-escaped entity and a control byte, a hostile title through four different emission paths,
+  colour validation including an `" onload="` injection attempt, document structure and balance,
+  the transform and its single y flip, degenerate data, NaN and infinity, explicit and automatic
+  limits, every chart type, the stateful API sharing one figure, `savefig` round-tripping, and path
+  simplification both on and off.
+- **[test]** `tests/bplot_stress.sh` — **20 checks**, including the one that cannot be written in
+  Bantu: every emitted document handed to a **real XML parser**. A subtly malformed document still
+  contains all the right substrings and simply renders as a blank page, so substring assertions
+  cannot catch it.
+- **[test]** Full regression green on the same build: 37 `.b` suites, 13 `.sh` suites.
