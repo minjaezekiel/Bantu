@@ -289,3 +289,160 @@ true.
   contains all the right substrings and simply renders as a blank page, so substring assertions
   cannot catch it.
 - **[test]** Full regression green on the same build: 37 `.b` suites, 13 `.sh` suites.
+
+---
+
+## B2 — The chart types, the scales, and the date axis
+
+Eight statistical chart types, three scales, calendar-aware date ticks, annotations, and categorical
+axes. Everything still pure Bantu.
+
+```bantu
+include "bplot" as plt;
+plt.hist($samples, {"bins": 30});
+plt.yscale("log", null);
+plt.savefig("chart.svg");
+```
+
+### Added
+
+- **[feature]** `hist` `boxplot` `violin` `errorbar` `fill_between` `step` `stem` `pie`.
+- **[feature]** `log` and `symlog` scales, with decade major ticks and 2–9 minor ticks.
+- **[feature]** date axes over **epoch milliseconds, UTC** — arctic's own datetime storage, so a
+  column plots without conversion.
+- **[feature]** `text` and `annotate`, with arrows and text rotation.
+- **[feature]** **categorical axes** — a sequence of strings becomes positions with the strings as
+  tick labels (BP28). `bar(["Jan", "Feb", …], rainfall)` is the first thing anyone types, and before
+  this it died inside `min()` with an error about the wrong thing.
+- **[feature]** two backend primitives, `polygon` and `path` — and no more, which is what keeps B6's
+  raster backend a finite job.
+
+### Verified against the tools people will compare with
+
+Reference values were generated once, at authoring time, from **numpy 2.5.2** and **matplotlib
+3.11.2**, and pasted into the tests as literals. Nothing at run time depends on Python.
+
+| checked against | result |
+|---|---|
+| `matplotlib.scale.SymmetricalLogTransform` | 17 points × 3 `linthresh` settings, to **9 decimals** |
+| matplotlib's log ticks | **8 ranges exact** |
+| matplotlib's symlog ticks | 6 limit/`linthresh` combinations |
+| `AutoDateLocator` | **8 ranges exact**, ten seconds to 25 years |
+| numpy `quantile` · `cbook.boxplot_stats` | exact |
+| numpy `histogram` / numba `nd_histogram` | exact, including the **inclusive top edge** |
+
+**Two ranges deliberately disagree with matplotlib**, and the disagreement is asserted so it cannot
+decay into a bug. Asked for a log axis from 2 to 9, matplotlib returns **no major ticks at all** — an
+axis with no labelled tick anywhere on it; `1..3` gets exactly one. bplot promotes the 2–9 minors to
+labelled ticks when fewer than two decades fall in view (BP17), because an unlabelled axis is not a
+style difference.
+
+**Date ticks reproduce `AutoDateLocator`'s selection rule rather than approximating it.** The rule
+turned out to be four lines, so exact reproduction cost less than a look-alike and cannot drift on a
+range nobody checked. It gets the two cases an approximation misses: a three-month span switches to
+**semi-monthly** ticks (the 1st and the 15th), and a 25-year span picks a **four**-year interval
+anchored on multiples of four.
+
+### Measured
+
+| operation | result |
+|---|---|
+| 100k-point line, **linear** scale | **1,198 ms** against B1's 1,136 — the scale machinery costs a linear axis nothing |
+| 100k-point line, symlog scale | 2,585 ms — the honest price of a non-linear axis |
+| 200,000 points → `hist` | 1,103 ms, **6,959 bytes** (40 bars, however many points went in) |
+| 200,000 points → `violin` | 1,971 ms, **5,291 bytes** |
+
+The violin number is why the density is estimated from a 512-bin histogram rather than from every
+point (BP21): the textbook form is 200,000 × 128 kernel evaluations, which is minutes.
+
+**The transform is applied as a pre-pass over the sequence, never per point inside a drawing loop**
+(BP16). The first implementation materialised a pixel list even for linear axes and cost 100,000
+points **1,480 ms against 1,136** — a 30% tax on the common case for a feature it does not use. The
+hot artists fuse the projection into the single loop B1 had.
+
+### Solved defects encountered
+
+- **A bar's zero baseline made a log axis raise before any data was projected.** `bar()` and `hist()`
+  publish a baseline of zero as part of their bounds, and the log view-limit computation choked on
+  it — making both unusable on a log scale. Baselines are clamped to the view floor now, while real
+  non-positive **data** still raises. The difference is deliberate and documented: a line with a gap
+  in it is invisible and misleading, an absent bar already reads as zero.
+
+### Tests
+
+- **[test]** `tests/bplot_charts_test.b` — **196 assertions**.
+- **[test]** `tests/bplot_stress.sh` grew to **38 checks**; **51 documents** handed to a real XML
+  parser, every one well-formed.
+
+---
+
+## B3 — Layout and 2-D
+
+Subplots, twin and shared axes, measured layout, the published colormaps, colorbars, and the 2-D
+chart types.
+
+### Added
+
+- **[feature]** `subplots(rows, cols)`, `subplot(r, c, i)`, `subplotSpan`, `twinx`, `twiny`,
+  `sharex`, `sharey`, `tight_layout`.
+- **[feature]** `imshow` `heatmap` `pcolormesh` `contour`, and `colorbar`.
+- **[feature]** colormaps `viridis` `plasma` `coolwarm` `gray`, as the **published 256-entry tables**
+  embedded as hex strings (BP25). `jet` is deliberately not shipped.
+- **[feature]** style sheets: `default`, `dark`, `print` — the last ordered by **lightness** rather
+  than hue, so the series stay distinguishable in a photocopy and under the common colour-vision
+  deficiencies.
+
+### Measured
+
+| gate | result |
+|---|---|
+| 1000×1000 `imshow` (1,000,000 cells) | **1,473,633 bytes, 256 elements**, 30.6 s |
+| — the naive encoding, one `<rect>` per cell | ~55 MB |
+| 6,000 figures built and dropped | RSS **10.5 MB → 12.0 MB** — flat |
+| an 8×8 grid | 64 panels, no overlap, all inside the figure |
+| rendering the same figure twice | **byte-identical** |
+
+`imshow` block-reduces to a cell budget and batches every cell of one colour into a **single
+`<path>`** (BP26). A colormapped image has at most 256 colours by construction, so the element count
+is bounded however many cells go in.
+
+**The B3 roadmap gate was corrected rather than quietly met.** It asked for "a single embedded
+image", which means a base64 PNG, which means CRC32, Adler-32 and deflate — the native work that *is*
+B6. The original wording is kept in the roadmap alongside the correction, and B6 inherits the gate.
+
+### Solved defects encountered — both of them general Bantu defects
+
+- **Every Bantu object leaked.** `new ClassName()` allocated an instance that **nothing ever
+  deleted**, so every object a Bantu program created leaked for the life of the process: ~300 bytes
+  each, ~45 KB per figure, **372 MB over 20,000 figures and still climbing**. A `sua` handler
+  creating objects per request would have grown without bound until the worker was killed. Instances
+  are refcounted now — 20,000 instances is flat at 4.9 MB. Refcounting does not collect **cycles**,
+  so bplot's Axes deliberately holds no pointer back to its Figure and share groups are stored as
+  indices (BP30). The gate is an RSS measurement, not an inspection.
+- **`&&` and `||` did not short-circuit.** The universal guard idiom
+  `if ($i < len($a) && $a[$i] == x)` evaluated the right operand unconditionally and died with
+  "Index out of bounds" on exactly the boundary it was written to prevent. Fixed; A/B'd on a
+  1M-iteration loop with no logical operators at all, best-of-5 in both orderings: **540/541 ms
+  before against 535/533 ms after**, so the cost is below the noise floor.
+- **The colormap index was `round(t × 255)` where matplotlib uses `floor(t × 256)`.** The two agree
+  at 0, 0.5 and 1 — so the obvious test passes — and disagree at 0.625 by a visibly different green.
+  Caught by sampling the interior rather than only the endpoints (BP29).
+- **The legend card, histogram bar edges and pie separators were hardcoded white**, which the dark
+  style exposed as a white box carrying near-invisible light text. They follow the theme now, and
+  cell and slice labels pick black or white by the fill's own luminance.
+
+### Added to the language, because bplot could not be written without them
+
+- **[feature] `sort` and `reverse`.** Bantu had `push`, `pop`, `insert`, `extend` and `slice` and no
+  way to **order** a list, so every median, quantile, boxplot and ranking in every Bantu program was
+  an interpreted sort. `NaN` sorts last in both directions — a comparator that answers `false` to
+  every `NaN` comparison is not a strict weak ordering, and `std::sort` given one reads past the end
+  of its range. A user comparator gets a merge sort, which cannot leave its range whatever the
+  comparator answers.
+
+### Tests
+
+- **[test]** `tests/bplot_layout_test.b` — **132 assertions**.
+- **[test]** `tests/bplot_stress.sh` — **48 checks**, including the RSS gate.
+- **[test]** Full regression green on the same build: **37 `.b` suites, 13 `.sh` suites**, and all
+  four `samples/bplot/` programs executed by `tests/run_samples.sh`.

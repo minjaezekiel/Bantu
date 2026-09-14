@@ -271,6 +271,444 @@ else
     bad "the quickstart did not run"
 fi
 
+# ════════════════════════════════════════════════════════════════════════
+#  B2 — the chart types, the scales, and the date axis
+# ════════════════════════════════════════════════════════════════════════
+echo ""
+echo "-- B2: every chart type, fed the input that breaks it --"
+
+B2="$TMP/b2"
+mkdir -p "$B2"
+cat > "$TMP/b2.b" <<'BEOF'
+include "./bplot/bplot.b" as plt;
+
+def fig() { return plt.figure(600, 400); }
+def save($f, $name) { $f.savefig("OUTDIR/" + $name + ".svg"); return null; }
+
+// ── Degenerate input to each new chart type ──────────────────────────────
+// A single-bin histogram: the range collapses, so the widening rule is the
+// only thing standing between this and a division by zero.
+$f = fig(); $a = $f.addAxes(); $a.hist([3, 3, 3], {"bins": 1});           save($f, "hist_onebin");
+$f = fig(); $a = $f.addAxes(); $a.hist([1], {"bins": 10});                save($f, "hist_onevalue");
+$f = fig(); $a = $f.addAxes(); $a.hist([1, NAN, 2, NAN], {"bins": 4});    save($f, "hist_nan");
+$f = fig(); $a = $f.addAxes(); $a.hist([1, 2, 3], {"bins": 500});         save($f, "hist_manybins");
+$f = fig(); $a = $f.addAxes(); $a.hist([-5, -4, -3, 0, 3], {"density": true}); save($f, "hist_density");
+
+// A boxplot of one point: every quartile is that point and both whiskers
+// have zero length.
+$f = fig(); $a = $f.addAxes(); $a.boxplot([7], null);                     save($f, "box_one");
+$f = fig(); $a = $f.addAxes(); $a.boxplot([[1],[2],[3]], null);           save($f, "box_ones");
+$f = fig(); $a = $f.addAxes(); $a.boxplot([[5,5,5,5]], null);             save($f, "box_identical");
+$f = fig(); $a = $f.addAxes(); $a.boxplot([[1,2,3,4,5,6,7,8,9,1000]], null); save($f, "box_outlier");
+
+// A violin with no spread has no bandwidth; it must not divide by zero.
+$f = fig(); $a = $f.addAxes(); $a.violin([[4,4,4]], null);                save($f, "violin_flat");
+$f = fig(); $a = $f.addAxes(); $a.violin([[1,2],[3,4]], null);            save($f, "violin_tiny");
+
+$f = fig(); $a = $f.addAxes(); $a.errorbar([1,2],[1,2],{"yerr":0});       save($f, "err_zero");
+$f = fig(); $a = $f.addAxes(); $a.errorbar([1],[1],{"yerr":1,"xerr":1});  save($f, "err_one");
+$f = fig(); $a = $f.addAxes(); $a.fill_between([1,2,3],[1,NAN,3],null,null); save($f, "band_nan");
+$f = fig(); $a = $f.addAxes(); $a.fill_between([1],[1],null,null);        save($f, "band_one");
+$f = fig(); $a = $f.addAxes(); $a.step([1],[1],{"where":"mid"});          save($f, "step_one");
+$f = fig(); $a = $f.addAxes(); $a.step([1,2,3],[1,NAN,3],{"where":"post"}); save($f, "step_nan");
+$f = fig(); $a = $f.addAxes(); $a.stem([1,2,3],[0,0,0],null);             save($f, "stem_zero");
+$f = fig(); $a = $f.addAxes(); $a.pie([1],null);                          save($f, "pie_one");
+$f = fig(); $a = $f.addAxes(); $a.pie([1,0,1],{"percent":true});          save($f, "pie_zeroslice");
+$f = fig(); $a = $f.addAxes(); $a.pie([0.0001, 99999],{"percent":true});  save($f, "pie_sliver");
+
+// ── Scales ───────────────────────────────────────────────────────────────
+$f = fig(); $a = $f.addAxes(); $a.setScale("y","log",null);
+$a.plot([1,2,3,4],[0.001,1,1000,1000000],null); $a.setGrid(true);         save($f, "log_wide");
+$f = fig(); $a = $f.addAxes(); $a.setScale("y","log",null);
+$a.plot([1,2],[3,7],null);                                               save($f, "log_narrow");
+$f = fig(); $a = $f.addAxes(); $a.setScale("x","log",null); $a.setScale("y","log",null);
+$a.scatter([1,10,100],[1,10,100],null);                                  save($f, "log_both");
+$f = fig(); $a = $f.addAxes(); $a.setScale("y","log",null);
+$a.bar([1,2,3],[0,10,1000],null);                                        save($f, "log_bar_zero");
+$f = fig(); $a = $f.addAxes(); $a.setScale("y","symlog",null);
+$a.plot([1,2,3,4,5],[0-1000,0-1,0,1,1000],null); $a.setGrid(true);        save($f, "symlog");
+$f = fig(); $a = $f.addAxes(); $a.setScale("y","symlog",0.001);
+$a.plot([1,2,3],[0-0.0001,0,0.0001],null);                               save($f, "symlog_tiny");
+
+// ── Date axis, including a span short enough to fall off the ladder ──────
+$f = fig(); $a = $f.addAxes(); $a.setDateAxis(true);
+$a.plot([1704067200000,1704153600000,1704240000000],[1,2,3],null);        save($f, "date_days");
+$f = fig(); $a = $f.addAxes(); $a.setDateAxis(true);
+$a.plot([1704067200000,1704067200100,1704067200200],[1,2,3],null);        save($f, "date_sub_second");
+$f = fig(); $a = $f.addAxes(); $a.setDateAxis(true);
+$a.plot([0, 1704067200000],[1,2],null);                                   save($f, "date_epoch_span");
+
+// ── A hostile annotation, which is a text node reached by a new route ────
+$evil = "</text><script>alert(1)</script><foreignObject>";
+$f = fig(); $a = $f.addAxes();
+$a.plot([1,2,3],[1,2,3],null);
+$a.addText(2, 2, $evil, {"rotate": 30});
+$a.annotate($evil, 1.5, 2.5, {"to": [3, 3]});
+$a.boxplot([[1,2],[3,4]], {"labels": [$evil, $evil]});
+save($f, "hostile_b2");
+
+// A hostile string through pie slice labels, which the legend never sees.
+$f = fig(); $a = $f.addAxes();
+$a.pie([1,1], {"labels": [$evil, "ok"], "percent": true});
+save($f, "hostile_pie");
+
+print("rendered");
+BEOF
+sed -i.bak "s#OUTDIR#$B2#g" "$TMP/b2.b" && rm -f "$TMP/b2.b.bak"
+
+if "$BANTU" -q run "$TMP/b2.b" > "$TMP/b2.log" 2>&1; then
+    ok "every B2 chart type rendered on degenerate input without raising"
+else
+    bad "a B2 case raised"
+    tail -20 "$TMP/b2.log"
+fi
+
+if [ -z "$PY" ]; then
+    echo "  --    no python found; skipping the B2 XML gate"
+else
+    BADXML=0; COUNT=0
+    for f in "$B2"/*.svg; do
+        [ -e "$f" ] || continue
+        COUNT=$((COUNT+1))
+        wellformed "$f" || { BADXML=$((BADXML+1)); echo "        malformed: $(basename "$f")"; }
+    done
+    echo "        $COUNT B2 documents checked"
+    check "$([ "$BADXML" = "0" ] && [ "$COUNT" -gt 25 ] && echo 1 || echo 0)" \
+          "every B2 document parses as well-formed XML"
+fi
+
+DIRTY=0
+for f in "$B2"/*.svg; do
+    [ -e "$f" ] || continue
+    grep -qE '(NaN|[^a-z-]inf|-inf)[,"]' "$f" && { DIRTY=$((DIRTY+1)); echo "        $(basename "$f")"; }
+done
+check "$([ "$DIRTY" = "0" ] && echo 1 || echo 0)" \
+      "no NaN or infinity reached a coordinate in any B2 document"
+
+if [ -f "$B2/hostile_b2.svg" ]; then
+    check "$(grep -c '<script' "$B2/hostile_b2.svg" | grep -q '^0$' && echo 1 || echo 0)" \
+          "no <script survived an annotation, a text node or a group label"
+    check "$(grep -c '<foreignObject' "$B2/hostile_b2.svg" | grep -q '^0$' && echo 1 || echo 0)" \
+          "and no <foreignObject either"
+    check "$(wellformed "$B2/hostile_b2.svg" && echo 1 || echo 0)" \
+          "and the document still parses"
+fi
+if [ -f "$B2/hostile_pie.svg" ]; then
+    check "$(grep -c '<script' "$B2/hostile_pie.svg" | grep -q '^0$' && echo 1 || echo 0)" \
+          "pie slice labels are escaped too"
+fi
+
+# ── The raise a log axis exists to produce ───────────────────────────────
+echo ""
+echo "-- B2: a log axis must REFUSE non-positive data, not draw nothing --"
+logfail() {
+    cat > "$TMP/logbad.b" <<BEOF
+include "./bplot/bplot.b" as plt;
+\$f = plt.figure(400, 300);
+\$a = \$f.addAxes();
+\$a.setScale("$1", "log", null);
+\$a.plot([1, 2, 3], [$2]);
+\$f.to_svg();
+print("NO_RAISE");
+BEOF
+    "$BANTU" -q run "$TMP/logbad.b" 2>&1
+}
+OUT="$(logfail y '1, 0, 3')"
+check "$(echo "$OUT" | grep -q 'NO_RAISE' && echo 0 || echo 1)" "a zero in the data raises"
+check "$(echo "$OUT" | grep -q 'cannot show 0' && echo 1 || echo 0)" "and the message names the value"
+check "$(echo "$OUT" | grep -q 'symlog' && echo 1 || echo 0)" "and suggests symlog"
+OUT="$(logfail y '1, -8, 3')"
+check "$(echo "$OUT" | grep -q 'NO_RAISE' && echo 0 || echo 1)" "a negative in the data raises"
+check "$(echo "$OUT" | grep -q -- '-8' && echo 1 || echo 0)" "and the message names it"
+
+# ── Scale: a violin and a histogram over a lot of points ─────────────────
+echo ""
+echo "-- B2: 200,000 points through hist, boxplot and violin --"
+cat > "$TMP/b2big.b" <<'BEOF'
+include "./bplot/bplot.b" as plt;
+$n = 200000;
+$v = [];
+$i = 0;
+$s = 12345;
+while ($i < $n) {
+    // A cheap deterministic spread; the point is the volume, not the shape.
+    $s = ($s * 1103515245 + 12345) - floor(($s * 1103515245 + 12345) / 2147483648) * 2147483648;
+    push($v, $s / 2147483648 * 100);
+    $i = $i + 1;
+}
+$t0 = clock();
+$f = plt.figure(700, 450);
+$a = $f.addAxes();
+$a.hist($v, {"bins": 40});
+$hs = $f.to_svg();
+$t1 = clock();
+print("HIST_MS " + str($t1 - $t0));
+print("HIST_BYTES " + str(len($hs)));
+
+$t0 = clock();
+$f2 = plt.figure(700, 450);
+$a2 = $f2.addAxes();
+$a2.violin([$v], null);
+$vs = $f2.to_svg();
+$t1 = clock();
+print("VIOLIN_MS " + str($t1 - $t0));
+print("VIOLIN_BYTES " + str(len($vs)));
+writefile("OUTDIR/b2big_hist.svg", $hs);
+writefile("OUTDIR/b2big_violin.svg", $vs);
+BEOF
+sed -i.bak "s#OUTDIR#$TMP#g" "$TMP/b2big.b" && rm -f "$TMP/b2big.b.bak"
+if "$BANTU" -q run "$TMP/b2big.b" > "$TMP/b2big.log" 2>&1; then
+    HMS=$(grep '^HIST_MS' "$TMP/b2big.log" | awk '{print $2}')
+    VMS=$(grep '^VIOLIN_MS' "$TMP/b2big.log" | awk '{print $2}')
+    HBY=$(grep '^HIST_BYTES' "$TMP/b2big.log" | awk '{print $2}')
+    VBY=$(grep '^VIOLIN_BYTES' "$TMP/b2big.log" | awk '{print $2}')
+    echo "        hist ${HMS} ms / ${HBY} bytes; violin ${VMS} ms / ${VBY} bytes"
+    ok "200,000 points bin and estimate without failing"
+    # A histogram is 40 rects however many points went in: output must not
+    # scale with the data.
+    check "$([ "${HBY:-999999}" -lt 30000 ] && echo 1 || echo 0)" \
+          "the histogram document is under 30 KB — it is 40 bars, not 200,000"
+    # The binned KDE is why this is possible: a per-point kernel would be
+    # 200,000 x 128 evaluations.
+    check "$([ "${VMS:-999999}" -lt 60000 ] && echo 1 || echo 0)" \
+          "the violin's binned KDE finishes in under 60 s at 200,000 points"
+    check "$([ "${VBY:-999999}" -lt 30000 ] && echo 1 || echo 0)" \
+          "and its document is under 30 KB"
+    check "$(wellformed "$TMP/b2big_hist.svg" && echo 1 || echo 0)" "the big histogram parses"
+    check "$(wellformed "$TMP/b2big_violin.svg" && echo 1 || echo 0)" "the big violin parses"
+else
+    bad "the 200,000-point B2 run failed"
+    tail -20 "$TMP/b2big.log"
+fi
+
+# ════════════════════════════════════════════════════════════════════════
+#  B3 — layout, 2-D, and the memory gate
+# ════════════════════════════════════════════════════════════════════════
+echo ""
+echo "-- B3: layout and 2-D, on the input that breaks them --"
+
+B3="$TMP/b3"
+mkdir -p "$B3"
+cat > "$TMP/b3.b" <<'BEOF'
+include "./bplot/bplot.b" as plt;
+
+def grid($rows, $cols) {
+    $z = [];
+    $r = 0;
+    while ($r < $rows) {
+        $row = [];
+        $c = 0;
+        while ($c < $cols) { push($row, sin($r / 7) * cos($c / 9) * 50); $c = $c + 1; }
+        push($z, $row);
+        $r = $r + 1;
+    }
+    return $z;
+}
+
+// An 8x8 grid, every panel carrying labels long enough to collide.
+$f = plt.figure(1600, 1200);
+$axs = $f.subplots(8, 8);
+$i = 0;
+while ($i < 64) {
+    $axs[$i].plot([1, 2, 3], [100000, 250000, 175000], null);
+    $axs[$i].setTitle("panel " + str($i));
+    $axs[$i].setXLabel("a long x axis label");
+    $axs[$i].setYLabel("a long y axis label");
+    $i = $i + 1;
+}
+$f.tight_layout(true);
+writefile("OUTDIR/grid8.svg", $f.to_svg());
+
+// Degenerate layouts.
+$f = plt.figure(200, 150); $f.subplots(4, 4); $f.tight_layout(true);
+writefile("OUTDIR/tiny_grid.svg", $f.to_svg());
+$f = plt.figure(400, 300); $a = $f.subplots(1, 1)[0]; $a.plot([1], [1], null);
+writefile("OUTDIR/grid_1x1.svg", $f.to_svg());
+
+// Twin axes on a log scale, with a shared group.
+$f = plt.figure(700, 450);
+$a = $f.addAxes();
+$a.setScale("y", "log", null);
+$a.plot([1, 2, 3], [1, 100, 10000], null);
+$a.setYLabel("log left");
+$b = $f.twinx($a);
+$b.bar([1, 2, 3], [5, 3, 8], null);
+$b.setYLabel("linear right");
+$f.tight_layout(true);
+writefile("OUTDIR/twin_log.svg", $f.to_svg());
+
+// 2-D degenerate cases.
+$f = plt.figure(500, 400); $f.addAxes().imshow([[1]], null);
+writefile("OUTDIR/im_1x1.svg", $f.to_svg());
+$f = plt.figure(500, 400); $f.addAxes().imshow([[5, 5], [5, 5]], null);
+writefile("OUTDIR/im_flat.svg", $f.to_svg());
+$f = plt.figure(500, 400); $f.addAxes().imshow([[NAN, NAN], [NAN, NAN]], null);
+writefile("OUTDIR/im_allnan.svg", $f.to_svg());
+$f = plt.figure(500, 400); $f.addAxes().imshow([[0 - INF, 1], [2, INF]], null);
+writefile("OUTDIR/im_inf.svg", $f.to_svg());
+$f = plt.figure(500, 400); $a = $f.addAxes(); $a.imshow(grid(3, 3), null); $a.colorbar(null);
+writefile("OUTDIR/im_cbar.svg", $f.to_svg());
+$f = plt.figure(600, 450); $f.addAxes().heatmap(grid(12, 12), null);
+writefile("OUTDIR/heat.svg", $f.to_svg());
+$f = plt.figure(500, 400); $f.addAxes().contour(grid(2, 2), {"levels": 3});
+writefile("OUTDIR/ct_min.svg", $f.to_svg());
+$f = plt.figure(500, 400); $f.addAxes().contour([[1, 1], [1, 1]], {"levels": 3});
+writefile("OUTDIR/ct_flat.svg", $f.to_svg());
+$f = plt.figure(500, 400); $f.addAxes().pcolormesh([0, 1, 5], [0, 2, 3], grid(2, 2), null);
+writefile("OUTDIR/mesh.svg", $f.to_svg());
+
+// Every style, so a theme change cannot break a document.
+each ($s in ["default", "dark", "print"]) {
+    plt.style($s);
+    $f = plt.figure(500, 380);
+    $a = $f.addAxes();
+    $a.plot([1, 2, 3], [1, 3, 2], {"label": "a"});
+    $a.hist([1, 2, 2, 3], {"bins": 3, "label": "h"});
+    $a.setGrid(true);
+    $a.setLegend(true);
+    $a.setTitle($s);
+    writefile("OUTDIR/style_" + $s + ".svg", $f.to_svg());
+}
+plt.style("default");
+
+print("rendered");
+BEOF
+sed -i.bak "s#OUTDIR#$B3#g" "$TMP/b3.b" && rm -f "$TMP/b3.b.bak"
+
+if "$BANTU" -q run "$TMP/b3.b" > "$TMP/b3.log" 2>&1; then
+    ok "every B3 layout and 2-D case rendered without raising"
+else
+    bad "a B3 case raised"
+    tail -20 "$TMP/b3.log"
+fi
+
+if [ -z "$PY" ]; then
+    echo "  --    no python found; skipping the B3 XML gate"
+else
+    BADXML=0; COUNT=0
+    for f in "$B3"/*.svg; do
+        [ -e "$f" ] || continue
+        COUNT=$((COUNT+1))
+        wellformed "$f" || { BADXML=$((BADXML+1)); echo "        malformed: $(basename "$f")"; }
+    done
+    echo "        $COUNT B3 documents checked"
+    check "$([ "$BADXML" = "0" ] && [ "$COUNT" -gt 13 ] && echo 1 || echo 0)" \
+          "every B3 document parses as well-formed XML"
+fi
+
+DIRTY=0
+for f in "$B3"/*.svg; do
+    [ -e "$f" ] || continue
+    grep -qE '(NaN|[^a-z-]inf|-inf)[,"]' "$f" && { DIRTY=$((DIRTY+1)); echo "        $(basename "$f")"; }
+done
+check "$([ "$DIRTY" = "0" ] && echo 1 || echo 0)" \
+      "no NaN or infinity reached a coordinate in any B3 document"
+
+# A dark figure must contain no hardcoded white — the legend card used to be
+# one, which put near-invisible light text on a white box.
+if [ -f "$B3/style_dark.svg" ]; then
+    check "$(grep -c 'fill="#ffffff"' "$B3/style_dark.svg" | grep -q '^0$' && echo 1 || echo 0)" \
+          "the dark style leaves no hardcoded white in the document"
+fi
+
+# ── The gate BP26 exists for ────────────────────────────────────────────
+echo ""
+echo "-- B3: a 1000x1000 imshow, which is where the naive encoding dies --"
+cat > "$TMP/b3big.b" <<'BEOF'
+include "./bplot/bplot.b" as plt;
+$n = 1000;
+$z = [];
+$r = 0;
+while ($r < $n) {
+    $row = [];
+    $c = 0;
+    while ($c < $n) { push($row, ($r - 500) * ($r - 500) + ($c - 500) * ($c - 500)); $c = $c + 1; }
+    push($z, $row);
+    $r = $r + 1;
+}
+$t0 = clock();
+$f = plt.figure(800, 600);
+$a = $f.addAxes();
+$a.imshow($z, null);
+$a.colorbar(null);
+$svg = $f.to_svg();
+$ms = clock() - $t0;
+writefile("OUTDIR/big_image.svg", $svg);
+print("IMG_MS " + str($ms));
+print("IMG_BYTES " + str(len($svg)));
+print("IMG_PATHS " + str(len(split($svg, "<path")) - 1));
+BEOF
+sed -i.bak "s#OUTDIR#$TMP#g" "$TMP/b3big.b" && rm -f "$TMP/b3big.b.bak"
+if "$BANTU" -q run "$TMP/b3big.b" > "$TMP/b3big.log" 2>&1; then
+    IMS=$(grep '^IMG_MS' "$TMP/b3big.log" | awk '{print $2}')
+    IBY=$(grep '^IMG_BYTES' "$TMP/b3big.log" | awk '{print $2}')
+    IPA=$(grep '^IMG_PATHS' "$TMP/b3big.log" | awk '{print $2}')
+    echo "        ${IMS} ms, ${IBY} bytes, ${IPA} path elements (1,000,000 input cells)"
+    ok "a 1,000,000-cell image renders"
+    # One <rect> per input cell would be ~55 MB. The cell budget plus
+    # per-colour path batching is what keeps this openable.
+    check "$([ "${IBY:-99999999}" -lt 2000000 ] && echo 1 || echo 0)" \
+          "and the document is under 2 MB, not the 55 MB of one rect per cell"
+    # At most 256 colours by construction, plus one bucket for no-data.
+    check "$([ "${IPA:-99999}" -le 257 ] && echo 1 || echo 0)" \
+          "and at most 257 elements, however many cells went in"
+    check "$([ "${IMS:-999999}" -lt 300000 ] && echo 1 || echo 0)" \
+          "and it finishes inside five minutes on a shared runner"
+    check "$(wellformed "$TMP/big_image.svg" && echo 1 || echo 0)" \
+          "the big image parses"
+else
+    bad "the 1000x1000 imshow failed"
+    tail -20 "$TMP/b3big.log"
+fi
+
+# ── Memory: figures must be RECLAIMED, not merely survived ───────────────
+echo ""
+echo "-- B3: 6,000 figures built and dropped, with RSS measured --"
+cat > "$TMP/rss.b" <<'BEOF'
+include "./bplot/bplot.b" as plt;
+$N = 1;
+each ($a in split(env("BPLOT_RSS_N"), ",")) { $N = num($a); }
+$xs = [];
+$ys = [];
+$i = 0;
+while ($i < 60) { push($xs, $i); push($ys, $i * $i); $i = $i + 1; }
+$k = 0;
+$acc = 0;
+while ($k < $N) {
+    $f = plt.figure(420, 320);
+    $a = $f.addAxes();
+    $a.plot($xs, $ys, {"label": "s"});
+    $a.setTitle("t");
+    $a.setLegend(true);
+    $acc = $acc + len($f.to_svg());
+    $k = $k + 1;
+}
+print("ACC " + str($acc));
+BEOF
+rssOf() {
+    # Portable-ish peak RSS. GNU time reports KB; BSD /usr/bin/time -l bytes.
+    if /usr/bin/time -l true >/dev/null 2>&1; then
+        BPLOT_RSS_N="$1" /usr/bin/time -l "$BANTU" -q run "$TMP/rss.b" 2>&1 |
+            awk '/maximum resident/ { print int($1/1024); found=1 } END { if (!found) print 0 }'
+    else
+        BPLOT_RSS_N="$1" /usr/bin/time -v "$BANTU" -q run "$TMP/rss.b" 2>&1 |
+            awk '/Maximum resident/ { print int($NF); found=1 } END { if (!found) print 0 }'
+    fi
+}
+R_SMALL="$(rssOf 300)"
+R_BIG="$(rssOf 6000)"
+if [ "${R_SMALL:-0}" -gt 0 ] && [ "${R_BIG:-0}" -gt 0 ]; then
+    echo "        300 figures: ${R_SMALL} KB;  6,000 figures: ${R_BIG} KB"
+    # Twenty times the work must not cost twenty times the memory. Before class
+    # instances were given an owner this grew linearly -- 8,000 figures reached
+    # 372 MB and climbing, so a sua handler drawing a chart per request would
+    # have been OOM-killed.
+    check "$([ "$R_BIG" -lt $((R_SMALL * 2)) ] && echo 1 || echo 0)" \
+          "RSS is flat: 20x the figures costs under 2x the memory"
+else
+    echo "  --    could not measure RSS on this platform; skipping"
+fi
+
 echo ""
 echo "  $PASS passed, $FAIL failed"
 exit $([ "$FAIL" -eq 0 ] && echo 0 || echo 1)

@@ -93,33 +93,80 @@ author:
 **Deferred from B1 with a reason:** `tight_layout` uses the embedded Helvetica metrics but belongs
 with subplots (B3), so gutters are fixed for now; the metrics table is in and used for legend boxes.
 
-## Phase B2 — The chart types
+## Phase B2 — The chart types ✅
 
-- [ ] `hist` `boxplot` `violin` `errorbar` `fill_between` `step` `stem` `pie`
-- [ ] log and symlog scales, with decade and minor ticks
-- [ ] date axes (arctic's datetime columns as x)
-- [ ] annotations, arrows, text rotation
-- [ ] `tests/bplot_charts_test.b`
+- [x] `hist` `boxplot` `violin` `errorbar` `fill_between` `step` `stem` `pie`
+- [x] log and symlog scales, with decade and minor ticks
+- [x] date axes (epoch milliseconds, UTC — arctic's own datetime storage)
+- [x] annotations, arrows, text rotation
+- [x] categorical axes (a string sequence becomes positions and tick labels — BP28)
+- [x] `tests/bplot_charts_test.b` (196), B2 additions to `tests/bplot_stress.sh`
 
-**Gate:** each chart type against a golden file; histogram bin edges against numba's `nd_histogram`.
-**Stress:** log scale fed zero and negative values (must raise, naming the value); a single-bin
-histogram; a boxplot of one point; degenerate ranges; a hostile annotation string.
+| gate | result |
+|---|---|
+| symlog transform vs `matplotlib.scale.SymmetricalLogTransform` | ✅ 17 points, 3 `linthresh` settings, to 9 decimals |
+| log ticks vs matplotlib | ✅ 8 ranges exact; **2 ranges deliberately differ** (BP17 — matplotlib leaves the axis unlabelled) |
+| symlog ticks vs matplotlib | ✅ 6 limit/linthresh combinations |
+| date ticks vs `AutoDateLocator` | ✅ **8 ranges exact**, ten seconds to 25 years, including the semi-monthly and 4-year cases |
+| calendar arithmetic | ✅ 1,461 consecutive days round-trip; 1900 and 2000 leap rules |
+| quantiles vs numpy · boxplot vs `cbook.boxplot_stats` | ✅ exact |
+| histogram binning vs `nd_histogram` / numpy | ✅ including the **inclusive top edge**, which otherwise loses the maximum silently |
+| log axis fed zero or a negative | ✅ raises, names the value, suggests `symlog` |
+| every B2 document parses as XML | ✅ **32 documents**, every degenerate and hostile case |
+| escaping through annotations, group labels and pie slices | ✅ no `<script`, no `<foreignObject` |
+| 200,000 points through `hist` and `violin` | ✅ 1,103 ms / 6,959 bytes and 1,971 ms / 5,291 bytes — output does not scale with input |
+| 100k-point line, linear scale | ✅ **1,198 ms** against B1's 1,136 — the scale machinery costs a linear axis nothing (BP16) |
+
+**One defect found and fixed while building it:** a bar's zero baseline is published as part of its
+data bounds, so a log axis raised on the *baseline* before any data was projected — making `bar()`
+and `hist()` unusable on a log scale. Baselines are now clamped to the view floor while real
+non-positive **data** still raises, and the difference is deliberate: a line with a gap is invisible
+and misleading, an absent bar already reads as zero.
 
 ---
 
-## Phase B3 — Layout and 2-D
+## Phase B3 — Layout and 2-D ✅
 
-- [ ] `subplots`, `GridSpec`, `twinx`/`twiny`, shared axes
-- [ ] `tight_layout` using the embedded Helvetica metrics (BP12)
-- [ ] colormaps (`viridis` `plasma` `coolwarm` `gray`), colorbars
-- [ ] `imshow` `contour` `pcolormesh` `heatmap`, taking numba 2-D arrays
-- [ ] style sheets
-- [ ] `tests/bplot_layout_test.b`
+- [x] `subplots`, `GridSpec`, `subplot(r,c,i)`, spanning cells, `twinx`/`twiny`, shared axes
+- [x] `tight_layout` using the embedded Helvetica metrics (BP12)
+- [x] colormaps (`viridis` `plasma` `coolwarm` `gray`), colorbars
+- [x] `imshow` `contour` `pcolormesh` `heatmap`
+- [x] style sheets (`default`, `dark`, `print`)
+- [x] `tests/bplot_layout_test.b` (132), B3 additions to `tests/bplot_stress.sh`
+
+| gate | result |
+|---|---|
+| `subplots()` and `subplot(r,c,i)` rectangles | ✅ **identical**, asserted cell by cell (BP27) |
+| an 8×8 grid | ✅ 64 panels, none overlapping, all inside the figure |
+| a 1×1 grid | ✅ reproduces B1's fixed gutters exactly, so B1 output did not move |
+| `tight_layout` | ✅ wider labels reserve more gutter; every box stays inside its cell; **rendering twice is byte-identical** |
+| colormap entries vs matplotlib | ✅ 20 sampled positions + 7 individual entries, written into the test independently |
+| 1000×1000 `imshow` | ✅ **1,473,633 bytes and 256 elements** for 1,000,000 cells — against ~55 MB for one `<rect>` each |
+| twin axes | ✅ same rectangle, **frame stroked once**, independent y scales |
+| shared axes | ✅ union limits, and sharing is **transitive** |
+| 6,000 figures built and dropped | ✅ **RSS flat** — 10.5 MB at 300 figures, 12.0 MB at 6,000 |
+| every B3 document parses as XML | ✅ 16 documents, including every style |
+| the dark style | ✅ no hardcoded white survives anywhere in the document |
+
+**Two defects found and fixed while building it, both of them general:**
+- **Every Bantu object leaked.** `new ClassName()` allocated an instance nothing ever deleted —
+  ~45 KB per figure, 372 MB over 20,000 figures and climbing. Instances are refcounted now, and an
+  Axes deliberately holds no pointer back to its Figure, because refcounting does not collect cycles
+  (BP30). The gate is an RSS measurement, not an inspection.
+- **`&&` and `||` did not short-circuit**, so the universal guard `if ($i < len($a) && $a[$i] == x)`
+  died on exactly the boundary it was written to prevent. Fixed, measured at no cost.
 
 **Gate:** an 8×8 subplot grid lays out without overlap; `tight_layout` on labels long enough to
 collide; colormap values against reference tables.
-**Stress:** a 1000×1000 `imshow` with a wall-clock gate **and a file-size gate** (the naive encoding
-is one `<rect>` per pixel — a 60 MB document; the correct one is a single embedded image).
+**Stress:** a 1000×1000 `imshow` with a wall-clock gate **and a file-size gate**.
+
+> **This gate was corrected, and the original wording is kept so the change is visible.** It read:
+> "the naive encoding is one `<rect>` per pixel — a 60 MB document; the correct one is a single
+> embedded image". The first half is right and measured. The second half is **not reachable in B3**:
+> a single embedded image means `<image href="data:image/png;base64,…">`, which means a PNG encoder —
+> CRC32, Adler-32 and deflate — which is the native work that *is* B6. B3 instead block-reduces to a
+> cell budget and batches cells into one `<path>` per colour (decision BP26), which is ≤ 256 elements
+> and ~14 bytes per cell rather than ~55. B6 inherits the single-image gate, where it belongs.
 
 ---
 

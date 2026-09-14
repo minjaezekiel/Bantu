@@ -9,6 +9,63 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] `sort(list)` and `reverse(list)`** — the language had `push`, `pop`, `insert`,
+  `extend` and `slice` and **no way to order a list**, so every median, quantile, boxplot, ranking
+  and "top N" in every Bantu program was an interpreted sort. Both return a new list; the argument is
+  untouched.
+
+  ```bantu
+  sort([3, 1, 2])                    // [1, 2, 3]
+  sort([5, 2, 9], "desc")            // [9, 5, 2]
+  sort(["aaa", "b", "cc"], byLength) // a comparator: negative, zero or positive
+  reverse([1, 2, 3])                 // [3, 2, 1]
+  reverse("abc")                     // "cba"
+  ```
+
+  `NaN` sorts **last in both directions** — a comparator that answers false to every `NaN`
+  comparison is not a strict weak ordering, and `std::sort` given one reads past the end of its
+  range. A mixed list of numbers and strings **raises**: ordering them has no correct answer, and
+  picking one silently is how a sort quietly produces garbage that still looks sorted. A
+  user-supplied comparator gets a merge sort, which cannot leave its range however badly the
+  comparator behaves. See [`docs/language-features.md`](docs/language-features.md).
+
+- **[feature] bplot grew its chart types, its scales and its layout engine** — `hist` `boxplot`
+  `violin` `errorbar` `fill_between` `step` `stem` `pie`; `log` and `symlog` scales; calendar-aware
+  date axes; annotations and arrows; categorical axes; `subplots`, twin and shared axes,
+  `tight_layout`; `imshow` `heatmap` `pcolormesh` `contour` with colormaps and colorbars; and style
+  sheets. Tick locations, the symlog transform, quantiles, boxplot statistics and histogram bins are
+  all checked against matplotlib's and numpy's own answers, with the reference values embedded as
+  literals — **nothing at run time depends on Python**. Details in
+  [`bplot-suite/CHANGELOG.md`](bplot-suite/CHANGELOG.md).
+
+### Fixed
+
+- **[bug fix] Every object a Bantu program created leaked.** `new ClassName()` allocated an instance
+  that **nothing ever deleted**, so instances accumulated for the life of the process — measured at
+  ~300 bytes each, and a program building 20,000 plotting figures reached **372 MB** of resident
+  memory and was still climbing. A `sua` handler creating objects per request grew without bound
+  until the worker was killed. Instances are refcounted now, like every other Bantu value: 20,000
+  instances is **flat at 4.9 MB**.
+
+  Refcounting does not collect **reference cycles** — two objects that point at each other keep each
+  other alive, as in Swift or any other refcounted runtime without a cycle collector. If you build a
+  graph with back-references, break the cycle when you are done or hold the back-reference as an
+  index. This is documented in [`docs/language-features.md`](docs/language-features.md).
+
+- **[bug fix] `&&` and `||` now short-circuit.** They evaluated the right-hand side
+  unconditionally, so the universal guard idiom
+
+  ```bantu
+  if ($i < len($a) && $a[$i] == 9) { ... }    // died with "Index out of bounds"
+  if ($d != null && $d["k"] == 1) { ... }     // indexed a null
+  ```
+
+  failed on exactly the boundary it was written to prevent — and any side effect on the right ran
+  even when the left had already decided the answer. The result is still a boolean, so nothing that
+  already worked changes value. A/B'd on a 1M-iteration arithmetic loop containing no logical
+  operators at all, best-of-5 in both orderings: **540/541 ms before against 535/533 ms after**.
+
+
 - **[feature] bplot — data visualisation, in the shape of matplotlib** — 100% pure Bantu, emitting
   SVG. A chart is three lines:
 

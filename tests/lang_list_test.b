@@ -155,6 +155,79 @@ eq(len($out), 20000, "the idiom still builds the right list");
 ok($idiom < 3000, "and is linear now (was 7,027ms at this size)");
 
 print("");
+print("-- sort and reverse (new: the language could not ORDER a list) --");
+$src = [3, 1, 2];
+eq(join(sort($src), ","), "1,2,3", "sort ascending");
+eq(join($src, ","), "3,1,2", "and the argument is untouched — value semantics");
+eq(join(sort([5, 2, 9, 1], "desc"), ","), "9,5,2,1", "sort descending");
+eq(join(sort([5, 2, 9, 1], "asc"), ","), "1,2,5,9", "\"asc\" is accepted explicitly");
+eq(join(sort(["pear", "apple", "fig"]), ","), "apple,fig,pear", "strings sort lexicographically");
+eq(join(sort([]), ","), "", "an empty list sorts to an empty list");
+eq(join(sort([7]), ","), "7", "one element");
+eq(join(sort([2, 2, 1, 1]), ","), "1,1,2,2", "duplicates survive");
+eq(join(sort([-3, 0, 2, -1]), ","), "-3,-1,0,2", "negatives order correctly");
+
+// NaN sorts last, and that is a correctness requirement: every comparison
+// with NaN is false, so `a < b` is not a strict weak ordering when one is
+// present, and std::sort given such a comparator reads past the end of its
+// range. numba's nd_sort already orders NaN last, so the two agree.
+$withNan = sort([3, NAN, 1, NAN, 2]);
+eq(len($withNan), 5, "NaN entries are kept, not dropped");
+eq($withNan[0], 1, "the finite values sort first");
+eq($withNan[2], 3, "in order");
+ok(isnan($withNan[3]) && isnan($withNan[4]), "and both NaNs land at the end");
+$descNan = sort([3, NAN, 1], "desc");
+eq($descNan[0], 3, "descending puts the largest first");
+ok(isnan($descNan[2]), "and NaN is STILL last — it is not a large value, it is an absent one");
+
+// A comparator gets a merge sort, which is stable and cannot run off its
+// range whatever the comparator answers.
+def byLen($a, $b) { return len($a) - len($b); }
+eq(join(sort(["aaa", "b", "cc"], byLen), ","), "b,cc,aaa", "a comparator orders by any rule");
+def tie($a, $b) { return 0; }
+eq(join(sort(["x", "y", "z"], tie), ","), "x,y,z", "a comparator that always ties keeps the order (stable)");
+
+$caught = false;
+try { sort([1, "a"]); } catch ($e) { $caught = true; }
+ok($caught, "a list mixing numbers and strings raises rather than inventing an order");
+$caught = false;
+try { sort([1, 2], "sideways"); } catch ($e) { $caught = true; }
+ok($caught, "an unknown direction raises");
+$caught = false;
+try { sort("not a list"); } catch ($e) { $caught = true; }
+ok($caught, "sort of a non-list raises");
+
+eq(join(reverse([1, 2, 3]), ","), "3,2,1", "reverse a list");
+eq(reverse("abc"), "cba", "reverse a string");
+eq(join(reverse([]), ","), "", "reverse an empty list");
+$r = [1, 2, 3];
+reverse($r);
+eq(join($r, ","), "1,2,3", "reverse does not mutate its argument either");
+
+// Sorting has to be usable on real data, not just on three elements.
+$big = [];
+$i = 0;
+$seed = 12345;
+while ($i < 20000) {
+    $seed = ($seed * 1103515245 + 12345) - floor(($seed * 1103515245 + 12345) / 2147483648) * 2147483648;
+    push($big, $seed);
+    $i = $i + 1;
+}
+$t0 = clock();
+$sorted = sort($big);
+$sortMs = clock() - $t0;
+print("        20,000 elements sorted: " + str($sortMs) + "ms");
+eq(len($sorted), 20000, "20,000 elements come back");
+$ordered = true;
+$i = 1;
+while ($i < 20000) {
+    if ($sorted[$i] < $sorted[$i - 1]) { $ordered = false; }
+    $i = $i + 1;
+}
+ok($ordered, "and they are in order");
+ok($sortMs < 3000, "in well under three seconds");
+
+print("");
 print("========================================");
 print("  PASS: " + str($R.pass) + "   FAIL: " + str($R.fail));
 print("========================================");

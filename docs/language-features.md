@@ -149,6 +149,83 @@ every case, including `len` of a string, a dict (`0`) and a non-container (`0`),
 semantics and has not changed: `col($big, "f64")`, `sum($big)` and any user function taking a list
 copy on the way in. For large data, prefer native containers (arctic columns) over Bantu lists.
 
+### `sort` and `reverse` (new)
+
+The language had `push`, `pop`, `insert`, `remove`, `extend` and `slice`, and **no way to order a
+list**. Every median, quantile, boxplot, ranking and "top N" in every Bantu program was an
+interpreted sort. Both return a **new** list; the argument is untouched, as value semantics require.
+
+```bantu
+sort([3, 1, 2])                  // [1, 2, 3]
+sort([3, 1, 2], "desc")          // [3, 2, 1]
+sort(["pear", "apple", "fig"])   // ["apple", "fig", "pear"]
+reverse([1, 2, 3])               // [3, 2, 1]
+reverse("abc")                   // "cba"
+
+def byLength($a, $b) { return len($a) - len($b); }
+sort(["aaa", "b", "cc"], byLength)      // ["b", "cc", "aaa"]
+```
+
+Four things worth knowing, each with a reason:
+
+- **`NaN` sorts last, in both directions.** This is a correctness requirement, not a preference:
+  every comparison with `NaN` is false, so `a < b` is *not* a strict weak ordering when one is
+  present, and `std::sort` given such a comparator reads past the end of its range — a genuine
+  out-of-bounds access, not merely a wrong order. numba's `nd_sort` already orders `NaN` last, so
+  the two agree on the same data.
+- **`"desc"` reverses the comparison, not the finished list.** Reversing the list afterwards would
+  reverse *ties* too, destroying stability, and would drag `NaN` to the front.
+- **A mixed list raises.** Ordering a number against a string has no correct answer, and picking one
+  silently is how a sort quietly produces garbage that still looks sorted.
+- **A comparator gets a merge sort.** A comparator written in Bantu can be non-transitive and no
+  validation catches that; a merge sort cannot leave its range whatever the comparator answers, so
+  the worst case is a strangely ordered list rather than memory corruption. Return a negative number
+  if the first argument comes first, positive if the second does, zero if they tie.
+
+### `&&` and `||` now short-circuit (fixed)
+
+They did not, and that was a real defect rather than a quirk. The universal guard idiom
+
+```bantu
+if ($i < len($a) && $a[$i] == 9) { ... }     // died with "Index out of bounds"
+if ($d != null && $d["k"] == 1) { ... }      // evaluated $d["k"] on a null
+```
+
+evaluated the right operand unconditionally and failed on exactly the boundary the guard was written
+to prevent. Every programmer arriving from any other language writes that line.
+
+The result is still a boolean, so nothing that already worked changes value — only the point at
+which the right side stops being evaluated, and with it any side effect it carries. A/B'd on a
+1M-iteration arithmetic loop containing no logical operators at all, best-of-5 in both orderings:
+**540/541 ms without the guard against 535/533 ms with it**, so the cost is below the noise floor.
+
+### Objects are freed (fixed — this was a leak)
+
+`new ClassName()` allocated an instance that **nothing ever deleted**, so every object a Bantu
+program created leaked for the life of the process. Measured before the fix: ~300 bytes per
+instance, and a program building 20,000 plotting figures reached **372 MB** of resident memory and
+climbing. A `sua` handler creating objects per request grew without bound until the worker was
+killed.
+
+Instances are now refcounted, like every other Bantu value. Measured after: 20,000 instances is
+**flat** at 4.9 MB, and 6,000 figures built and dropped move resident memory from 10.5 MB to 12.0 MB.
+
+**One thing refcounting does not do is collect cycles.** Two objects that point at each other keep
+each other alive, exactly as in Swift or any other refcounted runtime without a cycle collector:
+
+```bantu
+class Node { def init() { $this.peer = null; } }
+$a = new Node();
+$b = new Node();
+$a.peer = $b;
+$b.peer = $a;      // neither is ever freed
+```
+
+If you build a graph with back-references and create many of them, break the cycle when you are done
+(`$a.peer = null;`), or hold the back-reference as an index into a list the owner already keeps.
+`bplot` takes the second approach: an Axes deliberately does **not** hold a pointer back to its
+Figure, and shared-axes groups are stored as indices for exactly this reason.
+
 
 ## Scalar maths (new)
 

@@ -3186,6 +3186,39 @@ private:
     }
 
     Value evalBinaryOp(BinaryOpNode* n) {
+        // && and || SHORT-CIRCUIT, and must be handled before the right-hand
+        // side is evaluated at all.
+        //
+        // They did not, and that was a real defect rather than a quirk: the
+        // universal guard idiom
+        //
+        //     if ($i < len($a) && $a[$i] == x) { ... }
+        //     if ($d != null && $d["k"] == 1) { ... }
+        //
+        // evaluated the right operand unconditionally and died with "Index out
+        // of bounds" on exactly the boundary the guard was written to prevent.
+        // Every programmer arriving from any other language writes that line.
+        //
+        // The result is still a BOOL, as before, so nothing that already worked
+        // changes value -- only the point at which the right side stops being
+        // evaluated, and with it any side effect it carries.
+        //
+        // AND and OR are adjacent in BantuTokenType (types.hpp:328), so this
+        // guard is one unsigned compare on the hottest path in the
+        // interpreter. A/B'd on a 1M-iteration arithmetic loop containing no
+        // logical operators at all, best-of-5 in both orderings: 540/541 ms
+        // without the guard against 535/533 ms with it. The cost is below the
+        // noise floor.
+        if (__builtin_expect((unsigned)((int)n->op - (int)BantuTokenType::AND) <= 1u, 0)) {
+            const bool leftTrue = evalNode(n->left).isTruthy();
+            if (n->op == BantuTokenType::AND) {
+                if (!leftTrue) return Value(false);
+            } else {
+                if (leftTrue) return Value(true);
+            }
+            return Value(evalNode(n->right).isTruthy());
+        }
+
         Value left = evalNode(n->left);
         Value right = evalNode(n->right);
 
@@ -3250,8 +3283,15 @@ private:
             case BantuTokenType::LESSTHAN: return Value(left.numberVal < right.numberVal);
             case BantuTokenType::GREATERTHANEQUAL: return Value(left.numberVal >= right.numberVal);
             case BantuTokenType::LESSTHANEQUAL: return Value(left.numberVal <= right.numberVal);
-            case BantuTokenType::AND: return Value(left.isTruthy() && right.isTruthy());
-            case BantuTokenType::OR: return Value(left.isTruthy() || right.isTruthy());
+            // AND and OR are handled at the top of this function, where they
+            // can short-circuit. Reaching here would mean the guard above
+            // stopped matching, so say so rather than silently evaluating both
+            // sides again.
+            case BantuTokenType::AND:
+            case BantuTokenType::OR:
+                ErrorHandler::throwRuntimeError("internal: && / || reached the non-short-circuit path",
+                                                n->line, n->col);
+                return Value();
             default:
                 ErrorHandler::throwRuntimeError("Unknown operator", n->line, n->col);
                 return Value();
@@ -4488,6 +4528,69 @@ private:
         return Value();
     }
 
+    // Call any callable Value with arguments that have already been evaluated.
+    //
+    // Lifted out of evalCall so that a NATIVE BUILTIN can call back into Bantu —
+    // `sort($list, $cmp)` is the first to need it, and map/filter/find would be
+    // the next. A builtin only ever receives Values, so without this there is no
+    // way for one to invoke a Bantu function at all.
+    //
+    // evalCall keeps its own "what did you actually call?" diagnostic, because
+    // that one needs the CallNode to name the callee; this raises a plain error
+    // for the callback case, where the caller knows which argument was wrong and
+    // says so itself.
+    Value invokeCallable(const Value& callee, std::vector<Value> args) {
+        if (callee.isNativeFn()) {
+            return callee.nativeFn(std::move(args));
+        }
+
+        if (callee.isClassDef()) {
+            return instantiateClass(callee.classDefVal, args);
+        }
+
+        if (callee.isFunction()) {
+            auto fn = callee.functionVal;
+            auto callEnv = std::make_shared<Environment>(fn->closure);
+            callEnv->functionScope = true;   // function-local assignment boundary
+
+            // Propagate the caller's `this` into free functions (dynamic `this`),
+            // but NOT into a bound method — a method accessed via obj.method already
+            // carries its own receiver in its closure (see evalDotAccess), and
+            // overwriting it here would make an instance's method run with the
+            // *caller's* `this` (breaks obj-A calling obj-B.method()). Only inherit
+            // when the callee's closure has no real instance `this` of its own.
+            bool calleeHasOwnThis = fn->closure && fn->closure->has("this") &&
+                                    fn->closure->get("this").isClassInstance();
+            if (!calleeHasOwnThis && env_->has("this")) {
+                callEnv->define("this", env_->get("this"));
+                callEnv->define("self", env_->get("this"));
+            }
+
+            if (args.size() > fn->params.size()) {
+                ErrorHandler::throwRuntimeError("Too many arguments for function " + fn->name);
+            }
+            for (size_t i = 0; i < fn->params.size(); i++) {
+                callEnv->define(fn->params[i], i < args.size() ? args[i] : Value());
+            }
+
+            auto prevEnv = env_;
+            env_ = callEnv;
+            Value result;
+            try {
+                for (auto& stmt : fn->body) {
+                    result = evalNode(stmt);
+                }
+            } catch (const ReturnSignal& sig) {
+                result = sig.value;
+            }
+            env_ = prevEnv;
+            return result;
+        }
+
+        ErrorHandler::throwRuntimeError("Cannot call a value that is not a function");
+        return Value();
+    }
+
     Value evalCall(CallNode* n) {
         // In-place list mutators (append/push/pop/insert/remove/extend). Resolved
         // here because a native builtin only receives args by value and could not
@@ -4577,51 +4680,8 @@ private:
             args.push_back(evalNode(arg));
         }
 
-        if (callee.isNativeFn()) {
-            return callee.nativeFn(std::move(args));
-        }
-
-        if (callee.isClassDef()) {
-            return instantiateClass(callee.classDefVal, args);
-        }
-
-        if (callee.isFunction()) {
-            auto fn = callee.functionVal;
-            auto callEnv = std::make_shared<Environment>(fn->closure);
-            callEnv->functionScope = true;   // function-local assignment boundary
-
-            // Propagate the caller's `this` into free functions (dynamic `this`),
-            // but NOT into a bound method — a method accessed via obj.method already
-            // carries its own receiver in its closure (see evalDotAccess), and
-            // overwriting it here would make an instance's method run with the
-            // *caller's* `this` (breaks obj-A calling obj-B.method()). Only inherit
-            // when the callee's closure has no real instance `this` of its own.
-            bool calleeHasOwnThis = fn->closure && fn->closure->has("this") &&
-                                    fn->closure->get("this").isClassInstance();
-            if (!calleeHasOwnThis && env_->has("this")) {
-                callEnv->define("this", env_->get("this"));
-                callEnv->define("self", env_->get("this"));
-            }
-
-            if (args.size() > fn->params.size()) {
-                ErrorHandler::throwRuntimeError("Too many arguments for function " + fn->name);
-            }
-            for (size_t i = 0; i < fn->params.size(); i++) {
-                callEnv->define(fn->params[i], i < args.size() ? args[i] : Value());
-            }
-
-            auto prevEnv = env_;
-            env_ = callEnv;
-            Value result;
-            try {
-                for (auto& stmt : fn->body) {
-                    result = evalNode(stmt);
-                }
-            } catch (const ReturnSignal& sig) {
-                result = sig.value;
-            }
-            env_ = prevEnv;
-            return result;
+        if (callee.isNativeFn() || callee.isClassDef() || callee.isFunction()) {
+            return invokeCallable(callee, std::move(args));
         }
 
         // Name what was called and what it actually holds. "Cannot call
@@ -5218,7 +5278,21 @@ private:
     }
 
     Value instantiateClass(ClassDefinition* classDef, std::vector<Value>& args) {
-        auto* instance = new ClassInstance(classDef);
+        // OWNED, not `new`-and-forget. This used to be a bare
+        // `new ClassInstance(classDef)` with no delete anywhere, so every
+        // object a Bantu program ever created leaked for the life of the
+        // process. Measured before the fix: ~300 bytes per instance, and a
+        // program building 20,000 bplot figures reached 372 MB of resident
+        // memory and climbing. A sua handler creating objects per request grew
+        // without bound until the worker was killed.
+        //
+        // Refcounting frees an instance when the last Value referring to it
+        // goes. It does NOT collect reference CYCLES — two objects pointing at
+        // each other keep each other alive, as in Swift or any other
+        // refcounted runtime without a cycle collector. That is documented
+        // rather than hidden, and it is why bplot's Axes does not hold a
+        // pointer back to its Figure.
+        auto instance = std::make_shared<ClassInstance>(classDef);
 
         // Copy default properties from parent classes (extends chain)
         ClassDefinition* current = classDef->parentClass;
@@ -5289,7 +5363,7 @@ private:
             }
         }
 
-        return Value(instance);
+        return Value(std::move(instance));
     }
 
     // ════════════════════════════════════════════════════════════
@@ -7143,6 +7217,143 @@ private:
                 else                 out += L[i].toString();
             }
             return Value(out);
+        }));
+
+        // sort(list) · sort(list, "desc") · sort(list, cmp)
+        //
+        // Bantu had push, pop, insert, remove, extend and slice, and no way to
+        // ORDER a list — so every median, quantile, boxplot, ranking and "top N"
+        // in every Bantu program was an interpreted sort. This is the same shape
+        // of gap `join` was: a primitive whose absence forces everyone to write
+        // the slow version.
+        //
+        // Returns a NEW list; the argument is untouched. Bantu lists have value
+        // semantics, so a builtin receives a copy and could not sort in place
+        // even if that were wanted.
+        //
+        // NaN SORTS LAST, and that is a correctness requirement rather than a
+        // preference: every comparison with NaN is false, so `a < b` is NOT a
+        // strict weak ordering when NaN is present, and std::sort given one
+        // walks off the end of its range — a genuine out-of-bounds access, not
+        // merely a wrong order. numba's nd_sort already orders NaN last
+        // (lessNaNLast), so the two agree on the same data.
+        //
+        // A USER COMPARATOR gets a hand-written bottom-up merge sort. A comparator
+        // written in Bantu can be non-transitive and no validation catches that;
+        // a merge sort cannot leave its range whatever the comparator answers, so
+        // the worst case is a strangely ordered list instead of memory corruption.
+        env_->define("sort", makeNative([this](std::vector<Value> a) -> Value {
+            if (a.empty() || !a[0].isList()) {
+                ErrorHandler::throwError(std::string("sort(): first argument must be a list, got ") +
+                    (a.empty() ? "nothing" : typeNameOf(a[0])), 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            std::vector<Value> v = a[0].listVal;
+            if (v.size() < 2) return Value(std::move(v));
+
+            // A comparator, or the "desc" flag, or nothing.
+            bool desc = false;
+            Value cmp;
+            if (a.size() > 1 && !a[1].isNull()) {
+                if (a[1].isFunction())      cmp = a[1];
+                else if (a[1].isString()) {
+                    if (a[1].stringVal == "desc")      desc = true;
+                    else if (a[1].stringVal != "asc") {
+                        ErrorHandler::throwError("sort(): the second argument must be \"asc\", \"desc\" "
+                            "or a comparator function, got \"" + a[1].stringVal + "\"",
+                            0, 0, ErrorHandler::RUNTIME_ERROR);
+                    }
+                } else {
+                    ErrorHandler::throwError(std::string("sort(): the second argument must be \"asc\", "
+                        "\"desc\" or a comparator function, got ") + typeNameOf(a[1]),
+                        0, 0, ErrorHandler::RUNTIME_ERROR);
+                }
+            }
+
+            if (!cmp.isNull()) {
+                // Bottom-up merge sort, stable, and safe against a comparator
+                // that is not a strict weak ordering.
+                std::vector<Value> buf(v.size());
+                auto before = [&](const Value& x, const Value& y) -> bool {
+                    Value r = invokeCallable(cmp, { x, y });
+                    if (!r.isNumber()) {
+                        ErrorHandler::throwError(std::string("sort(): the comparator must return a "
+                            "number — negative if the first argument comes first, positive if the "
+                            "second does, zero if they tie — got ") + typeNameOf(r),
+                            0, 0, ErrorHandler::RUNTIME_ERROR);
+                    }
+                    return r.numberVal < 0;   // strictly-before keeps it stable
+                };
+                for (size_t width = 1; width < v.size(); width *= 2) {
+                    for (size_t lo = 0; lo < v.size(); lo += 2 * width) {
+                        const size_t mid = std::min(lo + width, v.size());
+                        const size_t hi  = std::min(lo + 2 * width, v.size());
+                        size_t i = lo, j = mid, k = lo;
+                        while (i < mid && j < hi) buf[k++] = before(v[j], v[i]) ? v[j++] : v[i++];
+                        while (i < mid) buf[k++] = v[i++];
+                        while (j < hi)  buf[k++] = v[j++];
+                    }
+                    v.swap(buf);
+                }
+                return Value(std::move(v));
+            }
+
+            // No comparator: numbers numerically, strings lexicographically, and
+            // a mixed list raises. Ordering a number against a string has no
+            // right answer, and choosing one silently is how a sort quietly
+            // produces garbage that looks sorted.
+            bool allNum = true, allStr = true;
+            for (const Value& e : v) {
+                if (!e.isNumber()) allNum = false;
+                if (!e.isString()) allStr = false;
+            }
+            if (!allNum && !allStr) {
+                std::string first = typeNameOf(v[0]), other;
+                for (const Value& e : v) {
+                    if (typeNameOf(e) != first) { other = typeNameOf(e); break; }
+                }
+                ErrorHandler::throwError("sort(): every element must be the same type — this list "
+                    "mixes " + first + " and " + other + ". Pass a comparator function to order a "
+                    "mixed list.", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            // "desc" reverses the COMPARISON, not the finished list. Reversing the
+            // list would reverse ties too — destroying the stability the sort just
+            // guaranteed — and would drag NaN to the front, contradicting the rule
+            // above. NaN stays last in both directions: it is not a large value,
+            // it is an absent one.
+            if (allNum) {
+                std::stable_sort(v.begin(), v.end(), [desc](const Value& x, const Value& y) {
+                    // NaN last, and total: see the note above.
+                    const bool nx = std::isnan(x.numberVal), ny = std::isnan(y.numberVal);
+                    if (nx || ny) return !nx && ny;
+                    return desc ? (y.numberVal < x.numberVal) : (x.numberVal < y.numberVal);
+                });
+            } else {
+                std::stable_sort(v.begin(), v.end(), [desc](const Value& x, const Value& y) {
+                    return desc ? (y.stringVal < x.stringVal) : (x.stringVal < y.stringVal);
+                });
+            }
+            return Value(std::move(v));
+        }));
+
+        // reverse(list) · reverse(string) — a new list/string, back to front.
+        env_->define("reverse", makeNative([](std::vector<Value> a) -> Value {
+            if (a.empty()) {
+                ErrorHandler::throwError("reverse(): needs a list or a string",
+                    0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            if (a[0].isList()) {
+                std::vector<Value> v = a[0].listVal;
+                std::reverse(v.begin(), v.end());
+                return Value(std::move(v));
+            }
+            if (a[0].isString()) {
+                std::string s = a[0].stringVal;
+                std::reverse(s.begin(), s.end());
+                return Value(s);
+            }
+            ErrorHandler::throwError(std::string("reverse(): needs a list or a string, got ") +
+                typeNameOf(a[0]), 0, 0, ErrorHandler::RUNTIME_ERROR);
+            return Value();
         }));
 
         // trim(s) — strip whitespace from both ends.

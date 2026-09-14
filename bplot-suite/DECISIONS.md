@@ -179,3 +179,198 @@ across them — the same hazard that made numba's PRNG `thread_local` and its li
 concurrent requests plotting into the implicit figure would interleave into one chart.
 **Implication:** the sua sample uses only the object API, and the caveat sits at the top of the
 serving section, not in a footnote.
+
+### BP16 — A scale is a pre-pass over the data, not a branch in the drawing loop
+**Decision:** a non-linear scale transforms the whole sequence once (`_project`), and the artists then
+run the same affine `v * a + b` loop they ran in B1.
+**Why:** the obvious implementation calls `fwd(v)` per point, which at ~0.38 µs per interpreted
+operation costs 200,000 extra calls on a 100k-point line — and the *branch deciding whether to call*
+would sit in the loop too, so **linear axes would pay for a feature they do not use**. Linear is the
+overwhelming majority of axes and it must stay exactly as fast as it was.
+**Also why:** it puts the non-positive-value check in exactly one function. Four artists each doing
+their own check is four chances to forget, and the one that forgets emits `NaN` coordinates.
+**Rejected:** a transform object per axis with a `fwd()` method — the same per-point cost with an
+extra dynamic dispatch on top.
+**Implication:** limits, ticks and artists cannot disagree, because all three go through `_project`.
+The B1 100k-point timing is re-run as a gate and must not move.
+
+### BP17 — Log ticks are decades; below two decades the minors are promoted
+**Decision:** major ticks at `10^k`, minor at `2..9 × 10^k`. **If fewer than two decades fall in
+view, the minors become the labelled ticks and the minor set is dropped.**
+**Why:** matplotlib, asked for an axis from 2 to 9, returns **no major ticks at all** — an axis with
+no labelled tick anywhere on it. `1..3` gets exactly one. That is not a style difference; it is a
+chart nobody can read, and matching it faithfully would be matching a wart.
+**Why not always promote:** on a wide range the 2..9 multiples are 8× too many labels and they
+collide.
+**Implication:** the test suite asserts *both* the agreement with matplotlib on the eight sane ranges
+and the divergence on the two, so the divergence stays a decision rather than decaying into a bug.
+
+### BP18 — symlog is matplotlib's transform, constants and all
+**Decision:** `linscale_adj = 1/(1 - 1/10) = 10/9`; inside the band `x * linscale_adj`, outside
+`sign(x) * linthresh * (linscale_adj + log10(|x|/linthresh))`.
+**Why:** symlog exists so data spanning decades *and* crossing zero can be plotted, and anyone
+reaching for it knows it from matplotlib. A subtly different curve would make the same data look
+different in the two tools with no way to tell which was right.
+**Verified, not assumed:** checked against `matplotlib.scale.SymmetricalLogTransform` at three
+`linthresh` values and ten sample points; those reference numbers are literals in
+`tests/bplot_charts_test.b`.
+**Implication:** `linthresh <= 0` raises naming the value — it would divide by zero and produce
+exactly the `NaN` coordinates BP9 exists to prevent.
+
+### BP19 — Histogram binning copies `nd_histogram` exactly, including the inclusive top edge
+**Decision:** `floor((x - lo) / width)`, top edge inclusive, out-of-range dropped, `NaN` dropped,
+`lo == hi` widened by ±0.5, empty input falling back to `0..1`.
+**Why:** B4's gate is identical output from a list, an ndarray, a column and a Series. That is only
+reachable if the pure-Bantu binner and numba's native one make the same decisions — so bplot copies
+the native rules rather than writing the obvious ones and discovering the difference at B4.
+**The one that bites:** without the inclusive top edge the largest value in the data silently
+disappears, and a histogram missing its maximum lies about its range. It has its own test.
+**Implication:** `density` normalises by `n × width` so bar *areas* sum to 1 (NumPy's definition),
+not heights — which differ the moment bin widths are unequal.
+
+### BP20 — Quantiles are NumPy's linear interpolation, because `nd_quantile` already is
+**Decision:** `pos = q(n-1)`, linear between the bracketing order statistics (Hyndman–Fan type 7).
+Boxplot is Tukey's: box Q1–Q3, median line, whiskers to the most extreme **observed** value within
+1.5 × IQR, the rest drawn as outlier points.
+**Why:** there are nine defensible quantile definitions and the only one that matters is the one the
+rest of the tree uses. A median that moves depending on whether the data arrived as a list or an
+array is worse than any of the nine.
+**Why the whisker lands on a datum:** drawing it at `Q1 - 1.5·IQR` itself — the common error — puts
+the whisker end in empty space where no observation exists.
+
+### BP21 — Violin is a *binned* KDE, so its cost does not scale with n
+**Decision:** bin into 512 bins in one pass, then evaluate the Gaussian kernel against the bins.
+`O(n + bins × grid)` rather than `O(n × grid)`.
+**Why:** the textbook form is 12.8 million interpreted operations for 100,000 points on a 128-point
+grid — most of a minute, for one violin. Binned KDE is the standard approximation (R's `density()`
+does it via an FFT) and its error is bounded by the bin width, which is far below the bandwidth the
+kernel is already smoothing with.
+**Bandwidth:** Scott's rule, `1.06 σ n^(-1/5)`, matching `scipy.stats.gaussian_kde`'s default.
+**Implication:** fewer than two distinct values has no density; it degenerates to a flat line rather
+than dividing by a zero bandwidth.
+
+### BP22 — Date axes use a calendar ladder and UTC, and parity with matplotlib is not claimed
+**Decision:** matplotlib's `AutoDateLocator` selection rule, reproduced exactly — walk the units
+coarsest first, take the first spanning at least five of that unit, then the smallest interval with
+`span <= interval × (maxticks - 1)`. Ticks are **anchored to the calendar** (days-of-month, months
+from January, years on multiples of the interval), never accumulated. All UTC.
+**Why:** `MaxNLocator` on epoch milliseconds proposes steps like 2,500,000,000 ms — a tick every 28.9
+days, landing mid-afternoon on drifting dates. And months and years are not fixed-length, so no
+amount of millisecond arithmetic can produce "the first of each month".
+**Why UTC only:** local time needs a timezone database. That is not a dependency this tree will take
+for an axis label, and arctic already stores epoch ms in UTC (`dataframe_native.hpp:77`).
+**Calendar arithmetic:** Howard Hinnant's `civil_from_days`/`days_from_civil` — twelve lines, exact
+over the proleptic Gregorian calendar, no table.
+**Parity is exact** on all eight ranges checked, ten seconds to twenty-five years — including the two
+a look-alike gets wrong: a three-month range switches to *semi-monthly* ticks (the 1st and the 15th),
+and a twenty-five-year range picks a **four**-year interval on multiples of four, not five.
+**This entry originally hedged** ("close but not claimed to be exact"), because the plan was to
+approximate the ladder. Reading `AutoDateLocator.get_locator` showed the rule is four lines, so
+exact reproduction cost less than approximation and cannot drift on a range nobody checked. The
+hedge is withdrawn rather than left standing.
+
+### BP23 — `sort` and `reverse` are language additions, and NaN sorts last
+**Decision (found while building B2):** Bantu has `push`, `pop`, `insert`, `extend` and `slice` but
+**no `sort` and no `reverse`**. Both are added as native builtins returning a new list.
+**Why this is a language fix, not a bplot one:** a language shipping a dataframe library, an ORM and
+now a plotting library could not order a list. Quantiles, medians, boxplots, `unique`, ranked output,
+leaderboards and "top N" all need it, and every one of them was previously an interpreted sort.
+**Why NaN sorts last:** a comparator that answers `false` to every NaN comparison is **not a strict
+weak ordering**, and `std::sort` given one reads past the end of its range — a real out-of-bounds
+write, not merely a wrong order. numba's `nd_sort` already sorts NaN last (`lessNaNLast`); `sort`
+matches it, so the two agree.
+**Why a merge sort for a user comparator:** a user-supplied comparator can be non-transitive, and no
+amount of validation catches that. A merge sort cannot run off its range whatever the comparator
+answers, so a bad comparator gives a strangely ordered list instead of memory corruption.
+**Mixed types raise.** Ordering a list of numbers and strings has no correct answer, and picking one
+silently is how a sort quietly produces garbage.
+
+### BP24 — `tight_layout` measures at render time, not at call time
+**Decision:** gutters are computed from the text that will actually be drawn, using the Helvetica
+metrics, during rendering.
+**Why at render time:** labels and titles are normally set *after* the axes exists, so measuring at
+call time measures an empty axes. matplotlib has exactly this trap and answers it with "call it
+last"; bplot removes the trap instead.
+**Why it always pads outward:** the viewer picks the font, so the measurement is an estimate. An
+overestimate is whitespace; an underestimate is a collision. The asymmetry is deliberate, and it is
+why an approximate metrics table is good enough to be useful.
+
+### BP25 — Colormaps are the published 256-entry tables, embedded as hex, never approximated
+**Decision:** `viridis`, `plasma`, `coolwarm`, `gray` as 1,536-character hex strings, sliced six
+characters per entry. Generated once at authoring time from the published source; **no runtime
+dependency on anything.**
+**Why not a polynomial fit:** there is no closed form for viridis — it is the output of an
+optimisation in CAM02-UCS perceptual space. A fit called "viridis" would be a different colormap
+wearing the name, and perceptual uniformity, the entire reason to use it, is exactly what the fit
+loses.
+**Why a hex string:** one twelfth the source size of 768 numbers, it cannot be half-edited into a
+valid-but-wrong table, and parsing is four `ord` calls.
+**Provenance, recorded in the source:** viridis and plasma are Smith and van der Walt's tables,
+released **CC0**; coolwarm is Moreland's diverging map as matplotlib samples it.
+**Implication:** the tests assert sampled entries against values written independently into the test
+file, so a corrupted table fails instead of agreeing with itself.
+
+### BP26 — `imshow` block-reduces and batches by colour; full-resolution raster is B6
+**Decision:** an array larger than `maxcells` (default 256) per axis is reduced by **block mean**;
+cells are then merged into horizontal runs and emitted as **one `<path>` per distinct colour**.
+**Why:** one `<rect>` per pixel makes a 1000×1000 array a **55 MB** document. A colormapped image has
+at most 256 colours by construction, so per-colour batching gives ≤ 256 elements and ~14 bytes per
+cell instead of ~55 — and the axes box is only ~500×380 CSS pixels, so cells beyond the budget were
+never visible.
+**Correcting a gate I wrote.** The B3 roadmap gate said the correct encoding is "a single embedded
+image". That is right, and it is **not reachable in B3**: a single image means a base64 PNG, which
+means CRC32, Adler-32 and deflate — the native work that *is* B6. The gate is corrected in the
+roadmap with the reason, not quietly dropped, and B6 inherits it.
+**Implication:** the API does not change at B6; only the encoder behind it does. That is what the
+backend boundary was for.
+
+### BP27 — `GridSpec` is the only layout arithmetic; sharing is symmetric
+**Decision:** every axes rectangle — `figure()`, `subplots`, `subplot(r,c,i)`, `twinx` — comes from
+one `GridSpec` calculation. Shared axes hold a **list of peers**, not a parent pointer.
+**Why one calculation:** matplotlib's `subplot` and `add_subplot` drifted apart historically; two code
+paths producing "the same" rectangle is how that happens. Both spellings are asserted to produce
+identical rects.
+**Why peers, not a parent:** sharing is symmetric. A parent pointer makes the first axes special,
+which breaks the moment it is the one removed.
+**Implication:** `twinx` is a second Axes over the same rect with its x limits pinned; the frame is
+drawn once by the original, because a doubled 1px stroke is visible and reads as a rendering bug.
+
+### BP28 — A string sequence makes the axis categorical
+**Decision (found by writing the gallery):** a sequence of strings on any axis becomes positions
+`0..n-1` with the strings as tick labels. The mapping is kept **on the axes** and extended, never
+rebuilt.
+**Why:** `bar(["Jan", "Feb", …], rainfall)` is the first thing anyone types, and without this it died
+inside `min()` with *"element 1 must be a number"* — an error about the wrong thing entirely, three
+layers below the call the user made.
+**Why the mapping is kept and extended:** two series sharing categories must line up. If the second
+series were numbered from scratch its bars would sit under the first series' labels — a chart that
+lies, which is worse than one that errors.
+**Mixed text and numbers raise.** An axis is either categorical or numeric; guessing which would
+silently misplace every point.
+**Implication:** `boxplot`, `violin` and `heatmap` already set tick overrides, so this reuses the
+same mechanism rather than adding a second one.
+
+### BP29 — The colormap index is `floor(t × 256)`, not `round(t × 255)`
+**Decision:** a fraction is quantised to a table entry exactly as matplotlib does it.
+**Why this needed a decision at all:** the two formulas look equivalent and agree at 0, 0.5 and 1 —
+so an implementation written from intuition passes every obvious test. They disagree at 0.625, where
+`round` gives entry 159 and matplotlib gives 160: a visibly different green, in the middle of the
+most-used colormap in science.
+**How it was caught:** by checking nine sample points against values generated from the published
+source rather than three. The lesson is in the test, not just the code: **sample the interior, not
+only the endpoints.**
+
+### BP30 — Class instances leaked, and that is why an Axes has no Figure pointer
+**Found while building B3.** `new ClassName()` allocated an instance nothing ever deleted, so every
+Bantu object leaked for the life of the process — measured at ~45 KB per bplot figure, reaching
+372 MB over 20,000 figures and climbing. A `sua` handler drawing a chart per request would have been
+OOM-killed. Instances are refcounted now; see
+[`docs/language-features.md`](../docs/language-features.md).
+**The part that is a bplot decision:** refcounting does not collect **cycles**, and
+`Figure → axesList → Axes → fig → Figure` is one. So an Axes holds **no** back-reference to its
+Figure, and everything that needs the figure — `twinx`, `shareX`, `setCurrent` — is a *Figure*
+method. Share groups are stored as lists of axes **indices** for the same reason: an index points at
+nothing.
+**Implication:** the gate is an RSS measurement, not an inspection. `tests/bplot_stress.sh` builds
+300 figures and 6,000 figures and requires that twenty times the work costs under twice the memory —
+a test that a cycle would fail immediately.

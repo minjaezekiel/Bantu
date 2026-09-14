@@ -91,6 +91,18 @@ public:
     BantuFunction* functionVal = nullptr;
     std::shared_ptr<BantuFunction> functionPtr;
     ClassInstance* classInstanceVal = nullptr;
+    // Owning handle for CLASS_INSTANCE, exactly as functionPtr is for
+    // FUNCTION. Before this existed, instantiateClass did a bare
+    // `new ClassInstance(...)` that nothing ever deleted, so EVERY object a
+    // Bantu program created leaked for the life of the process — measured at
+    // ~300 bytes each, and ~45 KB per bplot figure. A server creating objects
+    // per request grew without bound.
+    //
+    // shared_ptr<ClassInstance> needs ClassInstance only DECLARED here, not
+    // complete: the deleter is type-erased when the shared_ptr is constructed
+    // (in instantiateClass, where class.hpp is included). This is the same
+    // reasoning that already applies to objectVal below.
+    std::shared_ptr<ClassInstance> classInstancePtr;
     ClassDefinition* classDefVal = nullptr;
     // Object form — shared_ptr so the unordered_map instantiation is
     // deferred until Value is complete. Left null for non-OBJECT values;
@@ -109,7 +121,12 @@ public:
     explicit Value(std::nullptr_t) : type(NULL_VAL) {}
     explicit Value(BantuFunction* fn) : type(FUNCTION), functionVal(fn) {}
     explicit Value(std::shared_ptr<BantuFunction> fn) : type(FUNCTION), functionVal(fn.get()), functionPtr(std::move(fn)) {}
+    // Non-owning: kept only for the few places that already hold the instance
+    // alive by other means. New code should use the shared_ptr form below, so
+    // the instance is actually freed.
     explicit Value(ClassInstance* ci) : type(CLASS_INSTANCE), classInstanceVal(ci) {}
+    explicit Value(std::shared_ptr<ClassInstance> ci)
+        : type(CLASS_INSTANCE), classInstanceVal(ci.get()), classInstancePtr(std::move(ci)) {}
     explicit Value(ClassDefinition* cd) : type(CLASS_DEF), classDefVal(cd) {}
     // ObjectMap is taken by const-ref (NOT by value) to avoid requiring
     // `ObjectMap` to be complete at the parameter declaration site —

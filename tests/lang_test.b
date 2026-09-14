@@ -159,6 +159,78 @@ $db = 5; $list = [1, 2, 3]; $create = "ok";
 eq($db + len($list), 8, "$db and $list usable as variables");
 
 print("");
+print("-- && and || short-circuit (fixed) --");
+// They did not, and the universal guard idiom died on exactly the boundary
+// it was written to prevent.
+$SC = {"hits": 0};
+def sideEffect() { $SC["hits"] = $SC["hits"] + 1; return true; }
+
+$SC["hits"] = 0;
+$r = false && sideEffect();
+eq($r, false, "false && x is false");
+eq($SC["hits"], 0, "and the right side was NOT evaluated");
+
+$SC["hits"] = 0;
+$r = true || sideEffect();
+eq($r, true, "true || x is true");
+eq($SC["hits"], 0, "and the right side was NOT evaluated");
+
+$SC["hits"] = 0;
+$r = true && sideEffect();
+eq($r, true, "true && x still evaluates the right side");
+eq($SC["hits"], 1, "exactly once");
+
+$SC["hits"] = 0;
+$r = false || sideEffect();
+eq($r, true, "false || x still evaluates the right side");
+eq($SC["hits"], 1, "exactly once");
+
+// The whole point: these two lines must not raise.
+$arr = [1, 2];
+$i = 2;
+$guardOk = true;
+try {
+    if ($i < len($arr) && $arr[$i] == 9) { $guardOk = false; }
+} catch ($e) { $guardOk = false; }
+ok($guardOk, "if ($i < len($a) && $a[$i] == x) is safe at the boundary");
+
+$maybe = null;
+$nullOk = true;
+try {
+    if ($maybe != null && $maybe["k"] == 1) { $nullOk = false; }
+} catch ($e) { $nullOk = false; }
+ok($nullOk, "if ($d != null && $d[\"k\"] == 1) is safe on a null");
+
+// Truthiness and chaining are unchanged.
+eq(1 && 1, true, "&& still yields a boolean");
+eq(0 || 0, false, "|| still yields a boolean");
+eq(true && true && false, false, "chained && short-circuits at the first false");
+eq(false || false || true, true, "chained || stops at the first true");
+
+print("");
+print("-- objects are freed (fixed: instances used to leak forever) --");
+// The observable half of the fix. `new` used to allocate an instance nothing
+// ever deleted; the RSS gate lives in tests/bplot_stress.sh, and this asserts
+// that the semantics did not change when ownership did.
+class LifeTest { def init($v) { $this.v = $v; } def get() { return $this.v; } }
+$objA = new LifeTest(7);
+$objB = $objA;
+$objB.v = 9;
+eq($objA.get(), 9, "instances still have reference semantics through assignment");
+$held = [$objA];
+$held[0].v = 11;
+eq($objA.get(), 11, "and through a list");
+$bag = {"o": $objA};
+$bag["o"].v = 13;
+eq($objA.get(), 13, "and through a dict");
+def mutate($o) { $o.v = 15; return null; }
+mutate($objA);
+eq($objA.get(), 15, "and through a function argument");
+$k = 0;
+while ($k < 5000) { $tmp = new LifeTest($k); $k = $k + 1; }
+eq($k, 5000, "5,000 instances created and dropped without incident");
+
+print("");
 print("========================================");
 print("  PASS: " + str($R.pass) + "   FAIL: " + str($R.fail));
 if ($R.fail == 0) { print("  RESULT: ALL GREEN"); }

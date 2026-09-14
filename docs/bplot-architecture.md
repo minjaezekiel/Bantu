@@ -28,7 +28,7 @@ the docs rather than worked around.
 **It is not** a raster library until B6. Anti-aliased rasterisation means touching every pixel; a
 1000×1000 image is a million pixels at ~0.38 µs per interpreted operation, which is still most of a
 minute per figure.
-That half cannot be pure Bantu and is designed as a native backend below (§10).
+That half cannot be pure Bantu and is designed as a native backend below (§12).
 
 ---
 
@@ -229,14 +229,66 @@ enter and leave the view).
 
 | scale | forward | inverse | degenerate input |
 |---|---|---|---|
-| linear | `(x - lo) / (hi - lo)` | `lo + u*(hi-lo)` | `hi == lo` → expand by ±0.5, or ±5% of \|lo\| |
-| log | `(log10 x - log10 lo) / (...)` | `10^(...)` | **non-positive data raises with the offending value named** |
+| linear | `x` | `u` | `hi == lo` → expand by ±0.5, or ±5% of \|lo\| |
+| log | `log10 x` | `10^u` | **non-positive data raises with the offending value named** |
 | symlog | linear within ±`linthresh`, log outside | piecewise inverse | handles zero and negatives by construction |
 
 Log with zero or negative data is the classic silent-garbage case: `log10(0)` is `-inf`, which
 propagates to an `NaN` coordinate and emits `<polyline points="NaN,12 ...">`, which browsers render
 as *nothing at all*, with no error anywhere. bplot raises instead, names the value, and suggests
 `symlog`. That is adoption rule 7 ("errors teach") applied to the place it is most needed.
+
+### 5.1 Where the transform is applied, and why it is not in the drawing loop
+
+A scale is *non-affine*, so the obvious implementation calls `fwd(v)` on every point inside every
+artist's loop. At the interpreter's ~0.38 µs per operation, a 100,000-point line would pay for
+200,000 extra calls — and it would pay them on **linear** axes too, which are the overwhelming
+majority, because the branch that decides whether to call would itself sit in the loop.
+
+bplot applies the scale as a **pre-pass over the sequence** instead:
+
+```
+artist draws:   if scale is not linear:  vals = _project(vals, scale)     # one pass, once
+                then the existing affine loop:  px = v * a + b            # unchanged
+```
+
+Three consequences, all of them wanted:
+
+- **A linear axis costs exactly what it cost in B1** — not one extra instruction in the loop, not
+  one extra branch. The B1 100k-point measurement stays valid, and it is re-run as a gate.
+- **The non-positive check happens in exactly one place.** `_project` is the only function that can
+  produce a log coordinate, so it is the only function that can raise — and it names the offending
+  value, which a check scattered through four artists would eventually forget to do in one of them.
+- Limits, ticks and artists all agree by construction, because all three go through the same
+  `_project`.
+
+The cost is one transformed copy of the data per non-linear axis, which is the same order as the
+data already in hand and is bounded by path simplification immediately afterwards.
+
+### 5.2 symlog, exactly as matplotlib defines it
+
+Symlog exists to plot data that spans decades *and* crosses zero — residuals, profit and loss,
+temperature anomalies. It is linear in a band around zero and logarithmic outside it, so zero is
+representable and small values are not crushed against it.
+
+With base 10 and `linscale = 1`, matplotlib's transform is:
+
+```
+linscale_adj = linscale / (1 - 1/base) = 10/9 = 1.111…
+
+|x| <= linthresh :   x * linscale_adj
+|x| >  linthresh :   sign(x) * linthresh * (linscale_adj + log10(|x| / linthresh))
+```
+
+It is continuous at `|x| = linthresh` (both branches give `linthresh * linscale_adj`), which is the
+property that makes the axis look like one axis rather than two glued together. The constants are
+not folded or simplified here: these values were checked against
+`matplotlib.scale.SymmetricalLogTransform` at three `linthresh` settings and ten sample points, and
+the reference numbers are embedded in `tests/bplot_charts_test.b` rather than recomputed at runtime.
+
+`linthresh` must be positive and finite, and bplot raises naming the value if it is not — a
+`linthresh` of zero would divide by zero and produce the `NaN` coordinates the whole design exists to
+prevent.
 
 ---
 
@@ -274,6 +326,81 @@ axis). It is one native call: `max($list)` / `min($list)` over a list (B0 makes 
 limit routine filters explicitly rather than relying on `max`, because the *language* `max`
 propagates NaN by design (§9.2).
 
+### 6.1 Log ticks — decades, and the case matplotlib gets wrong
+
+Major ticks are the decades `10^k` that fall in view; minor ticks are `2..9 × 10^k`. Checked against
+matplotlib across ten ranges (`LogLocator` through a drawn axis, filtered to the view interval), this
+agrees exactly — `1..1000` → `1, 10, 100, 1000`; `1e-9..1e-6` → the four decades; `5..5000` →
+`10, 100, 1000`.
+
+**There is one range class where matching matplotlib would be wrong, and bplot deliberately
+diverges.** Asked for an axis from 2 to 9, matplotlib returns **no major ticks at all** — the axis is
+drawn with no labelled tick anywhere on it, because no decade falls inside. The same happens for
+`1..3` (one tick, at 1). An unlabelled axis is not a stylistic difference; it is a chart a reader
+cannot read.
+
+> **bplot's rule:** if fewer than two decades fall in view, the `2..9 × 10^k` minors are **promoted**
+> to labelled major ticks and the minor set is dropped.
+
+So `2..9` gets ticks at 2,3,4,5,6,7,8,9, and `1..3` gets 1,2,3. The test suite asserts both the
+agreement on the eight ranges where matplotlib is sane *and* the divergence on the two where it is
+not, so neither can regress silently and the divergence is a decision rather than an accident.
+
+### 6.2 symlog ticks
+
+Zero, plus `±10^k` for every decade `k ≥ floor(log10(linthresh))` that falls in view. Verified
+against `matplotlib.scale`'s symlog axis for six limit/linthresh combinations, including the
+`linthresh = 10` case where the `±1` ticks correctly disappear. Minor ticks are the `2..9` multiples
+in each decade outside the linear band; the linear band gets `MaxNLocator` treatment, since inside it
+the axis *is* linear.
+
+### 6.3 Date ticks — a calendar ladder, not a decimal one
+
+Time is the one axis where the nice-number algorithm of §6 is actively wrong. `MaxNLocator` on epoch
+milliseconds happily proposes a step of 2,500,000,000 ms, which is 28.9 days — a tick every 28.9
+days, landing mid-afternoon on drifting dates. Nobody wants that axis.
+
+Date ticking therefore uses a **calendar ladder** of steps that are units people recognise — and
+rather than invent a rule for choosing among them, bplot reproduces `AutoDateLocator`'s, which turned
+out to be four lines:
+
+```
+walk the units coarsest first (year, month, day, hour, minute, second);
+take the FIRST whose span is at least 5 of that unit;
+within it take the SMALLEST interval satisfying  span <= interval * (maxticks - 1)
+
+intervals   year  [1,2,4,5,10,20,40,50,100,…]   month [1,2,3,4,6]   day [1,2,3,7,14,21]
+            hour  [1,2,3,4,6,12]                minute/second [1,5,10,15,30]
+maxticks    year 11 · month 12 · day 11 · hour 12 · minute 11 · second 11
+```
+
+Ticks are *anchored to the calendar*, not accumulated: sub-day steps anchor to midnight UTC, day
+steps to days-of-month (a fortnightly axis is the 1st and the 15th; a weekly one the 1st, 8th, 15th
+and 22nd), month steps to a multiple of the interval counted from January, year steps to a multiple
+of the interval. Anchoring is what makes a monthly axis land on the 1st of each month rather than on
+30.44-day intervals from an arbitrary origin — and months and years are not fixed-length, so
+accumulating milliseconds cannot produce them at all.
+
+Calendar arithmetic is Howard Hinnant's `civil_from_days` / `days_from_civil` pair — twelve lines,
+exact for every proleptic-Gregorian date, no lookup table and no leap-year special-casing beyond the
+shifted-year trick. **All bplot date handling is UTC**, matching arctic's storage (epoch
+milliseconds, UTC — `dataframe_native.hpp:77`); local-time rendering would need a timezone database,
+which is not a dependency this tree is going to take for an axis label.
+
+Label formats follow the step: `HH:MM:SS`, `HH:MM`, `MM-DD HH:MM`, `YYYY-MM-DD`, `YYYY-MM`, `YYYY`.
+
+Parity is **exact** on the eight ranges checked, from a ten-second window to a
+twenty-five-year one — including the two that a look-alike implementation gets wrong: a
+three-month range, where matplotlib switches to *semi-monthly* ticks (the 1st and the 15th) rather
+than to months or to 14-day intervals, and a twenty-five-year range, where it picks a **four**-year
+interval anchored on multiples of four (2000, 2004, …) rather than five. The reference tick sets are
+embedded in `tests/bplot_charts_test.b` as literal strings.
+
+> An earlier draft of this section hedged — "close but not claimed to be exact" — because the
+> intention was to approximate the ladder. Reading `AutoDateLocator.get_locator` instead showed the
+> selection rule is four lines, so reproducing it exactly cost less than approximating it and cannot
+> disagree on a range nobody thought to check. The hedge is removed rather than left standing.
+
 ---
 
 ## 7. Number formatting
@@ -295,6 +422,16 @@ on an axis has the same number of decimals — a small thing that makes a chart 
 
 Two derived formatters: **scientific** (`1.2 × 10³`, with a shared exponent in the corner when the
 range warrants it, as matplotlib does) and **engineering** (`1.2k`, `3.4M`).
+
+### 7.1 Decade labels
+
+A log axis labels `10^k`, and the readable form depends on `k`. bplot writes the plain decimal while
+one exists — `0.001`, `0.01`, `0.1`, `1`, `10`, `1000`, `100000` — and switches to `1e6` / `1e-7`
+outside `-4 ≤ k ≤ 5`. The alternative, a superscript `10⁶`, needs either a `<tspan>` with
+`baseline-shift` (which the raster backend of B6 would then have to reimplement, for a label) or the
+Unicode superscript digits (which are missing from many of the fonts `sans-serif` resolves to, and
+render as boxes). `1e6` is unambiguous, is what every language's `str()` of that number produces, and
+costs the backend nothing.
 
 **A rule for every bplot test, inherited from numba:** never assert on a stringified number.
 `_fmt` itself is tested against explicit expected strings — it *is* the formatter, so its output is
@@ -428,7 +565,224 @@ which `jet` famously does not; `jet` is not shipped.
 
 ---
 
-## 10. The raster backend (B6), and why it is native
+## 10. The chart types (B2), and the statistics inside them
+
+A chart type is not a drawing routine. `hist` is a binning algorithm, `boxplot` is five order
+statistics and an outlier rule, `violin` is a density estimate — and each has a definition that
+*other tools already implement*, so bplot's job is to match a definition rather than invent one.
+Where a definition exists in the tree already, bplot matches **that**.
+
+### 10.1 Histogram binning matches `nd_histogram`, byte for byte
+
+numba's `nd_histogram` is already in the tree (`ndarray_sort_reg.hpp`), and B4's gate is that the
+same data plotted as a list and as an ndarray produces **identical output**. That is only achievable
+if the pure-Bantu binner and the native one make the same decisions, so bplot copies `nd_histogram`'s
+rules exactly rather than writing the obvious ones:
+
+| rule | value |
+|---|---|
+| bin index | `floor((x - lo) / width)`, `width = (hi - lo) / bins` |
+| top edge | **inclusive** — an `x` equal to `hi` lands in the last bin, not in a phantom bin past it |
+| out of range | values `< lo` or `> hi` are **dropped**, not clamped |
+| `NaN` | dropped |
+| degenerate range (`lo == hi`) | widened to `lo - 0.5 .. hi + 0.5`, which is not an error |
+| empty input | range falls back to `0..1` |
+
+The off-by-one at the top edge is the one that bites: without the inclusive rule, the largest value
+in the data silently vanishes from the chart, and a histogram missing its maximum is a histogram that
+lies about its range. It has a test of its own.
+
+`density` normalises so the bar *areas* sum to 1 (dividing by `n × width`), which is NumPy's
+definition — not so the heights sum to 1, which is the common mistake and gives a different shape for
+unequal bin widths.
+
+### 10.2 Quantiles are NumPy's linear interpolation, because `nd_quantile` is
+
+```
+pos = q * (n - 1);  lo = floor(pos);  hi = ceil(pos)
+result = v[lo] + (v[hi] - v[lo]) * (pos - lo)
+```
+
+This is NumPy's default (`method="linear"`, Hyndman–Fan type 7) and exactly what `nd_quantile` in
+`ndarray_reduce_reg.hpp` computes. There are nine defensible quantile definitions; the one that
+matters is the one the rest of the tree already uses, because a boxplot whose median moves depending
+on whether the data arrived as a list or an array is worse than any of the nine.
+
+**Boxplot**, then, is Tukey's, as matplotlib draws it: box from Q1 to Q3, line at the median, whiskers
+to the most extreme *observed* value within `1.5 × IQR` of the box, and everything beyond drawn as
+individual outlier points. The whisker lands on a real data point — not on `Q1 - 1.5×IQR` itself,
+which is the frequent error and draws a whisker into empty space where no observation exists.
+
+### 10.3 Violin: a binned kernel density estimate, so cost does not scale with n
+
+The textbook Gaussian KDE evaluates `n` kernels at each of `g` grid points: `O(n × g)`. For 100,000
+points on a 128-point grid that is 12.8 million interpreted operations — most of a minute, for one
+violin.
+
+bplot bins first. The data goes into a 512-bin histogram in one pass, and the grid is then evaluated
+against the **bins** rather than the points:
+
+```
+cost = O(n + bins × grid)  =  O(n + 65,536)
+```
+
+— independent of `n` beyond the single binning pass. This is the standard binned-KDE approximation
+(R's `density()` does the same thing, via an FFT); the error it introduces is bounded by the bin
+width, which at 512 bins across the data range is far below the bandwidth the kernel is smoothing
+with anyway. Bandwidth is Scott's rule, `1.06 × σ × n^(-1/5)`, matching `scipy.stats.gaussian_kde`'s
+default factor.
+
+A violin of fewer than two distinct values has no density to estimate; it degenerates to a flat line
+at that value rather than dividing by a zero bandwidth.
+
+### 10.4 The rest, and what is load-bearing in each
+
+| type | shape | the detail that matters |
+|---|---|---|
+| `errorbar` | line/marker + I-bars | `yerr`/`xerr` accept a scalar, one list (symmetric) or two lists (asymmetric, `[lower, upper]`); **negative error raises** — it is always a bug, and drawn it produces an inverted bar that reads as a smaller error |
+| `fill_between` | one polygon per contiguous run | NaN in either edge **breaks the band** into separate polygons, for the same reason NaN breaks a line (§9.1); `where` does the same |
+| `step` | polyline with doubled vertices | `where` ∈ `pre`/`post`/`mid`, matching matplotlib's names, because a step chart drawn with the wrong convention is off by one sample and looks plausible |
+| `stem` | baseline + stems + markers | the baseline is at `y = 0` by default and is drawn, so the sign of each value is readable |
+| `pie` | `<path>` arcs | angles from the **fraction of the total**, negatives raise; slices are drawn from `startangle` counter-clockwise as matplotlib does; `autopct` percentages are computed before rounding so they sum to 100 |
+
+`pie` is also the reason the Axes grows an `axisOff` flag: a pie with a frame, ticks and a grid behind
+it is nobody's intent, and `plt.axis("off")` is the matplotlib spelling.
+
+### 10.5 Categorical axes
+
+`bar(["Jan", "Feb", …], rainfall)` is the first thing anyone types. Before B2 it died inside `min()`
+with *"element 1 must be a number"* — an error about the wrong thing, three layers below the call the
+user made.
+
+A sequence of strings on any axis now becomes positions `0..n-1` with the strings as tick labels. The
+mapping lives **on the Axes** and is extended rather than rebuilt, because two series sharing
+categories have to line up: numbering the second series from scratch would put its bars under the
+first series' labels, which is a chart that lies rather than one that errors. A sequence that mixes
+text and numbers raises — an axis is either categorical or numeric, and guessing would silently
+misplace every point.
+
+### 10.6 Two new backend primitives, and no more
+
+`polygon(points, fill, stroke, width, opacity)` and `path(d, fill, stroke, width)` join the nine from
+B1. Everything in this section is expressible with those two plus what already exists — a pie slice
+is an arc path, an arrowhead is a three-point polygon, a violin is a polygon, a filled band is a
+polygon. Adding two primitives rather than one per chart type is what keeps B6's raster backend a
+finite job: **eleven methods, not thirty**.
+
+`path` takes a `d` string, which is the one place in the backend where a caller could in principle
+inject markup. It is therefore **not** a free-text parameter: `d` is assembled by bplot's own arc and
+rectangle helpers from numbers that have been through `_px`, and the backend escapes it like every
+other attribute. There is still no path by which user text reaches a `d`.
+
+---
+
+## 11. Layout and 2-D (B3)
+
+### 11.1 Subplots: one rectangle calculation, used by everything
+
+`GridSpec` is the only layout arithmetic in bplot. `subplots(nrows, ncols)` builds one, and every
+other entry point — a single `figure()`, a `twinx`, an inset — resolves to a rectangle through it:
+
+```
+cell(row, col) = left + col * (cellW + wspace),  top + row * (cellH + hspace)
+```
+
+with the figure's outer margins reserved first. A `subplot(r, c, index)` call in matplotlib's
+1-based, row-major numbering maps onto the same grid, so both spellings produce identical
+rectangles — asserted, because "the two APIs drift apart" is how matplotlib's own `subplot` /
+`add_subplot` history went.
+
+**Shared axes** (`sharex`, `sharey`) are a *list of peers* on each Axes, and view limits are the union
+over the group. They are not a parent pointer: sharing is symmetric, and a parent pointer makes the
+first axes special, which then breaks when it is the one removed.
+
+**Twin axes** (`twinx`, `twiny`) are a second Axes with the *same rectangle*, its x limits pinned to
+the first and its y ticks drawn on the right. The frame is drawn once, by the original, so the two do
+not double-stroke the box — a doubled 1px stroke is visible and looks like a rendering bug.
+
+### 11.2 `tight_layout` measures; the default gutters do not
+
+B1 reserved fixed gutters (62px left, 34 top, 52 bottom, 18 right), which is right for a default and
+wrong the moment a y tick label reads `-1.2345e+06` or an axis label is two words long.
+`tight_layout` computes each gutter from what will actually be drawn, using the embedded Helvetica
+metrics (§8.2):
+
+```
+left   = max width of the y tick labels + tick length + ylabel height + pad
+bottom = x tick label height + xlabel height + pad
+top    = title height + pad
+right  = half the width of the last x tick label, so it cannot overhang the figure
+```
+
+The measurement is an *estimate*, because the viewer picks the font. Layout therefore always pads
+**outward**: an underestimate produces a slightly tight label, an overestimate produces whitespace,
+and neither produces the overlap that an exact-fit algorithm produces the first time a font differs.
+That asymmetry is deliberate and is why the metrics table does not need to be exact to be useful.
+
+`tight_layout` runs at render time, not at call time, because the labels it measures are usually set
+*after* the axes is created. Running it at call time would measure an empty axes — matplotlib has
+exactly this trap, and the answer there is "call it last"; bplot removes the trap instead.
+
+### 11.3 Colormaps are data, and the data is the published data
+
+`viridis`, `plasma`, `coolwarm` and `gray` ship as **256-entry tables of the authoritative RGB
+values**, embedded as a single 1,536-character hex string per map and sliced six characters at a
+time. Provenance is recorded in the source: viridis and plasma are Nathaniel Smith and Stéfan van der
+Walt's tables, released into the **public domain (CC0)**; `coolwarm` is Kenneth Moreland's diverging
+map as matplotlib samples it.
+
+**They are not approximated.** There is no closed form for viridis — it is the output of an
+optimisation in CAM02-UCS perceptual space — so a polynomial fit called "viridis" would be a
+different colormap wearing the name, and the whole point of viridis is its perceptual uniformity,
+which a fit does not preserve. The tables were generated once, at authoring time, from the published
+source and pasted in; **nothing at runtime depends on Python, matplotlib or any download.** The test
+suite checks sampled entries against values embedded independently in the test file, so a corrupted
+table fails rather than agreeing with itself.
+
+A hex string rather than a list of 768 numbers because it is one twelfth of the source size, it
+cannot be half-edited into a valid-but-wrong table, and parsing six hex characters is four
+`ord` calls.
+
+**The index is `floor(t × 256)` clamped to 255, not `round(t × 255)`** — matplotlib's own
+quantisation. The two formulas look equivalent and agree at 0, 0.5 and 1, so an implementation
+written from intuition passes every obvious test; they disagree at 0.625, where `round` gives entry
+159 and matplotlib gives 160, a visibly different green in the middle of the most-used colormap in
+science. It was caught by checking nine sample points rather than three, and the lesson is recorded
+in the test as much as in the code: **sample the interior, not only the endpoints.**
+
+### 11.4 `imshow` — why a 1000×1000 image is downsampled, and what B6 changes
+
+**The naive encoding is one `<rect>` per pixel**: a 1000×1000 array is a million elements at ~55
+bytes each — a **55 MB** document that no browser will open happily. The roadmap's B3 gate demanded
+"a single embedded image" instead. That gate was written before the encoding question was worked
+through, and it is **not achievable in B3**: a single embedded image means
+`<image href="data:image/png;base64,…">`, which means a PNG encoder, which means CRC32, Adler-32 and
+deflate — the native work that *is* B6. The gate is corrected in the roadmap rather than quietly
+dropped, alongside what B3 does instead.
+
+What B3 does instead is two things, and together they are enough for what vector graphics is
+actually for:
+
+1. **Block-reduce to a cell budget.** An array larger than `maxcells` per axis (default 256) is
+   reduced by block mean before drawing. This is not a compromise imposed by the format — the axes
+   box is ~500×380 CSS pixels, so cells beyond that are *already* invisible, and averaging is a more
+   honest reduction than the nearest-neighbour sampling a browser would do to the same data.
+2. **Batch cells into one `<path>` per colour.** A colormapped image has at most 256 distinct
+   colours by construction, so every cell of one colour goes into a single `<path>` element as
+   `M x y h w v h z` subpaths, with horizontally adjacent equal-coloured cells merged into one run
+   first. A 256×256 image becomes **≤ 256 elements** instead of 65,536, and ~14 bytes per cell
+   instead of ~55.
+
+Measured together: a 1000×1000 `imshow` renders as ≤ 256 elements and a file **under 1.5 MB**, in
+place of 55 MB of rectangles. `heatmap` and `pcolormesh` share the encoder; `contour` marches squares
+over the grid and emits polylines, which are small regardless.
+
+At B6 the same call gains a raster path and the downsample limit goes away. The API does not change,
+which is the point of having a backend boundary at all.
+
+---
+
+## 12. The raster backend (B6), and why it is native
 
 | | SVG (B1–B5) | raster (B6) |
 |---|---|---|
@@ -449,7 +803,7 @@ Windows that corrupts every `\n` in a PNG into `\r\n`. The gate that proves the 
 
 ---
 
-## 11. Interop — one library, four input types
+## 13. Interop — one library, four input types
 
 bplot accepts, everywhere a sequence is expected:
 
@@ -469,7 +823,7 @@ feel like one.
 
 ---
 
-## 12. The six questions
+## 14. The six questions
 
 **Scalable?** Yes, and in the dimension that matters. Output is bounded by canvas resolution, not by
 input size, because of path simplification (§2.3) — a 10-million-point series produces the same
@@ -505,7 +859,7 @@ dimensions are checked), and no bplot path writes a file it was not asked to wri
 
 ---
 
-## 13. Rejected alternatives
+## 15. Rejected alternatives
 
 **A native rendering core for B1.** Rejected: the work is proportional to elements, not pixels
 (§2), so the interpreter is fast enough, and a native core would put the tick algorithm, the layout
@@ -534,7 +888,7 @@ deficiencies. `viridis` is the default and `jet` is not shipped at all.
 
 ---
 
-## 14. Phases
+## 16. Phases
 
 Full table with gates in [`bplot-suite/ROADMAP.md`](../bplot-suite/ROADMAP.md). In brief:
 
