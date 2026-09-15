@@ -215,6 +215,15 @@ void registerBuiltins(const DefineFn& rawDefine) {
 
     // print($a) renders the array rather than "<ndarray>".
     registerHandleRepr(NDARRAY_TAG, &reprArrayHandle);
+    // len($a) is the first axis, as in NumPy. A 0-d array has no length, and
+    // saying so beats answering 0 -- which is what len() of any handle did
+    // before, making a loop over an array silently never run.
+    registerHandleLen(NDARRAY_TAG, [](const std::shared_ptr<void>& h) -> long long {
+        if (!h) return 0;
+        const NdArray& a = *std::static_pointer_cast<NdArray>(h);
+        if (a.shape.empty()) return -1;
+        return (long long)a.shape[0];
+    });
 
     // Read BANTU_ND_MAX_BYTES once, here, before any script line runs and so
     // before sua has spawned a connection thread.

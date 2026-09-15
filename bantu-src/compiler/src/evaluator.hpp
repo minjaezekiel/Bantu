@@ -21,6 +21,7 @@
 #include "dataframe_native.hpp" // native column primitives for the arctic data-science suite
 #include "dataframe_arrow.hpp"  // Parquet + Feather/Arrow-IPC I/O (opt-in: -DBANTU_ARROW)
 #include "ndarray_api.hpp"      // numba n-dimensional arrays (implementation in ndarray_native.cpp)
+#include "plot_native.hpp"      // bplot's native line/scatter kernels (docs/bplot-architecture.md §13.3)
 #include "mime_types.hpp"       // extension -> Content-Type for the static file server
 #include "event_loop.hpp"       // kqueue/epoll/poll readiness loop for the sua server
 #include "worker_pool.hpp"      // SO_REUSEPORT workers + the cross-worker broadcast bus
@@ -5585,6 +5586,28 @@ private:
             if (args.empty()) return Value(0.0);
             if (args[0].isString()) return Value((double)args[0].stringVal.size());
             if (args[0].isList()) return Value((double)args[0].listVal.size());
+            // A dict, an ndarray and a column all used to fall through to the 0
+            // below, which is the worst possible answer: `while ($i < len($a))`
+            // over an array never ran and nothing said why. Each now reports
+            // its real length. Everything else keeps answering 0 -- len(null)
+            // is a common idiom and changing it would break working programs.
+            if (args[0].isObject()) {
+                return Value((double)(args[0].objectVal ? args[0].objectVal->size() : 0));
+            }
+            if (args[0].type == Value::NATIVE_HANDLE && args[0].handle) {
+                const auto& reg = handleLenRegistry();
+                auto it = reg.find(args[0].stringVal);
+                if (it != reg.end() && it->second) {
+                    const long long n = it->second(args[0].handle);
+                    if (n < 0) {
+                        ErrorHandler::throwError("len(): a " + args[0].stringVal +
+                            " with no dimensions has no length -- a 0-d array is a single value",
+                            0, 0, ErrorHandler::RUNTIME_ERROR);
+                    }
+                    return Value((double)n);
+                }
+                if (arctic::isColumn(args[0])) return Value((double)arctic::asColumn(args[0])->n);
+            }
             return Value(0.0);
         }));
 
@@ -6083,6 +6106,7 @@ private:
                     "hmac_sha256","hash_file",
                     "col",     // arctic native column primitives + kernels
                     "ndarray", // numba n-dimensional arrays + kernels
+                    "bplot",   // bplot's line/scatter/escape kernels (plot_native.hpp)
                     "pwa"      // sua.pwa: manifest / service worker / offline
 #ifdef BANTU_ARROW
                     ,"arrow"  // Parquet + Feather/Arrow-IPC I/O (opt-in build)
@@ -6369,6 +6393,26 @@ private:
                             }
                             ErrorHandler::throwError(msg, 0, 0,
                                                      ErrorHandler::RUNTIME_ERROR);
+                        }
+                        return Value();
+                    }));
+            });
+
+            // bplot's kernels, through the same translation: a bad argument is a
+            // catchable Bantu error naming the builtin, never a process kill.
+            bplot_native::registerBuiltins([this](const char* name, NativeFn fn) {
+                std::string where = name;
+                env_->define(name, makeNative(
+                    [where, fn](std::vector<Value> args) -> Value {
+                        try { return fn(std::move(args)); }
+                        catch (const std::exception& e) {
+                            std::string msg = e.what();
+                            const std::string pfx = where + ": ";
+                            if (msg.size() < pfx.size() ||
+                                msg.compare(0, pfx.size(), pfx) != 0) {
+                                msg = pfx + msg;
+                            }
+                            ErrorHandler::throwError(msg, 0, 0, ErrorHandler::RUNTIME_ERROR);
                         }
                         return Value();
                     }));
@@ -7492,8 +7536,22 @@ private:
         }));
 
         // contains(s, needle) → bool
+        // contains(string, needle) -> substring test
+        // contains(list, value)     -> membership, with the same equality as ==
+        //
+        // The list form used to fall into the string check and answer false for
+        // EVERY list -- contains([1, 2], 1) was false -- so a membership guard
+        // silently took the wrong branch. Equality is Value::equals, the one
+        // `==` uses, so contains([[1, 2]], [1, 2]) is true exactly when
+        // [[1, 2]][0] == [1, 2] is.
         env_->define("contains", makeNative([](std::vector<Value> args) -> Value {
-            if (args.size() < 2 || !args[0].isString() || !args[1].isString()) return Value(false);
+            if (args.size() < 2) return Value(false);
+            if (args[0].isList()) {
+                for (const Value& e : args[0].listVal)
+                    if (e.equals(args[1])) return Value(true);
+                return Value(false);
+            }
+            if (!args[0].isString() || !args[1].isString()) return Value(false);
             return Value(args[0].stringVal.find(args[1].stringVal) != std::string::npos);
         }));
 

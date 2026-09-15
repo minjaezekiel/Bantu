@@ -170,17 +170,45 @@ collide; colormap values against reference tables.
 
 ---
 
-## Phase B4 — Data integration
+## Phase B4 — Data integration ✅
 
-- [ ] accept Bantu lists, numba `ndarray`s, arctic `Column`s, `Series` and `DataFrame` everywhere
-- [ ] `df.plot()` on an arctic DataFrame
-- [ ] native reductions for data limits and binning when numba is present
-- [ ] `tests/bplot_data_test.b`
+- [x] accept Bantu lists, numba `ndarray`s, arctic `Column`s, `Series` and `DataFrame` everywhere
+- [x] `df.plot()` on an arctic DataFrame — plus `$series.plot()`, `plot_frame($df)` and `heatmap($df)`
+- [x] native reductions for data limits and binning when numba is present — and native line
+      simplification and scatter batching, which turned out to be where the time was (BP32, BP33)
+- [x] `tests/bplot_data_test.b` (138), B4 additions to `tests/bplot_stress.sh` (48 → 62)
 
 **Gate:** **identical output from all four input types for the same data.** Mismatched lengths raise
 clearly, naming both.
 **Stress:** a 1M-row arctic column plotted end to end; a column containing nulls; a DataFrame with a
 non-numeric column selected.
+
+| gate | result |
+|---|---|
+| identical output from a list, an ndarray, a column and a Series | ✅ **byte-identical** across 17 chart configurations — line, simplified line, scatter, batched scatter, hist, density hist, boxplot, violin ×2, bar, step, stem, fill_between, errorbar, log line, symlog line and symlog scatter |
+| the native path against the pure-Bantu path | ✅ **byte-identical** on every one of those; and every B1–B3 assertion, written against lists, passes through the native path |
+| mismatched lengths name both | ✅ `x ('date') has 5 points and y ('price') has 4` — on both paths |
+| **a 1,000,000-row arctic column as a line** | ✅ **252 ms, 112 MB peak RSS** — against **15,455 ms and 2.69 GB** through the pure path on the same build. The document is **23,825 bytes both ways** |
+| 1,000,000 rows through hist / two boxes / a violin | ✅ 61 ms / 241 ms / 306 ms |
+| a 1,000,000-point scatter | ✅ 1,523 ms, one `<path>` of 60.9 MB — at that size the raster backend (B6) is the right format |
+| a column containing nulls | ✅ a null draws exactly the gap a NaN draws, from a list, a column and a Series; an all-null column renders an empty, valid chart |
+| a DataFrame with a non-numeric column selected | ✅ raises catchably, naming the column and its type, and the same process then draws the frame correctly |
+| hostile column names | ✅ escaped wherever `plot_frame` writes them |
+| every B4 document parses as XML | ✅ |
+
+**Seven defects found and fixed while building it — five of them in the language, all silent:**
+- **`include "bplot"` bound an empty module** when run from a folder containing a `bplot/` directory,
+  because the resolver accepted a directory as a file. That is this repository's own layout.
+- **`len()` answered 0 for a dict, an ndarray and a column**, so a loop bounded by it never ran.
+- **`contains()` answered false for every list.**
+- **Date axes at hour and minute resolution carried no date** — `00:00 12:00 00:00` — though the
+  architecture doc had specified a dated label. They follow matplotlib's formats now.
+- **Numeric data was materialised as Bantu lists**, costing ~20 s and 3.1 GB for one million-point
+  chart. That is §13 of the architecture doc.
+- A Bantu list containing `null` could not be plotted at all; it is a gap now, consistently with a
+  null in a column.
+- `nd_to_list` of a 2-D ndarray passed to `plot` produced nested lists that failed far from the
+  cause; it raises at the boundary now, naming the shape.
 
 ---
 

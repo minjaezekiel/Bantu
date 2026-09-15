@@ -273,6 +273,10 @@ class Series {
         return new Series(this.name, col($out, _inferDtype($out)));
     }
     def apply($fn) { return this.map($fn); }
+
+    // plot(opts) -> the bplot Axes. A line of the values against the row
+    // number, named after this Series. See _plotWithBplot below.
+    def plot($opts) { return _plotWithBplot(this, $opts, "Series.plot()"); }
 }
 
 
@@ -291,6 +295,10 @@ class DataFrame {
 
     def shape()   { return [this.nrows, this.ncols]; }
     def columns() { return this.names; }
+
+    // plot(opts) -> the bplot Axes. {kind, x, y, title}: every numeric column
+    // as a line against the row number by default. See _plotWithBplot below.
+    def plot($opts) { return _plotWithBplot(this, $opts, "DataFrame.plot()"); }
 
     // The whole frame as one (rows, columns) numba matrix, ready for
     // np.solve / np.lstsq / np.svd. Unlike a Series this COPIES, because the
@@ -1149,6 +1157,36 @@ def series($name, $list, $dtype) {
 def from_column($name, $column) {
     _need();
     return new Series($name, $column);
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Plotting, through bplot — included LAZILY
+// ════════════════════════════════════════════════════════════════════════════
+//
+// arctic does not depend on bplot, and a program that never plots never loads
+// it. The include happens inside this function, on the first plot() call, which
+// is pandas' own design for df.plot() and matplotlib, for the same reason: the
+// dependency exists only when the convenience is used. Repeat includes bind the
+// cached module, so $df.plot() and your own `include "bplot" as plt` share one
+// current figure, and plt.savefig() writes the chart $df.plot() drew.
+//
+// Only the include is inside the try. Errors from bplot itself -- a column that
+// is not numeric, say -- must reach the caller as themselves, not be mistaken
+// for "bplot is not installed".
+def _plotWithBplot($target, $opts, $what) {
+    $draw = null;
+    try {
+        include "bplot" as _bplot;
+        $draw = _bplot.plot_frame;
+    } catch ($e) {
+        $draw = null;
+    }
+    if ($draw == null) {
+        throw "arctic: " + $what + " draws with the bplot package, which could not be found -- " +
+              "install it with `bantu add bplot`, or include bplot yourself and call plt.plot_frame($df)";
+    }
+    return $draw($target, $opts);
 }
 
 

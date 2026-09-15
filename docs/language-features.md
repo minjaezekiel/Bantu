@@ -141,9 +141,10 @@ while (...) { $out[len($out)] = $v; }    // 20,000 items: 7,027 ms before, 58 ms
 ```
 
 That idiom is used throughout `hash.b` and `crypto.b`, so their pure-Bantu paths were quadratic in
-input length. `len($var)` now reads the length from the real storage. The answer is identical in
-every case, including `len` of a string, a dict (`0`) and a non-container (`0`), and a user-defined
-`len()` still shadows the builtin.
+input length. `len($var)` now reads the length from the real storage. The answer was identical in
+every case — including a dict (then `0`) and a non-container (`0`) — and a user-defined `len()` still
+shadows the builtin. A dict has since learned to report its real length; see *`len` and `contains`
+on every container* below.
 
 **Passing a big list to any other function still copies it.** This is inherent to the value
 semantics and has not changed: `col($big, "f64")`, `sum($big)` and any user function taking a list
@@ -198,6 +199,21 @@ Five things worth knowing, each with a reason:
   validation catches that; a merge sort cannot leave its range whatever the comparator answers, so
   the worst case is a strangely ordered list rather than memory corruption. Return a negative number
   if the first argument comes first, positive if the second does, zero if they tie.
+
+### `len` and `contains` on every container (fixed)
+
+Both answered silently wrong for the containers they did not know about:
+
+| call | before | now |
+|---|---|---|
+| `len({"a": 1, "b": 2})` | `0` | `2` — a dict counts its entries |
+| `len($ndarray)` | `0` | the first axis, as in NumPy; a 0-d array raises |
+| `len($column)` | `0` | the row count |
+| `contains([1, 2], 1)` | `false` | `true` — list membership, with the same equality as `==` |
+
+`while ($i < len($a))` over an array or a dict never ran, and `if (contains($seen, $x))` never
+fired, with nothing to say why. `len` of anything else — a number, `null` — still answers `0`,
+because `len(null)` is a common guard and changing it would break working programs.
 
 ### `&&` and `||` now short-circuit (fixed)
 
@@ -393,6 +409,17 @@ A bare name (no `./`, no slash) searches `bantu_modules/<name>/` beside the impo
 the working directory — where `bantu add <pkg>` installs — honouring the package's `package.json`
 `"main"`, then falling back to `<name>.b`, `index.b`, `main.b`. A path with `./` or `../` always
 means exactly that path. `$BANTU_PATH` is searched last.
+
+A bare name that names a **directory** beside the importing file or under the working directory is
+resolved *inside* it, the way `bantu_modules/<name>/` is — `package.json` `"main"`, then `<name>.b`,
+then `index.b` — which is how `include "bplot"` works from a checkout that has `bplot/bplot.b`, and is
+Node's convention for `require('./dir')`. An installed package still wins over a folder that happens
+to share its name.
+
+**A module is a regular file (fixed).** The resolver's existence check used to accept a directory,
+and a directory opened as a stream reads as empty — so `include "bplot" as plt;` run from a folder
+containing a `bplot/` directory parsed an empty file and bound `plt` to a module with nothing in it.
+No error was raised; the first sign was `Cannot call 'figure': it holds null` at the first call.
 
 **One file, one module.** A module executes once; every later `include` of it binds that same
 namespace object, so two of your files can both `include "arctic" as arctic;` and both get a working

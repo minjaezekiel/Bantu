@@ -47,10 +47,11 @@ peakRss() {
 # Writes $TMP/cycle.b: $2 iterations of the cycle shape named by $1.
 #
 # The shape is read from the environment but the COUNT is written into the
-# source, because env() yields a string and Bantu has no string-to-number
-# builtin -- `0 + env(...)` concatenates instead of adding, which silently
-# produces a loop that never runs. (That mistake is how the first measurement
-# of this leak came back falsely flat.)
+# source, so the loop bound is a literal and cannot be mis-parsed. env() yields
+# a string, and `0 + env(...)` CONCATENATES rather than adding -- which silently
+# produced a loop that never ran, and is how the first measurement of this leak
+# came back falsely flat. (num(env(...)) would parse it; an earlier version of
+# this comment wrongly said Bantu had no string-to-number builtin.)
 writeShape() {
     cat > "$TMP/cycle.b" <<BEOF
 \$kind = env("GC_KIND");

@@ -74,6 +74,22 @@ inline void registerHandleRepr(const std::string& tag, HandleReprFn fn) {
     handleReprRegistry()[tag] = fn;
 }
 
+// len() of a native handle, by the same mechanism and for the same reason.
+// Before this, len() answered 0 for any handle -- so `while ($i < len($a))`
+// over an ndarray or a column silently never ran. The owning layer knows what
+// "length" means for its type (an ndarray's first axis, a column's rows); a
+// renderer returning a negative number means "this handle has no length" and
+// len() raises rather than inventing one.
+using HandleLenFn = long long (*)(const std::shared_ptr<void>&);
+
+inline std::unordered_map<std::string, HandleLenFn>& handleLenRegistry() {
+    static std::unordered_map<std::string, HandleLenFn> r;
+    return r;
+}
+inline void registerHandleLen(const std::string& tag, HandleLenFn fn) {
+    handleLenRegistry()[tag] = fn;
+}
+
 class Value {
 public:
     enum Type { NUMBER, STRING, BOOL, NULL_VAL, FUNCTION, CLASS_INSTANCE, CLASS_DEF, OBJECT, NATIVE_FN, LIST,

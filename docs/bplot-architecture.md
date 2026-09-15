@@ -387,7 +387,15 @@ shifted-year trick. **All bplot date handling is UTC**, matching arctic's storag
 milliseconds, UTC — `dataframe_native.hpp:77`); local-time rendering would need a timezone database,
 which is not a dependency this tree is going to take for an axis label.
 
-Label formats follow the step: `HH:MM:SS`, `HH:MM`, `MM-DD HH:MM`, `YYYY-MM-DD`, `YYYY-MM`, `YYYY`.
+Label formats follow the step, and are matplotlib's defaults (`date.autoformatter.*`, checked
+against 3.11.2): seconds `HH:MM:SS`, minutes `DD HH:MM`, hours `MM-DD HH`, days `YYYY-MM-DD`, months
+`YYYY-MM`, years `YYYY`.
+
+> **Corrected in B4.** This line read "`HH:MM:SS`, `HH:MM`, `MM-DD HH:MM`, `YYYY-MM-DD`, `YYYY-MM`,
+> `YYYY`" — which already intended a dated hour label, but the code shipped bare `HH:MM` for both
+> minutes and hours. Any axis crossing midnight read `12:00 00:00 12:00`, with no way to tell which
+> day a tick belonged to. B4's first datetime column, four days long, produced exactly that. Minute
+> and hour labels now carry the day, as matplotlib's do.
 
 Parity is **exact** on the eight ranges checked, from a ten-second window to a
 twenty-five-year one — including the two that a look-alike implementation gets wrong: a
@@ -803,25 +811,149 @@ Windows that corrupts every `\n` in a PNG into `\r\n`. The gate that proves the 
 
 ---
 
-## 13. Interop — one library, four input types
+## 13. Interop — one library, four input types (B4)
 
-bplot accepts, everywhere a sequence is expected:
+bplot accepts, everywhere a sequence is expected, a Bantu list, a numba `ndarray`, an arctic `Column`,
+an arctic `Series`, and — where a table makes sense — an arctic `DataFrame`. **Identical output from
+all four input types for the same data is the B4 gate**, because "works with lists, subtly different
+with arrays" is the failure this design exists to prevent.
 
-| input | how it is read |
+The design below is the second one. The first — convert everything to a Bantu list at the boundary,
+which is what B1–B3 did for ndarrays and columns — was measured before B4 started, on one
+1,000,000-point line:
+
+| step | time |
 |---|---|
-| a Bantu list | directly |
-| a numba `ndarray` | `nd_get` for small, native reductions for limits, native binning for `hist` |
-| an arctic `Column` | zero-copy borrow into an ndarray via `nd_from_column`, then as above |
-| an arctic `Series` / `DataFrame` | `.to_ndarray()`, added in numba's Phase 6 |
+| `nd_to_list` on x and y | 630 ms |
+| data limits | 908 ms |
+| `plot()` | 10,915 ms |
+| render | 8,171 ms |
+| **peak RSS** | **3.1 GB** |
 
-The conversion happens once, at the API boundary, into one internal representation. **Identical
-output from all four input types for the same data is the B4 gate**, because "works with lists,
-subtly different with arrays" is the failure this design is meant to prevent.
+Twenty seconds and three gigabytes for one chart. The cause is not the drawing: a Bantu `Value` is
+~190 bytes, a list of a million is ~190 MB, and **lists have value semantics**, so every function
+call that takes one as an argument copies all of it. The plotting code was fine; the representation
+was wrong.
 
-`df.plot()` on an arctic DataFrame is the headline convenience: it is what makes the two libraries
-feel like one.
+### 13.1 Recognition is structural, and bplot includes neither library (BP31)
 
----
+| input | recognised by |
+|---|---|
+| list | `type($v) == "list"` |
+| ndarray | `type($v) == "ndarray"` |
+| column | `type($v) == "column"` |
+| Series | an instance whose `.col` is a column |
+| DataFrame | an instance whose `.names` is a list and `.cols` a dict |
+
+bplot never `include`s arctic or numba. A plotting library that required a dataframe library would
+be wrong, and one that included it would load 1,400 lines into every chart. Recognising the *shape*
+instead means any future type that wraps a column works with bplot without either side changing.
+
+### 13.2 Numeric data stays native until it becomes pixels (BP32)
+
+For the chart kinds whose inputs are routinely large — `plot`, `scatter`, `hist`, `boxplot`,
+`violin` — every numeric input, **lists included**, is normalised at the boundary into one
+representation: a 1-D f64 ndarray. Columns get there by a zero-copy borrow; lists by one native
+pass. From then on the data is a `shared_ptr`, so passing it between functions costs nothing, and
+every reduction over it is a numba kernel.
+
+Because all four input types then run the *same* code over the *same* representation, identical
+output is **structural**, not a property that has to be tested into existence. It is tested anyway.
+
+The pure-Bantu path B1–B3 used is kept, for two reasons. An interpreter without numba still plots.
+And it is the **differential oracle**: `_useNative(false)` forces it, and the test suite requires the
+same data to render byte-identically through both. B1–B3's 477 assertions, all of which pass Bantu
+lists, now run through the native path — so every one of them is also a check that the native path
+reproduces what they pinned.
+
+Charts whose inputs are small by nature — bar, step, stem, errorbar, fill_between, pie, the 2-D
+grids — keep materialising a list at the boundary. A 1,000,000-bar chart is not a chart.
+
+### 13.3 The one new kernel, and why it contains no arithmetic (BP33)
+
+Everything above composes from kernels numba already has — `nd_isfinite`, `nd_compress`,
+`nd_sort`, `nd_histogram`, `nd_min`/`nd_max`, `nd_log10`, `nd_where`, `nd_multiply`, `nd_add`. One
+thing does not compose: B1's path simplification (BP3), which walks the points in order, splits them
+into runs at every non-finite value, and keeps first/min/max/last per pixel column.
+
+That becomes `bp_line_runs(px, py, simplify)`, and **it is handed pixel coordinates, not data**. The
+scale transform and the affine map are done first, in Bantu, as separate numba passes. That split is
+deliberate: `x * a + b` evaluated by a C++ compiler may be contracted into a fused multiply-add,
+which rounds differently in the last bit from the interpreter's two separate operations — and a
+different last bit is a different `_px` string on a rounding boundary. Two separate kernel calls
+cannot be fused. So the kernel contains nothing but comparisons and `std::round`, which is what the
+interpreter's own `round()` calls, and its output is BP3's output by construction.
+
+Scatter gets the same treatment one step further: at **1,000 finite points and above** — the same
+threshold BP3 already uses — the circles are emitted as one `<path>` built natively rather than one
+`<circle>` element each, reproducing `_fmt`'s arithmetic for every coordinate. Below the threshold
+nothing changes, so no existing document moves.
+
+### 13.4 Nulls, datetimes and integers (BP34)
+
+- **A numeric null is a missing value, and becomes NaN**: a gap in a line, skipped by limits,
+  histograms and box statistics. That is what pandas does, and it is the only choice that neither
+  invents a value nor refuses to draw.
+- **A categorical null is labelled `null`**, as `print` would show it.
+- **A datetime column becomes epoch milliseconds** and turns its axis into a date axis
+  automatically; a date column is days, scaled to milliseconds. That is the integration that makes
+  `plot($df.get("day"), $df.get("sales"))` produce a readable time axis with no further call.
+- **An i64 column is exact to 2^53**, the same caveat arctic documents as A4.
+
+### 13.5 Frames, and `df.plot()` (BP35)
+
+`plot_frame($df, $opts)` is the table-shaped entry point, on an Axes and at module level:
+
+| option | meaning |
+|---|---|
+| `kind` | `line` (default), `bar`, `barh`, `scatter`, `hist`, `box`, `step` |
+| `x` | the column for the x axis; default is the row number |
+| `y` | a column name or a list of them; default is **every numeric column** except `x` |
+| `title` | a title; axis labels default to the column names |
+
+More than one series turns the legend on and, for bars, groups them side by side. Naming a column
+that is not numeric **raises, naming the column and its type** — silently skipping a column the user
+asked for by name is the worst of the three possible answers. Only the *default* selection skips
+non-numeric columns, because nobody asked for those.
+
+`heatmap($df)` draws the numeric columns as a matrix with their names as labels.
+
+**`$df.plot($opts)` and `$series.plot($opts)` live in arctic, and include bplot lazily** — inside the
+method, on first call. That is pandas' own design, for the same reason: the dependency points from
+the convenience to the library, and only when the convenience is used. arctic loads nothing extra
+for a program that never plots, and a program without bplot installed gets an error that says
+`bantu add bplot` rather than an undefined name.
+
+### 13.6 What B4 found in the language (BP36)
+
+Four defects, each silent, each fixed rather than worked around:
+
+- **`include "bplot"` from a folder containing a `bplot/` directory bound an empty module.** The
+  resolver's existence check accepted directories, and a directory parses as an empty file. Modules
+  must now be regular files, and a bare name that names a directory is resolved as a package inside
+  it (`package.json` `main`, then `<name>.b`, then `index.b`) — Node's convention.
+- **`len()` returned 0 for a dict, an ndarray and a column**, so `while ($i < len($a))` over an array
+  never ran. A dict now reports its entries, an ndarray its first axis, a column its rows.
+- **`contains()` returned false for every list.** It now tests list membership with `==`.
+- **The performance wall above**, which is §13.2.
+
+### 13.7 Results
+
+Measured on the build that shipped B4 (Intel Core i7-9750H, macOS, Apple clang), one million rows:
+
+| | native path | pure path, same build |
+|---|---|---|
+| a line from an arctic column | **252 ms** | 15,455 ms |
+| peak resident memory | **112 MB** | 2.69 GB |
+| the document | 23,825 bytes | 23,825 bytes — **identical** |
+| histogram / two boxes / violin | 61 / 241 / 306 ms | — |
+| scatter | 1,523 ms, one 60.9 MB `<path>` | — |
+
+The byte-identical document at a million rows is the strongest form of the §13.2 claim: the native
+kernels are not an approximation of the pure path that happens to agree on test-sized data.
+
+`tests/bplot_data_test.b` holds the gate — 17 chart configurations, each rendered from a list, an
+ndarray, a column and a Series and through both paths, compared byte for byte.
 
 ## 14. The six questions
 

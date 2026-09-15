@@ -57,6 +57,24 @@ inline bool pathExists(const std::string& p) {
     return stat(p.c_str(), &buf) == 0;
 }
 
+// A module must be a REGULAR FILE. pathExists() also says yes to a directory,
+// and a directory opened as a stream reads as empty -- so `include "bplot"`
+// run from a folder that contains a bplot/ directory parsed an empty file and
+// bound the alias to a module with nothing in it. No error anywhere: the first
+// sign was "figure holds null" at the first call. That is exactly the layout
+// of this repository, and of any project that vendors a package.
+inline bool isRegularFile(const std::string& p) {
+    struct stat buf;
+    if (stat(p.c_str(), &buf) != 0) return false;
+    return (buf.st_mode & S_IFMT) == S_IFREG;
+}
+
+inline bool isDirectory(const std::string& p) {
+    struct stat buf;
+    if (stat(p.c_str(), &buf) != 0) return false;
+    return (buf.st_mode & S_IFMT) == S_IFDIR;
+}
+
 inline std::string dirOf(const std::string& path) {
     size_t slash = path.find_last_of("/\\");
     return (slash == std::string::npos) ? "." : path.substr(0, slash);
@@ -246,6 +264,27 @@ inline ResolvedModule resolveAndParse(const std::string& rawPath,
         }
         addPackageCandidates(candidates, getCwd(), rawPath);
     }
+    // 5b. A bare name that names a DIRECTORY is a package directory: resolve
+    //     inside it exactly as bantu_modules/<name>/ is resolved. This is how
+    //     `include "bplot"` works from a checkout that has bplot/bplot.b, and
+    //     it is Node's convention for require('./dir'). Placed after
+    //     bantu_modules so an installed package still wins over a folder that
+    //     happens to share its name.
+    if (isBareModuleName(rawPath)) {
+        auto addDirPackage = [&](const std::string& baseDir) {
+            const std::string dir = joinPath(baseDir, rawPath);
+            if (!isDirectory(dir)) return;
+            const std::string manifest = joinPath(dir, "package.json");
+            if (isRegularFile(manifest)) {
+                const std::string main = readManifestField(readWholeFile(manifest), "main");
+                if (!main.empty()) candidates.push_back(joinPath(dir, main));
+            }
+            candidates.push_back(joinPath(dir, rawPath + ".b"));
+            candidates.push_back(joinPath(dir, "index.b"));
+        };
+        if (!importingFilePath.empty()) addDirPackage(dirOf(importingFilePath));
+        addDirPackage(getCwd());
+    }
     // 6. (v1.2.2) $BANTU_PATH lookup — for shared module libraries
     for (const auto& dir : bantuPathDirs()) {
         candidates.push_back(joinPath(dir, rawPath));
@@ -258,7 +297,7 @@ inline ResolvedModule resolveAndParse(const std::string& rawPath,
 
     std::string chosen;
     for (const auto& c : candidates) {
-        if (pathExists(c)) { chosen = c; break; }
+        if (isRegularFile(c)) { chosen = c; break; }
     }
 
     if (chosen.empty()) {

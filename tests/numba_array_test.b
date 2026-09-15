@@ -371,6 +371,23 @@ ok($viewMs < 50, "a view of 10M elements is effectively free (no copy)");
 ok(nd_base_id($v) == nd_base_id($big), "and really is the same buffer");
 
 print("");
+print("-- len() of an array (fixed: it answered 0 for every handle) --");
+// len($a) used to be 0 for any ndarray, so `while ($i < len($a))` never ran and
+// nothing said why. It is now the first axis, as in NumPy.
+ok(len(nd_zeros([7], null)) == 7, "a 1-D array's length is its size");
+ok(len(nd_zeros([3, 4], null)) == 3, "a 2-D array's length is its first axis, as in NumPy");
+ok(len(nd_T(nd_zeros([3, 4], null))) == 4, "a transposed view reports its own first axis");
+ok(len(nd_zeros([0], null)) == 0, "an empty array has length 0");
+$lenLoop = nd([10, 20, 30], null);
+$lenAcc = 0;
+$li = 0;
+while ($li < len($lenLoop)) { $lenAcc = $lenAcc + $lenLoop[$li]; $li = $li + 1; }
+ok($lenAcc == 60, "and the loop that never ran now visits every element");
+$zeroD = null;
+try { len(nd_sum(nd([1, 2], null), null)); $zeroD = "no error"; } catch ($e) { $zeroD = str($e); }
+ok(contains($zeroD, "no dimensions has no length"), "a 0-d array has no length, and says so rather than answering 0");
+
+print("");
 print("========================================");
 print("  PASS: " + str($R.pass) + "   FAIL: " + str($R.fail));
 print("========================================");

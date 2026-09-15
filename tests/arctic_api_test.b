@@ -158,6 +158,12 @@ eq($back.height(), 5, "read_json rows");
 eq($back.get("amount").sum(), 150, "read_json values round-trip");
 
 print("");
+print("-- len() of a column (fixed: it answered 0) --");
+eq(len($df.get("amount").col), 5, "len() of a native column is its row count");
+eq(len(arctic.series("e", [], "f64").col), 0, "an empty column has length 0");
+eq(len({"a": 1, "b": 2, "c": 3}), 3, "and len() of a dict counts its entries");
+
+print("");
 print("========================================");
 print("  PASS: " + str($R.pass) + "   FAIL: " + str($R.fail));
 print("========================================");

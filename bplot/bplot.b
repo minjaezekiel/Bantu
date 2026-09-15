@@ -84,7 +84,34 @@ $_ADVANCE = [278,278,355,556,556,889,667,191,333,333,389,584,278,333,278,278,
 // XML 1.0 at all -- one of them makes the whole document fail to parse,
 // turning a chart into a blank page with nothing in any log -- so they are
 // dropped rather than escaped.
+// ── Native acceleration (decisions BP32, BP33) ───────────────────────────
+// bplot is pure Bantu. When the interpreter also has numba and bplot's own
+// kernels, numeric data is kept as an ndarray until it becomes pixels, which
+// is what took one 1,000,000-point line from ~20 s and 3.1 GB to well under a
+// second. The pure path is kept -- for an interpreter without the kernels, and
+// as the differential oracle: _useNative(false) forces it, and the tests
+// require the same data to render byte-identically both ways.
+$_NAT = {"on": false};
+def _nativeAvailable() {
+    $ok = false;
+    try { $ok = has_native("bplot") && has_native("ndarray"); } catch ($e) { $ok = false; }
+    return $ok;
+}
+$_NAT["on"] = _nativeAvailable();
+
+// Returns the previous setting. Turning it on only succeeds where the kernels exist.
+def _useNative($on) {
+    $was = $_NAT["on"];
+    if ($on == true) { $_NAT["on"] = _nativeAvailable(); } else { $_NAT["on"] = false; }
+    return $was;
+}
+
 def _esc($s) {
+    // bp_escape is exactly this function, in C++ (plot_native.hpp). Escaping
+    // stays mandatory either way; native only makes it linear in real time --
+    // the loop below walks every character in interpreted Bantu, which is fine
+    // for a label and minutes for a path holding a million circles.
+    if ($_NAT["on"]) { return bp_escape($s); }
     $t = str($s);
     $t = replace($t, "&", "&amp;");
     $t = replace($t, "<", "&lt;");
@@ -203,18 +230,188 @@ def _color($c, $fallback) {
     throw "bplot: unknown colour '" + $s + "' -- use #rrggbb, [r,g,b], or one of " + join(keys($_NAMED), ", ");
 }
 
-// ── Reading data ─────────────────────────────────────────────────────────
-// A sequence may be a Bantu list, a numba ndarray, or an arctic column --
-// converted once, here, at the API boundary, so nothing downstream has to
-// care which it was. (Series/DataFrame land in B4.)
+// ── Reading data (decisions BP31, BP32, BP34) ────────────────────────────
+//
+// A sequence may be a Bantu list, a numba ndarray, an arctic column or an
+// arctic Series; a table may be an arctic DataFrame. bplot includes neither
+// library -- it recognises them by SHAPE, so a plotting library does not
+// depend on a dataframe library, and any future type that wraps a column
+// works unchanged.
+
+def _kindOf($v) {
+    $t = type($v);
+    if ($t != "instance") { return $t; }
+    // A missing field reads as null, so these probes are safe on any object.
+    if (type($v.col) == "column") { return "series"; }
+    if (type($v.names) == "list" && type($v.cols) == "dict") { return "frame"; }
+    return "instance";
+}
+
+// " ('price')" for a Series, so a length mismatch names both sides.
+def _nameOf($v) {
+    if (_kindOf($v) == "series") { return " ('" + str($v.name) + "')"; }
+    return "";
+}
+
+def _inList($list, $v) {
+    $i = 0;
+    while ($i < len($list)) { if ($list[$i] == $v) { return true; } $i = $i + 1; }
+    return false;
+}
+
+// What a column holds, as far as a chart is concerned.
+def _colKind($c) {
+    $dt = col_dtype($c);
+    if ($dt == "datetime" || $dt == "date") { return $dt; }
+    if ($dt == "f64" || $dt == "i64" || $dt == "bool") { return "number"; }
+    return "text";
+}
+
+// A numeric, datetime or date column as a null-free f64 column (BP34):
+// a null is a missing value and becomes NaN -- a gap, not an invented zero.
+// Datetimes are epoch milliseconds already; a date is days, scaled to ms.
+def _colF64($c) {
+    $k = _colKind($c);
+    $n = $c;
+    if ($k == "datetime") { $n = col_cast($c, "i64"); }
+    if ($k == "date") { $n = col_mul(col_cast($c, "f64"), 86400000); }
+    $f = col_cast($n, "f64");
+    if (col_null_count($f) > 0) { $f = col_fill_null($f, NAN); }
+    return $f;
+}
+
+// Numeric columns, in frame order: what a table plots by default. Booleans
+// and datetimes are left out of the DEFAULT -- nobody asked for them -- but a
+// caller may still name one explicitly.
+def _numericNames($names, $cols, $except) {
+    $out = [];
+    $i = 0;
+    while ($i < len($names)) {
+        $nm = $names[$i];
+        $dt = col_dtype($cols[$nm]);
+        if ($nm != $except && ($dt == "f64" || $dt == "i64")) { push($out, $nm); }
+        $i = $i + 1;
+    }
+    return $out;
+}
+
+// A list's nulls, as the column path treats them: NaN among numbers, the
+// label "null" among text. Only walks the list when a null is actually there.
+def _listNulls($xs) {
+    if (!_hasNull($xs)) { return $xs; }
+    $text = false;
+    $i = 0;
+    while ($i < len($xs)) { if (type($xs[$i]) == "string") { $text = true; break; } $i = $i + 1; }
+    $out = [];
+    $i = 0;
+    while ($i < len($xs)) {
+        $e = $xs[$i];
+        if ($e == null) { if ($text) { push($out, "null"); } else { push($out, NAN); } }
+        else { push($out, $e); }
+        $i = $i + 1;
+    }
+    return $out;
+}
+
+// contains() learned list membership in this release; an older interpreter
+// answers false for every list, so fall back to a walk there.
+def _hasNull($xs) {
+    if ($_NAT["on"]) { return contains($xs, null); }
+    $i = 0;
+    while ($i < len($xs)) { if ($xs[$i] == null) { return true; } $i = $i + 1; }
+    return false;
+}
+
+def _frameMisuse($what) {
+    return "bplot: " + $what + " is a DataFrame -- pass one column, $df.get(\"name\"), " +
+           "or draw the whole table with plot_frame($df)";
+}
+
+// Any sequence as a Bantu LIST. Used by the chart kinds whose inputs are small
+// by nature (bars, steps, stems, pies, grids).
 def _seq($v, $what) {
     if ($v == null) { throw "bplot: " + $what + " is null"; }
-    $t = type($v);
-    if ($t == "list") { return $v; }
-    if ($t == "ndarray") { return nd_to_list($v); }
-    if ($t == "column")  { return col_to_list($v); }
-    throw "bplot: " + $what + " must be a list" +
-          " (or an ndarray or a column), got " + $t;
+    $k = _kindOf($v);
+    if ($k == "series") { $v = $v.col; $k = "column"; }
+    if ($k == "list") { return _listNulls($v); }
+    if ($k == "ndarray") { return nd_to_list($v); }
+    if ($k == "column") {
+        if (_colKind($v) == "text") {
+            $raw = col_to_list($v);
+            if (!_hasNull($raw)) { return $raw; }
+            $out = [];
+            $i = 0;
+            while ($i < len($raw)) {
+                if ($raw[$i] == null) { push($out, "null"); } else { push($out, $raw[$i]); }
+                $i = $i + 1;
+            }
+            return $out;
+        }
+        return col_to_list(_colF64($v));
+    }
+    if ($k == "frame") { throw _frameMisuse($what); }
+    throw "bplot: " + $what + " must be a list, an ndarray, or an arctic column or Series, got " + $k;
+}
+
+// Any sequence in the NATIVE representation (BP32): {"a": 1-D f64 ndarray,
+// "date": is-a-time-column}, or null when the data is text and belongs on a
+// categorical axis. Only called when _NAT is on.
+def _arr($v, $what) {
+    if ($v == null) { throw "bplot: " + $what + " is null"; }
+    $k = _kindOf($v);
+    if ($k == "series") { $v = $v.col; $k = "column"; }
+    if ($k == "ndarray") {
+        if (len(nd_shape($v)) != 1) {
+            throw "bplot: " + $what + " must be 1-dimensional, got an array of shape " + str(nd_shape($v));
+        }
+        $a = $v;
+        if (nd_dtype($v) != "f64") { $a = nd_astype($v, "f64"); }
+        return {"a": $a, "date": false};
+    }
+    if ($k == "column") {
+        $ck = _colKind($v);
+        if ($ck == "text") { return null; }
+        // Zero-copy: the ndarray borrows the filled column's own storage.
+        return {"a": nd_from_column(_colF64($v)), "date": $ck == "datetime" || $ck == "date"};
+    }
+    if ($k == "list") {
+        $xs = _listNulls($v);
+        $a = null;
+        try { $a = nd($xs, "f64"); } catch ($e) { $a = null; }
+        // Text, or a mix: the categorical path owns that, and its message.
+        if ($a == null) { return null; }
+        if (len(nd_shape($a)) != 1) {
+            throw "bplot: " + $what + " must be a flat sequence of numbers, got nested lists";
+        }
+        return {"a": $a, "date": false};
+    }
+    if ($k == "frame") { throw _frameMisuse($what); }
+    throw "bplot: " + $what + " must be a list, an ndarray, or an arctic column or Series, got " + $k;
+}
+
+// A sequence of numbers in whichever representation the current mode uses.
+def _nums($v, $what) {
+    if ($_NAT["on"]) {
+        $A = _arr($v, $what);
+        if ($A != null) { return $A["a"]; }
+    }
+    return _seq($v, $what);
+}
+
+def _isTimeData($v) {
+    $k = _kindOf($v);
+    if ($k == "series") { $v = $v.col; $k = "column"; }
+    if ($k != "column") { return false; }
+    $ck = _colKind($v);
+    return $ck == "datetime" || $ck == "date";
+}
+
+// Finite limits of an ndarray, as three native passes and no Bantu loop.
+def _limitsArr($a) {
+    if (nd_size($a) == 0) { return null; }
+    $f = nd_compress(nd_isfinite($a), $a);
+    if (nd_size($f) == 0) { return null; }
+    return [nd_to_list(nd_min($f, null)), nd_to_list(nd_max($f, null))];
 }
 
 // Numeric limits over a sequence, skipping NaN and infinities.
@@ -225,6 +422,7 @@ def _seq($v, $what) {
 // design -- a primitive should not silently discard a value it was handed --
 // so a NaN or an infinity in the data sends us to the filtering loop.
 def _limits($xs) {
+    if (type($xs) == "ndarray") { return _limitsArr($xs); }
     if (len($xs) == 0) { return null; }
     $lo = min($xs);
     $hi = max($xs);
@@ -689,8 +887,13 @@ def _fmtDate($ms, $unit) {
     $ymd = _fmt($p[0], 0) + "-" + _pad2($p[1]) + "-" + _pad2($p[2]);
     $hms = _pad2($p[3]) + ":" + _pad2($p[4]) + ":" + _pad2($p[5]);
     if ($unit == "second") { return $hms; }
-    if ($unit == "minute") { return _pad2($p[3]) + ":" + _pad2($p[4]); }
-    if ($unit == "hour")   { return _pad2($p[3]) + ":" + _pad2($p[4]); }
+    // Minute and hour labels carry the DAY, as matplotlib's defaults do
+    // (date.autoformatter.minute '%d %H:%M', .hour '%m-%d %H'). They used to
+    // be a bare "HH:MM", so any axis crossing midnight read "12:00 00:00 12:00"
+    // with no way to tell which day a tick belonged to -- found in B4, when a
+    // four-day datetime column produced exactly that.
+    if ($unit == "minute") { return _pad2($p[2]) + " " + _pad2($p[3]) + ":" + _pad2($p[4]); }
+    if ($unit == "hour")   { return _pad2($p[1]) + "-" + _pad2($p[2]) + " " + _pad2($p[3]); }
     if ($unit == "day")    { return $ymd; }
     if ($unit == "month")  { return _fmt($p[0], 0) + "-" + _pad2($p[1]); }
     if ($unit == "year")   { return _fmt($p[0], 0); }
@@ -857,6 +1060,13 @@ def _dateTicks($lo, $hi) {
 // -- it did not exist before, which is why every quantile in every Bantu
 // program used to be an interpreted sort.
 def _finiteSorted($xs, $what) {
+    if (type($xs) == "ndarray") {
+        $fa = nd_compress(nd_isfinite($xs), $xs);
+        if (nd_size($fa) == 0) {
+            throw "bplot." + $what + ": no finite values to summarise";
+        }
+        return nd_sort($fa, null);
+    }
     $f = [];
     $i = 0;
     $n = len($xs);
@@ -894,6 +1104,8 @@ def _quantile($v, $q) {
 // in the data silently vanishes, and a histogram missing its maximum lies
 // about its range.
 def _histCounts($xs, $bins, $lo, $hi) {
+    // nd_histogram IS the rule below, decision for decision (BP19).
+    if (type($xs) == "ndarray") { return nd_to_list(nd_histogram($xs, $bins, $lo, $hi)); }
     $counts = [];
     $i = 0;
     while ($i < $bins) { push($counts, 0); $i = $i + 1; }
@@ -937,12 +1149,23 @@ def _kde($sorted, $grid) {
     if ($hi <= $lo) { return null; }               // no spread: caller draws a line
     // Scott's rule, matching scipy.stats.gaussian_kde's default factor.
     $mean = 0;
-    $i = 0;
-    while ($i < $n) { $mean = $mean + $sorted[$i]; $i = $i + 1; }
-    $mean = $mean / $n;
     $ss = 0;
-    $i = 0;
-    while ($i < $n) { $d = $sorted[$i] - $mean; $ss = $ss + $d * $d; $i = $i + 1; }
+    if (type($sorted) == "ndarray") {
+        // The last element of a cumulative sum IS the left-to-right sum the
+        // loop below computes -- not nd_sum, which is pairwise and rounds
+        // differently. Same order, same bits, same violin both ways.
+        $cs = nd_cumsum($sorted, null);
+        $mean = $cs[$n - 1] / $n;
+        $dev = nd_subtract($sorted, $mean, null);
+        $sq = nd_cumsum(nd_multiply($dev, $dev, null), null);
+        $ss = $sq[$n - 1];
+    } else {
+        $i = 0;
+        while ($i < $n) { $mean = $mean + $sorted[$i]; $i = $i + 1; }
+        $mean = $mean / $n;
+        $i = 0;
+        while ($i < $n) { $d = $sorted[$i] - $mean; $ss = $ss + $d * $d; $i = $i + 1; }
+    }
     $sd = sqrt($ss / $n);
     if ($sd <= 0) { return null; }
     $bw = 1.06 * $sd * pow($n, 0 - 0.2);
@@ -993,6 +1216,21 @@ def _boxStats($sorted) {
     $wlo = $q1;
     $whi = $q3;
     $out = [];
+    if (type($sorted) == "ndarray") {
+        // The loop below, as masks: inside the fences sets the whiskers,
+        // outside is an outlier, kept in sorted order.
+        $inside = nd_logical_and(nd_greater_equal($sorted, $floLim, null),
+                                 nd_less_equal($sorted, $fhiLim, null), null);
+        $in = nd_compress($inside, $sorted);
+        if (nd_size($in) > 0) {
+            $mn = nd_to_list(nd_min($in, null));
+            $mx = nd_to_list(nd_max($in, null));
+            if ($mn < $wlo) { $wlo = $mn; }
+            if ($mx > $whi) { $whi = $mx; }
+        }
+        $out = nd_to_list(nd_compress(nd_logical_not($inside, null), $sorted));
+        return {"q1": $q1, "med": $q2, "q3": $q3, "wlo": $wlo, "whi": $whi, "out": $out};
+    }
     $i = 0;
     $n = len($sorted);
     while ($i < $n) {
@@ -1276,6 +1514,181 @@ class BPlotAxes {
         return $out;
     }
 
+    // A datetime or date column on x makes this a date axis (BP34), so a time
+    // series reads as one with no separate xdate() call.
+    def dateIfTime($x) {
+        if (_isTimeData($x)) { $this.xdate = true; }
+        return null;
+    }
+
+    // plot() and scatter() over native data (BP32). The artist holds the
+    // ndarrays themselves -- a shared_ptr each -- rather than lists, so no
+    // later call copies the data again.
+    def addNativeXY($kind, $X, $Y, $x, $y, $opts, $fn) {
+        $nx = nd_size($X["a"]);
+        $ny = nd_size($Y["a"]);
+        if ($nx != $ny) {
+            throw "bplot." + $fn + ": x" + _nameOf($x) + " has " + str($nx) + " points and y" +
+                  _nameOf($y) + " has " + str($ny) + " -- they must match";
+        }
+        if ($opts == null) { $opts = {}; }
+        if ($X["date"]) { $this.xdate = true; }
+        $art = {
+            "kind":   $kind,
+            "native": true,
+            "x":      $X["a"],
+            "y":      $Y["a"],
+            "bx":     _limitsArr($X["a"]),
+            "by":     _limitsArr($Y["a"]),
+            "color":  _color($opts["color"], $this.nextColor()),
+            "label":  $opts["label"]
+        };
+        if ($kind == "line") {
+            $art["width"] = _optNum($opts["width"], 1.8);
+            $art["dash"] = $opts["dash"];
+        } else {
+            $art["size"] = _optNum($opts["size"], 3);
+        }
+        push($this.artists, $art);
+        return $this;
+    }
+
+    // plot_frame(df, {kind, x, y, title, bins}) — draw a table (BP35).
+    //
+    //   kind  "line" (default), "bar", "barh", "scatter", "hist", "box", "step"
+    //   x     the column on the x axis; default is the row number
+    //   y     a column name or a list of names; default is every numeric column
+    //
+    // More than one series turns the legend on, and groups bars side by side.
+    // A column named explicitly that is not numeric raises, naming it: silently
+    // skipping a column the caller asked for by name is the worst answer. Only
+    // the DEFAULT selection skips text columns, because nobody asked for those.
+    def plot_frame($df, $opts) {
+        if ($opts == null) { $opts = {}; }
+        $k = _kindOf($df);
+        if ($k == "series") {
+            // A Series is a one-column table named after itself.
+            $one = {};
+            $one[str($df.name)] = $df.col;
+            return $this.plotTable([str($df.name)], $one, $opts);
+        }
+        if ($k != "frame") {
+            throw "bplot.plot_frame: expected an arctic DataFrame or Series, got " + $k;
+        }
+        return $this.plotTable($df.names, $df.cols, $opts);
+    }
+
+    def plotTable($names, $cols, $opts) {
+        $kinds = ["line", "bar", "barh", "scatter", "hist", "box", "step"];
+        $kind = $opts["kind"];
+        if ($kind == null) { $kind = "line"; }
+        if (!_inList($kinds, $kind)) {
+            throw "bplot.plot_frame: unknown kind \"" + str($kind) + "\" -- use " + join($kinds, ", ");
+        }
+        $xname = $opts["x"];
+        if ($xname != null && !_inList($names, $xname)) { throw _noColumn($xname, $names); }
+
+        $ynames = [];
+        $yopt = $opts["y"];
+        if ($yopt == null) {
+            $ynames = _numericNames($names, $cols, $xname);
+            if (len($ynames) == 0) {
+                throw "bplot.plot_frame: there is no numeric column to plot -- the columns are " +
+                      _describeColumns($names, $cols);
+            }
+        } else {
+            if (type($yopt) == "string") { $yopt = [$yopt]; }
+            if (type($yopt) != "list") {
+                throw "bplot.plot_frame: y must be a column name or a list of names, got " + type($yopt);
+            }
+            $i = 0;
+            while ($i < len($yopt)) {
+                $nm = $yopt[$i];
+                if (!_inList($names, $nm)) { throw _noColumn($nm, $names); }
+                if (_colKind($cols[$nm]) == "text") {
+                    throw "bplot.plot_frame: column '" + str($nm) + "' is " + col_dtype($cols[$nm]) +
+                          ", not numeric -- a " + $kind + " chart needs numbers. The columns are " +
+                          _describeColumns($names, $cols);
+                }
+                push($ynames, $nm);
+                $i = $i + 1;
+            }
+        }
+        $nrows = 0;
+        if (len($names) > 0) { $nrows = col_len($cols[$names[0]]); }
+        $multi = len($ynames) > 1;
+
+        if ($kind == "hist") {
+            each ($nm in $ynames) { $this.hist($cols[$nm], {"label": $nm, "bins": $opts["bins"]}); }
+            if (!$multi) { $this.setXLabel($ynames[0]); }
+        }
+        if ($kind == "box") {
+            $data = [];
+            each ($nm in $ynames) { push($data, $cols[$nm]); }
+            $this.boxplot($data, {"labels": $ynames});
+        }
+        if ($kind == "scatter") {
+            if ($xname == null || len($ynames) != 1) {
+                throw "bplot.plot_frame: a scatter needs one x column and one y column -- " +
+                      "{\"kind\": \"scatter\", \"x\": \"a\", \"y\": \"b\"}";
+            }
+            $this.scatter($cols[$xname], $cols[$ynames[0]], {"label": $ynames[0]});
+            $this.setXLabel($xname);
+            $this.setYLabel($ynames[0]);
+        }
+        if ($kind == "line" || $kind == "step") {
+            $xs = null;
+            if ($xname == null) { $xs = _rowNumbers($nrows); } else { $xs = $cols[$xname]; }
+            each ($nm in $ynames) {
+                if ($kind == "line") { $this.plot($xs, $cols[$nm], {"label": $nm}); }
+                else { $this.step($xs, $cols[$nm], {"label": $nm}); }
+            }
+            if ($xname != null) { $this.setXLabel($xname); }
+            if (!$multi) { $this.setYLabel($ynames[0]); }
+        }
+        if ($kind == "bar" || $kind == "barh") {
+            // Grouped: m series share each slot, each 0.8/m wide, centred on
+            // the category position -- the positions categorise() would give.
+            $labels = [];
+            if ($xname == null) {
+                $i = 0;
+                while ($i < $nrows) { push($labels, _fmt($i, 0)); $i = $i + 1; }
+            } else {
+                $raw = _seq($cols[$xname], "x");
+                if (_colKind($cols[$xname]) == "datetime" || _colKind($cols[$xname]) == "date") {
+                    $raw = col_to_list($cols[$xname]);
+                }
+                $i = 0;
+                while ($i < len($raw)) { push($labels, _labelText($raw[$i])); $i = $i + 1; }
+            }
+            $m = len($ynames);
+            $w = 0.8 / $m;
+            $j = 0;
+            while ($j < $m) {
+                $pos = [];
+                $i = 0;
+                while ($i < $nrows) { push($pos, $i + ($j - ($m - 1) / 2) * $w); $i = $i + 1; }
+                $o = {"label": $ynames[$j], "width": $w};
+                if ($kind == "bar") { $this.bar($pos, $cols[$ynames[$j]], $o); }
+                else { $this.barh($pos, $cols[$ynames[$j]], $o); }
+                $j = $j + 1;
+            }
+            $over = _gridTicks($labels, len($labels), "plot_frame");
+            if ($kind == "bar") {
+                $this.xcats = $labels; $this.xtickOverride = $over;
+                if ($xname != null) { $this.setXLabel($xname); }
+                if (!$multi) { $this.setYLabel($ynames[0]); }
+            } else {
+                $this.ycats = $labels; $this.ytickOverride = $over;
+                if ($xname != null) { $this.setYLabel($xname); }
+                if (!$multi) { $this.setXLabel($ynames[0]); }
+            }
+        }
+        if ($multi && $kind != "box") { $this.setLegend(true); }
+        if ($opts["title"] != null) { $this.setTitle($opts["title"]); }
+        return $this;
+    }
+
     def nextColor() {
         $c = $_STYLE["cycle"][$this.colorIdx - floor($this.colorIdx / len($_STYLE["cycle"])) * len($_STYLE["cycle"])];
         $this.colorIdx = $this.colorIdx + 1;
@@ -1291,11 +1704,17 @@ class BPlotAxes {
     // know the shape of every artist kind, which is exactly the coupling that
     // makes adding a chart type a change in three places.
     def plot($x, $y, $opts) {
+        if ($_NAT["on"]) {
+            $X = _arr($x, "x");
+            $Y = _arr($y, "y");
+            if ($X != null && $Y != null) { return $this.addNativeXY("line", $X, $Y, $x, $y, $opts, "plot"); }
+        }
+        $this.dateIfTime($x);
         $xs = $this.categorise(_seq($x, "x"), "x");
         $ys = $this.categorise(_seq($y, "y"), "y");
         if (len($xs) != len($ys)) {
-            throw "bplot.plot: x has " + str(len($xs)) + " points and y has " +
-                  str(len($ys)) + " -- they must match";
+            throw "bplot.plot: x" + _nameOf($x) + " has " + str(len($xs)) + " points and y" +
+                  _nameOf($y) + " has " + str(len($ys)) + " -- they must match";
         }
         if ($opts == null) { $opts = {}; }
         push($this.artists, {
@@ -1313,11 +1732,17 @@ class BPlotAxes {
     }
 
     def scatter($x, $y, $opts) {
+        if ($_NAT["on"]) {
+            $X = _arr($x, "x");
+            $Y = _arr($y, "y");
+            if ($X != null && $Y != null) { return $this.addNativeXY("scatter", $X, $Y, $x, $y, $opts, "scatter"); }
+        }
+        $this.dateIfTime($x);
         $xs = $this.categorise(_seq($x, "x"), "x");
         $ys = $this.categorise(_seq($y, "y"), "y");
         if (len($xs) != len($ys)) {
-            throw "bplot.scatter: x has " + str(len($xs)) + " points and y has " +
-                  str(len($ys)) + " -- they must match";
+            throw "bplot.scatter: x" + _nameOf($x) + " has " + str(len($xs)) + " points and y" +
+                  _nameOf($y) + " has " + str(len($ys)) + " -- they must match";
         }
         if ($opts == null) { $opts = {}; }
         push($this.artists, {
@@ -1375,7 +1800,7 @@ class BPlotAxes {
     // Binning matches numba's nd_histogram decision for decision (BP19), so
     // the same data binned in Bantu and through numba gives the same chart.
     def hist($v, $opts) {
-        $vs = _seq($v, "values");
+        $vs = _nums($v, "values");
         if ($opts == null) { $opts = {}; }
         $bins = _optNum($opts["bins"], 10);
         if ($bins < 1 || $bins != floor($bins)) {
@@ -1455,7 +1880,7 @@ class BPlotAxes {
             if ($hi == null || $bhi > $hi) { $hi = $bhi; }
             $i = $i + 1;
         }
-        $this.xtickOverride = _categoryTicks($opts["labels"], len($groups), "boxplot");
+        $this.xtickOverride = _categoryTicks(_labelsFor($data, $opts["labels"]), len($groups), "boxplot");
         push($this.artists, {
             "kind":  "box",
             "stats": $stats,
@@ -1496,7 +1921,7 @@ class BPlotAxes {
             }
             $i = $i + 1;
         }
-        $this.xtickOverride = _categoryTicks($opts["labels"], len($groups), "violin");
+        $this.xtickOverride = _categoryTicks(_labelsFor($data, $opts["labels"]), len($groups), "violin");
         push($this.artists, {
             "kind":   "violin",
             "shapes": $shapes,
@@ -1513,6 +1938,7 @@ class BPlotAxes {
     // yerr/xerr take a number, one sequence (symmetric) or two sequences
     // [lower, upper] (asymmetric).
     def errorbar($x, $y, $opts) {
+        $this.dateIfTime($x);
         $xs = $this.categorise(_seq($x, "x"), "x");
         $ys = $this.categorise(_seq($y, "y"), "y");
         if (len($xs) != len($ys)) {
@@ -1544,6 +1970,7 @@ class BPlotAxes {
     // y2 defaults to zero. NaN in either edge breaks the band, for the same
     // reason NaN breaks a line (BP9).
     def fill_between($x, $y1, $y2, $opts) {
+        $this.dateIfTime($x);
         $xs = $this.categorise(_seq($x, "x"), "x");
         $a = _seq($y1, "y1");
         if (len($xs) != len($a)) {
@@ -1591,6 +2018,7 @@ class BPlotAxes {
     // because a step chart drawn with the wrong convention is off by one
     // sample and still looks plausible.
     def step($x, $y, $opts) {
+        $this.dateIfTime($x);
         $xs = $this.categorise(_seq($x, "x"), "x");
         $ys = $this.categorise(_seq($y, "y"), "y");
         if (len($xs) != len($ys)) {
@@ -1620,6 +2048,7 @@ class BPlotAxes {
 
     // stem(x, y, {bottom, color, size, label})
     def stem($x, $y, $opts) {
+        $this.dateIfTime($x);
         $xs = $this.categorise(_seq($x, "x"), "x");
         $ys = $this.categorise(_seq($y, "y"), "y");
         if (len($xs) != len($ys)) {
@@ -1746,6 +2175,14 @@ class BPlotAxes {
     // and the axes labelled by category. The combination people actually want
     // when they say "heatmap", and the one SVG is genuinely good at.
     def heatmap($z, $opts) {
+        // A frame is drawn as its numeric columns, labelled with their names,
+        // unless the caller labelled them.
+        if (_kindOf($z) == "frame") {
+            $o = {};
+            if ($opts != null) { each ($k in keys($opts)) { $o[$k] = $opts[$k]; } }
+            if ($o["cols"] == null) { $o["cols"] = _numericNames($z.names, $z.cols, null); }
+            $opts = $o;
+        }
         if ($opts == null) { $opts = {}; }
         $o = {};
         each ($k in keys($opts)) { $o[$k] = $opts[$k]; }
@@ -2075,21 +2512,67 @@ def _anchorOf($a) {
 // boxplot/violin take either one sequence or a list of sequences. Telling
 // them apart by looking at the first element is the only way -- and getting it
 // wrong silently turns fifty samples into fifty one-point boxes.
+def _noColumn($nm, $names) {
+    return "bplot.plot_frame: there is no column '" + str($nm) + "' -- the columns are " + join($names, ", ");
+}
+
+def _describeColumns($names, $cols) {
+    $parts = [];
+    $i = 0;
+    while ($i < len($names)) {
+        push($parts, $names[$i] + " (" + col_dtype($cols[$names[$i]]) + ")");
+        $i = $i + 1;
+    }
+    return join($parts, ", ");
+}
+
+// 0..n-1 in the current representation: the x of a table with no x column.
+def _rowNumbers($n) {
+    if ($_NAT["on"]) { return nd_arange(0, $n, 1); }
+    $out = [];
+    $i = 0;
+    while ($i < $n) { push($out, $i); $i = $i + 1; }
+    return $out;
+}
+
+// A category label: text as itself, a whole number without a decimal point.
+def _labelText($v) {
+    if (type($v) == "number" && isfinite($v) && $v == floor($v)) { return _fmt($v, 0); }
+    return str($v);
+}
+
+// Group labels default to a frame's numeric column names.
+def _labelsFor($data, $labels) {
+    if ($labels == null && _kindOf($data) == "frame") {
+        return _numericNames($data.names, $data.cols, null);
+    }
+    return $labels;
+}
+
 def _groupsOf($data, $what) {
     if ($data == null) { throw "bplot." + $what + ": data is null"; }
-    $t = type($data);
-    if ($t == "ndarray" || $t == "column") { return [_seq($data, "data")]; }
-    if ($t != "list") {
-        throw "bplot." + $what + ": data must be a list of numbers, or a list of such lists, got " + $t;
-    }
-    if (len($data) == 0) { throw "bplot." + $what + ": data is empty"; }
-    if (type($data[0]) == "list" || type($data[0]) == "ndarray" || type($data[0]) == "column") {
+    $k = _kindOf($data);
+    if ($k == "ndarray" || $k == "column" || $k == "series") { return [_nums($data, "data")]; }
+    if ($k == "frame") {
         $out = [];
-        $i = 0;
-        while ($i < len($data)) { push($out, _seq($data[$i], "data")); $i = $i + 1; }
+        each ($nm in _numericNames($data.names, $data.cols, null)) {
+            push($out, _nums($data.cols[$nm], "column '" + $nm + "'"));
+        }
+        if (len($out) == 0) { throw "bplot." + $what + ": the frame has no numeric columns"; }
         return $out;
     }
-    return [$data];
+    if ($k != "list") {
+        throw "bplot." + $what + ": data must be a list of numbers, or a list of such lists, got " + $k;
+    }
+    if (len($data) == 0) { throw "bplot." + $what + ": data is empty"; }
+    $k0 = _kindOf($data[0]);
+    if ($k0 == "list" || $k0 == "ndarray" || $k0 == "column" || $k0 == "series") {
+        $out = [];
+        $i = 0;
+        while ($i < len($data)) { push($out, _nums($data[$i], "data")); $i = $i + 1; }
+        return $out;
+    }
+    return [_nums($data, "data")];
 }
 
 // Positions 1..n with the caller's labels, or the position number.
@@ -2181,6 +2664,15 @@ def _spread($vals, $err) {
 def _grid2d($z, $what) {
     if ($z == null) { throw "bplot." + $what + ": data is null"; }
     $t = type($z);
+    if (_kindOf($z) == "frame") {
+        // The numeric columns, one row per frame row.
+        $names = _numericNames($z.names, $z.cols, null);
+        if (len($names) == 0) { throw "bplot." + $what + ": the frame has no numeric columns"; }
+        $filled = [];
+        each ($nm in $names) { push($filled, _colF64($z.cols[$nm])); }
+        $z = nd_to_list(nd_from_frame($filled));
+        $t = "list";
+    }
     if ($t == "ndarray") {
         $shape = nd_shape($z);
         if (len($shape) != 2) {
@@ -3175,7 +3667,49 @@ def _drawColorbar($bk, $ax) {
 // emits points="NaN,12 ..." which every browser renders as NOTHING AT ALL,
 // with no error anywhere -- the worst failure mode available. Splitting draws
 // the valid segments and makes the gap visible as a gap.
+// The scale pre-pass over an ndarray, as numba passes that reproduce _fwd bit
+// for bit: the same libm calls in the same order. A non-positive value on a log
+// axis raises through _fwd itself, so the message is the same one, naming the
+// first offending value in data order.
+def _projectArr($a, $scale, $lt) {
+    if ($scale == "linear") { return $a; }
+    if ($scale == "log") {
+        $bad = nd_logical_and(nd_isfinite($a), nd_less_equal($a, 0, null), null);
+        if (nd_to_list(nd_any($bad, null))) { _fwd($a[nd_to_list(nd_argmax($bad, null))], "log", $lt); }
+        return nd_log10($a, null);
+    }
+    $abs = nd_abs($a, null);
+    $inside = nd_multiply($a, $_LINADJ, null);
+    $sgnlt = nd_multiply(nd_sign($a, null), $lt, null);
+    $outside = nd_multiply($sgnlt, nd_add(nd_log10(nd_divide($abs, $lt, null), null), $_LINADJ, null), null);
+    return nd_where(nd_less_equal($abs, $lt, null), $inside, $outside);
+}
+
+// Pixels as separate numba passes -- multiply, then add -- so no compiler can
+// fuse them into a multiply-add that rounds differently from the interpreter's
+// `x * a + b` (BP33). `finite` is decided on the DATA, as the pure path does.
+def _pixelsArr($a, $T) {
+    $xs = _projectArr($a["x"], $T["xs"], $T["xlt"]);
+    $ys = _projectArr($a["y"], $T["ys"], $T["ylt"]);
+    return {
+        "fin": nd_logical_and(nd_isfinite($xs), nd_isfinite($ys), null),
+        "px":  nd_add(nd_multiply($xs, $T["xa"], null), $T["xb"], null),
+        "py":  nd_add(nd_multiply($ys, $T["ya"], null), $T["yb"], null)
+    };
+}
+
+def _drawLineNative($bk, $ax, $a, $T) {
+    $P = _pixelsArr($a, $T);
+    $runs = bp_line_runs($P["px"], $P["py"], $P["fin"], $ax.simplify);
+    each ($run in $runs) {
+        if (len($run) >= 4) { $bk.polyline($run, $a["color"], $a["width"], $a["dash"]); }
+        else { $bk.circle($run[0], $run[1], $a["width"], $a["color"]); }
+    }
+    return null;
+}
+
 def _drawLine($bk, $ax, $a, $T) {
+    if ($a["native"] == true) { return _drawLineNative($bk, $ax, $a, $T); }
     // The pre-pass happens here and only when it is needed; the loop below is
     // B1's, unchanged, so a linear axis runs exactly the code it used to.
     $xs = $a["x"];
@@ -3252,7 +3786,32 @@ def _colPoints($x, $first, $lo, $hi, $last) {
     return $p;
 }
 
+// At SCATTER_BATCH finite points and above -- BP3's own threshold -- a series
+// is one <path> of circles instead of one <circle> each. Each circle is two
+// half-arcs, the smallest exact circle a path can express. Below it nothing
+// changes, so no existing smaller document moves.
+$_SCATTER_BATCH = 1000;
+
+def _scatterArc($r) {
+    return "a" + _px($r) + "," + _px($r) + " 0 1,0 ";
+}
+
+def _drawScatterNative($bk, $ax, $a, $T) {
+    $P = _pixelsArr($a, $T);
+    $nf = nd_to_list(nd_sum(nd_astype($P["fin"], "f64"), null));
+    if ($nf >= $_SCATTER_BATCH) {
+        $bk.path(bp_scatter_path($P["px"], $P["py"], $P["fin"], $a["size"]), $a["color"], null, null);
+        return null;
+    }
+    $cx = nd_to_list(nd_compress($P["fin"], $P["px"]));
+    $cy = nd_to_list(nd_compress($P["fin"], $P["py"]));
+    $i = 0;
+    while ($i < len($cx)) { $bk.circle($cx[$i], $cy[$i], $a["size"], $a["color"]); $i = $i + 1; }
+    return null;
+}
+
 def _drawScatter($bk, $ax, $a, $T) {
+    if ($a["native"] == true) { return _drawScatterNative($bk, $ax, $a, $T); }
     $xs = $a["x"];
     $ys = $a["y"];
     if ($T["xs"] != "linear") { $xs = _project($xs, $T["xs"], $T["xlt"]); }
@@ -3261,8 +3820,31 @@ def _drawScatter($bk, $ax, $a, $T) {
     $ya = $T["ya"]; $yb = $T["yb"];
     $r = $a["size"];
     $c = $a["color"];
-    $i = 0;
     $n = len($xs);
+    $nf = 0;
+    $i = 0;
+    while ($i < $n) { if (isfinite($xs[$i]) && isfinite($ys[$i])) { $nf = $nf + 1; } $i = $i + 1; }
+    if ($nf >= $_SCATTER_BATCH) {
+        // The same string bp_scatter_path builds, from the same arithmetic.
+        $arc = _scatterArc($r);
+        $d2 = _px($r + $r);
+        $md2 = _px(0 - ($r + $r));
+        $parts = [];
+        $i = 0;
+        while ($i < $n) {
+            $xv = $xs[$i];
+            $yv = $ys[$i];
+            if (isfinite($xv) && isfinite($yv)) {
+                $pxv = $xv * $xa + $xb;
+                $pyv = $yv * $ya + $yb;
+                push($parts, "M" + _px($pxv - $r) + "," + _px($pyv) + $arc + $d2 + ",0" + $arc + $md2 + ",0");
+            }
+            $i = $i + 1;
+        }
+        $bk.path(join($parts, ""), $c, null, null);
+        return null;
+    }
+    $i = 0;
     while ($i < $n) {
         $xv = $xs[$i];
         $yv = $ys[$i];
@@ -3774,6 +4356,7 @@ def fill_between($x, $y1, $y2, $o)  { return gca().fill_between($x, $y1, $y2, $o
 def step($x, $y, $opts)             { return gca().step($x, $y, $opts); }
 def stem($x, $y, $opts)             { return gca().stem($x, $y, $opts); }
 def pie($v, $opts)                  { return gca().pie($v, $opts); }
+def plot_frame($df, $opts)          { return gca().plot_frame($df, $opts); }
 
 def text($x, $y, $s, $opts)         { return gca().addText($x, $y, $s, $opts); }
 def annotate($s, $x, $y, $opts)     { return gca().annotate($s, $x, $y, $opts); }
@@ -3885,6 +4468,8 @@ def help() {
     print("                violin(data, opts)  errorbar(x, y, opts)");
     print("                fill_between(x, y1, y2, opts)");
     print("                step(x, y, opts)    stem(x, y, opts)   pie(values, opts)");
+    print("  Tables        plot_frame(df, {kind, x, y, title})  kind: line bar barh");
+    print("                scatter hist box step;  with arctic, $df.plot(opts)");
     print("  Scales        xscale(s, linthresh)   yscale(s, linthresh)");
     print("                s is \"linear\", \"log\" or \"symlog\"");
     print("                xdate(on)   x values are epoch ms, UTC");
@@ -3906,7 +4491,8 @@ def help() {
     print("    color   a named colour, \"#rgb\", \"#rrggbb\", or [r, g, b]");
     print("    label   makes the series appear in legend()");
     print("");
-    print("  x and y accept a Bantu list, a numba ndarray, or an arctic column.");
+    print("  x and y accept a Bantu list, a numba ndarray, or an arctic column or");
+    print("  Series. A null is a gap; a datetime column makes a date axis.");
     print("");
     print("  Serving charts built from untrusted data? SVG is an executable");
     print("  document format. bplot escapes everything it emits, but serve it");

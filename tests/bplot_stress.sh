@@ -111,6 +111,152 @@ else
     cat "$TMP/cases.log"
 fi
 
+# ── B4: data from arctic and numba, at scale and with holes in it ────────
+# Rendered BEFORE the XML gate below, so every one of these documents is also
+# handed to a real XML parser.
+#
+# The numbers this section exists for, measured before B4 on one 1,000,000-
+# point line through the convert-to-a-list boundary: ~20 s and 3.1 GB of
+# resident memory (docs/bplot-architecture.md §13).
+echo "-- B4: arctic and numba data, at scale and with holes in it --"
+cat > "$TMP/b4.b" <<'BEOF'
+include "./bplot/bplot.b" as plt;
+include "./arctic/arctic.b" as ac;
+
+// 1,000,000 rows, built natively, so the frame is arctic columns end to end.
+$x = nd_linspace(0, 100, 1000000, null);
+$y = nd_add(nd_sin($x, null), nd_multiply(nd_cos(nd_multiply($x, 7.3, null), null), 0.2, null), null);
+$df = ac.from_columns({"t": nd_to_column($x, null), "v": nd_to_column($y, null)});
+
+$t0 = clock();
+$f = plt.figure(900, 500);
+$a = $f.addAxes();
+$a.plot($df.get("t"), $df.get("v"), {"label": "v"});
+$a.setTitle("1M rows");
+$f.savefig("OUTDIR/b4_million_line.svg");
+print("LINE_MS " + str(clock() - $t0));
+
+$t0 = clock();
+$f = plt.figure(900, 500); $a = $f.addAxes();
+$a.hist($df.get("v"), {"bins": 60});
+$f.savefig("OUTDIR/b4_million_hist.svg");
+print("HIST_MS " + str(clock() - $t0));
+
+$t0 = clock();
+$f = plt.figure(900, 500); $a = $f.addAxes();
+$a.boxplot([$df.get("v"), $df.get("t")], {"labels": ["v", "t"]});
+$f.savefig("OUTDIR/b4_million_box.svg");
+print("BOX_MS " + str(clock() - $t0));
+
+$t0 = clock();
+$f = plt.figure(900, 500); $a = $f.addAxes();
+$a.violin($df.get("v"), null);
+$f.savefig("OUTDIR/b4_million_violin.svg");
+print("VIOLIN_MS " + str(clock() - $t0));
+
+// A column that is one-third holes.
+$holes = [];
+$i = 0;
+while ($i < 5000) {
+    if ($i % 3 == 0) { push($holes, null); } else { push($holes, sin($i * 0.01)); }
+    $i = $i + 1;
+}
+$f = plt.figure(600, 400); $a = $f.addAxes();
+$a.plot(nd_arange(0, 5000, 1), ac.series("h", $holes, "f64"), null);
+$f.savefig("OUTDIR/b4_nulls.svg");
+print("NULLS_OK");
+
+// A column that is ALL nulls: nothing to draw, and still a valid chart.
+$f = plt.figure(600, 400); $a = $f.addAxes();
+$a.plot([1, 2, 3], ac.series("z", [null, null, null], "f64"), null);
+$a.hist(ac.series("z", [null, null, null], "f64"), null);
+$f.savefig("OUTDIR/b4_all_null.svg");
+print("ALLNULL_OK");
+
+// A frame with a text column selected by name raises, catchably -- and the
+// process carries on and still draws the frame correctly afterwards.
+$mixed = ac.dataframe({"name": ["a", "b", "c"], "score": [3, 1, 2]}, null);
+$msg = "";
+try { plt.figure(400, 300).addAxes().plot_frame($mixed, {"y": "name"}); } catch ($e) { $msg = str($e); }
+if (contains($msg, "column 'name' is utf8")) { print("NONNUMERIC_RAISED"); }
+$f = plt.figure(600, 400); $a = $f.addAxes();
+$a.plot_frame($mixed, {"kind": "bar", "x": "name"});
+$f.savefig("OUTDIR/b4_frame_bar.svg");
+print("FRAME_OK");
+
+// Hostile column NAMES reach the legend and the axis labels.
+$evil = "</text><script>alert(1)</script>";
+$d = {};
+$d[$evil] = [1, 2, 3];
+$d["ok"] = [3, 2, 1];
+$f = plt.figure(600, 400); $a = $f.addAxes();
+$a.plot_frame(ac.dataframe($d, null), null);
+$f.savefig("OUTDIR/b4_hostile_names.svg");
+print("HOSTILE_OK");
+
+// A 1,000,000-point scatter, batched into one path.
+$t0 = clock();
+$f = plt.figure(900, 500); $a = $f.addAxes();
+$a.scatter($x, $y, {"size": 1});
+$f.savefig("OUTDIR/b4_million_scatter.svg");
+print("SCATTER_MS " + str(clock() - $t0));
+BEOF
+sed -i.bak "s#OUTDIR#$TMP#g" "$TMP/b4.b" && rm -f "$TMP/b4.b.bak"
+if "$BANTU" -q run "$TMP/b4.b" > "$TMP/b4.log" 2>&1; then
+    ok "every B4 case rendered"
+else
+    bad "a B4 case raised"
+    tail -20 "$TMP/b4.log"
+fi
+msOf() { sed -n "s/^$1 //p" "$TMP/b4.log" | head -1; }
+LINE_MS="$(msOf LINE_MS)"; HIST_MS="$(msOf HIST_MS)"; BOX_MS="$(msOf BOX_MS)"
+VIOLIN_MS="$(msOf VIOLIN_MS)"; SCATTER_MS="$(msOf SCATTER_MS)"
+echo "        1,000,000 rows: line ${LINE_MS} ms, hist ${HIST_MS} ms, box ${BOX_MS} ms, violin ${VIOLIN_MS} ms, scatter ${SCATTER_MS} ms"
+# Gates carry roughly ten times headroom over this machine for a loaded CI box;
+# each is still an order of magnitude under what the list boundary cost.
+check "$([ -n "$LINE_MS" ] && [ "$LINE_MS" -lt 5000 ] && echo 1 || echo 0)" \
+      "a 1,000,000-row arctic column draws as a line in under 5 s (was ~20 s)"
+check "$([ -n "$HIST_MS" ] && [ "$HIST_MS" -lt 3000 ] && echo 1 || echo 0)" \
+      "a 1,000,000-row histogram in under 3 s"
+check "$([ -n "$BOX_MS" ] && [ "$BOX_MS" -lt 8000 ] && echo 1 || echo 0)" \
+      "two 1,000,000-row boxes in under 8 s"
+check "$([ -n "$VIOLIN_MS" ] && [ "$VIOLIN_MS" -lt 8000 ] && echo 1 || echo 0)" \
+      "a 1,000,000-row violin in under 8 s"
+check "$([ -n "$SCATTER_MS" ] && [ "$SCATTER_MS" -lt 20000 ] && echo 1 || echo 0)" \
+      "a 1,000,000-point scatter in under 20 s"
+LINE_BYTES="$(wc -c < "$TMP/b4_million_line.svg" 2>/dev/null | tr -d ' ')"
+echo "        the 1,000,000-row line document: ${LINE_BYTES} bytes"
+check "$([ "${LINE_BYTES:-0}" -gt 0 ] && [ "$LINE_BYTES" -lt 100000 ] && echo 1 || echo 0)" \
+      "and its size is set by the canvas, not the data"
+for mark in NULLS_OK ALLNULL_OK NONNUMERIC_RAISED FRAME_OK HOSTILE_OK; do
+    check "$(grep -c "^$mark\$" "$TMP/b4.log")" "B4 $mark"
+done
+check "$([ -f "$TMP/b4_hostile_names.svg" ] && ! grep -q '<script' "$TMP/b4_hostile_names.svg" && echo 1 || echo 0)" \
+      "a hostile column name is escaped wherever plot_frame writes it"
+
+cat > "$TMP/b4rss.b" <<'BEOF'
+include "./bplot/bplot.b" as plt;
+include "./arctic/arctic.b" as ac;
+$x = nd_linspace(0, 100, 1000000, null);
+$df = ac.from_columns({"t": nd_to_column($x, null), "v": nd_to_column(nd_sin($x, null), null)});
+$f = plt.figure(900, 500);
+$a = $f.addAxes();
+$a.plot($df.get("t"), $df.get("v"), null);
+print(len($f.to_svg()));
+BEOF
+if /usr/bin/time -l true >/dev/null 2>&1; then
+    B4_RSS="$(/usr/bin/time -l "$BANTU" -q run "$TMP/b4rss.b" 2>&1 | awk '/maximum resident/ { print int($1/1024) }')"
+else
+    B4_RSS="$(/usr/bin/time -v "$BANTU" -q run "$TMP/b4rss.b" 2>&1 | awk '/Maximum resident/ { print int($NF) }')"
+fi
+if [ -n "${B4_RSS:-}" ] && [ "$B4_RSS" -gt 0 ]; then
+    echo "        peak RSS plotting 1,000,000 rows: ${B4_RSS} KB (was ~3.1 GB)"
+    check "$([ "$B4_RSS" -lt 400000 ] && echo 1 || echo 0)" \
+          "plotting 1,000,000 rows peaks under 400 MB"
+else
+    echo "  --    could not measure RSS on this platform; skipping the B4 memory gate"
+fi
+
 # ── The gate that cannot be written in Bantu ─────────────────────────────
 if [ -z "$PY" ]; then
     echo "  --    no python found; skipping the XML well-formedness gate"

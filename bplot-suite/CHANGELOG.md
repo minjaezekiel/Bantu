@@ -446,3 +446,70 @@ B6. The original wording is kept in the roadmap alongside the correction, and B6
 - **[test]** `tests/bplot_stress.sh` — **48 checks**, including the RSS gate.
 - **[test]** Full regression green on the same build: **37 `.b` suites, 13 `.sh` suites**, and all
   four `samples/bplot/` programs executed by `tests/run_samples.sh`.
+
+---
+
+## Phase B4 — Data integration
+
+- **[design]** `docs/bplot-architecture.md` §13 rewritten around a measurement, and decisions
+  BP31–BP36. The B0 design converted every input to a Bantu list at the boundary; measured on one
+  1,000,000-point line that cost **~20 s and 3.1 GB**, because a list of a million 190-byte values is
+  copied on every function call that receives it.
+- **[feature]** `plot`, `scatter`, `hist`, `boxplot` and `violin` take a Bantu list, a numba ndarray,
+  an arctic column or a `Series`, and render **byte-identical documents** from all four (BP31, BP32).
+  bplot includes neither library; it recognises their shape.
+- **[feature]** `plot_frame($df, {kind, x, y, title})` — `line`, `bar`, `barh`, `scatter`, `hist`,
+  `box`, `step`. Every numeric column by default; more than one series turns the legend on and groups
+  bars. A text column named explicitly raises, naming it and its type (BP35).
+- **[feature]** arctic's `$df.plot(opts)` and `$series.plot(opts)`, which include bplot **lazily** —
+  only on the first plot, as pandas does — and share the current figure with your own `plt`.
+- **[feature]** `heatmap($df)` draws the numeric columns with their names as labels.
+- **[feature]** a null is a gap; a datetime column makes a date axis on its own; a date column is
+  days scaled to milliseconds (BP34).
+- **[perf]** `bp_line_runs`, `bp_scatter_path` and `bp_escape` in `plot_native.hpp` (BP33). They are
+  handed pixels, not data, so they contain no arithmetic a compiler could fuse into a multiply-add
+  that rounds differently from the interpreter, and they reproduce the pure path byte for byte.
+  Scatter at 1,000 points and above is one `<path>`; below it nothing changes.
+
+### Measured
+
+| | native | pure path, same build |
+|---|---|---|
+| 1,000,000-row column as a line | **252 ms** | 15,455 ms |
+| peak RSS | **112 MB** | 2.69 GB |
+| the document | 23,825 bytes | 23,825 bytes, identical |
+| 1,000,000 rows: hist / two boxes / violin | 61 / 241 / 306 ms | — |
+| 1,000,000-point scatter | 1,523 ms | — |
+
+### Solved defects encountered
+
+- **[bug fix] `include "bplot"` bound an empty module** when run from a folder that contains a
+  `bplot/` directory — this repository's own layout. The resolver's existence check accepted a
+  directory, a directory reads as an empty file, and the alias was bound with no error at all. A
+  module must now be a regular file, and a bare name naming a directory resolves inside it.
+- **[bug fix] `len()` returned 0 for a dict, an ndarray and a column**, so `while ($i < len($a))`
+  never ran. An existing test had pinned the dict answer to prove an earlier performance change was
+  behaviour-neutral; it is corrected in place with the reason.
+- **[bug fix] `contains()` returned false for every list.**
+- **[bug fix] hour and minute date labels carried no date** — a four-day axis read
+  `00:00 12:00 00:00 …` — although §6.3 had specified a dated label. Now matplotlib's
+  `%m-%d %H` and `%d %H:%M`, verified against matplotlib 3.11.2; the B2 assertions that pinned the
+  old format are corrected in place.
+- **[bug fix] a list containing `null` could not be plotted**; it is a gap now, like a null in a
+  column.
+- **[bug fix] a 2-D ndarray passed to `plot`** became nested lists that failed far from the cause; it
+  raises at the boundary, naming its shape.
+
+### Tests
+
+- **[test]** `tests/bplot_data_test.b` — **138 assertions**: the four-input gate and the
+  native-against-pure gate on 17 chart configurations, nulls, datetimes, text, every `plot_frame`
+  kind and its errors, `df.plot()` sharing the figure, and the kernels attacked directly.
+- **[test]** `tests/bplot_stress.sh` — **62 checks** (48 before): 1,000,000 rows through line, hist,
+  box, violin and scatter with wall-clock gates, a document-size gate, a peak-RSS gate, a mostly-null
+  and an all-null column, a non-numeric column selected, and hostile column names — every document
+  parsed as XML.
+- **[test]** the language fixes: `tests/lang_list_test.b`, `tests/lang_module_test.b`,
+  `tests/numba_array_test.b`, `tests/arctic_api_test.b`.
+- **[test]** `samples/bplot/05_dataframe.b` — a frame, a datetime column with a gap, and a million
+  rows, executed by `tests/run_samples.sh`.

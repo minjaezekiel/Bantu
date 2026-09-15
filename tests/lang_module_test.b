@@ -109,6 +109,28 @@ try {
 ok($raised, "using an alias whose include failed raises at the point of use");
 
 print("");
+print("-- a bare name naming a DIRECTORY resolves inside it --");
+// Fixtures: tests/dirpkg/, tests/dirmain/, tests/nomodule/, tests/greeter/.
+include "dirpkg" as dp;
+eq(dp.NAME, "dirpkg", "a folder holding <name>.b resolves, as Node's require('./dir') does");
+include "dirmain" as dm;
+eq(dm.NAME, "dirmain-main", "a folder's package.json main is honoured");
+include "greeter" as g2;
+eq(g2.ENTRY, "src/hello.b", "an installed package still wins over a folder of the same name");
+
+// THE DEFECT: a directory was accepted as a module file, read as empty, and
+// bound to the alias with no error -- so this raised nothing and every field
+// read null. A folder with no module in it must be reported as missing.
+include "nomodule" as nm;
+$emptyRaised = false;
+try {
+    $x = nm.anything;
+} catch ($e) {
+    $emptyRaised = true;
+}
+ok($emptyRaised, "a folder with no module in it is reported missing, never bound as an empty module");
+
+print("");
 print("========================================");
 print("  PASS: " + str($R.pass) + "   FAIL: " + str($R.fail));
 print("========================================");

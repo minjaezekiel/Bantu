@@ -287,7 +287,12 @@ eq(dateTickStr(946684800000, 1735689600000),
 print("");
 print("-- date labels carry only what the step needs --");
 eq(plt._fmtDate($E, "second"), "00:00:00", "a seconds axis drops the date");
-eq(plt._fmtDate($E, "minute"), "00:00", "a minutes axis drops the seconds");
+// These two read `"00:00", "a minutes axis drops the seconds"` until B4. A bare
+// time is ambiguous on any axis that crosses midnight, so minute and hour labels
+// now carry the day exactly as matplotlib's defaults do: '%d %H:%M' and
+// '%m-%d %H' (date.autoformatter.minute / .hour, checked against 3.11.2).
+eq(plt._fmtDate($E, "minute"), "01 00:00", "a minutes axis carries the day, as matplotlib's does");
+eq(plt._fmtDate($E + 13 * 3600000, "hour"), "01-01 13", "an hours axis carries month and day, as matplotlib's does");
 eq(plt._fmtDate($E, "day"), "2024-01-01", "a daily axis drops the time");
 eq(plt._fmtDate($E, "month"), "2024-01", "a monthly axis drops the day");
 eq(plt._fmtDate($E, "year"), "2024", "a yearly axis is just the year");

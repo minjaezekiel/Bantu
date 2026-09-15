@@ -47,6 +47,30 @@ All notable changes to the Bantu programming language are documented in this fil
   [`docs/object-lifetime-architecture.md`](docs/object-lifetime-architecture.md). Tests:
   `tests/lang_gc_test.b` (55 assertions) and `tests/gc_stress.sh` (19 checks).
 
+- **[feature] bplot draws arctic and numba data directly, and fast.** `plot`, `scatter`, `hist`,
+  `boxplot` and `violin` accept a Bantu list, a numba ndarray, an arctic column or a `Series`, and
+  produce **byte-identical documents** from all four. Numeric data now stays native until it becomes
+  pixels: one 1,000,000-row column drawn as a line went from **~20 s and 3.1 GB** to **under a
+  second**, because a Bantu list of a million 190-byte values was being copied on every function
+  call. A null is a gap, a datetime column makes a date axis on its own, and
+  `$df.plot({"kind": "bar", "x": "month", "y": ["rain", "temp"]})` draws a whole table — arctic
+  includes bplot lazily, only when you plot. See `docs/bplot-architecture.md` §13.
+
+- **[bug fix] `include "name"` no longer binds an empty module when a folder of that name exists.**
+  The resolver accepted a directory as a module and parsed it as an empty file, with no error. A
+  module must now be a regular file, and a bare name naming a directory resolves inside it
+  (`package.json` `main`, `<name>.b`, `index.b`).
+
+- **[bug fix] `len()` of a dict, an ndarray or a column returned 0**, so a loop bounded by it never
+  ran. A dict counts its entries, an ndarray reports its first axis (a 0-d array raises), a column
+  its rows.
+
+- **[bug fix] `contains(list, value)` returned false for every list.** It now tests membership with
+  the same equality as `==`.
+
+- **[bug fix] bplot date axes at hour and minute resolution showed no date.** A four-day axis read
+  `00:00 12:00 00:00 …`. Labels now follow matplotlib's defaults, `MM-DD HH` and `DD HH:MM`.
+
 - **[feature] `sort` by a key, not just a comparator.** A comparator is called O(n log n) times; a
   key is called n times, and the ordering then happens in C++ on the keys alone.
 

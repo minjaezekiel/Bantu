@@ -139,7 +139,12 @@ eq(len($L), 3, "len of a list variable");
 $S = "hello";
 eq(len($S), 5, "len of a string variable");
 $D = {"a": 1, "b": 2};
-eq(len($D), 0, "len of a dict is still 0, exactly as before");
+// This line used to read `eq(len($D), 0, "len of a dict is still 0, exactly as
+// before")`. It pinned the old answer to prove the copy-free change above did
+// not alter behaviour -- which it did not. But 0 was never RIGHT: it made
+// `while ($i < len($d))` silently skip every dict. len() now counts entries
+// (bplot decision BP36), so the pin moves with the fix.
+eq(len($D), 2, "len of a dict counts its entries");
 $Z = [];
 eq(len($Z), 0, "len of an empty list");
 $N = 42;
@@ -226,6 +231,24 @@ while ($i < 20000) {
 }
 ok($ordered, "and they are in order");
 ok($sortMs < 3000, "in well under three seconds");
+
+print("");
+print("-- contains() on a list (fixed: it answered false for EVERY list) --");
+// contains() was string-only and fell through to `false` for anything else,
+// so contains([1, 2], 1) was false and a membership guard silently took the
+// wrong branch. Equality is exactly the one == uses.
+eq(contains([1, 2, 3], 2), true, "a number that is there");
+eq(contains([1, 2, 3], 9), false, "a number that is not");
+eq(contains(["a", "b"], "b"), true, "a string element");
+eq(contains(["ab", "cd"], "b"), false, "membership, not a substring search inside elements");
+eq(contains([1, null, 3], null), true, "null is a value like any other");
+eq(contains([[1, 2], [3]], [1, 2]), true, "a nested list, compared structurally as == does");
+eq(contains([{"k": 1}], {"k": 1}), true, "a dict, compared structurally as == does");
+eq(contains([], 1), false, "an empty list contains nothing");
+eq(contains([1, 2], true), true, "true == 1 in Bantu, so contains agrees with ==");
+eq(contains("hello", "ell"), true, "the string form is unchanged");
+eq(contains("hello", "xyz"), false, "and still answers false when absent");
+eq(contains(42, 4), false, "a non-container still answers false");
 
 print("");
 print("========================================");

@@ -264,6 +264,10 @@ over the proleptic Gregorian calendar, no table.
 **Parity is exact** on all eight ranges checked, ten seconds to twenty-five years — including the two
 a look-alike gets wrong: a three-month range switches to *semi-monthly* ticks (the 1st and the 15th),
 and a twenty-five-year range picks a **four**-year interval on multiples of four, not five.
+> **Label formats corrected in B4.** Parity was checked for tick *locations*, not their *labels*, and
+> the minute and hour labels were bare `HH:MM` — ambiguous on any axis crossing midnight, and not what
+> the architecture doc specified. They are now matplotlib's defaults, `%d %H:%M` and `%m-%d %H`,
+> verified against matplotlib 3.11.2 on the four-day range that exposed it.
 **This entry originally hedged** ("close but not claimed to be exact"), because the plan was to
 approximate the ladder. Reading `AutoDateLocator.get_locator` showed the rule is four lines, so
 exact reproduction cost less than approximation and cannot drift on a range nobody checked. The
@@ -383,3 +387,49 @@ a test that a cycle would fail immediately.
 > worker holds less between collections. What changes is that this is now a preference rather than a
 > requirement — a future bplot feature that genuinely needs a back-reference may take one, and the
 > RSS gate above stays as the thing that would catch a mistake either way.
+
+### BP31 — Recognise data by its shape; include neither library
+bplot accepts a list, an ndarray, a column, a Series and a DataFrame without `include`-ing arctic or
+numba. A Series is an instance whose `.col` is a column; a DataFrame is an instance whose `.names` is a
+list and `.cols` a dict. Including arctic would load 1,400 lines into every chart and make a plotting
+library depend on a dataframe library, which is backwards; recognising the shape means any future
+type that wraps a column works unchanged. See §13.1.
+
+### BP32 — Numeric data stays native until it becomes pixels
+**Measured first:** one 1,000,000-point line through B3's convert-to-a-list boundary took ~20 s and
+**3.1 GB**. A Bantu `Value` is ~190 bytes and a list is copied on every call that receives it.
+So `plot`, `scatter`, `hist`, `boxplot` and `violin` normalise every numeric input — lists included —
+to a 1-D f64 ndarray at the boundary, and every reduction is a numba kernel. All four input types then
+run identical code over an identical representation, which makes the B4 gate structural.
+**The pure-Bantu path is kept** as the fallback for an interpreter without numba and as the
+differential oracle: `_useNative(false)` forces it, and the same data must render identically through
+both. See §13.2.
+**Measured result:** the same 1,000,000-row line is **252 ms and 112 MB** peak RSS through the native
+path and **15,455 ms and 2.69 GB** through the pure path, on one build — and both documents are
+23,825 bytes, identical.
+
+### BP33 — One kernel, and it is handed pixels, not data
+Everything composes from existing numba kernels except B1's path simplification (BP3), which becomes
+`bp_line_runs(px, py, simplify)`. The scale transform and the affine map are done beforehand as
+separate numba passes, so no compiler can fuse `x * a + b` into a multiply-add that rounds
+differently from the interpreter; the kernel holds only comparisons and `std::round`, and its output
+is BP3's by construction. Scatter at ≥ 1,000 points — BP3's own threshold — is emitted as one native
+`<path>` instead of one `<circle>` per point; below it nothing moves. See §13.3.
+
+### BP34 — A numeric null is a gap
+Numeric nulls become NaN — a gap in a line, skipped by limits, binning and box statistics — which is
+pandas' behaviour and the only answer that neither invents a value nor refuses to draw. Categorical
+nulls label as `null`. Datetime columns become epoch ms and switch the x axis to a date axis; date
+columns are days × 86,400,000. See §13.4.
+
+### BP35 — `plot_frame` in bplot; `df.plot()` in arctic, included lazily
+bplot owns the table-shaped entry point. arctic's `DataFrame.plot()` and `Series.plot()` include bplot
+inside the method on first call — pandas' design, for pandas' reason: the dependency exists only when
+the convenience is used, and a missing package produces "bantu add bplot" rather than an undefined
+name. A column named explicitly that is not numeric raises naming it; only the default selection
+skips non-numeric columns. See §13.5.
+
+### BP36 — Four silent language defects, found by B4 and fixed
+`include` of a bare name bound an empty module when a same-named directory existed; `len()` returned
+0 for dicts, ndarrays and columns; `contains()` returned false for every list; and the performance wall
+of BP32. Each is fixed in the interpreter, not worked around in bplot. See §13.6.
