@@ -513,3 +513,44 @@ B6. The original wording is kept in the roadmap alongside the correction, and B6
   `tests/numba_array_test.b`, `tests/arctic_api_test.b`.
 - **[test]** `samples/bplot/05_dataframe.b` — a frame, a datetime column with a gap, and a million
   rows, executed by `tests/run_samples.sh`.
+
+---
+
+## Phase B5 — Package, docs, gallery
+
+- **[docs]** `docs/bplot.md` — three lines to a chart; a tour of lines, bars, scatters, distributions,
+  scales and dates, layouts, grids, tables from arctic and styles; serving from sua; **the SVG
+  security section**, under a heading a reader will actually reach; measured numbers; things worth
+  knowing; and blunt caveats. Every example on the page is executed.
+- **[test]** `tests/run_doc_examples.sh` — every ```` ```bantu ```` block of a doc runs as **one
+  program, in reading order**, from an empty directory that links the packages, so an example cannot
+  rot and cannot write into the repository (BP37). Covers `docs/bplot.md`, `docs/numba.md` and
+  `docs/arctic.md`.
+- **[test]** `tests/bplot_package_test.sh` — the clean-project gate, 17 checks, run in a throwaway
+  `HOME` so it never touches the real registry.
+- **[feature]** `samples/bplot/server.b` — a chart drawn per request and served through sua, with the
+  object API and a Content-Security-Policy (BP38); `tests/bplot_sua_test.sh`, 15 checks including 40
+  concurrent requests that must each receive only their own chart.
+- **[feature]** bplot **1.1.0**. `package.json` describes what the package now is; the smoke test also
+  draws an ndarray.
+- **[test]** CI: the three new gates in the Linux and macOS jobs, and bplot's smoke test in the
+  Windows job — which is also the proof that `plot_native.hpp` compiles under MSVC.
+
+### Solved defects encountered
+
+- **[bug fix] numba's documented examples had never been run.** The numba roadmap recorded "every
+  documented example executed by CI" as met; no test executed them. Run for the first time, two of the
+  nine failed: `np.sum($m, [0, 2], null)` on a 2×3 array, and a destination-buffer loop over `$a` and
+  `$b` that its block never defined, so a reader copying it hit a broadcast error from arrays built
+  sections earlier. Both corrected.
+- **[bug fix] `num()` read a prefix, swallowed overflow and ignored bools** — `num("12abc")` was 12,
+  `num("1e999")` was 0, `num(true)` was 0. It now reads the whole string, overflow is infinity, a bool
+  is 1 or 0, and `num($s, $default)` returns `$default` for input that is not a number.
+- **[bug fix] `tests/numba_sua_test.sh` described sua's threading wrongly** — every connection on its
+  own detached thread. Handlers run one at a time on the event loop; suspended handlers continue on
+  pooled task threads under a baton, never concurrently.
+
+### Not yet observed
+
+- **Cross-platform CI.** Every gate above is wired into CI; no CI run has happened on this branch, so
+  "green on three platforms" is still a claim about configuration, not a result.

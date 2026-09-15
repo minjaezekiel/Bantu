@@ -4500,4 +4500,4 @@ def help() {
     return null;
 }
 
-def version() { return "1.0.0"; }
+def version() { return "1.1.0"; }

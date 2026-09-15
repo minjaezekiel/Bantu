@@ -47,6 +47,21 @@ All notable changes to the Bantu programming language are documented in this fil
   [`docs/object-lifetime-architecture.md`](docs/object-lifetime-architecture.md). Tests:
   `tests/lang_gc_test.b` (55 assertions) and `tests/gc_stress.sh` (19 checks).
 
+- **[feature] bplot 1.1.0 — a user guide whose every example runs, a served chart, and a clean-install
+  gate.** [`docs/bplot.md`](docs/bplot.md) covers every chart family, tables from arctic, styles,
+  serving from sua and the SVG security rules, with measured numbers. Three new gates make "finished"
+  checkable: `tests/run_doc_examples.sh` executes every example in `docs/bplot.md`, `docs/numba.md`
+  and `docs/arctic.md`, each doc as one program in reading order; `tests/bplot_package_test.sh`
+  publishes, runs `bantu add` in an empty directory and draws, including a DataFrame through arctic's
+  lazy include; and `samples/bplot/server.b` serves a chart per request, which
+  `tests/bplot_sua_test.sh` holds to a Content-Security-Policy, an escaped hostile title and forty
+  concurrent requests that each receive only their own chart.
+
+- **[bug fix] numba's documented examples had never been run.** Its roadmap recorded "every
+  documented example executed by CI"; nothing executed them, and two of nine were broken — a
+  reduction over an axis the array did not have, and a loop over arrays its block never defined.
+  Both fixed, and the doc runner now executes them in CI.
+
 - **[bug fix] `num()` read a prefix, swallowed overflow and ignored bools.** `num("12abc")` was
   `12`, `num("1e999")` was `0` and `num(true)` was `0` — plausible wrong numbers in exactly the code
   that parses input it did not write. The whole string must now be a decimal number (surrounding

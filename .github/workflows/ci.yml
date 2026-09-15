@@ -122,6 +122,9 @@ jobs:
                    tests/numba_sua_test.sh \
                    tests/bplot_stress.sh \
                    tests/gc_stress.sh \
+                   tests/run_doc_examples.sh \
+                   tests/bplot_package_test.sh \
+                   tests/bplot_sua_test.sh \
                    tests/run_samples.sh; do
             echo "── $s ──"
             if out=$(bash "$s" 2>&1); then
@@ -206,6 +209,9 @@ jobs:
                    tests/numba_sua_test.sh \
                    tests/bplot_stress.sh \
                    tests/gc_stress.sh \
+                   tests/run_doc_examples.sh \
+                   tests/bplot_package_test.sh \
+                   tests/bplot_sua_test.sh \
                    tests/run_samples.sh; do
             if out=$(bash "$s" 2>&1); then
               echo "$out"
@@ -271,3 +277,8 @@ jobs:
           # Must DEGRADE to 1, not fail and not pretend it forked.
           grep -q 'workers=1' probe.out || {
             echo "::error::workers(4) should degrade to 1 on Windows"; exit 1; }
+          # bplot on Windows: its native kernels compile under MSVC, and the
+          # package draws. The full suites run in the Linux and macOS jobs.
+          "$bin" run bplot/bplot_test.b | tee bplot.out
+          grep -q 'RESULT: ALL GREEN' bplot.out || {
+            echo "::error::bplot smoke test failed on Windows"; exit 1; }

@@ -190,6 +190,12 @@ machine and no Docker here, so only macOS has actually run.**
 | Concurrency | — | — | numba called inside a sua handler under `sua_concurrency_test.sh`; a big allocation inside a handler **raises rather than OOM-killing the worker** | [ ] |
 | Cross-platform | — | — | CI green on Linux, macOS **and** Windows | [ ] |
 
+> **Correction, recorded by bplot's B5.** The *Package, docs, gallery* row gives "every documented
+> example and every sample executed by CI" as its gate. The samples half was true; **the documented
+> examples were never executed by anything**. When `tests/run_doc_examples.sh` first ran `docs/numba.md`,
+> two of its nine examples failed — see the numba CHANGELOG. Both are fixed and the runner is in CI,
+> so the gate holds from that point, not before.
+
 ## Phase 7 — Deferred, each needing its own justification
 
 Nothing here is scheduled. Each item lands only on a concrete measured wall, with its own gate.

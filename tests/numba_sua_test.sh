@@ -3,8 +3,12 @@
 #  numba_sua_test.sh — numba inside concurrent sua request handlers.
 #
 #  WHY THIS EXISTS
-#  sua runs each connection's Bantu handler on its own detached std::thread
-#  (server.hpp). numba is the first thing in the tree to put MUTABLE
+#  sua runs Bantu handlers on its event loop, one at a time; a handler that
+#  opts into suspension continues on a pooled task thread that is handed a
+#  baton, so handlers do run on DIFFERENT OS threads, never concurrently.
+#  (This comment used to say every connection got its own detached
+#  std::thread. That describes server.hpp's SuaServer, which nothing in the
+#  tree constructs.) numba is the first thing in the tree to put MUTABLE
 #  process-global state behind a builtin, so it is the first to care:
 #
 #    1. The allocation counters are shared across every request. They are

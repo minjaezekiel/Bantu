@@ -433,3 +433,20 @@ skips non-numeric columns. See §13.5.
 `include` of a bare name bound an empty module when a same-named directory existed; `len()` returned
 0 for dicts, ndarrays and columns; `contains()` returned false for every list; and the performance wall
 of BP32. Each is fixed in the interpreter, not worked around in bplot. See §13.6.
+
+### BP37 — A doc's examples run as one program, in reading order
+`tests/run_doc_examples.sh` concatenates every ```` ```bantu ```` block of a doc and runs the result
+once, rather than running each block on its own. **Why:** a tour builds on itself, and a doc where
+every block repeats its includes and its data is worse to read. Run standalone, eight of numba's nine
+blocks "failed" without being wrong; run in order, exactly the two real defects failed. Code that is
+illustrative only — a request handler, which would block — goes in a ```` ```text ```` fence.
+Each doc runs in an empty directory holding links to the packages, so `include "bplot"` resolves as it
+does in a project and examples write their files freely. That last part was learned the hard way: an
+early probe run from the repository root wrote a chart into it.
+
+### BP38 — The serving example shows both rules, and a test enforces them
+`samples/bplot/server.b` builds each chart with `plt.figure()`, never `plt.*`, and sends every SVG with
+`Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'`. **Why:** the sample is what
+people copy into production, so it must be the safe version of itself — `plt.*` shares one current
+figure across the process (BP15), and SVG executes. `tests/bplot_sua_test.sh` holds it to that with a
+hostile query-string title and 40 concurrent requests, each of which must receive only its own chart.

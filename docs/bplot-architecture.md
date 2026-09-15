@@ -1037,6 +1037,20 @@ Full table with gates in [`bplot-suite/ROADMAP.md`](../bplot-suite/ROADMAP.md). 
 Each phase passes the same five-tier gate numba uses — feature, differential, **stress**, regression,
 sanitizers — with the numbers recorded in [`bplot-suite/CHANGELOG.md`](../bplot-suite/CHANGELOG.md).
 
+### 16.1 What B5 holds the package to
+
+A package is finished when a stranger can install it and the documentation does not lie. B5 turned
+both into tests rather than checklist items:
+
+- **The documentation runs.** `tests/run_doc_examples.sh` executes every example in `docs/bplot.md`,
+  `docs/numba.md` and `docs/arctic.md`, each doc as one program in reading order (BP37). Its first run
+  found two broken numba examples that a roadmap had recorded as executed.
+- **The package installs.** `tests/bplot_package_test.sh` publishes into a throwaway registry, runs
+  `bantu add` in an empty directory, and draws — including a DataFrame through arctic's lazy include,
+  which is the path that only exists once both packages live in `bantu_modules/`.
+- **The server example is the safe one.** `tests/bplot_sua_test.sh` serves real charts under
+  concurrency with a hostile title in the query string (BP38).
+
 ---
 
 ## Sources

@@ -212,16 +212,39 @@ non-numeric column selected.
 
 ---
 
-## Phase B5 — Package, docs, gallery
+## Phase B5 — Package, docs, gallery ✅
 
-- [ ] `bplot/{bplot.b, bplot_test.b, package.json}`, `bantu publish ./bplot`
-- [ ] `docs/bplot.md` — quickstart, tour, measured numbers, the SVG security caveat, blunt closing
-      caveats
-- [ ] `samples/bplot/` — a line chart, a histogram, a heatmap, a dashboard served through `sua`
-- [ ] `tests/run_samples.sh` picks them up
+- [x] `bplot/{bplot.b, bplot_test.b, package.json}` at **1.1.0**, `bantu publish ./bplot`
+- [x] `docs/bplot.md` — three lines to a chart, a tour, serving from sua, the SVG security section,
+      measured numbers, blunt closing caveats
+- [x] `samples/bplot/` — a line chart, the chart types, statistics, a dashboard with a heatmap, a
+      DataFrame, and `server.b`, charts served through `sua`
+- [x] `tests/run_samples.sh` picks them up; `tests/run_doc_examples.sh` executes every documented
+      example
 
 **Gate:** every documented example and every sample executed by CI; `bantu add bplot` then
 `include "bplot" as plt` works from a clean project; the sua example serves a real chart.
+
+| gate | result |
+|---|---|
+| every documented example executed | ✅ `tests/run_doc_examples.sh` runs each doc as **one program, in reading order**: `docs/bplot.md` (8 examples), `docs/numba.md` (9), `docs/arctic.md` (1) |
+| every sample executed | ✅ `tests/run_samples.sh`, and `server.b` by `tests/bplot_sua_test.sh` |
+| `bantu add bplot` → `include "bplot"` in a clean project | ✅ `tests/bplot_package_test.sh`, 17 checks, in a throwaway `HOME`: publish, add, include, a DataFrame drawn through arctic's lazy include from `bantu_modules/`, the installed copy byte-identical to its source, the installed smoke test green, and arctic without bplot naming `bantu add bplot` |
+| the sua example serves a real chart | ✅ `tests/bplot_sua_test.sh`, 15 checks: `image/svg+xml` with a CSP and `nosniff`, parses as XML, a hostile query-string title escaped, **40 concurrent requests each receiving only its own chart**, and still serving afterwards |
+| CI green on three platforms | ⚠️ **wired, not yet observed.** The new gates are in the Linux and macOS jobs and the Windows job now runs bplot's smoke test, but no CI run has happened on this branch — carried forward, as it has been since B1 |
+
+**Three defects found and fixed while building it:**
+- **numba's documented examples had never been run.** Its roadmap recorded "every documented example
+  executed by CI" as its gate; nothing executed them, and two of nine were broken — a reduction over
+  axis 2 of a two-dimensional array, and a loop over arrays its block never defined. Both are fixed,
+  and the runner executes them from now on.
+- **`num()` read a prefix and swallowed overflow**: `num("12abc")` was 12, `num("1e999")` was 0 and
+  `num(true)` was 0 — plausible wrong numbers in exactly the code that parses a query string. Found
+  while preparing the serving example.
+- **A test comment described sua's threading wrongly**, saying every connection got its own detached
+  thread. Handlers run one at a time on the event loop; the comment described legacy code nothing
+  constructs. Corrected, because anyone reasoning about thread safety from it would reach the wrong
+  answer.
 
 ---
 

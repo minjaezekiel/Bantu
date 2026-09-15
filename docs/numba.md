@@ -80,7 +80,7 @@ $x.multiply($x).add($x).sqrt().mean();
 ```bantu
 np.sum($m, null, null);        // everything
 np.sum($m, 0, null);           // down the columns
-np.sum($m, [0, 2], null);      // several axes at once
+np.sum($m, [0, 1], null);      // several axes at once
 np.mean($m, 1, true);          // keepdims — the result broadcasts back
 ```
 
@@ -176,6 +176,8 @@ A chained expression holds several full-size temporaries at once: `$a.add($b).mu
 which is what lets a loop run in constant memory:
 
 ```bantu
+$a = np.random([10000000], null, null);
+$b = np.random([10000000], null, null);
 $out = np.empty([10000000], null);
 $i = 0;
 while ($i < 100) {

@@ -788,3 +788,21 @@ observed green for this work** — only macOS has actually run. Stated rather th
 
 - **[bug fix] `arctic.from_columns` used `$len` as a variable**, which silently replaced the `len()`
   builtin — see the language fix below.
+
+---
+
+## Correction — the documented examples had never run (found by bplot B5)
+
+The Phase 6 gate recorded "every documented example executed by CI". No test executed them.
+`tests/run_doc_examples.sh`, written for bplot's documentation, runs every ```` ```bantu ```` block of
+a doc as one program in reading order — and on its first run over `docs/numba.md`, two of nine
+failed:
+
+- **[bug fix]** *Reductions* — `np.sum($m, [0, 2], null)` asked for axis 2 of the tour's 2×3 `$m`.
+  Now `[0, 1]`.
+- **[bug fix]** *Working with large arrays* — the destination-buffer loop used `$a` and `$b` without
+  defining them, so in reading order it picked up a 2×2 and a 500-element array from earlier sections
+  and failed to broadcast; a reader copying the block alone got an undefined variable. It now builds
+  its own 10,000,000-element operands.
+- **[test]** `tests/run_doc_examples.sh` covers `docs/numba.md` in both CI test jobs, so the gate is
+  enforced from here on.
