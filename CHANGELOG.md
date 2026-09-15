@@ -47,6 +47,13 @@ All notable changes to the Bantu programming language are documented in this fil
   [`docs/object-lifetime-architecture.md`](docs/object-lifetime-architecture.md). Tests:
   `tests/lang_gc_test.b` (55 assertions) and `tests/gc_stress.sh` (19 checks).
 
+- **[bug fix] `num()` read a prefix, swallowed overflow and ignored bools.** `num("12abc")` was
+  `12`, `num("1e999")` was `0` and `num(true)` was `0` — plausible wrong numbers in exactly the code
+  that parses input it did not write. The whole string must now be a decimal number (surrounding
+  whitespace allowed), overflow is infinity, and a bool is 1 or 0. Unparsable input still reads `0`,
+  so existing handlers keep working; `num($s, $default)` returns `$default` instead, so a caller can
+  tell a real zero from no number at all.
+
 - **[feature] bplot draws arctic and numba data directly, and fast.** `plot`, `scatter`, `hist`,
   `boxplot` and `violin` accept a Bantu list, a numba ndarray, an arctic column or a `Series`, and
   produce **byte-identical documents** from all four. Numeric data now stays native until it becomes

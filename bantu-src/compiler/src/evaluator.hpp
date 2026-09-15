@@ -5706,14 +5706,48 @@ private:
             return Value(args[0].toString());
         }));
 
+        // num(x)            -> the number x holds, or 0 when it holds none
+        // num(x, default)   -> the number x holds, or `default` when it holds none
+        //
+        // This used std::stod inside a catch-all, which gave three plausible
+        // wrong numbers in exactly the code that parses input it did not write:
+        //   num("12abc") -> 12    stod reads the longest PREFIX that parses
+        //   num("1e999") -> 0     the overflow exception was caught as "not a number"
+        //   num(true)    -> 0
+        // Now the WHOLE string must be a decimal number (surrounding whitespace
+        // is fine), overflow is +/-infinity, and a bool is 1 or 0. Unparsable
+        // input still reads 0, so `num($req.query["page"])` keeps working; the
+        // second argument lets a caller tell a real zero from no number at all.
+        //
+        // Hex is refused: strtod accepts "0x10", str() never writes it, and a
+        // query string that means 16 when a user typed 0x10 is a surprise, not a
+        // feature. "inf" and "nan" are accepted, because str() writes them and
+        // num(str($x)) must round-trip.
         env_->define("num", makeNative([](std::vector<Value> args) -> Value {
+            const bool hasDefault = args.size() > 1;
+            const Value none = hasDefault ? args[1] : Value(0.0);
             if (args.empty()) return Value(0.0);
-            if (args[0].isNumber()) return args[0];
-            if (args[0].isString()) {
-                try { return Value(std::stod(args[0].stringVal)); }
-                catch (...) { return Value(0.0); }
-            }
-            return Value(0.0);
+            const Value& v = args[0];
+            if (v.isNumber()) return v;
+            if (v.type == Value::BOOL) return Value(v.boolVal ? 1.0 : 0.0);
+            if (!v.isString()) return none;
+            const std::string& s = v.stringVal;
+            auto space = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; };
+            size_t b = 0, e = s.size();
+            while (b < e && space(s[b])) b++;
+            while (e > b && space(s[e - 1])) e--;
+            if (b == e) return none;
+            const std::string t = s.substr(b, e - b);
+            size_t d = (t[0] == '+' || t[0] == '-') ? 1 : 0;
+            if (d + 1 < t.size() && t[d] == '0' && (t[d + 1] == 'x' || t[d + 1] == 'X')) return none;
+            char* end = nullptr;
+            const double x = std::strtod(t.c_str(), &end);
+            // An embedded NUL stops c_str() short, so this also refuses "12\0junk".
+            if (end != t.c_str() + t.size()) return none;
+            // strtod reports overflow as +/-HUGE_VAL, which IS the right answer:
+            // "1e999" is infinite. Underflow gives the nearest representable
+            // value, also right. So errno is deliberately not consulted.
+            return Value(x);
         }));
 
         env_->define("chr", makeNative([](std::vector<Value> args) -> Value {

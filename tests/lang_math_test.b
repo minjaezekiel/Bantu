@@ -285,6 +285,37 @@ eq(str(NAN), "nan", "a NaN");
 close(num(str(1e21)), 1e21, "num(str(1e21)) round-trips");
 close(num(str(1e308)), 1e308, "and so does the largest decade");
 
+print("");
+print("-- [defect] num() read a prefix, swallowed overflow, and ignored bools --");
+// num() used std::stod inside a catch-all: "12abc" read as 12 (a prefix),
+// "1e999" as 0 (the overflow exception was caught) and true as 0 -- plausible
+// wrong numbers, in exactly the code that parses input it did not write.
+eq(num("42"), 42, "a plain integer string");
+eq(num("-3.5"), -3.5, "a negative fraction");
+eq(num("  7  "), 7, "surrounding whitespace is ignored");
+eq(num("1e3"), 1000, "exponent notation");
+eq(num("+5"), 5, "an explicit plus sign");
+eq(num("12abc"), 0, "a number with trailing junk is not a number (was 12)");
+eq(num("abc"), 0, "text still reads 0 by default");
+eq(num(""), 0, "an empty string reads 0");
+eq(num("0x10"), 0, "hex is refused -- str() never writes it (was 16)");
+eq(num("1e999"), INF, "overflow is infinity, not 0 (was 0)");
+eq(num("-1e999"), 0 - INF, "negative overflow is negative infinity");
+eq(isnan(num("nan")), true, "nan reads back, so num(str(NAN)) round-trips");
+eq(num("inf"), INF, "and so does inf");
+eq(num(true), 1, "true is 1 (was 0)");
+eq(num(false), 0, "false is 0");
+eq(num(null), 0, "null reads 0 by default");
+// The second argument is returned instead, so a caller can tell a real zero
+// from no number at all.
+eq(num("abc", null), null, "num(s, null) is null for text");
+eq(num("12abc", -1), -1, "the default is returned for trailing junk");
+eq(num("", "missing"), "missing", "and for an empty string");
+eq(num("0", null), 0, "a real zero is still a zero, not the default");
+eq(num(null, 5), 5, "null takes the default too");
+eq(num([1, 2], null), null, "a list is not a number");
+eq(num(12, null), 12, "a number passes straight through");
+
 // ════════════════════════════════════════════════════════════════════════
 //  DEFECT 3 — no join(), so building a string was O(n^2)
 // ════════════════════════════════════════════════════════════════════════

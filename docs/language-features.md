@@ -379,6 +379,29 @@ and converting a floating-point value outside the destination integer range is u
 behaviour — it saturates to `INT64_MIN` on x86-64 and ARM64. It now prints `1e+21`, and
 `num(str($x))` round-trips at every magnitude.
 
+### `num()` reads the whole string (fixed)
+
+`num()` used `std::stod`, which reads the longest *prefix* that looks like a number and throws on
+overflow — and every exception was caught and turned into `0`. So it produced plausible wrong
+numbers in exactly the code that parses input it did not write:
+
+| call | before | now |
+|---|---|---|
+| `num("12abc")` | `12` | `0` — trailing junk means it is not a number |
+| `num("0x10")` | `16` | `0` — decimal only; `str()` never writes hex |
+| `num("1e999")` | `0` | `inf` |
+| `num(true)` | `0` | `1` |
+
+Surrounding whitespace is fine, and `"inf"` and `"nan"` are read, so `num(str($x))` still
+round-trips. **Unparsable input still reads `0`**, so a handler written as
+`num($req.query["page"])` keeps working. To tell a real zero from no number at all, pass a second
+argument — it is returned instead:
+
+```bantu
+$page = num("12abc", null);     // null, not 12
+if ($page == null) { $page = 1; }
+```
+
 ## Performance
 
 ### List indexing is no longer O(n) (fixed)
