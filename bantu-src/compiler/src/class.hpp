@@ -6,6 +6,8 @@
 
 #include "types.hpp"
 #include "environment.hpp"
+#include "gc.hpp"
+#include <memory>
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -60,7 +62,11 @@ public:
     }
 };
 
-class ClassInstance {
+// Tracked by the cycle collector: `properties` holds Values, so two instances
+// referring to each other -- a tree node and its parent, the commonest shape
+// there is -- keep each other's reference count at one forever. See gc.hpp.
+class ClassInstance : public bantu_gc::Tracked<bantu_gc::Kind::Instance>,
+                      public std::enable_shared_from_this<ClassInstance> {
 public:
     ClassDefinition* classDef;
     std::unordered_map<std::string, Value> properties;

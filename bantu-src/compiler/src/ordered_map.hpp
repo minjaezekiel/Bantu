@@ -27,7 +27,10 @@
 //  since dict deletion is rare and order must survive it.
 // ════════════════════════════════════════════════════════════════════════════
 
+#include "gc.hpp"
+
 #include <cstddef>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -38,8 +41,13 @@
 // types.hpp), so this template must not require T to be complete at
 // declaration time. std::vector permits that; the members are only
 // instantiated once T is complete.
+// Tracked by the cycle collector: a dict entry holding the dict itself
+// ($d["self"] = $d, or two dicts pointing at each other) is a cycle reference
+// counting cannot free. Deriving here rather than at the ObjectMap alias keeps
+// it in one place; ObjectMap is the only instantiation. See gc.hpp.
 template <typename T>
-class BantuOrderedMap {
+class BantuOrderedMap : public bantu_gc::Tracked<bantu_gc::Kind::Dict>,
+                        public std::enable_shared_from_this<BantuOrderedMap<T>> {
 public:
     using value_type     = std::pair<std::string, T>;
     using storage        = std::vector<value_type>;

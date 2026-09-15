@@ -4,11 +4,17 @@
  */
 
 #include "types.hpp"
+#include "gc.hpp"
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
 
-class Environment {
+// Tracked by the cycle collector. A scope and a function defined in it refer
+// to each other by construction -- evalFuncDecl stores the function into the
+// very scope it closes over -- so every nested `def` leaked its whole call
+// frame before this. See gc.hpp.
+class Environment : public bantu_gc::Tracked<bantu_gc::Kind::Env>,
+                    public std::enable_shared_from_this<Environment> {
 public:
     std::unordered_map<std::string, Value> variables;
     std::unordered_set<std::string> constNames;  // names declared `const` in THIS scope

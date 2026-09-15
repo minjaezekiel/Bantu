@@ -121,6 +121,7 @@ jobs:
                    tests/numba_stress.sh \
                    tests/numba_sua_test.sh \
                    tests/bplot_stress.sh \
+                   tests/gc_stress.sh \
                    tests/run_samples.sh; do
             echo "── $s ──"
             if out=$(bash "$s" 2>&1); then
@@ -204,6 +205,7 @@ jobs:
                    tests/numba_stress.sh \
                    tests/numba_sua_test.sh \
                    tests/bplot_stress.sh \
+                   tests/gc_stress.sh \
                    tests/run_samples.sh; do
             if out=$(bash "$s" 2>&1); then
               echo "$out"

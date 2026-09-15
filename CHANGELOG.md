@@ -9,6 +9,59 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] A cycle collector, so objects that refer to each other are freed too.** Reference
+  counting frees a Bantu object the moment its last reference drops, but it cannot free a **cycle**
+  — and three ordinary things made one, two of which the user never wrote:
+
+  ```bantu
+  $a.peer = $b; $b.peer = $a;          // a tree node and its parent
+  $a.callback = $a.someMethod;         // a handler stored on its own object
+  def outer() { def helper() { … } }   // a private helper inside a function
+  ```
+
+  The second is the interpreter's doing: binding a method builds a scope holding `this` and a
+  function closing over it. The third is too: a nested `def` is stored into the very scope it
+  captured, so **every call leaked its whole call frame**. Measured over 400,000 iterations each, the
+  mutual pair reached **502 MB**, the stored method **558 MB**, and 20,000 nested-`def` calls held
+  **20,001 scopes**. A `sua` handler doing any of these grew until the worker was OOM-killed, with no
+  error and no log line — reachable by anyone who could send requests.
+
+  Bantu now runs a cycle collector alongside reference counting, as CPython and PHP do. The same runs
+  are **flat at 17–20 MB**, and ten times the run length costs under twice the memory. It infers its
+  roots from reference counts rather than scanning a root set, so no C++ temporary can be missed; and
+  it never frees anything itself — it clears a dead cycle's fields and lets reference counting do the
+  freeing, so a logic error could not corrupt memory.
+
+  **A program with no cycles never pays for it**: one million acyclic objects trigger **zero**
+  collections, and the interpreter benchmark is **−0.85%** against the build before it existed,
+  inside the ±2% gate. Three builtins make it observable:
+
+  ```bantu
+  gc_stats()         // {"live", "collections", "freed", "threshold", "enabled"}
+  gc_collect()       // collect now; returns how many objects were freed
+  gc_enable(false)   // stop the automatic one; returns the previous setting
+  ```
+
+  `BANTU_GC=0` disables automatic collection for the process; `gc_collect()` still works when it is
+  off. Design, measurements and the rejected alternatives:
+  [`docs/object-lifetime-architecture.md`](docs/object-lifetime-architecture.md). Tests:
+  `tests/lang_gc_test.b` (55 assertions) and `tests/gc_stress.sh` (19 checks).
+
+- **[feature] `sort` by a key, not just a comparator.** A comparator is called O(n log n) times; a
+  key is called n times, and the ordering then happens in C++ on the keys alone.
+
+  ```bantu
+  def byAge($r) { return $r["age"]; }
+  sort($rows, {"key": byAge})                  // youngest first
+  sort($rows, {"key": byAge, "desc": true})    // oldest first
+  ```
+
+  On 100,000 rows, with the cost of building the list subtracted from both: **13,331 ms with a
+  comparator against 764 ms with a key — 17× faster**, identical result. Python replaced `cmp=` with
+  `key=` in 3.0 for the same reason. The key must return the same type for every element, `NaN` keys
+  sort last in both directions, and passing both `"key"` and `"cmp"` raises rather than silently
+  ignoring one.
+
 - **[feature] `sort(list)` and `reverse(list)`** — the language had `push`, `pop`, `insert`,
   `extend` and `slice` and **no way to order a list**, so every median, quantile, boxplot, ranking
   and "top N" in every Bantu program was an interpreted sort. Both return a new list; the argument is

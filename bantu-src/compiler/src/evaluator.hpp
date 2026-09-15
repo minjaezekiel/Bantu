@@ -13,6 +13,7 @@
 #include "environment.hpp"
 #include "function.hpp"
 #include "class.hpp"
+#include "gc_collect.hpp"   // the cycle collector (docs/object-lifetime-architecture.md)
 #include "server.hpp"
 #include "module_resolver.hpp"
 #include "crypto_native.hpp"   // native (C++) accelerators for the hash/crypto/uuid suite
@@ -3345,6 +3346,10 @@ private:
 
     Value evalWhile(WhileNode* n) {
         while (evalNode(n->condition).isTruthy()) {
+            // A safe point for the cycle collector: the previous iteration's
+            // statements are finished, so no raw Value* into a container is in
+            // flight. See docs/object-lifetime-architecture.md §4.5.
+            bantu_gc::maybeCollect();
             auto prevEnv = env_;
             env_ = std::make_shared<Environment>(env_);
             try {
@@ -3369,6 +3374,7 @@ private:
 
         int safety = 0;
         while (evalNode(n->condition).isTruthy() && safety < 100000) {
+            bantu_gc::maybeCollect();
             auto loopEnv = std::make_shared<Environment>(env_);
             auto savedEnv = env_;
             env_ = loopEnv;
@@ -3399,6 +3405,7 @@ private:
 
         // Runs the body once with the loop var(s) bound. Returns false on break.
         auto runBody = [&](const Value& a, const Value& b) -> bool {
+            bantu_gc::maybeCollect();
             auto prevEnv = env_;
             env_ = std::make_shared<Environment>(prevEnv);
             env_->define(n->varName, a);
@@ -6028,6 +6035,44 @@ private:
                 return bantuBytesToList(out.data(), out.size());
             }));
 
+            // ── The cycle collector, from Bantu ────────────────────────
+            // Reference counting frees an object the moment its last reference
+            // drops; a cycle is freed by the collector instead, at the next
+            // safe point after enough allocation has built up. These three
+            // exist so that behaviour is observable and controllable rather
+            // than folklore -- and so a leak test can assert on a NUMBER
+            // instead of squinting at RSS, which was too coarse to show the
+            // dict cycle at all. Modelled on Python's gc module.
+            //
+            // gc_collect() -> number of objects freed
+            bantu_gc::applyEnvironmentOverride();
+            env_->define("gc_collect", makeNative([](std::vector<Value>) -> Value {
+                return Value((double)bantu_gc::collect());
+            }));
+            // gc_stats() -> {"live","collections","freed","threshold","enabled"}
+            // "live" counts objects that CAN take part in a cycle -- class
+            // instances, dicts, scopes and functions. Lists and numbers are not
+            // counted: a list is held by value, so it cannot be a cycle's node.
+            env_->define("gc_stats", makeNative([](std::vector<Value>) -> Value {
+                const bantu_gc::Registry& r = bantu_gc::registry();
+                ObjectMap m;
+                m["live"]        = Value((double)r.live);
+                m["collections"] = Value((double)r.collections);
+                m["freed"]       = Value((double)r.freed);
+                m["threshold"]   = Value((double)r.threshold);
+                m["enabled"]     = Value(r.enabled);
+                return Value(m);
+            }));
+            // gc_enable(on) -> the PREVIOUS setting, so a caller can restore it.
+            // Turning it off does not turn off gc_collect(); it only stops the
+            // automatic one, which is what a latency-sensitive section wants.
+            env_->define("gc_enable", makeNative([](std::vector<Value> a) -> Value {
+                bantu_gc::Registry& r = bantu_gc::registry();
+                const bool was = r.enabled;
+                if (!a.empty()) r.enabled = a[0].isTruthy();
+                return Value(was);
+            }));
+
             // has_native(name) -> bool. Lets .b modules feature-detect an
             // accelerator and fall back to the pure implementation when a given
             // interpreter build doesn't ship it. Kept in sync with the set above.
@@ -7250,11 +7295,40 @@ private:
             std::vector<Value> v = a[0].listVal;
             if (v.size() < 2) return Value(std::move(v));
 
-            // A comparator, or the "desc" flag, or nothing.
+            // A comparator, an options dict, the "desc" flag, or nothing.
             bool desc = false;
             Value cmp;
+            Value keyFn;
             if (a.size() > 1 && !a[1].isNull()) {
                 if (a[1].isFunction())      cmp = a[1];
+                else if (a[1].isObject()) {
+                    // sort($xs, {"key": fn, "desc": true})
+                    //
+                    // A COMPARATOR is called O(n log n) times; a KEY is called
+                    // n times. At 1-3 us for an interpreted call that is the
+                    // difference between 1.7 million calls and 100,000 on a
+                    // 100k-row list, which is why Python replaced cmp= with
+                    // key= in 3.0 and why this exists.
+                    auto it = a[1].objectVal->find("key");
+                    if (it != a[1].objectVal->end() && !it->second.isNull()) {
+                        if (!it->second.isFunction() && !it->second.isNativeFn()) {
+                            ErrorHandler::throwError(std::string("sort(): \"key\" must be a function, got ") +
+                                typeNameOf(it->second), 0, 0, ErrorHandler::RUNTIME_ERROR);
+                        }
+                        keyFn = it->second;
+                    }
+                    auto dt = a[1].objectVal->find("desc");
+                    if (dt != a[1].objectVal->end()) desc = dt->second.isTruthy();
+                    auto ct = a[1].objectVal->find("cmp");
+                    if (ct != a[1].objectVal->end() && !ct->second.isNull()) {
+                        if (!keyFn.isNull()) {
+                            ErrorHandler::throwError("sort(): pass \"key\" or \"cmp\", not both — a "
+                                "comparator already decides the order, so a key would be ignored.",
+                                0, 0, ErrorHandler::RUNTIME_ERROR);
+                        }
+                        cmp = ct->second;
+                    }
+                }
                 else if (a[1].isString()) {
                     if (a[1].stringVal == "desc")      desc = true;
                     else if (a[1].stringVal != "asc") {
@@ -7264,9 +7338,60 @@ private:
                     }
                 } else {
                     ErrorHandler::throwError(std::string("sort(): the second argument must be \"asc\", "
-                        "\"desc\" or a comparator function, got ") + typeNameOf(a[1]),
+                        "\"desc\", a comparator function, or an options dict like "
+                        "{\"key\": fn, \"desc\": true} — got ") + typeNameOf(a[1]),
                         0, 0, ErrorHandler::RUNTIME_ERROR);
                 }
+            }
+
+            // ── The key path: decorate, sort natively, undecorate ──────────
+            // One call per element, then the ordering happens in C++ on the
+            // keys alone. Keys must be all numbers or all strings for the same
+            // reason the elements must be on the no-comparator path below:
+            // ordering a number against a string has no right answer.
+            if (!keyFn.isNull()) {
+                const size_t n = v.size();
+                std::vector<Value> keys;
+                keys.reserve(n);
+                for (const Value& e : v) keys.push_back(invokeCallable(keyFn, { e }));
+
+                bool kNum = true, kStr = true;
+                for (const Value& k : keys) {
+                    if (!k.isNumber()) kNum = false;
+                    if (!k.isString()) kStr = false;
+                }
+                if (!kNum && !kStr) {
+                    std::string first = typeNameOf(keys[0]), other;
+                    for (const Value& k : keys) {
+                        if (typeNameOf(k) != first) { other = typeNameOf(k); break; }
+                    }
+                    ErrorHandler::throwError("sort(): the key function must return the same type for "
+                        "every element — it returned " + first + " and " + other + ".",
+                        0, 0, ErrorHandler::RUNTIME_ERROR);
+                }
+
+                // Sort an index permutation so the keys move once, not with
+                // every swap of a possibly large element.
+                std::vector<size_t> idx(n);
+                for (size_t i = 0; i < n; ++i) idx[i] = i;
+                if (kNum) {
+                    std::stable_sort(idx.begin(), idx.end(), [&](size_t x, size_t y) {
+                        // NaN last in both directions, exactly as below.
+                        const bool nx = std::isnan(keys[x].numberVal), ny = std::isnan(keys[y].numberVal);
+                        if (nx || ny) return !nx && ny;
+                        return desc ? (keys[y].numberVal < keys[x].numberVal)
+                                    : (keys[x].numberVal < keys[y].numberVal);
+                    });
+                } else {
+                    std::stable_sort(idx.begin(), idx.end(), [&](size_t x, size_t y) {
+                        return desc ? (keys[y].stringVal < keys[x].stringVal)
+                                    : (keys[x].stringVal < keys[y].stringVal);
+                    });
+                }
+                std::vector<Value> out;
+                out.reserve(n);
+                for (size_t i : idx) out.push_back(std::move(v[i]));
+                return Value(std::move(out));
             }
 
             if (!cmp.isNull()) {

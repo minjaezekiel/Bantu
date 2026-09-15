@@ -166,7 +166,24 @@ def byLength($a, $b) { return len($a) - len($b); }
 sort(["aaa", "b", "cc"], byLength)      // ["b", "cc", "aaa"]
 ```
 
-Four things worth knowing, each with a reason:
+For anything bigger than a toy, sort by a **key** rather than a comparator:
+
+```bantu
+def byAge($r) { return $r["age"]; }
+
+sort($rows, {"key": byAge})                  // youngest first
+sort($rows, {"key": byAge, "desc": true})    // oldest first
+sort($rows, {"desc": true})                  // no key, just the direction
+```
+
+A comparator is called **O(n log n)** times; a key is called **n** times, and the ordering itself
+then happens in C++ on the keys alone. On a 100,000-row list that is the difference between about
+1.7 million calls and 100,000. Measured on the same rows, with the cost of building the list
+subtracted from both: **13,331 ms with a comparator against 764 ms with a key — 17× faster**, for an
+identical result. Python replaced `cmp=` with `key=` in 3.0 for exactly this reason. The key function must return the same type for every element, and `NaN` keys sort last in
+both directions, just as elements do.
+
+Five things worth knowing, each with a reason:
 
 - **`NaN` sorts last, in both directions.** This is a correctness requirement, not a preference:
   every comparison with `NaN` is false, so `a < b` is *not* a strict weak ordering when one is
@@ -210,21 +227,52 @@ killed.
 Instances are now refcounted, like every other Bantu value. Measured after: 20,000 instances is
 **flat** at 4.9 MB, and 6,000 figures built and dropped move resident memory from 10.5 MB to 12.0 MB.
 
-**One thing refcounting does not do is collect cycles.** Two objects that point at each other keep
-each other alive, exactly as in Swift or any other refcounted runtime without a cycle collector:
+### Cycles are collected too (fixed — this was the other half of the leak)
+
+Reference counting cannot free a cycle: two objects that point at each other each hold the other's
+count at one. That left three ordinary things leaking without bound, and **two of them the user never
+wrote** — the interpreter built the cycle itself:
 
 ```bantu
-class Node { def init() { $this.peer = null; } }
-$a = new Node();
-$b = new Node();
-$a.peer = $b;
-$b.peer = $a;      // neither is ever freed
+$a.peer = $b; $b.peer = $a;     // a tree node and its parent
+$a.callback = $a.someMethod;    // a handler stored on its own object
+def outer() { def helper() { … } }   // a private helper inside a function
 ```
 
-If you build a graph with back-references and create many of them, break the cycle when you are done
-(`$a.peer = null;`), or hold the back-reference as an index into a list the owner already keeps.
-`bplot` takes the second approach: an Axes deliberately does **not** hold a pointer back to its
-Figure, and shared-axes groups are stored as indices for exactly this reason.
+The second is a bound method: binding one builds a scope holding `this` and a function closing over
+that scope. The third is a nested `def`: the call frame holds the function and the function closes
+over the call frame, so **every call leaked its whole frame**. Measured before the collector, 400,000
+iterations of each: the mutual pair reached **502 MB**, the stored method **558 MB**, and 20,000
+nested-`def` calls held **20,001 scopes**.
+
+Bantu now runs a **cycle collector** alongside reference counting, the way CPython and PHP do.
+Refcounting still frees the overwhelming majority promptly; the collector handles only what it
+provably cannot, running at a statement boundary once enough garbage has built up. After it, the
+same 400,000-iteration runs are **flat at 17–20 MB**, and ten times the run length costs under twice
+the memory.
+
+**A program that has no cycles never pays for it**: one million acyclic objects trigger **zero**
+collections. The interpreter benchmark is **−0.85%** against the build before the collector existed —
+inside the ±2% gate, and below the noise floor.
+
+You can watch it, and turn it off:
+
+```bantu
+gc_stats()      // {"live", "collections", "freed", "threshold", "enabled"}
+gc_collect()    // collect now; returns how many objects were freed
+gc_enable(false)   // stop the automatic one; returns the previous setting
+```
+
+`BANTU_GC=0` in the environment disables automatic collection for the process. `gc_collect()` still
+works when it is off, so the switch is a diagnostic and a latency escape hatch, never a way to lose
+the fix.
+
+Two limits worth knowing. A cycle is freed at the **next collection**, not at the statement that
+dropped it — only non-cyclic garbage is freed promptly. And a cycle that runs through a **native
+closure's captures** cannot be traced, so it is retained rather than freed; the one place in the tree
+that ever built one (sua's `$res` object) captures weakly instead.
+
+Design, and the alternatives rejected: [`docs/object-lifetime-architecture.md`](object-lifetime-architecture.md).
 
 
 ## Scalar maths (new)

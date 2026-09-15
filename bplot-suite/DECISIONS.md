@@ -374,3 +374,12 @@ nothing.
 **Implication:** the gate is an RSS measurement, not an inspection. `tests/bplot_stress.sh` builds
 300 figures and 6,000 figures and requires that twenty times the work costs under twice the memory —
 a test that a cycle would fail immediately.
+
+> **Superseded in part — the constraint this decision worked around is gone.** Bantu now has a
+> **cycle collector** ([`docs/object-lifetime-architecture.md`](../docs/object-lifetime-architecture.md)),
+> so `Figure → axesList → Axes → fig → Figure` would no longer leak. bplot's acyclic design is
+> **kept anyway**, and deliberately: a cycle is freed at the next collection rather than at the
+> statement that drops it, so an acyclic figure is still freed promptly and a long-running `sua`
+> worker holds less between collections. What changes is that this is now a preference rather than a
+> requirement — a future bplot feature that genuinely needs a back-reference may take one, and the
+> RSS gate above stays as the thing that would catch a mistake either way.

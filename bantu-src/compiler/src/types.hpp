@@ -121,10 +121,12 @@ public:
     explicit Value(std::nullptr_t) : type(NULL_VAL) {}
     explicit Value(BantuFunction* fn) : type(FUNCTION), functionVal(fn) {}
     explicit Value(std::shared_ptr<BantuFunction> fn) : type(FUNCTION), functionVal(fn.get()), functionPtr(std::move(fn)) {}
-    // Non-owning: kept only for the few places that already hold the instance
-    // alive by other means. New code should use the shared_ptr form below, so
-    // the instance is actually freed.
-    explicit Value(ClassInstance* ci) : type(CLASS_INSTANCE), classInstanceVal(ci) {}
+    // There is deliberately NO Value(ClassInstance*) constructor. One existed
+    // while instances were raw pointers; it has no call sites, and keeping it
+    // would leave a way to build a CLASS_INSTANCE Value that owns nothing and
+    // dangles the moment the real owner drops. The cycle collector also reads
+    // classInstancePtr to decide whether a Value holds a reference at all
+    // (gc_collect.hpp), so a non-owning instance Value would be invisible to it.
     explicit Value(std::shared_ptr<ClassInstance> ci)
         : type(CLASS_INSTANCE), classInstanceVal(ci.get()), classInstancePtr(std::move(ci)) {}
     explicit Value(ClassDefinition* cd) : type(CLASS_DEF), classDefVal(cd) {}
