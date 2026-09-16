@@ -579,3 +579,45 @@ B6. The original wording is kept in the roadmap alongside the correction, and B6
 - **[test]** `tests/lang_file_test.b` — every byte value, runs of NUL, CR, LF and 0x1A, a PNG
   signature and a megabyte round-trip in binary; text defaults unchanged; each refused mode leaves the
   file untouched.
+
+### B6b — the canvas and the PNG encoder
+
+- **[feature]** `raster_core.hpp` (portable C++, no Bantu types) and `raster_native.cpp` (the
+  builtins over it), a new translation unit in all four build files. `bp_canvas_new`,
+  `bp_canvas_info`, `bp_canvas_clip`, `bp_fill_rect`, `bp_canvas_pixel`, `bp_canvas_raw`, `bp_png`,
+  `bp_png_save`, `bp_zlib`, `bp_crc32`, `bp_adler32`; `has_native("raster")`.
+- **[feature]** **Deflate, written here** — LZ77 over a 32 KiB window with hash chains and one-step
+  lazy matching, then the cheapest of a stored, fixed-Huffman or dynamic-Huffman block, with
+  package-merge code lengths limited to 15 bits and every tie broken by symbol. The system zlib was
+  not an option: distributions ship different versions, and zlib does not promise identical output
+  across them, so a byte-identical gate built on it would fail on the first upgrade.
+- **[feature]** The PNG encoder: adaptive per-row filtering (smallest sum of absolute residuals, ties
+  to the lowest filter number), RGB at 8 bits, a `pHYs` chunk carrying the dpi, and **no `tIME`
+  chunk** — a timestamp would make every render of the same figure a different file.
+- **[feature]** Coverage is exact and integer: a pixel's alpha is its covered area in 1/65536 of a
+  pixel times the fill's alpha, and blending is `(src*a + dst*(255-a) + 127) / 255`. A pixel half
+  covered by black over white is `#7f7f7f`; a quarter covered is `#bfbfbf`. The tests assert those
+  values, not "about grey".
+- **[feature]** `bp_png_save` writes the file itself, in binary, rather than passing megabytes
+  through a Bantu string — the first use of B6a's binary modes.
+
+### Measured
+
+| | |
+|---|---|
+| deflate: 1,000,000 identical bytes | **992 bytes** (1000:1) |
+| deflate: 20,000 random bytes | 20,011 bytes — incompressible, with the right overhead |
+| a 400×250 chart-like canvas | **1,107-byte PNG** |
+| the same canvas at 300 dpi (625×375) | 1,764 bytes |
+| the same canvas, a second process | **byte-identical** (sha256 `8f8754ee…`) |
+
+### Verified by decoders we did not write
+
+- **[test]** `tests/bplot_png_test.sh` — Python's `zlib` decompresses every stream produced (empty,
+  one byte, a megabyte of one value, all 256 byte values, 20,000 random) back to exactly its input;
+  **Pillow decodes every PNG to exactly the bytes `bp_canvas_raw()` holds**, at four sizes and two
+  dpi values, with the `pHYs` resolution correct; and the same canvas rendered in a second process is
+  byte-identical.
+- **[test]** `tests/bplot_raster_test.b` — 67 assertions: exact pixel values for coverage, blending,
+  clipping and dpi scaling; the PNG signature byte by byte; known-answer CRC-32 and Adler-32; and
+  every size cap, bad colour, non-finite coordinate and out-of-range pixel read raising by name.

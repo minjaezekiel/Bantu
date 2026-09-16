@@ -22,6 +22,7 @@
 #include "dataframe_arrow.hpp"  // Parquet + Feather/Arrow-IPC I/O (opt-in: -DBANTU_ARROW)
 #include "ndarray_api.hpp"      // numba n-dimensional arrays (implementation in ndarray_native.cpp)
 #include "plot_native.hpp"      // bplot's native line/scatter kernels (docs/bplot-architecture.md §13.3)
+#include "raster_api.hpp"       // bplot's canvas + PNG encoder (implementation in raster_native.cpp)
 #include "mime_types.hpp"       // extension -> Content-Type for the static file server
 #include "event_loop.hpp"       // kqueue/epoll/poll readiness loop for the sua server
 #include "worker_pool.hpp"      // SO_REUSEPORT workers + the cross-worker broadcast bus
@@ -6141,6 +6142,7 @@ private:
                     "col",     // arctic native column primitives + kernels
                     "ndarray", // numba n-dimensional arrays + kernels
                     "bplot",   // bplot's line/scatter/escape kernels (plot_native.hpp)
+                    "raster",  // bplot's canvas and PNG encoder (raster_native.cpp)
                     "pwa"      // sua.pwa: manifest / service worker / offline
 #ifdef BANTU_ARROW
                     ,"arrow"  // Parquet + Feather/Arrow-IPC I/O (opt-in build)
@@ -6435,6 +6437,25 @@ private:
             // bplot's kernels, through the same translation: a bad argument is a
             // catchable Bantu error naming the builtin, never a process kill.
             bplot_native::registerBuiltins([this](const char* name, NativeFn fn) {
+                std::string where = name;
+                env_->define(name, makeNative(
+                    [where, fn](std::vector<Value> args) -> Value {
+                        try { return fn(std::move(args)); }
+                        catch (const std::exception& e) {
+                            std::string msg = e.what();
+                            const std::string pfx = where + ": ";
+                            if (msg.size() < pfx.size() ||
+                                msg.compare(0, pfx.size(), pfx) != 0) {
+                                msg = pfx + msg;
+                            }
+                            ErrorHandler::throwError(msg, 0, 0, ErrorHandler::RUNTIME_ERROR);
+                        }
+                        return Value();
+                    }));
+            });
+
+            // bplot's raster backend, through the same translation.
+            bplot_raster::registerBuiltins([this](const char* name, NativeFn fn) {
                 std::string where = name;
                 env_->define(name, makeNative(
                     [where, fn](std::vector<Value> args) -> Value {

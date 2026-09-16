@@ -85,6 +85,7 @@ set(SOURCES
     src/function.cpp
     src/class.cpp
     src/ndarray_native.cpp
+    src/raster_native.cpp
 )
 
 # The numba kernels are the one translation unit built at -O3; everything else

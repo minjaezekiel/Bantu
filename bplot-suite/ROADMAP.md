@@ -254,6 +254,12 @@ non-numeric column selected.
 identity rules out, the integer rasteriser, the embedded font, the encoder, and the six steps B6a–B6f.
 
 - [ ] `bp_*`: scanline anti-aliased polygon fill, stroke-to-path, deflate, CRC32, PNG
+      - [x] **B6b** — the canvas, rectangle fills with exact fractional coverage, deflate with
+            dynamic Huffman codes, CRC-32, Adler-32 and the PNG encoder
+            (`tests/bplot_raster_test.b`, `tests/bplot_png_test.sh`)
+      - [ ] B6c — the rasteriser: polygons, strokes, caps, joins, dashes, circles, path parsing
+      - [ ] B6d — text: the embedded font, glyph rendering, rotation, measurement
+      - [ ] B6e — `BPlotRaster`, `savefig(".png", {dpi})`, `to_png()`, PNG from sua
 - [x] **binary-safe file writes** — `open()`/`writefile()`/`appendfile()` accept `"wb"/"rb"/"ab"` and
       set `std::ios::binary`; today `open(path,"wb")` falls through the mode chain and silently opens
       the file for *reading* — **done as B6a**, with `readfile()` too, unknown modes raising instead of

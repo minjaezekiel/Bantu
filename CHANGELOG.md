@@ -47,6 +47,16 @@ All notable changes to the Bantu programming language are documented in this fil
   [`docs/object-lifetime-architecture.md`](docs/object-lifetime-architecture.md). Tests:
   `tests/lang_gc_test.b` (55 assertions) and `tests/gc_stress.sh` (19 checks).
 
+- **[feature] A raster canvas and a PNG encoder, written from scratch.** `bp_canvas_new`,
+  `bp_fill_rect`, `bp_png` and `bp_png_save` draw into an RGB canvas and encode it — including a
+  deflate implementation (LZ77 with dynamic Huffman codes), CRC-32, Adler-32 and adaptive PNG row
+  filtering. Nothing is linked: the system zlib does not promise identical output across versions,
+  and bplot's PNGs must be byte-identical on Linux, macOS and Windows. Checked against decoders we
+  did not write — Python's `zlib` and Pillow — and the same canvas rendered twice in separate
+  processes is byte-identical. This is the second step of the raster backend
+  ([`docs/bplot-raster-architecture.md`](docs/bplot-raster-architecture.md)); the rasteriser and text
+  follow.
+
 - **[bug fix] `read($f)` could not be called.** `read`, `await`, `private`, `public`, `calc`,
   `import` and `export` were lexed as keywords that no grammar rule ever accepted, so the documented
   `read()` builtin failed to parse in every position — `$rest = read($f);` included — and no function

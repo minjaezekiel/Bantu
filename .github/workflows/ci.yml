@@ -125,6 +125,7 @@ jobs:
                    tests/run_doc_examples.sh \
                    tests/bplot_package_test.sh \
                    tests/bplot_sua_test.sh \
+                   tests/bplot_png_test.sh \
                    tests/run_samples.sh; do
             echo "── $s ──"
             if out=$(bash "$s" 2>&1); then
@@ -212,6 +213,7 @@ jobs:
                    tests/run_doc_examples.sh \
                    tests/bplot_package_test.sh \
                    tests/bplot_sua_test.sh \
+                   tests/bplot_png_test.sh \
                    tests/run_samples.sh; do
             if out=$(bash "$s" 2>&1); then
               echo "$out"

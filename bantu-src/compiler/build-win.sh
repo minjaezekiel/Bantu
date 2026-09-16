@@ -133,6 +133,7 @@ SOURCES=(
     src/function.cpp
     src/class.cpp
     src/ndarray_native.cpp
+    src/raster_native.cpp
     src/evaluator.cpp
     src/main.cpp
 )
