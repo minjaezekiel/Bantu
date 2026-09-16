@@ -809,6 +809,10 @@ B6 also carries the binary-file fix: `open()` and `writefile()` never set `std::
 Windows that corrupts every `\n` in a PNG into `\r\n`. The gate that proves the fix is
 **byte-identical PNG output on Linux, macOS and Windows** — a test that cannot pass by accident.
 
+The full design — what byte identity rules out, the integer rasteriser, circles and text without a
+single trigonometric call, the embedded font, the encoder and the security limits — is
+[`docs/bplot-raster-architecture.md`](bplot-raster-architecture.md).
+
 ---
 
 ## 13. Interop — one library, four input types (B4)

@@ -47,6 +47,20 @@ All notable changes to the Bantu programming language are documented in this fil
   [`docs/object-lifetime-architecture.md`](docs/object-lifetime-architecture.md). Tests:
   `tests/lang_gc_test.b` (55 assertions) and `tests/gc_stress.sh` (19 checks).
 
+- **[bug fix] `read($f)` could not be called.** `read`, `await`, `private`, `public`, `calc`,
+  `import` and `export` were lexed as keywords that no grammar rule ever accepted, so the documented
+  `read()` builtin failed to parse in every position — `$rest = read($f);` included — and no function
+  could take one of those names. They are ordinary identifiers now. Found when the tests for binary
+  file modes called `read()`.
+
+- **[bug fix] Binary files could not be written, and an unknown file mode opened the file for
+  reading.** `open($path, "wb")` — and `"w+"`, `"r+"`, `"x"` — fell through to read mode, so every
+  write failed silently; and no file builtin set `std::ios::binary`, so on Windows every `\n` in a
+  binary file became `\r\n`. `open`, `readfile`, `writefile` and `appendfile` now take `"rb"`, `"wb"` and
+  `"ab"`; an unknown mode raises, naming the ones that exist; and a failed write raises instead of
+  reporting success. The defaults remain text. This is the first step of bplot's PNG backend; its
+  design is [`docs/bplot-raster-architecture.md`](docs/bplot-raster-architecture.md).
+
 - **[feature] bplot 1.1.0 — a user guide whose every example runs, a served chart, and a clean-install
   gate.** [`docs/bplot.md`](docs/bplot.md) covers every chart family, tables from arctic, styles,
   serving from sua and the SVG security rules, with measured numbers. Three new gates make "finished"

@@ -231,6 +231,33 @@ while ($k < 5000) { $tmp = new LifeTest($k); $k = $k + 1; }
 eq($k, 5000, "5,000 instances created and dropped without incident");
 
 print("");
+print("-- words the lexer reserved for nothing (fixed) --");
+// read, await, private, public, calc, import and export were lexed as keywords
+// that no grammar rule accepted: the documented read() builtin could not be
+// called anywhere, and no function could take one of these names.
+def calc($a, $b) { return $a + $b; }
+def export($x) { return "exported " + str($x); }
+def import($x) { return "imported " + str($x); }
+def await($x) { return $x * 2; }
+def private() { return "private"; }
+def public() { return "public"; }
+eq(calc(2, 3), 5, "a function can be named calc");
+eq(export(1), "exported 1", "or export");
+eq(import(2), "imported 2", "or import");
+eq(await(21), 42, "or await");
+eq(private() + " " + public(), "private public", "or private and public");
+$rf = open("/tmp/bantu_lang_test_read.txt", "w");
+write($rf, "abc");
+close($rf);
+$rf = open("/tmp/bantu_lang_test_read.txt", "r");
+eq(read($rf), "abc", "read($f) can be called at all, including as an argument");
+close($rf);
+$rf = open("/tmp/bantu_lang_test_read.txt", "r");
+$whole = read($rf);
+close($rf);
+eq($whole, "abc", "and in the documented form, $rest = read($f)");
+
+print("");
 print("========================================");
 print("  PASS: " + str($R.pass) + "   FAIL: " + str($R.fail));
 if ($R.fail == 0) { print("  RESULT: ALL GREEN"); }

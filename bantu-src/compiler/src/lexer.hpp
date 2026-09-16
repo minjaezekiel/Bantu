@@ -281,6 +281,19 @@ private:
         }
     }
 
+    // A word belongs in this table only if some grammar rule consumes its token.
+    //
+    // Seven were here that none did: read, await, private, public, calc, import
+    // and export. Reserving a word the grammar never accepts buys nothing and
+    // costs a name. The cost was concrete: `read($f)` -- a documented builtin --
+    // could not be called at all, even as `$rest = read($f);`, because the lexer
+    // turned it into a READ token no rule expects; and no function could be named
+    // calc or export. They are ordinary identifiers now. Nothing that parsed
+    // before parses differently, because no rule ever accepted those tokens.
+    //
+    // Their BantuTokenType values are left in the enum on purpose: the evaluator
+    // relies on the numeric adjacency of some members (AND/OR), and a future
+    // feature can reintroduce any of these words as a keyword with a rule.
     static BantuTokenType keywordToTokenType(const std::string& word) {
         static const std::unordered_map<std::string, BantuTokenType> keywords = {
             // Control flow
@@ -303,15 +316,11 @@ private:
 
             // I/O
             {"print",    BantuTokenType::PRINT},
-            {"read",     BantuTokenType::READ},
             {"db",       BantuTokenType::DB},
             {"fetch",    BantuTokenType::FETCH},
-            {"await",    BantuTokenType::AWAIT},
 
             // Modifiers
             {"const",    BantuTokenType::CONST},
-            {"private",  BantuTokenType::PRIVATE},
-            {"public",   BantuTokenType::PUBLIC},
             {"from",     BantuTokenType::FROM},
 
             // Error handling
@@ -323,7 +332,6 @@ private:
             {"create",   BantuTokenType::CREATE},
             {"delete",   BantuTokenType::DELETE},
             {"update",   BantuTokenType::UPDATE},
-            {"calc",     BantuTokenType::CALC},
 
             // Class
             {"class",     BantuTokenType::CLASS},
@@ -332,8 +340,6 @@ private:
             {"super",     BantuTokenType::SUPER},
 
             // Module
-            {"import",   BantuTokenType::IMPORT},
-            {"export",   BantuTokenType::EXPORT},
             // v1.2.1: module include (Bantu-style imports)
             {"include",  BantuTokenType::INCLUDE},
 

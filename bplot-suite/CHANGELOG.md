@@ -554,3 +554,28 @@ B6. The original wording is kept in the roadmap alongside the correction, and B6
 
 - **Cross-platform CI.** Every gate above is wired into CI; no CI run has happened on this branch, so
   "green on three platforms" is still a claim about configuration, not a result.
+
+---
+
+## Phase B6 — The native raster backend (in progress)
+
+- **[design]** [`docs/bplot-raster-architecture.md`](../docs/bplot-raster-architecture.md), written
+  before any code. Byte-identical PNGs on three platforms rule out fused multiply-adds, libm's
+  transcendental functions, the system zlib and system fonts in any step that decides a pixel; so every
+  coordinate is quantised exactly as `_px` quantises it for SVG, everything after is integer
+  arithmetic, circles and arcs come from embedded integer tables, text uses an embedded DejaVu Sans
+  subset (211 glyphs, about 13 KB), and deflate is written here. The PNG draws the SVG's numbers.
+
+### B6a — binary-safe file I/O
+
+- **[bug fix]** `open()` sent every mode other than `"r"`, `"w"` and `"a"` to read mode, so
+  `open($path, "wb")` silently opened for reading and every write failed. `open`, `readfile`,
+  `writefile` and `appendfile` now accept `"rb"`, `"wb"` and `"ab"` with `std::ios::binary`, an unknown
+  mode raises naming the ones that exist, `readfile` refuses a write mode before it can truncate
+  anything, and a failed write raises. Text remains the default.
+- **[bug fix] `read($f)` could not be called at all.** Found by the first test of the modes above:
+  `read`, `await`, `private`, `public`, `calc`, `import` and `export` were lexed as keywords no grammar
+  rule accepted. They are ordinary identifiers now.
+- **[test]** `tests/lang_file_test.b` — every byte value, runs of NUL, CR, LF and 0x1A, a PNG
+  signature and a megabyte round-trip in binary; text defaults unchanged; each refused mode leaves the
+  file untouched.

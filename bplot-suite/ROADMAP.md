@@ -250,10 +250,15 @@ non-numeric column selected.
 
 ## Phase B6 — The native raster backend
 
+**Design:** [`docs/bplot-raster-architecture.md`](../docs/bplot-raster-architecture.md) — what byte
+identity rules out, the integer rasteriser, the embedded font, the encoder, and the six steps B6a–B6f.
+
 - [ ] `bp_*`: scanline anti-aliased polygon fill, stroke-to-path, deflate, CRC32, PNG
-- [ ] **binary-safe file writes** — `open()`/`writefile()`/`appendfile()` accept `"wb"/"rb"/"ab"` and
+- [x] **binary-safe file writes** — `open()`/`writefile()`/`appendfile()` accept `"wb"/"rb"/"ab"` and
       set `std::ios::binary`; today `open(path,"wb")` falls through the mode chain and silently opens
-      the file for *reading*
+      the file for *reading* — **done as B6a**, with `readfile()` too, unknown modes raising instead of
+      opening for reading, and failed writes raising instead of reporting success
+      (`tests/lang_file_test.b`)
 - [ ] `savefig("x.png", {"dpi": 150})`
 
 **Gate:** PNG validated by an external decoder; **byte-identical output on Linux, macOS and

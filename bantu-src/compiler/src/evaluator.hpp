@@ -7137,14 +7137,50 @@ private:
         // $f = open(path, mode)   modes: "r" read, "w" truncate-write, "a" append
         // read($f) whole file · readline($f) one line · readlines($f) list of lines
         // write($f, text) · close($f) · plus one-shot readfile/writefile/appendfile.
-        env_->define("open", makeNative([](std::vector<Value> args) -> Value {
+        // File modes (bplot B6a, docs/bplot-raster-architecture.md §8).
+        //
+        // Text modes -- "r", "w", "a", also spelled "rt", "wt", "at" -- are the
+        // defaults and behave exactly as before on every platform. The binary
+        // modes "rb", "wb", "ab" set std::ios::binary. Without it, Windows turns
+        // every \n byte written into \r\n and treats 0x1A as end of file when
+        // reading, which corrupts any binary file: a PNG, a zip, a key.
+        //
+        // An UNKNOWN mode raises. It used to fall through to read mode, so
+        // open($path, "wb") silently opened the file for READING and every write
+        // to it failed without a word; "w+", "r+" and "x" did the same.
+        static const auto fileModeFor = [](const char* fn, const std::string& mode,
+                                           const char* allowed) -> std::ios_base::openmode {
+            std::ios_base::openmode m = std::ios::in;
+            bool known = true;
+            if      (mode == "r"  || mode == "rt") m = std::ios::in;
+            else if (mode == "rb")                 m = std::ios::in  | std::ios::binary;
+            else if (mode == "w"  || mode == "wt") m = std::ios::out | std::ios::trunc;
+            else if (mode == "wb")                 m = std::ios::out | std::ios::trunc | std::ios::binary;
+            else if (mode == "a"  || mode == "at") m = std::ios::out | std::ios::app;
+            else if (mode == "ab")                 m = std::ios::out | std::ios::app   | std::ios::binary;
+            else known = false;
+            // `allowed` is the set of leading letters this builtin accepts, so
+            // readfile() refuses "wb" rather than opening a file to truncate it.
+            if (!known || std::string(allowed).find(mode[0]) == std::string::npos) {
+                std::string want;
+                for (const char* c = allowed; *c; ++c) {
+                    if (!want.empty()) want += ", ";
+                    want += std::string("\"") + *c + "\" or \"" + *c + "b\"";
+                }
+                ErrorHandler::throwError(std::string(fn) + ": unknown mode '" + mode +
+                    "' -- use " + want + " (the b forms are binary)", 0, 0, ErrorHandler::FILE_ERROR);
+            }
+            return m;
+        };
+        auto modeArg = [](const std::vector<Value>& args, size_t i, const char* dflt) -> std::string {
+            return (args.size() > i && !args[i].isNull()) ? args[i].toString() : std::string(dflt);
+        };
+
+        env_->define("open", makeNative([modeArg](std::vector<Value> args) -> Value {
             if (args.empty()) ErrorHandler::throwError("open() needs a path", 0, 0, ErrorHandler::FILE_ERROR);
             std::string path = args[0].toString();
-            std::string mode = args.size() > 1 ? args[1].toString() : "r";
-            std::ios_base::openmode m;
-            if (mode == "w")      m = std::ios::out | std::ios::trunc;
-            else if (mode == "a") m = std::ios::out | std::ios::app;
-            else                  m = std::ios::in;   // default "r"
+            std::string mode = modeArg(args, 1, "r");
+            std::ios_base::openmode m = fileModeFor("open()", mode, "rwa");
             std::fstream fs(path, m);
             if (!fs.is_open()) {
                 ErrorHandler::throwError("Cannot open file '" + path + "' (mode " + mode + ")",
@@ -7199,6 +7235,19 @@ private:
             if (it == bantuFileTable().end()) ErrorHandler::throwError("write(): not an open file", 0, 0, ErrorHandler::FILE_ERROR);
             std::string data = args[1].toString();
             it->second << data;
+            // A stream opened for reading refuses the write by setting badbit. It
+            // used to be ignored, so write() reported every byte as written.
+            if (!it->second) {
+                std::string mode;
+                if (args[0].isObject()) {
+                    auto mt = args[0].objectVal->find("mode");
+                    if (mt != args[0].objectVal->end()) mode = mt->second.toString();
+                }
+                it->second.clear();
+                ErrorHandler::throwError("write(): the write failed" +
+                    (mode.empty() ? std::string("") : " -- the file was opened with mode '" + mode + "'") ,
+                    0, 0, ErrorHandler::FILE_ERROR);
+            }
             return Value((double)data.size());
         }));
         env_->define("close", makeNative([fileIdOf](std::vector<Value> args) -> Value {
@@ -7210,25 +7259,34 @@ private:
             bantuFileTable().erase(it);
             return Value(true);
         }));
-        env_->define("readfile", makeNative([](std::vector<Value> args) -> Value {
+        // readfile(path [, "r" | "rb"])
+        env_->define("readfile", makeNative([modeArg](std::vector<Value> args) -> Value {
             if (args.empty()) return Value(std::string(""));
-            std::ifstream fs(args[0].toString());
+            std::ifstream fs(args[0].toString(), fileModeFor("readfile()", modeArg(args, 1, "r"), "r"));
             if (!fs.is_open()) ErrorHandler::throwError("Cannot read file '" + args[0].toString() + "'", 0, 0, ErrorHandler::FILE_ERROR);
             std::stringstream ss; ss << fs.rdbuf();
             return Value(ss.str());
         }));
-        env_->define("writefile", makeNative([](std::vector<Value> args) -> Value {
+        // writefile(path, data [, "w" | "wb"])
+        env_->define("writefile", makeNative([modeArg](std::vector<Value> args) -> Value {
             if (args.size() < 2) return Value(false);
-            std::ofstream fs(args[0].toString(), std::ios::trunc);
+            std::ofstream fs(args[0].toString(), fileModeFor("writefile()", modeArg(args, 2, "w"), "w"));
             if (!fs.is_open()) ErrorHandler::throwError("Cannot write file '" + args[0].toString() + "'", 0, 0, ErrorHandler::FILE_ERROR);
             fs << args[1].toString();
+            // A full disk or a vanished directory fails HERE, and used to be
+            // reported as success.
+            fs.flush();
+            if (!fs) ErrorHandler::throwError("Cannot write file '" + args[0].toString() + "' -- the write failed", 0, 0, ErrorHandler::FILE_ERROR);
             return Value(true);
         }));
-        env_->define("appendfile", makeNative([](std::vector<Value> args) -> Value {
+        // appendfile(path, data [, "a" | "ab"])
+        env_->define("appendfile", makeNative([modeArg](std::vector<Value> args) -> Value {
             if (args.size() < 2) return Value(false);
-            std::ofstream fs(args[0].toString(), std::ios::app);
+            std::ofstream fs(args[0].toString(), fileModeFor("appendfile()", modeArg(args, 2, "a"), "a"));
             if (!fs.is_open()) ErrorHandler::throwError("Cannot append file '" + args[0].toString() + "'", 0, 0, ErrorHandler::FILE_ERROR);
             fs << args[1].toString();
+            fs.flush();
+            if (!fs) ErrorHandler::throwError("Cannot append file '" + args[0].toString() + "' -- the write failed", 0, 0, ErrorHandler::FILE_ERROR);
             return Value(true);
         }));
 

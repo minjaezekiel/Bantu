@@ -456,7 +456,7 @@ so a package should prefix its class names to avoid collisions.
 
 ## File I/O (new — Python style)
 ```bantu
-$f = open("data.txt", "w");    // modes: "r" "w" "a"
+$f = open("data.txt", "w");    // text: "r" "w" "a"   binary: "rb" "wb" "ab"
 write($f, "hello\n");
 close($f);
 
@@ -470,7 +470,29 @@ $all = readfile("data.txt");
 writefile("out.txt", "hi");
 appendfile("log.txt", "line\n");
 $lines = readlines(open("data.txt", "r"));
+
+// the helpers take the same modes, as an optional last argument:
+$png = readfile("chart.png", "rb");
+writefile("copy.png", $png, "wb");
+appendfile("frames.bin", $png, "ab");
 ```
+
+### Binary files, and modes that do not exist (fixed)
+
+Two defects, both silent, both fatal to any binary file:
+
+- **An unknown mode opened the file for reading.** `open()` recognised `"r"`, `"w"` and `"a"` and sent
+  everything else to read mode — so `open($path, "wb")`, `"w+"`, `"r+"` and `"x"` all opened the file
+  for *reading*, and every `write()` to it failed without a word. An unknown mode now **raises**, naming
+  the modes that exist, and `readfile()` refuses a write mode *before* opening, so it can never truncate
+  the file it was asked to read.
+- **Nothing set `std::ios::binary`.** On Windows a text-mode stream turns every `\n` written into
+  `\r\n` and treats byte `0x1A` as the end of the file — which destroys a PNG at its eighth byte. The
+  `"rb"`, `"wb"` and `"ab"` modes are binary on every platform.
+
+**The defaults are still text**, so no existing program changes behaviour anywhere. `"rt"`, `"wt"` and
+`"at"` are accepted as spellings of the text modes. `write()` to a file opened for reading, and a
+`writefile()` that fails part-way — a full disk — now raise instead of reporting success.
 
 ## FFI — call C libraries (new, via libffi)
 Type names: `"int"`, `"double"`, `"string"`, `"pointer"`, `"void"`.
@@ -495,6 +517,13 @@ The `$` sigil means "variable", so reserved words are usable as variable names:
 ```bantu
 $db = sua.sqlite;   $list = [1, 2, 3];   $create = "ok";
 ```
+
+**Seven words were reserved for nothing (fixed).** `read`, `await`, `private`, `public`, `calc`,
+`import` and `export` were lexed as keywords that no grammar rule accepted. The cost was concrete:
+`read($f)`, a documented builtin, **could not be called at all** — even `$rest = read($f);` failed
+with `Unexpected token: 'read'` — and no function could be named `calc` or `export`. They are
+ordinary names now. Nothing that parsed before parses differently, because no rule ever accepted
+those tokens.
 
 ## Linter & compile gate (new)
 ```sh
