@@ -68,3 +68,12 @@
   #define BANTU_PACKED __attribute__((packed))
 
 #endif
+
+// Branch-weight hint for the interpreter's hot paths. __builtin_expect is a
+// GCC/Clang builtin that MSVC does not have (C3861); C++20's [[unlikely]] would
+// do instead, but the default build is C++17. On MSVC the hint is simply absent.
+#if defined(__GNUC__) || defined(__clang__)
+  #define BANTU_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+  #define BANTU_UNLIKELY(x) (x)
+#endif

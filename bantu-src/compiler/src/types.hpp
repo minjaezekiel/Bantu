@@ -54,6 +54,42 @@ class Value;
 using ObjectMap = BantuOrderedMap<Value>;
 using NativeFn = std::function<Value(std::vector<Value>)>;
 
+// ── NATIVE_HANDLE rendering ──────────────────────────────────────────────────
+// A NATIVE_HANDLE used to stringify to "<column>", so print($col) told you the
+// type and nothing else -- which made an opaque handle genuinely hard to work
+// with, since there was no way to look at the data without materializing it to
+// a list first. A native layer registers a renderer for the tag it owns and
+// print() shows the value.
+//
+// Keyed by tag, so types.hpp needs to know nothing about what any tag means.
+// A plain function pointer (not std::function) keeps this header free of
+// per-tag state and makes the registry trivially constant after startup.
+using HandleReprFn = std::string (*)(const std::shared_ptr<void>&);
+
+inline std::unordered_map<std::string, HandleReprFn>& handleReprRegistry() {
+    static std::unordered_map<std::string, HandleReprFn> r;
+    return r;
+}
+inline void registerHandleRepr(const std::string& tag, HandleReprFn fn) {
+    handleReprRegistry()[tag] = fn;
+}
+
+// len() of a native handle, by the same mechanism and for the same reason.
+// Before this, len() answered 0 for any handle -- so `while ($i < len($a))`
+// over an ndarray or a column silently never ran. The owning layer knows what
+// "length" means for its type (an ndarray's first axis, a column's rows); a
+// renderer returning a negative number means "this handle has no length" and
+// len() raises rather than inventing one.
+using HandleLenFn = long long (*)(const std::shared_ptr<void>&);
+
+inline std::unordered_map<std::string, HandleLenFn>& handleLenRegistry() {
+    static std::unordered_map<std::string, HandleLenFn> r;
+    return r;
+}
+inline void registerHandleLen(const std::string& tag, HandleLenFn fn) {
+    handleLenRegistry()[tag] = fn;
+}
+
 class Value {
 public:
     enum Type { NUMBER, STRING, BOOL, NULL_VAL, FUNCTION, CLASS_INSTANCE, CLASS_DEF, OBJECT, NATIVE_FN, LIST,
@@ -71,6 +107,18 @@ public:
     BantuFunction* functionVal = nullptr;
     std::shared_ptr<BantuFunction> functionPtr;
     ClassInstance* classInstanceVal = nullptr;
+    // Owning handle for CLASS_INSTANCE, exactly as functionPtr is for
+    // FUNCTION. Before this existed, instantiateClass did a bare
+    // `new ClassInstance(...)` that nothing ever deleted, so EVERY object a
+    // Bantu program created leaked for the life of the process — measured at
+    // ~300 bytes each, and ~45 KB per bplot figure. A server creating objects
+    // per request grew without bound.
+    //
+    // shared_ptr<ClassInstance> needs ClassInstance only DECLARED here, not
+    // complete: the deleter is type-erased when the shared_ptr is constructed
+    // (in instantiateClass, where class.hpp is included). This is the same
+    // reasoning that already applies to objectVal below.
+    std::shared_ptr<ClassInstance> classInstancePtr;
     ClassDefinition* classDefVal = nullptr;
     // Object form — shared_ptr so the unordered_map instantiation is
     // deferred until Value is complete. Left null for non-OBJECT values;
@@ -89,7 +137,14 @@ public:
     explicit Value(std::nullptr_t) : type(NULL_VAL) {}
     explicit Value(BantuFunction* fn) : type(FUNCTION), functionVal(fn) {}
     explicit Value(std::shared_ptr<BantuFunction> fn) : type(FUNCTION), functionVal(fn.get()), functionPtr(std::move(fn)) {}
-    explicit Value(ClassInstance* ci) : type(CLASS_INSTANCE), classInstanceVal(ci) {}
+    // There is deliberately NO Value(ClassInstance*) constructor. One existed
+    // while instances were raw pointers; it has no call sites, and keeping it
+    // would leave a way to build a CLASS_INSTANCE Value that owns nothing and
+    // dangles the moment the real owner drops. The cycle collector also reads
+    // classInstancePtr to decide whether a Value holds a reference at all
+    // (gc_collect.hpp), so a non-owning instance Value would be invisible to it.
+    explicit Value(std::shared_ptr<ClassInstance> ci)
+        : type(CLASS_INSTANCE), classInstanceVal(ci.get()), classInstancePtr(std::move(ci)) {}
     explicit Value(ClassDefinition* cd) : type(CLASS_DEF), classDefVal(cd) {}
     // ObjectMap is taken by const-ref (NOT by value) to avoid requiring
     // `ObjectMap` to be complete at the parameter declaration site —
@@ -152,7 +207,15 @@ public:
     std::string toString() const {
         switch (type) {
             case NUMBER: {
-                if (numberVal == std::floor(numberVal) && !std::isinf(numberVal)) {
+                // Integral doubles print without a fractional part -- but only when
+                // they actually FIT in a long long. Converting a floating-point value
+                // outside the destination integer range is undefined behaviour
+                // (ISO C++ [conv.fpint]), and on x86-64 and ARM64 it saturates to
+                // INT64_MIN, so str(1e21) used to print "-9223372036854775808".
+                // 9.2e18 is safely below 2^63 (9.223372036854775808e18); past it we
+                // fall through to the stream, which prints 1e+21 correctly.
+                if (numberVal == std::floor(numberVal) && !std::isinf(numberVal) &&
+                    std::fabs(numberVal) < 9.2e18) {
                     return std::to_string((long long)numberVal);
                 }
                 std::ostringstream oss;
@@ -190,7 +253,17 @@ public:
                 oss << "]";
                 return oss.str();
             }
-            case NATIVE_HANDLE: return "<" + stringVal + ">";   // e.g. "<column>"
+            case NATIVE_HANDLE: {
+                // Render through the owning layer's renderer when one is
+                // registered; fall back to the tag so an unregistered handle
+                // still prints something honest rather than nothing.
+                if (handle) {
+                    const auto& reg = handleReprRegistry();
+                    auto it = reg.find(stringVal);
+                    if (it != reg.end() && it->second) return it->second(handle);
+                }
+                return "<" + stringVal + ">";   // e.g. "<column>"
+            }
         }
         return "null";
     }
@@ -334,8 +407,10 @@ struct Token {
 //                   the top-level/parser can recover instead of looping.
 //   * BantuThrow  — a value thrown by a Bantu `throw <expr>;` statement. Carries
 //                   the thrown Value so the catch block receives it verbatim.
-// (BreakSignal/ContinueSignal/ReturnSignal are deliberately NOT std::exception,
-//  so they pass through try/catch untouched — see evaluator.hpp.)
+// (return, break and continue are not exceptions at all -- they are a pending
+//  signal in the Evaluator; see docs/control-flow-architecture.md. The legacy
+//  BreakSignal/ContinueSignal are deliberately NOT std::exception, so they pass
+//  through try/catch untouched.)
 
 // A structured, position-carrying error. `what()` returns a formatted message.
 struct BantuError : std::exception {

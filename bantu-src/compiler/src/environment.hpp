@@ -4,11 +4,17 @@
  */
 
 #include "types.hpp"
+#include "gc.hpp"
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
 
-class Environment {
+// Tracked by the cycle collector. A scope and a function defined in it refer
+// to each other by construction -- evalFuncDecl stores the function into the
+// very scope it closes over -- so every nested `def` leaked its whole call
+// frame before this. See gc.hpp.
+class Environment : public bantu_gc::Tracked<bantu_gc::Kind::Env>,
+                    public std::enable_shared_from_this<Environment> {
 public:
     std::unordered_map<std::string, Value> variables;
     std::unordered_set<std::string> constNames;  // names declared `const` in THIS scope
@@ -38,6 +44,39 @@ public:
         if (parent) return parent->get(name);
         ErrorHandler::throwReferenceError("Undefined variable: " + name);
         return Value();
+    }
+
+    // The slot `assign()` would write to -- but only if it ALREADY exists
+    // within the window assign() searches, which is this scope up to and
+    // including the nearest function boundary. Never creates a binding, and
+    // refuses a const so the caller falls back and assign() raises as usual.
+    //
+    // Exists so that `$s = $s + …` can append into the string in place without
+    // guessing where assign() would have put the result. Resolving it any other
+    // way would be subtly wrong: getRef() walks the WHOLE chain, so inside a
+    // function it would find and mutate a global that assign() would instead
+    // have shadowed with a new local.
+    Value* existingAssignSlot(const std::string& name) {
+        Environment* e = this;
+        while (true) {
+            auto it = e->variables.find(name);
+            if (it != e->variables.end())
+                return e->constNames.count(name) ? nullptr : &it->second;
+            if (e->functionScope || !e->parent) return nullptr;
+            e = e->parent.get();
+        }
+    }
+
+    // Like getRef, but reports a missing name instead of raising. One walk of
+    // the scope chain answers both "is it there?" and "where is it?" —
+    // has() followed by getRef() walks it twice, which is measurable on a path
+    // as hot as `$a[$i]`.
+    Value* tryGetRef(const std::string& name) {
+        for (Environment* e = this; e; e = e->parent.get()) {
+            auto it = e->variables.find(name);
+            if (it != e->variables.end()) return &it->second;
+        }
+        return nullptr;
     }
 
     Value& getRef(const std::string& name) {

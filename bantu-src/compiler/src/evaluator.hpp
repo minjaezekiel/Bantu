@@ -7,17 +7,22 @@
  */
 
 #include <list>
+#include <limits>   // infinity()/quiet_NaN() for the INF and NAN constants
 #include "types.hpp"
 #include "ast.hpp"
 #include "environment.hpp"
 #include "function.hpp"
 #include "class.hpp"
+#include "gc_collect.hpp"   // the cycle collector (docs/object-lifetime-architecture.md)
 #include "server.hpp"
 #include "module_resolver.hpp"
 #include "crypto_native.hpp"   // native (C++) accelerators for the hash/crypto/uuid suite
 #include "crypto_sodium.hpp"    // optional libsodium AEAD + argon2id (feature-gated)
 #include "dataframe_native.hpp" // native column primitives for the arctic data-science suite
 #include "dataframe_arrow.hpp"  // Parquet + Feather/Arrow-IPC I/O (opt-in: -DBANTU_ARROW)
+#include "ndarray_api.hpp"      // numba n-dimensional arrays (implementation in ndarray_native.cpp)
+#include "plot_native.hpp"      // bplot's native line/scatter kernels (docs/bplot-architecture.md §13.3)
+#include "raster_api.hpp"       // bplot's canvas + PNG encoder (implementation in raster_native.cpp)
 #include "mime_types.hpp"       // extension -> Content-Type for the static file server
 #include "event_loop.hpp"       // kqueue/epoll/poll readiness loop for the sua server
 #include "worker_pool.hpp"      // SO_REUSEPORT workers + the cross-worker broadcast bus
@@ -2418,9 +2423,11 @@ static Value bantuPushUnsubscribeHandler(std::vector<Value> args) {
 // SIGNALS FOR CONTROL FLOW
 // ════════════════════════════════════════════════════════════════
 
+// Thrown only on the rare legacy path: a break/continue that escapes the
+// function it was written in (see Evaluator::finishCall). return, and break
+// and continue inside their own loop, are a pending signal, not a throw.
 struct BreakSignal {};
 struct ContinueSignal {};
-struct ReturnSignal { Value value; };
 
 // ════════════════════════════════════════════════════════════════
 // EVALUATOR CLASS
@@ -2477,16 +2484,13 @@ public:
     Value evaluate(std::vector<std::shared_ptr<ASTNode>>& program) {
         Value result;
         try {
-            for (auto& node : program) {
-                result = evalNode(node);
-            }
+            result = runStatements(program);
         } catch (const BreakSignal&) {
             ErrorHandler::throwRuntimeError("'break' used outside of a loop");
         } catch (const ContinueSignal&) {
             ErrorHandler::throwRuntimeError("'continue' used outside of a loop");
-        } catch (const ReturnSignal&) {
-            // A top-level `return` simply ends the program.
         }
+        finishProgram();   // a top-level `return` simply ends the program
         return result;
     }
 
@@ -2497,19 +2501,16 @@ public:
         filePathStack_.push_back(path);
         Value result;
         try {
-            for (auto& node : program) {
-                result = evalNode(node);
-            }
+            result = runStatements(program);
         } catch (const BreakSignal&) {
             if (!filePathStack_.empty()) filePathStack_.pop_back();
             ErrorHandler::throwRuntimeError("'break' used outside of a loop");
         } catch (const ContinueSignal&) {
             if (!filePathStack_.empty()) filePathStack_.pop_back();
             ErrorHandler::throwRuntimeError("'continue' used outside of a loop");
-        } catch (const ReturnSignal&) {
-            // A top-level `return` simply ends the file.
         }
         if (!filePathStack_.empty()) filePathStack_.pop_back();
+        finishProgram();   // a top-level `return` simply ends the file
         return result;
     }
 
@@ -2522,11 +2523,80 @@ private:
     std::shared_ptr<Environment> env_;
     std::shared_ptr<Environment> globalEnv_;
 
+    // ── Control flow as a pending signal ─────────────────────────────
+    // return / break / continue set flow_ and return normally; statement
+    // lists stop at the first statement that leaves it set, loops consume
+    // Break and Continue, calls consume Return. They used to be C++
+    // exceptions: 8.9 us per `return` against 1.2 us for the whole rest of
+    // a call. Design: docs/control-flow-architecture.md.
+    enum class Flow : uint8_t { Normal, Break, Continue, Return };
+    Flow  flow_ = Flow::Normal;
+    Value flowValue_;
+
+    // Runs a statement list up to the first pending signal. The value is the
+    // last statement's -- what a function without `return` has always returned.
+    Value runStatements(std::vector<std::shared_ptr<ASTNode>>& body) {
+        Value last;
+        for (auto& stmt : body) {
+            last = evalNode(stmt);
+            if (flow_ != Flow::Normal) break;
+        }
+        return last;
+    }
+
+    // At a function boundary, after the caller's scope is restored: the call's
+    // result, consuming a pending return. A break or continue that escaped the
+    // function takes the legacy exception path to the caller's loop -- odd,
+    // but it is existing behaviour, and it is not the common path.
+    Value finishCall(Value last) {
+        switch (flow_) {
+            case Flow::Normal:   return last;
+            case Flow::Return: {
+                flow_ = Flow::Normal;
+                Value v = std::move(flowValue_);
+                flowValue_ = Value();
+                return v;
+            }
+            case Flow::Break:    flow_ = Flow::Normal; throw BreakSignal{};
+            case Flow::Continue: flow_ = Flow::Normal; throw ContinueSignal{};
+        }
+        return last;
+    }
+
+    // After a loop body: true to go round again. Consumes break and continue;
+    // leaves a return pending for the function around the loop.
+    bool loopGoesOn() {
+        switch (flow_) {
+            case Flow::Normal:   return true;
+            case Flow::Continue: flow_ = Flow::Normal; return true;
+            case Flow::Break:    flow_ = Flow::Normal; return false;
+            case Flow::Return:   return false;
+        }
+        return false;
+    }
+
+    // At the top of a program or file: a return ends it; a stray break or
+    // continue is the same error it always was.
+    void finishProgram() {
+        const Flow f = flow_;
+        flow_ = Flow::Normal;
+        flowValue_ = Value();
+        if (f == Flow::Break)    ErrorHandler::throwRuntimeError("'break' used outside of a loop");
+        if (f == Flow::Continue) ErrorHandler::throwRuntimeError("'continue' used outside of a loop");
+    }
+
     // v1.2.1: stack of file paths being executed (for relative include resolution)
     std::vector<std::string> filePathStack_;
 
     // Cycle guard: includes already loaded in the current chain
     std::vector<std::string> loadedModules_;
+
+    // The namespace object each fully-loaded module exported, keyed by its
+    // canonical path. A module executes once; every later include of it binds
+    // this same object, which is what makes `include "x" as x` work in two
+    // different files. A path that is in loadedModules_ but absent here is
+    // still executing -- that, and only that, is a genuine circular include.
+    std::unordered_map<std::string, Value> moduleExports_;
 
     // v1.2.2: include depth guard (prevent infinite include chains)
     int includeDepth_ = 0;
@@ -2542,7 +2612,75 @@ private:
     Value evalNode(std::shared_ptr<ASTNode>& node) {
         if (!node) return Value();
 
-        // Dispatch by dynamic cast
+        // ── Dispatch ────────────────────────────────────────────────────
+        // One byte load and one jump table. This used to be the chain of 38
+        // dynamic_casts kept below as the default: arm -- which a profile of a
+        // 20M-iteration arithmetic loop measured at **79.6% of all interpreter
+        // time**, four times everything else in the process combined. A failing
+        // dynamic_cast is a hierarchy walk inside libc++abi, not a comparison,
+        // and the chain was ordered by when each node type was added rather
+        // than by how often it runs: every CallNode paid for nineteen failed
+        // searches before reaching its own arm.
+        //
+        // Ordering here is irrelevant -- that is the point. Adding a node type
+        // costs nothing at run time, and omitting its case is a compiler
+        // warning (-Wswitch on an unhandled enumerator) where omitting a line
+        // from the old chain was silent.
+        //
+        // See docs/interpreter-performance.md. NODE() is a static_cast in a
+        // normal build and a checked one under -DBANTU_CHECK_NODEKIND.
+        #define NODE(K, T) nodeExact<NodeKind::K, T>(node.get())
+        switch (node->kind) {
+            case NodeKind::Number:      return evalNumber(NODE(Number, NumberNode));
+            case NodeKind::String:      return evalString(NODE(String, StringNode));
+            case NodeKind::Bool:        return evalBool(NODE(Bool, BoolNode));
+            case NodeKind::Null:        return Value();
+            case NodeKind::List:        return evalList(NODE(List, ListNode));
+            case NodeKind::Dict:        return evalDict(NODE(Dict, DictNode));
+            case NodeKind::Variable:    return evalVariable(NODE(Variable, VariableNode));
+            case NodeKind::VarDecl:     return evalVarDecl(NODE(VarDecl, VarDeclNode));
+            case NodeKind::Assign:      return evalAssign(NODE(Assign, AssignNode));
+            case NodeKind::IndexAssign: return evalIndexAssign(NODE(IndexAssign, IndexAssignNode));
+            case NodeKind::DictAssign:  return evalDictAssign(NODE(DictAssign, DictAssignNode));
+            case NodeKind::BinaryOp:    return evalBinaryOp(NODE(BinaryOp, BinaryOpNode));
+            case NodeKind::UnaryOp:     return evalUnaryOp(NODE(UnaryOp, UnaryOpNode));
+            case NodeKind::If:          return evalIf(NODE(If, IfNode));
+            case NodeKind::While:       return evalWhile(NODE(While, WhileNode));
+            case NodeKind::For:         return evalFor(NODE(For, ForNode));
+            case NodeKind::Each:        return evalEach(NODE(Each, EachNode));
+            case NodeKind::FuncDecl:    return evalFuncDecl(NODE(FuncDecl, FuncDeclNode));
+            case NodeKind::Return:      return evalReturn(NODE(Return, ReturnNode));
+            case NodeKind::Call:        return evalCall(NODE(Call, CallNode));
+            case NodeKind::DotAccess:   return evalDotAccess(NODE(DotAccess, DotAccessNode));
+            case NodeKind::IndexAccess: return evalIndexAccess(NODE(IndexAccess, IndexAccessNode));
+            case NodeKind::TryCatch:    return evalTryCatch(NODE(TryCatch, TryCatchNode));
+            case NodeKind::Break:       flow_ = Flow::Break;    return Value();
+            case NodeKind::Continue:    flow_ = Flow::Continue; return Value();
+            case NodeKind::Throw:       return evalThrow(NODE(Throw, ThrowNode));
+            case NodeKind::Switch:      return evalSwitch(NODE(Switch, SwitchNode));
+            case NodeKind::ClassDecl:   return evalClassDecl(NODE(ClassDecl, ClassDeclNode));
+            case NodeKind::Super:       return evalSuper(NODE(Super, SuperNode));
+            case NodeKind::Print:       return evalPrint(NODE(Print, PrintNode));
+            case NodeKind::Channel:     return evalChannel(NODE(Channel, ChannelNode));
+            case NodeKind::Broadcast:   return evalBroadcast(NODE(Broadcast, BroadcastNode));
+            case NodeKind::Stream:      return evalStream(NODE(Stream, StreamNode));
+            case NodeKind::Stun:        return evalStun(NODE(Stun, StunNode));
+            case NodeKind::Relay:       return evalRelay(NODE(Relay, RelayNode));
+            case NodeKind::Signal:      return evalSignal(NODE(Signal, SignalNode));
+            case NodeKind::Connect:     return evalConnect(NODE(Connect, ConnectNode));
+            case NodeKind::Include:     return evalInclude(NODE(Include, IncludeNode));
+            // BlockNode is declared but never constructed -- the parser inlines
+            // statement lists. It reached `return Value()` through the old
+            // chain and still does, by the same route.
+            case NodeKind::Block:       break;
+        }
+        #undef NODE
+
+        // The original chain, retained deliberately. Nothing routes here today;
+        // it exists so that a node type added without a case above evaluates
+        // correctly -- slowly, but correctly -- instead of falling through to
+        // null. A fix that can only fail to accelerate is worth more than one
+        // that can fail.
         if (auto n = dynamic_cast<NumberNode*>(node.get()))    return evalNumber(n);
         if (auto n = dynamic_cast<StringNode*>(node.get()))    return evalString(n);
         if (auto n = dynamic_cast<BoolNode*>(node.get()))      return evalBool(n);
@@ -2566,8 +2704,8 @@ private:
         if (auto n = dynamic_cast<DotAccessNode*>(node.get())) return evalDotAccess(n);
         if (auto n = dynamic_cast<IndexAccessNode*>(node.get())) return evalIndexAccess(n);
         if (auto n = dynamic_cast<TryCatchNode*>(node.get()))  return evalTryCatch(n);
-        if (dynamic_cast<BreakNode*>(node.get()))              throw BreakSignal{};
-        if (dynamic_cast<ContinueNode*>(node.get()))           throw ContinueSignal{};
+        if (dynamic_cast<BreakNode*>(node.get()))              { flow_ = Flow::Break;    return Value(); }
+        if (dynamic_cast<ContinueNode*>(node.get()))           { flow_ = Flow::Continue; return Value(); }
         if (auto n = dynamic_cast<ThrowNode*>(node.get()))     return evalThrow(n);
         if (auto n = dynamic_cast<SwitchNode*>(node.get()))    return evalSwitch(n);
         if (auto n = dynamic_cast<ClassDeclNode*>(node.get())) return evalClassDecl(n);
@@ -2632,16 +2770,330 @@ private:
         return val;
     }
 
+    // ── Appending to a string in place ──────────────────────────────────
+    //
+    // [found] `$s = $s + $part` is O(n^2). Every + builds a fresh std::string
+    // holding a copy of the whole accumulated left operand, so building a
+    // 1.16 MB document out of 40,000 pieces moves ~23 GB and takes 6,752 ms.
+    // join() gave Bantu a linear way to build a string; it did not make the
+    // quadratic way stop being quadratic, and the quadratic way is the one
+    // people write.
+    //
+    // The fix is CPython's (unicode_concatenate in ceval.c, since 2.4, and the
+    // reason "string concatenation is quadratic in Python" is folklore rather
+    // than fact): when the result of x + y is assigned straight back to x, x's
+    // old value is dead the moment the assignment lands, so it can be appended
+    // to in place instead of copied.
+    //
+    // The parser has already arranged for this to cover both spellings --
+    // `$s += $x` desugars to exactly AssignNode(s, BinaryOp(PLUS, Var(s), x)).
+    // Walking the left spine covers `$s = $s + $a + $b` too, since + is
+    // left-associative and the leftmost leaf of the chain is the accumulator.
+    //
+    // Every operand is fully evaluated BEFORE anything is appended, which is
+    // what makes `$s = $s + $s` and `$s = $s + f()` (where f touches $s)
+    // correct. Lists and dicts are untouched: this fires only when the target
+    // currently holds a STRING and every piece stringifies.
+    //
+    // Returns false when the shape does not match, and the ordinary path runs.
+    // Can evaluating this subtree rebind a plain variable in the CURRENT scope?
+    //
+    // Only an assignment can, and only one written literally here: a function
+    // called from inside the expression assigns into its own scope, because
+    // Environment::assign stops at the nearest function boundary, so it cannot
+    // reach our slot. An anonymous function appearing as an operand is merely
+    // constructed, not run.
+    //
+    // The whitelist is deliberate: anything not named here answers "yes, it
+    // might", so a node type added later declines the optimisation instead of
+    // silently invalidating its premise.
+    static bool mayRebindLocal(ASTNode* n) {
+        if (!n) return false;
+        switch (n->kind) {
+            case NodeKind::Number: case NodeKind::String: case NodeKind::Bool:
+            case NodeKind::Null:   case NodeKind::Variable:
+            case NodeKind::FuncDecl:                       // constructed, not called
+                return false;
+            case NodeKind::BinaryOp: {
+                auto* b = nodeAs<BinaryOpNode>(n);
+                return mayRebindLocal(b->left.get()) || mayRebindLocal(b->right.get());
+            }
+            case NodeKind::UnaryOp:
+                return mayRebindLocal(nodeAs<UnaryOpNode>(n)->operand.get());
+            case NodeKind::DotAccess:
+                return mayRebindLocal(nodeAs<DotAccessNode>(n)->object.get());
+            case NodeKind::IndexAccess: {
+                auto* ix = nodeAs<IndexAccessNode>(n);
+                return mayRebindLocal(ix->object.get()) || mayRebindLocal(ix->index.get());
+            }
+            case NodeKind::List: {
+                for (auto& e : nodeAs<ListNode>(n)->elements)
+                    if (mayRebindLocal(e.get())) return true;
+                return false;
+            }
+            case NodeKind::Dict: {
+                for (auto& kv : nodeAs<DictNode>(n)->pairs)
+                    if (mayRebindLocal(kv.second.get())) return true;
+                return false;
+            }
+            case NodeKind::Call: {
+                auto* c = nodeAs<CallNode>(n);
+                if (mayRebindLocal(c->callee.get())) return true;
+                for (auto& a : c->args) if (mayRebindLocal(a.get())) return true;
+                return false;
+            }
+            default:
+                return true;
+        }
+    }
+
+    // Does this expression name the same storage location as that one?
+    // `$o.parts = $o.parts + …` only qualifies if both `$o.parts` are the same
+    // `$o.parts`. Restricted to the forms whose identity is decidable from the
+    // syntax alone -- a variable, a field of one, an element at a fixed or
+    // named index.
+    static bool sameLValue(ASTNode* a, ASTNode* b) {
+        if (!a || !b || a->kind != b->kind) return false;
+        switch (a->kind) {
+            case NodeKind::Variable:
+                return nodeAs<VariableNode>(a)->name == nodeAs<VariableNode>(b)->name;
+            case NodeKind::DotAccess: {
+                auto* x = nodeAs<DotAccessNode>(a);
+                auto* y = nodeAs<DotAccessNode>(b);
+                return x->property == y->property && sameLValue(x->object.get(), y->object.get());
+            }
+            case NodeKind::IndexAccess: {
+                auto* x = nodeAs<IndexAccessNode>(a);
+                auto* y = nodeAs<IndexAccessNode>(b);
+                if (!sameLValue(x->object.get(), y->object.get())) return false;
+                ASTNode* i = x->index.get();
+                ASTNode* j = y->index.get();
+                if (!i || !j || i->kind != j->kind) return false;
+                if (i->kind == NodeKind::Number)
+                    return nodeAs<NumberNode>(i)->value == nodeAs<NumberNode>(j)->value;
+                if (i->kind == NodeKind::String)
+                    return nodeAs<StringNode>(i)->value == nodeAs<StringNode>(j)->value;
+                if (i->kind == NodeKind::Variable)
+                    return nodeAs<VariableNode>(i)->name == nodeAs<VariableNode>(j)->name;
+                return false;   // a computed index may not be the same index twice
+            }
+            default: return false;
+        }
+    }
+
+    // Can this expression run ANY user code?
+    //
+    // The plain-variable append only needs "no operand can rebind this local",
+    // because Environment::assign stops at the function boundary so a callee
+    // cannot reach a caller's binding. A field or element target has no such
+    // protection: dicts and lists are reachable through references, so a callee
+    // holding the same object can replace the very string being appended to.
+    // For those targets the bar is therefore absolute -- nothing may run.
+    static bool isPureExpr(ASTNode* n) {
+        if (!n) return true;
+        switch (n->kind) {
+            case NodeKind::Number: case NodeKind::String:
+            case NodeKind::Bool:   case NodeKind::Null:
+            case NodeKind::Variable:
+                return true;
+            case NodeKind::BinaryOp: {
+                auto* b = nodeAs<BinaryOpNode>(n);
+                return isPureExpr(b->left.get()) && isPureExpr(b->right.get());
+            }
+            case NodeKind::UnaryOp:
+                return isPureExpr(nodeAs<UnaryOpNode>(n)->operand.get());
+            case NodeKind::DotAccess:
+                return isPureExpr(nodeAs<DotAccessNode>(n)->object.get());
+            case NodeKind::IndexAccess: {
+                auto* ix = nodeAs<IndexAccessNode>(n);
+                return isPureExpr(ix->object.get()) && isPureExpr(ix->index.get());
+            }
+            default: return false;
+        }
+    }
+
+    // Is `value` the chain `<target> + p1 + p2 …`? Returns the piece count, or 0.
+    // `+` is left-associative, so the accumulator is the leftmost leaf.
+    int appendChainShape(ASTNode* value, ASTNode* target) {
+        BinaryOpNode* top = nodeIf<BinaryOpNode>(value);
+        if (!top || top->op != BantuTokenType::PLUS) return 0;
+        int count = 0;
+        BinaryOpNode* cur = top;
+        while (true) {
+            if (++count > 100) return 0;              // keep it inside a signed char
+            if (!isPureExpr(cur->right.get())) return 0;
+            BinaryOpNode* nx = nodeIf<BinaryOpNode>(cur->left.get());
+            if (!nx || nx->op != BantuTokenType::PLUS) break;
+            cur = nx;
+        }
+        return sameLValue(cur->left.get(), target) ? count : 0;
+    }
+
+    // Evaluate the chain's operands, then append them all. Shared by the three
+    // assignment forms; `acc` is the target's own buffer.
+    void appendChain(std::string& acc, BinaryOpNode* top, int pieces) {
+        if (pieces == 1) {                            // nearly all of them: no container
+            Value v = evalNode(top->right);
+            appendOne(acc, v);
+            return;
+        }
+        // Every operand is evaluated before a single byte is appended, so
+        // `$s = $s + $s` reads the old value rather than the buffer being written.
+        std::vector<Value> vals;
+        vals.reserve((size_t)pieces);
+        BinaryOpNode* cur = top;
+        while (true) {
+            vals.push_back(evalNode(cur->right));
+            BinaryOpNode* nx = nodeIf<BinaryOpNode>(cur->left.get());
+            if (!nx || nx->op != BantuTokenType::PLUS) break;
+            cur = nx;
+        }
+        size_t extra = 0;
+        for (const Value& v : vals) extra += v.isString() ? v.stringVal.size() : 8;
+        size_t need = acc.size() + extra;
+        if (need > acc.capacity()) acc.reserve(std::max(need, acc.capacity() * 2));
+        // Collected right-to-left down the spine; applied in written order.
+        for (size_t i = vals.size(); i-- > 0; ) appendOne(acc, vals[i]);
+    }
+
+    // The purely syntactic half of the test, computed once per site and cached
+    // on the node as a piece count: is this `$x = $x + …`, with operands that
+    // cannot rebind $x? Every `$i = $i + 1` in every loop runs this, so after
+    // the first visit it must be a byte load and nothing more.
+    signed char appendShapeOf(AssignNode* n) {
+        if (n->appendShape >= 0) return n->appendShape;
+
+        BinaryOpNode* top = nodeIf<BinaryOpNode>(n->value.get());
+        if (!top || top->op != BantuTokenType::PLUS) return n->appendShape = 0;
+
+        // `$s + $a + $b` parses as ((s + a) + b): walk the left spine, which is
+        // where the accumulator sits, counting the right operands.
+        int count = 0;
+        BinaryOpNode* cur = top;
+        while (true) {
+            if (++count > 100) return n->appendShape = 0;   // keep it in a signed char
+            if (mayRebindLocal(cur->right.get())) return n->appendShape = 0;
+            BinaryOpNode* nextLeft = nodeIf<BinaryOpNode>(cur->left.get());
+            if (!nextLeft || nextLeft->op != BantuTokenType::PLUS) break;
+            cur = nextLeft;
+        }
+        VariableNode* leaf = nodeIf<VariableNode>(cur->left.get());
+        if (!leaf || leaf->name != n->name) return n->appendShape = 0;
+        return n->appendShape = (signed char)count;
+    }
+
+    // Append one evaluated operand the way evalBinaryOp's PLUS arm would: with
+    // a string on either side it is toString() on both, for every operand type.
+    static void appendOne(std::string& acc, const Value& v) {
+        if (v.isString()) acc += v.stringVal;
+        else              acc += v.toString();
+    }
+
     Value evalAssign(AssignNode* n) {
+        // ── Appending to a string in place ──────────────────────────────
+        //
+        // [found] `$s = $s + $part` is O(n^2). Every + builds a fresh string
+        // holding a copy of the whole accumulated left operand, so assembling
+        // a 1.16 MB document out of 40,000 pieces moves ~23 GB and took
+        // 6,752 ms. join() gave Bantu a linear way to build a string; it did
+        // not make the quadratic way stop being quadratic, and the quadratic
+        // way is the one people write.
+        //
+        // The fix is CPython's (unicode_concatenate in ceval.c, since 2.4,
+        // and the reason "string concatenation is quadratic in Python" is
+        // folklore rather than fact): when the result of x + y is assigned
+        // straight back to x, x's old value is dead the moment the assignment
+        // lands, so it can be appended to rather than copied.
+        //
+        // `$s += $x` is covered for free -- the parser desugars it into
+        // exactly this shape -- and so is `$s = $s + $a + $b`, because + is
+        // left-associative and the accumulator is the leftmost leaf.
+        //
+        // `slot` is resolved ONCE and reused by the ordinary path below, so a
+        // non-string target (`$i = $i + 1`) pays nothing: this lookup replaces
+        // the one Environment::assign would have done rather than adding to
+        // it. Holding it across evaluation is safe because appendShapeOf has
+        // already proved no operand can rebind the name, unordered_map keeps
+        // element addresses stable across insertion, and nothing in the
+        // interpreter ever erases a binding.
+        Value* slot = nullptr;
+        signed char pieces = appendShapeOf(n);
+        if (pieces > 0) {
+            slot = env_->existingAssignSlot(n->name);
+            if (slot && slot->isString()) {
+                std::string& acc = slot->stringVal;
+                if (pieces == 1) {
+                    // Nearly every append is this shape, and it allocates
+                    // nothing: one operand, one Value, one append.
+                    Value v = evalNode(nodeAs<BinaryOpNode>(n->value.get())->right);
+                    appendOne(acc, v);
+                } else {
+                    // Every operand is evaluated before a single byte is
+                    // appended, which is what makes `$s = $s + $s` read the
+                    // old value rather than the buffer being written.
+                    std::vector<Value> vals;
+                    vals.reserve((size_t)pieces);
+                    BinaryOpNode* cur = nodeAs<BinaryOpNode>(n->value.get());
+                    while (true) {
+                        vals.push_back(evalNode(cur->right));
+                        BinaryOpNode* nx = nodeIf<BinaryOpNode>(cur->left.get());
+                        if (!nx || nx->op != BantuTokenType::PLUS) break;
+                        cur = nx;
+                    }
+                    // Collected right-to-left down the spine; applied in the
+                    // order the operators are written.
+                    size_t extra = 0;
+                    for (const Value& v : vals) extra += v.isString() ? v.stringVal.size() : 8;
+                    size_t need = acc.size() + extra;
+                    if (need > acc.capacity()) acc.reserve(std::max(need, acc.capacity() * 2));
+                    for (size_t i = vals.size(); i-- > 0; ) appendOne(acc, vals[i]);
+                }
+                // Returning the value would copy the whole accumulated string,
+                // leaving a discarded statement O(n^2) -- the very thing this
+                // exists to fix. parseExpressionStatement marks the statements
+                // whose value nobody reads.
+                return n->resultDiscarded ? Value() : *slot;
+            }
+        }
+
         Value val = evalNode(n->value);
         // Function-local assignment: resolve up to the enclosing function
         // boundary only, else define locally. Prevents a callee from clobbering
         // a caller's/global's variable of the same name (e.g. a loop counter).
+        if (slot) { *slot = std::move(val); return *slot; }   // the slot assign() would have found
         env_->assign(n->name, val);
         return val;
     }
 
     Value evalIndexAssign(IndexAssignNode* n) {
+        // `$a[$i] = $a[$i] + …` and `$d["k"] += …`, for the same reason as
+        // evalDictAssign above. The index must be a literal or a variable for
+        // the two spellings to be provably the same element (sameLValue).
+        if (n->appendShape != 0) {
+            if (n->appendShape < 0) {
+                IndexAccessNode probe(n->object, n->index, n->line, n->col);
+                n->appendShape = (signed char)appendChainShape(n->value.get(), &probe);
+            }
+            if (n->appendShape > 0) {
+                if (Value* base = resolveLValue(n->object.get())) {
+                    Value idx = evalNode(n->index);
+                    Value* slot = nullptr;
+                    if (base->isList() && idx.isNumber()) {
+                        long long i = (long long)idx.numberVal;
+                        if (i >= 0 && i < (long long)base->listVal.size())
+                            slot = &base->listVal[(size_t)i];
+                    } else if (base->isObject() && base->objectVal) {
+                        slot = &(*base->objectVal)[idx.toString()];
+                    }
+                    if (slot && slot->isString()) {
+                        appendChain(slot->stringVal, nodeAs<BinaryOpNode>(n->value.get()),
+                                    n->appendShape);
+                        return n->resultDiscarded ? Value() : *slot;
+                    }
+                }
+            }
+        }
+
         Value val = evalNode(n->value);
 
         // Preferred path: resolve the container to its real storage location and
@@ -2667,12 +3119,33 @@ private:
                 (*base->objectVal)[idx.toString()] = val;
                 return val;
             }
+            // $a[i] = v on an array. After the list and dict cases so neither
+            // pays for it. A handle has REFERENCE semantics, so unlike a list
+            // this needs no write-back -- the "copy" is a shared_ptr to the same
+            // buffer. Previously this threw "Cannot index-assign to this type".
+            if (base->type == Value::NATIVE_HANDLE) {
+                try {
+                    if (numba::dispatchIndexAssign(*base, idx, val)) return val;
+                } catch (const std::exception& e) {
+                    ErrorHandler::throwRuntimeError(e.what(), n->line, n->col);
+                    return Value();
+                }
+            }
             // resolvable but not indexable → fall through to the error/slow path
         }
 
         // Slow path: evaluate expression and update
         Value obj = evalNode(n->object);
         Value idx = evalNode(n->index);
+
+        if (obj.type == Value::NATIVE_HANDLE) {
+            try {
+                if (numba::dispatchIndexAssign(obj, idx, val)) return val;
+            } catch (const std::exception& e) {
+                ErrorHandler::throwRuntimeError(e.what(), n->line, n->col);
+                return Value();
+            }
+        }
 
         if (obj.isList()) {
             int i = (int)idx.numberVal;
@@ -2684,7 +3157,7 @@ private:
                 obj.listVal.resize(i + 1, Value(0.0));
             }
             obj.listVal[i] = val;
-            if (auto varNode = dynamic_cast<VariableNode*>(n->object.get())) {
+            if (auto varNode = nodeIf<VariableNode>(n->object.get())) {
                 env_->set(varNode->name, obj);
             }
             return val;
@@ -2693,7 +3166,7 @@ private:
         if (obj.isObject()) {
             std::string key = idx.toString();
             (*obj.objectVal)[key] = val;
-            if (auto varNode = dynamic_cast<VariableNode*>(n->object.get())) {
+            if (auto varNode = nodeIf<VariableNode>(n->object.get())) {
                 env_->set(varNode->name, obj);
             }
             return val;
@@ -2704,6 +3177,33 @@ private:
     }
 
     Value evalDictAssign(DictAssignNode* n) {
+        // `$o.parts = $o.parts + …` appends in place, as the plain-variable
+        // form does. Without this, accumulating through a FIELD stayed O(n^2)
+        // while the identical code accumulating into a local was linear -- the
+        // same operation, 64x apart, which is not a defensible thing for a
+        // language to do. Operands must be pure here (isPureExpr): a callee
+        // holding this same dict could otherwise replace the string underneath
+        // the append, which the plain-variable case is structurally safe from.
+        if (n->appendShape != 0) {
+            if (n->appendShape < 0) {
+                DotAccessNode probe(n->object, n->key, n->line, n->col);
+                n->appendShape = (signed char)appendChainShape(n->value.get(), &probe);
+            }
+            if (n->appendShape > 0) {
+                if (Value* base = resolveLValue(n->object.get())) {
+                    Value* slot = nullptr;
+                    if (base->isObject() && base->objectVal) slot = &(*base->objectVal)[n->key];
+                    else if (base->isClassInstance() && base->classInstanceVal)
+                        slot = &base->classInstanceVal->properties[n->key];
+                    if (slot && slot->isString()) {
+                        appendChain(slot->stringVal, nodeAs<BinaryOpNode>(n->value.get()),
+                                    n->appendShape);
+                        return n->resultDiscarded ? Value() : *slot;
+                    }
+                }
+            }
+        }
+
         Value obj = evalNode(n->object);
         Value val = evalNode(n->value);
 
@@ -2715,7 +3215,7 @@ private:
 
         if (obj.isObject()) {
             (*obj.objectVal)[n->key] = val;
-            if (auto varNode = dynamic_cast<VariableNode*>(n->object.get())) {
+            if (auto varNode = nodeIf<VariableNode>(n->object.get())) {
                 env_->set(varNode->name, obj);
             }
             return val;
@@ -2729,9 +3229,94 @@ private:
     // OPERATOR EVALUATION
     // ════════════════════════════════════════════════════════════
 
+    // Map a token to numba's operator enum. Kept here so ndarray_api.hpp never
+    // has to see the token definitions.
+    static bool numbaOpOf(BantuTokenType t, numba::Op& op) {
+        switch (t) {
+            case BantuTokenType::PLUS:             op = numba::Op::Add; return true;
+            case BantuTokenType::MINUS:            op = numba::Op::Sub; return true;
+            case BantuTokenType::MULTIPLY:         op = numba::Op::Mul; return true;
+            case BantuTokenType::DIVIDE:           op = numba::Op::Div; return true;
+            case BantuTokenType::MODULO:           op = numba::Op::Mod; return true;
+            case BantuTokenType::GREATERTHAN:      op = numba::Op::Gt;  return true;
+            case BantuTokenType::LESSTHAN:         op = numba::Op::Lt;  return true;
+            case BantuTokenType::GREATERTHANEQUAL: op = numba::Op::Ge;  return true;
+            case BantuTokenType::LESSTHANEQUAL:    op = numba::Op::Le;  return true;
+            default: return false;
+        }
+    }
+
     Value evalBinaryOp(BinaryOpNode* n) {
+        // && and || SHORT-CIRCUIT, and must be handled before the right-hand
+        // side is evaluated at all.
+        //
+        // They did not, and that was a real defect rather than a quirk: the
+        // universal guard idiom
+        //
+        //     if ($i < len($a) && $a[$i] == x) { ... }
+        //     if ($d != null && $d["k"] == 1) { ... }
+        //
+        // evaluated the right operand unconditionally and died with "Index out
+        // of bounds" on exactly the boundary the guard was written to prevent.
+        // Every programmer arriving from any other language writes that line.
+        //
+        // The result is still a BOOL, as before, so nothing that already worked
+        // changes value -- only the point at which the right side stops being
+        // evaluated, and with it any side effect it carries.
+        //
+        // AND and OR are adjacent in BantuTokenType (types.hpp:328), so this
+        // guard is one unsigned compare on the hottest path in the
+        // interpreter. A/B'd on a 1M-iteration arithmetic loop containing no
+        // logical operators at all, best-of-5 in both orderings: 540/541 ms
+        // without the guard against 535/533 ms with it. The cost is below the
+        // noise floor.
+        if (BANTU_UNLIKELY((unsigned)((int)n->op - (int)BantuTokenType::AND) <= 1u)) {
+            const bool leftTrue = evalNode(n->left).isTruthy();
+            if (n->op == BantuTokenType::AND) {
+                if (!leftTrue) return Value(false);
+            } else {
+                if (leftTrue) return Value(true);
+            }
+            return Value(evalNode(n->right).isTruthy());
+        }
+
         Value left = evalNode(n->left);
         Value right = evalNode(n->right);
+
+        // Fast reject. Two plain numbers is overwhelmingly the common case, and
+        // this is one predictable branch on a byte already in L1. When it does
+        // fire we fall THROUGH to the switch below, so string +, ==/!= on any
+        // type and &&/|| are untouched.
+        //
+        // Every path this opens was previously DEAD: `$handle + 1` read
+        // numberVal, which is always 0 for a handle, and silently produced 1.
+        // NUMBER is 0 in Value::Type, so `both are numbers` is a single OR
+        // against zero: one compare and one well-predicted branch, rather than
+        // two short-circuited compares. Measured: the two-compare form cost
+        // 2.66% on a 1M arithmetic loop, over the phase's 2% budget.
+        if (BANTU_UNLIKELY(((int)left.type | (int)right.type) != (int)Value::NUMBER)) {
+            if (left.type == Value::NATIVE_HANDLE || right.type == Value::NATIVE_HANDLE) {
+                numba::Op nop;
+                if (numbaOpOf(n->op, nop)) {
+                    Value out;
+                    try {
+                        if (numba::dispatchBinary(nop, left, right, out)) return out;
+                    } catch (const std::exception& e) {
+                        ErrorHandler::throwRuntimeError(e.what(), n->line, n->col);
+                        return Value();
+                    }
+                }
+            }
+            // `[1] + [2, 3]` read numberVal from both lists and silently gave
+            // 0. Two lists now concatenate, as in Python. Both operands are
+            // this frame's own copies, so their elements are moved, not copied.
+            if (n->op == BantuTokenType::PLUS && left.isList() && right.isList()) {
+                std::vector<Value> out = std::move(left.listVal);
+                out.insert(out.end(), std::make_move_iterator(right.listVal.begin()),
+                           std::make_move_iterator(right.listVal.end()));
+                return Value(std::move(out));
+            }
+        }
 
         switch (n->op) {
             case BantuTokenType::PLUS:
@@ -2768,8 +3353,15 @@ private:
             case BantuTokenType::LESSTHAN: return Value(left.numberVal < right.numberVal);
             case BantuTokenType::GREATERTHANEQUAL: return Value(left.numberVal >= right.numberVal);
             case BantuTokenType::LESSTHANEQUAL: return Value(left.numberVal <= right.numberVal);
-            case BantuTokenType::AND: return Value(left.isTruthy() && right.isTruthy());
-            case BantuTokenType::OR: return Value(left.isTruthy() || right.isTruthy());
+            // AND and OR are handled at the top of this function, where they
+            // can short-circuit. Reaching here would mean the guard above
+            // stopped matching, so say so rather than silently evaluating both
+            // sides again.
+            case BantuTokenType::AND:
+            case BantuTokenType::OR:
+                ErrorHandler::throwRuntimeError("internal: && / || reached the non-short-circuit path",
+                                                n->line, n->col);
+                return Value();
             default:
                 ErrorHandler::throwRuntimeError("Unknown operator", n->line, n->col);
                 return Value();
@@ -2780,7 +3372,19 @@ private:
         Value operand = evalNode(n->operand);
         switch (n->op) {
             case BantuTokenType::NOT: return Value(!operand.isTruthy());
-            case BantuTokenType::MINUS: return Value(-operand.numberVal);
+            case BantuTokenType::MINUS:
+                // -$a on an array negates element-wise. Previously this read
+                // numberVal and produced -0 for any handle.
+                if (BANTU_UNLIKELY(operand.type == Value::NATIVE_HANDLE)) {
+                    Value out;
+                    try {
+                        if (numba::dispatchNegate(operand, out)) return out;
+                    } catch (const std::exception& e) {
+                        ErrorHandler::throwRuntimeError(e.what(), n->line, n->col);
+                        return Value();
+                    }
+                }
+                return Value(-operand.numberVal);
             default: return Value();
         }
     }
@@ -2794,16 +3398,12 @@ private:
         if (condition.isTruthy()) {
             auto prevEnv = env_;
             env_ = std::make_shared<Environment>(env_);
-            for (auto& stmt : n->body) {
-                evalNode(stmt);
-            }
+            runStatements(n->body);
             env_ = prevEnv;
         } else {
             auto prevEnv = env_;
             env_ = std::make_shared<Environment>(env_);
-            for (auto& stmt : n->elseBody) {
-                evalNode(stmt);
-            }
+            runStatements(n->elseBody);
             env_ = prevEnv;
         }
         return Value();
@@ -2811,19 +3411,22 @@ private:
 
     Value evalWhile(WhileNode* n) {
         while (evalNode(n->condition).isTruthy()) {
+            // A safe point for the cycle collector: the previous iteration's
+            // statements are finished, so no raw Value* into a container is in
+            // flight. See docs/object-lifetime-architecture.md §4.5.
+            bantu_gc::maybeCollect();
             auto prevEnv = env_;
             env_ = std::make_shared<Environment>(env_);
             try {
-                for (auto& stmt : n->body) {
-                    evalNode(stmt);
-                }
-            } catch (const BreakSignal&) {
+                runStatements(n->body);
+            } catch (const BreakSignal&) {       // escaped from a called function
                 env_ = prevEnv;
                 break;
             } catch (const ContinueSignal&) {
                 // continue to next iteration
             }
             env_ = prevEnv;
+            if (!loopGoesOn()) break;
         }
         return Value();
     }
@@ -2835,20 +3438,20 @@ private:
 
         int safety = 0;
         while (evalNode(n->condition).isTruthy() && safety < 100000) {
+            bantu_gc::maybeCollect();
             auto loopEnv = std::make_shared<Environment>(env_);
             auto savedEnv = env_;
             env_ = loopEnv;
             try {
-                for (auto& stmt : n->body) {
-                    evalNode(stmt);
-                }
-            } catch (const BreakSignal&) {
+                runStatements(n->body);
+            } catch (const BreakSignal&) {       // escaped from a called function
                 env_ = savedEnv;
                 break;
             } catch (const ContinueSignal&) {
                 // continue
             }
             env_ = savedEnv;
+            if (!loopGoesOn()) break;            // continue still runs the update
             evalNode(n->update);
             safety++;
         }
@@ -2865,24 +3468,25 @@ private:
 
         // Runs the body once with the loop var(s) bound. Returns false on break.
         auto runBody = [&](const Value& a, const Value& b) -> bool {
+            bantu_gc::maybeCollect();
             auto prevEnv = env_;
             env_ = std::make_shared<Environment>(prevEnv);
             env_->define(n->varName, a);
             if (twoVars) env_->define(n->valueVar, b);
             try {
-                for (auto& stmt : n->body) evalNode(stmt);
-            } catch (const BreakSignal&) {
+                runStatements(n->body);
+            } catch (const BreakSignal&) {       // escaped from a called function
                 env_ = prevEnv;
                 return false;
             } catch (const ContinueSignal&) {
                 env_ = prevEnv;
                 return true;
             } catch (...) {
-                env_ = prevEnv;   // return / error → restore scope and propagate
+                env_ = prevEnv;   // an error: restore scope and propagate
                 throw;
             }
             env_ = prevEnv;
-            return true;
+            return loopGoesOn();
         };
 
         if (iterable.isList()) {
@@ -2913,7 +3517,7 @@ private:
     // ════════════════════════════════════════════════════════════
 
     // Call a Bantu function Value with arguments. Returns the function's
-    // return value (or null). Catches ReturnSignal internally.
+    // return value (or null). Consumes a pending return (finishCall).
     Value bantuCallFunction(Value callee, std::vector<Value> args) {
         if (callee.isNativeFn()) {
             return callee.nativeFn(std::move(args));
@@ -2933,18 +3537,15 @@ private:
             env_ = callEnv;
             Value result;
             try {
-                for (auto& stmt : fn->body) {
-                    result = evalNode(stmt);
-                }
-            } catch (const ReturnSignal& sig) {
-                result = sig.value;
+                result = runStatements(fn->body);
             } catch (const std::exception& e) {
                 env_ = prevEnv;
+                flow_ = Flow::Normal;            // nothing pending survives an error
                 std::cerr << "  [SERVER] Handler error: " << e.what() << "\n";
                 return Value();
             }
             env_ = prevEnv;
-            return result;
+            return finishCall(result);
         }
         return Value();
     }
@@ -3900,19 +4501,20 @@ private:
     }
 
     Value evalReturn(ReturnNode* n) {
-        Value val = evalNode(n->value);
-        throw ReturnSignal{val};
+        flowValue_ = evalNode(n->value);
+        flow_ = Flow::Return;
+        return Value();
     }
 
     // Resolve an assignable slot (variable / list element / dict entry) to a
     // mutable Value*, or nullptr if the node isn't a valid lvalue. Powers the
     // in-place list mutators below.
     Value* resolveLValue(ASTNode* node) {
-        if (auto v = dynamic_cast<VariableNode*>(node)) {
+        if (auto v = nodeIf<VariableNode>(node)) {
             if (env_->has(v->name)) return &env_->getRef(v->name);
             return nullptr;
         }
-        if (auto idx = dynamic_cast<IndexAccessNode*>(node)) {
+        if (auto idx = nodeIf<IndexAccessNode>(node)) {
             Value* base = resolveLValue(idx->object.get());
             if (!base) return nullptr;
             Value key = evalNode(idx->index);
@@ -3924,7 +4526,7 @@ private:
             if (base->isObject()) return &(*base->objectVal)[key.toString()];
             return nullptr;
         }
-        if (auto dot = dynamic_cast<DotAccessNode*>(node)) {
+        if (auto dot = nodeIf<DotAccessNode>(node)) {
             Value* base = resolveLValue(dot->object.get());
             if (base && base->isObject()) return &(*base->objectVal)[dot->property];
             // A class instance stores its fields by value, so return a pointer to
@@ -3942,7 +4544,18 @@ private:
     //   append(l, x…) · push(l, x…) · pop(l) · insert(l, i, x) · remove(l, i) · extend(l, l2)
     // `argStart` is where the value arguments begin: 1 for function form
     // (arg0 is the list), 0 for method form ($l.push(x) — the list is the receiver).
-    Value listMutator(const std::string& op, Value& lst, CallNode* n, size_t argStart = 1) {
+    // `returnList` exists only for `push`. Returning the mutated list means
+    // deep-copying a std::vector<Value> -- and a Value is a ~190-byte struct
+    // holding a string, a vector, a std::function and three shared_ptrs -- so
+    // an O(1) append became O(n), and building a list in a loop became
+    // O(n^2). Measured: 20,000 `$l.push(x)` took 9,491 ms against 69 ms for
+    // the identical `append($l, x)`, a 137x difference that grows with n.
+    // The bare `push($l, x)` form keeps returning the list, because
+    // `$x = push($x, v)` is a documented idiom (tests/lang_test.b). The method
+    // form `$l.push(x)` returns the new length instead, as in JavaScript --
+    // nothing assigns from it, and it is the form that appears in loops.
+    Value listMutator(const std::string& op, Value& lst, CallNode* n,
+                      size_t argStart = 1, bool returnList = true) {
         std::vector<Value> args;
         for (size_t i = argStart; i < n->args.size(); i++) args.push_back(evalNode(n->args[i]));
         auto& vec = lst.listVal;
@@ -3951,9 +4564,8 @@ private:
             return Value((double)vec.size());
         }
         if (op == "push") {
-            // Same as append, but returns the (mutated) list so the older
-            // `$l = push($l, x)` idiom keeps working correctly.
-            for (auto& a : args) vec.push_back(a);
+            for (auto& a : args) vec.push_back(std::move(a));
+            if (!returnList) return Value((double)vec.size());
             return lst;
         }
         if (op == "pop") {
@@ -3984,61 +4596,18 @@ private:
         return Value();
     }
 
-    Value evalCall(CallNode* n) {
-        // In-place list mutators (append/push/pop/insert/remove/extend). Resolved
-        // here because a native builtin only receives args by value and could not
-        // mutate the caller's list. A user-defined function of the same name wins.
-        if (auto callVar = dynamic_cast<VariableNode*>(n->callee.get())) {
-            const std::string& fname = callVar->name;
-            if (!env_->has(fname) && !n->args.empty() &&
-                (fname == "append" || fname == "push" || fname == "pop" || fname == "insert" ||
-                 fname == "remove" || fname == "extend")) {
-                Value* lv = resolveLValue(n->args[0].get());
-                if (!lv || !lv->isList()) {
-                    ErrorHandler::throwRuntimeError(fname + "() expects a list variable as its first argument", n->line, n->col);
-                }
-                return listMutator(fname, *lv, n, 1);
-            }
-        }
-
-        // Method-style list mutation: $list.push(x) / $list.pop().
-        // evalDotAccess only ever sees a COPY of the list, so these are resolved
-        // against the real storage here. If the receiver isn't an addressable
-        // list (e.g. a literal), we fall through to the value-copy methods.
-        if (auto dot = dynamic_cast<DotAccessNode*>(n->callee.get())) {
-            if (dot->property == "push" || dot->property == "pop") {
-                Value* lv = resolveLValue(dot->object.get());
-                if (lv && lv->isList()) {
-                    return listMutator(dot->property, *lv, n, 0);
-                }
-            }
-        }
-
-        // Check for 'new ClassName()' pattern
-        if (auto varNode = dynamic_cast<VariableNode*>(n->callee.get())) {
-            // Check if it's preceded by 'new' keyword (handled via variable lookup)
-            // OR if the variable is a class definition
-            if (env_->has(varNode->name)) {
-                Value val = env_->get(varNode->name);
-                if (val.isClassDef()) {
-                    std::vector<Value> args;
-                    for (auto& arg : n->args) {
-                        args.push_back(evalNode(arg));
-                    }
-                    return instantiateClass(val.classDefVal, args);
-                }
-            }
-        }
-
-        // Check for 'new' keyword as outer expression
-        // Also handle: $obj.method() on class instances
-        Value callee = evalNode(n->callee);
-
-        std::vector<Value> args;
-        for (auto& arg : n->args) {
-            args.push_back(evalNode(arg));
-        }
-
+    // Call any callable Value with arguments that have already been evaluated.
+    //
+    // Lifted out of evalCall so that a NATIVE BUILTIN can call back into Bantu —
+    // `sort($list, $cmp)` is the first to need it, and map/filter/find would be
+    // the next. A builtin only ever receives Values, so without this there is no
+    // way for one to invoke a Bantu function at all.
+    //
+    // evalCall keeps its own "what did you actually call?" diagnostic, because
+    // that one needs the CallNode to name the callee; this raises a plain error
+    // for the callback case, where the caller knows which argument was wrong and
+    // says so itself.
+    Value invokeCallable(const Value& callee, std::vector<Value> args) {
         if (callee.isNativeFn()) {
             return callee.nativeFn(std::move(args));
         }
@@ -4074,19 +4643,143 @@ private:
 
             auto prevEnv = env_;
             env_ = callEnv;
-            Value result;
-            try {
-                for (auto& stmt : fn->body) {
-                    result = evalNode(stmt);
-                }
-            } catch (const ReturnSignal& sig) {
-                result = sig.value;
-            }
+            Value result = runStatements(fn->body);
             env_ = prevEnv;
-            return result;
+            return finishCall(result);
         }
 
-        ErrorHandler::throwRuntimeError("Cannot call non-function value");
+        ErrorHandler::throwRuntimeError("Cannot call a value that is not a function");
+        return Value();
+    }
+
+    Value evalCall(CallNode* n) {
+        // In-place list mutators (append/push/pop/insert/remove/extend). Resolved
+        // here because a native builtin only receives args by value and could not
+        // mutate the caller's list. A user-defined function of the same name wins.
+        if (auto callVar = nodeIf<VariableNode>(n->callee.get())) {
+            const std::string& fname = callVar->name;
+            if (!env_->has(fname) && !n->args.empty() &&
+                (fname == "append" || fname == "push" || fname == "pop" || fname == "insert" ||
+                 fname == "remove" || fname == "extend")) {
+                Value* lv = resolveLValue(n->args[0].get());
+                if (!lv || !lv->isList()) {
+                    ErrorHandler::throwRuntimeError(fname + "() expects a list variable as its first argument", n->line, n->col);
+                }
+                // `push($l, x);` as a whole statement throws its result away,
+                // so there is no reason to copy the list to produce one.
+                // `$x = push($x, v)` is not a statement, so it still gets the
+                // list. See CallNode::resultDiscarded.
+                return listMutator(fname, *lv, n, 1, /*returnList=*/!n->resultDiscarded);
+            }
+        }
+
+        // len($var) reads the length out of the real storage instead of
+        // copying the value into an argument vector. Passing a list to ANY
+        // function copies it -- Bantu lists have value semantics -- and len()
+        // is the one builtin that routinely appears inside a loop over the
+        // very container it is measuring:
+        //
+        //     while (...) { $out[len($out)] = $v; ... }
+        //
+        // which makes an O(1) append O(n) and the loop O(n^2). Measured:
+        // 20,000 appends written that way took 7,027 ms against 67 ms with a
+        // counter variable. That idiom is used throughout hash.b and crypto.b,
+        // so this is the difference between quadratic and linear hashing.
+        // Behaviour is unchanged -- same answer, no copy.
+        if (auto callVar = nodeIf<VariableNode>(n->callee.get())) {
+            if (callVar->name == "len" && n->args.size() == 1 &&
+                nodeIf<VariableNode>(n->args[0].get())) {
+                // Only when `len` is still the builtin: a user-defined len() wins.
+                Value& fn = env_->getRef("len");
+                if (fn.isNativeFn()) {
+                    Value* lv = resolveLValue(n->args[0].get());
+                    if (lv) {
+                        if (lv->isList())   return Value((double)lv->listVal.size());
+                        if (lv->isString()) return Value((double)lv->stringVal.size());
+                    }
+                }
+            }
+        }
+
+        // Method-style list mutation: $list.push(x) / $list.pop().
+        // evalDotAccess only ever sees a COPY of the list, so these are resolved
+        // against the real storage here. If the receiver isn't an addressable
+        // list (e.g. a literal), we fall through to the value-copy methods.
+        if (auto dot = nodeIf<DotAccessNode>(n->callee.get())) {
+            if (dot->property == "push" || dot->property == "pop") {
+                Value* lv = resolveLValue(dot->object.get());
+                if (lv && lv->isList()) {
+                    // returnList = false: see listMutator. $l.push(x) yields
+                    // the new length, not a copy of the whole list.
+                    return listMutator(dot->property, *lv, n, 0, /*returnList=*/false);
+                }
+            }
+        }
+
+        // Check for 'new ClassName()' pattern
+        if (auto varNode = nodeIf<VariableNode>(n->callee.get())) {
+            // Check if it's preceded by 'new' keyword (handled via variable lookup)
+            // OR if the variable is a class definition
+            if (env_->has(varNode->name)) {
+                Value val = env_->get(varNode->name);
+                if (val.isClassDef()) {
+                    std::vector<Value> args;
+                    for (auto& arg : n->args) {
+                        args.push_back(evalNode(arg));
+                    }
+                    return instantiateClass(val.classDefVal, args);
+                }
+            }
+        }
+
+        // Check for 'new' keyword as outer expression
+        // Also handle: $obj.method() on class instances
+        Value callee = evalNode(n->callee);
+
+        std::vector<Value> args;
+        for (auto& arg : n->args) {
+            args.push_back(evalNode(arg));
+        }
+
+        if (callee.isNativeFn() || callee.isClassDef() || callee.isFunction()) {
+            return invokeCallable(callee, std::move(args));
+        }
+
+        // Name what was called and what it actually holds. "Cannot call
+        // non-function value" alone gives no clue which of several calls on the
+        // line went wrong, and the commonest cause is invisible: Bantu keeps
+        // variables and functions in ONE namespace with the `$` stripped, so
+        // `$len = 3` replaces the len() builtin for the rest of the scope and
+        // every later len(...) fails here. Saying so turns a twenty-minute hunt
+        // into a one-line fix.
+        {
+            std::string what;
+            if (auto varNode = nodeIf<VariableNode>(n->callee.get())) {
+                what = varNode->name;
+            } else if (auto dotNode = nodeIf<DotAccessNode>(n->callee.get())) {
+                what = dotNode->property;
+            }
+            std::string holds;
+            switch (callee.type) {
+                case Value::NUMBER:   holds = "a number";  break;
+                case Value::STRING:   holds = "a string";  break;
+                case Value::BOOL:     holds = "a boolean"; break;
+                case Value::NULL_VAL: holds = "null";      break;
+                case Value::LIST:     holds = "a list";    break;
+                case Value::OBJECT:   holds = "a dict";    break;
+                default:              holds = "a value that is not callable"; break;
+            }
+            std::string msg;
+            if (what.empty()) msg = "Cannot call " + holds;
+            else {
+                msg = "Cannot call '" + what + "': it holds " + holds + ", not a function";
+                if (callee.type != Value::NULL_VAL) {
+                    msg += ". Note that Bantu keeps variables and functions in one namespace, so "
+                           "assigning $" + what + " replaces any function of that name";
+                }
+            }
+            ErrorHandler::throwRuntimeError(msg, n->line, n->col);
+        }
         return Value();
     }
 
@@ -4096,6 +4789,18 @@ private:
 
     Value evalDotAccess(DotAccessNode* n) {
         Value obj = evalNode(n->object);
+
+        // $a.sum() on an array. The chaining form, which works with or without
+        // operator dispatch and on any older build -- every method is bound to
+        // the SAME NativeFn the nd_* builtin uses, so the two cannot drift.
+        // Direct precedent in this file: dict pseudo-methods below, and number
+        // pseudo-methods (.floor(), .round()). Checked before the class and
+        // dict branches only because a handle is neither, and the check is a
+        // single compare on a byte already loaded.
+        if (obj.type == Value::NATIVE_HANDLE) {
+            Value out;
+            if (numba::dispatchMethod(obj, n->property, out)) return out;
+        }
 
         // Class instance
         if (obj.isClassInstance()) {
@@ -4284,27 +4989,139 @@ private:
         return Value();
     }
 
+    // ── Borrowing, and why list indexing needed it ──────────────────────
+    //
+    // [found] `$a[$i]` was O(n) in the length of $a, so every loop over a list
+    // was O(n^2). evalNode returns a Value BY VALUE, and a Value holding a list
+    // owns its elements inline -- a 20,000-element list is 20,000 structs of
+    // ~190 bytes, each carrying a std::string, a std::vector, a std::function
+    // and three shared_ptrs. Reading one element deep-copied all of them.
+    // Measured on an i7-9750H before the fix: 10,000 reads 1,919 ms, 20,000
+    // reads 8,093 ms -- 4.2x the time for 2x the work, and 405 us to read one
+    // element out of a 20,000-element list.
+    //
+    // Dicts and class instances never had this problem: they hold a shared_ptr,
+    // so copying their Value is a refcount bump (which is also why they have
+    // reference semantics and lists do not). Lists are the only inline
+    // container, so lists are the only thing this fixes.
+    //
+    // borrowLValue returns a pointer to the LIVE Value an expression names, or
+    // nullptr when the expression is not borrowable. It recurses through index
+    // chains ($m[1][2]) but ONLY when the index expression is a literal or a
+    // variable. That restriction is what makes it safe: returning nullptr
+    // half-way sends the caller down the copying path, which re-evaluates the
+    // index expressions, and re-evaluating a call would run it twice. A literal
+    // or a variable has no side effects, so evaluating it twice cannot be
+    // observed. Anything else falls back to exactly the behaviour it had.
+    //
+    // This is deliberately NOT resolveLValue, which exists a few hundred lines
+    // below for the assignment paths. resolveLValue addresses a slot to write
+    // to, so its dict branch is `(*objectVal)[key]`, which CREATES the entry if
+    // it is missing -- correct for `$d["new"] = 1`, and wrong for a read, where
+    // it would quietly insert a null every time you looked up a key that was
+    // not there. borrowLValue uses find() and reports failure instead.
+    static bool borrowableIndex(ASTNode* node) {
+        return nodeIf<VariableNode>(node) || nodeIf<NumberNode>(node) ||
+               nodeIf<StringNode>(node);
+    }
+
+    Value* borrowLValue(ASTNode* node) {
+        if (auto v = nodeIf<VariableNode>(node)) {
+            if (!env_->has(v->name)) return nullptr;   // the caller reports it, with a position
+            return &env_->getRef(v->name);
+        }
+        if (auto ia = nodeIf<IndexAccessNode>(node)) {
+            if (!borrowableIndex(ia->index.get())) return nullptr;
+            Value* base = borrowLValue(ia->object.get());
+            if (!base) return nullptr;
+            Value idx = evalNode(ia->index);
+            if (base->isList() && idx.isNumber()) {
+                long long i = (long long)idx.numberVal;
+                if (i < 0 || i >= (long long)base->listVal.size()) return nullptr;
+                return &base->listVal[(size_t)i];
+            }
+            if (base->isObject() && idx.isString() && base->objectVal) {
+                auto it = base->objectVal->find(idx.stringVal);
+                if (it == base->objectVal->end()) return nullptr;
+                return &it->second;
+            }
+            return nullptr;
+        }
+        return nullptr;
+    }
+
     Value evalIndexAccess(IndexAccessNode* n) {
-        Value obj = evalNode(n->object);
-        Value idx = evalNode(n->index);
+        // `base` points at the container to read from -- the LIVE one when we
+        // can reach it, a temporary otherwise. Reading through a pointer is
+        // what removes the copy; everything below is the same logic it always
+        // was, reading from *base rather than from a copy of it.
+        Value  held;                 // storage for the cannot-borrow case only
+        Value* base = nullptr;
+        Value  idx;
 
-        if (obj.isList() && idx.isNumber()) {
-            int i = (int)idx.numberVal;
-            if (i >= 0 && i < (int)obj.listVal.size()) return obj.listVal[i];
-            ErrorHandler::throwRuntimeError("Index out of bounds: " + std::to_string(i));
+        if (auto v = nodeIf<VariableNode>(n->object.get())) {
+            // The overwhelmingly common shape: $a[...]. One cast, one walk of
+            // the scope chain, no copy -- strictly less work than evaluating
+            // the variable into a temporary, which is what this replaces.
+            // Nothing is evaluated speculatively, so the index may be anything.
+            //
+            // The index is evaluated BEFORE the borrow, not after: $a[f()] can
+            // run arbitrary code, and a pointer into a scope must not be held
+            // across it. (unordered_map keeps element addresses stable across
+            // a rehash, so this is belt and braces -- but a borrow taken after
+            // every side effect cannot be wrong, and one taken before it needs
+            // an argument.)
+            idx = evalNode(n->index);
+            base = env_->tryGetRef(v->name);
+            if (!base) { held = evalNode(n->object); base = &held; }  // reports the name, with a position
+        } else if (borrowableIndex(n->index.get()) &&
+                   (base = borrowLValue(n->object.get())) != nullptr) {
+            // A chain: $m[1][2], $d["a"][0]. borrowLValue evaluated the inner
+            // index expressions, and the guard above restricted them to
+            // literals and variables -- so nothing here has a side effect that
+            // could invalidate the borrow, and re-evaluating them on the
+            // fallback path cannot be observed either.
+            idx = evalNode(n->index);
+        } else {
+            held = evalNode(n->object);
+            base = &held;
+            idx = evalNode(n->index);
+        }
+
+        if (base->isList() && idx.isNumber()) {
+            long long i = (long long)idx.numberVal;
+            if (i >= 0 && i < (long long)base->listVal.size()) return base->listVal[(size_t)i];
+            ErrorHandler::throwRuntimeError("Index out of bounds: " + std::to_string(i),
+                                            n->line, n->col);
             return Value();
         }
 
-        if (obj.isObject() && idx.isString()) {
-            auto it = obj.objectVal->find(idx.stringVal);
-            if (it != obj.objectVal->end()) return it->second;
+        if (base->isObject() && idx.isString() && base->objectVal) {
+            auto it = base->objectVal->find(idx.stringVal);
+            if (it != base->objectVal->end()) return it->second;
             return Value();
         }
 
-        if (obj.isString() && idx.isNumber()) {
-            int i = (int)idx.numberVal;
-            if (i >= 0 && i < (int)obj.stringVal.size()) return Value(std::string(1, obj.stringVal[i]));
+        if (base->isString() && idx.isNumber()) {
+            long long i = (long long)idx.numberVal;
+            if (i >= 0 && i < (long long)base->stringVal.size())
+                return Value(std::string(1, base->stringVal[(size_t)i]));
             return Value();
+        }
+
+        // $a[i] on an array. Deliberately LAST: a handle is not a list, a dict
+        // or a string, so putting this check first made every ordinary list
+        // index pay for it -- measured at 2.31%, over the phase's 2% budget.
+        // Down here the common paths are untouched and this one is still free,
+        // because it replaces a fall-through that returned null.
+        if (base->type == Value::NATIVE_HANDLE) {
+            Value out;
+            try {
+                if (numba::dispatchIndex(*base, idx, out)) return out;
+            } catch (const std::exception& e) {
+                ErrorHandler::throwRuntimeError(e.what(), n->line, n->col);
+                return Value();
+            }
         }
 
         return Value();
@@ -4322,14 +5139,14 @@ private:
         auto prevEnv = env_;
         try {
             env_ = std::make_shared<Environment>(prevEnv);
-            for (auto& stmt : n->tryBody) evalNode(stmt);
+            runStatements(n->tryBody);
             env_ = prevEnv;
         }
         catch (const BantuThrow& t) {
             // A Bantu `throw <expr>` — bind the catch var to the thrown value.
             env_ = std::make_shared<Environment>(prevEnv);
             env_->define(n->catchVar, t.value);
-            for (auto& stmt : n->catchBody) evalNode(stmt);
+            runStatements(n->catchBody);
             env_ = prevEnv;
         }
         catch (const BantuError& e) {
@@ -4340,19 +5157,20 @@ private:
             err["type"]    = Value(e.typeName);
             err["line"]    = Value((double)e.line);
             env_->define(n->catchVar, Value(std::move(err)));
-            for (auto& stmt : n->catchBody) evalNode(stmt);
+            runStatements(n->catchBody);
             env_ = prevEnv;
         }
         catch (const std::exception& e) {
             // Any other C++ exception — bind its message string.
             env_ = std::make_shared<Environment>(prevEnv);
             env_->define(n->catchVar, Value(std::string(e.what())));
-            for (auto& stmt : n->catchBody) evalNode(stmt);
+            runStatements(n->catchBody);
             env_ = prevEnv;
         }
         catch (...) {
-            // break/continue/return must not be swallowed by try/catch —
-            // restore scope and let them reach the enclosing loop/function.
+            // A break/continue that escaped a called function must not be
+            // swallowed by try/catch -- restore scope and let it reach the
+            // enclosing loop. (Signals raised here are pending, not thrown.)
             env_ = prevEnv;
             throw;
         }
@@ -4373,7 +5191,7 @@ private:
             auto prevEnv = env_;
             env_ = std::make_shared<Environment>(prevEnv);
             try {
-                for (auto& stmt : body) evalNode(stmt);
+                runStatements(body);
             } catch (...) { env_ = prevEnv; throw; }
             env_ = prevEnv;
         };
@@ -4441,7 +5259,7 @@ private:
         currentClassName_ = n->name;
 
         for (auto& member : n->body) {
-            if (auto funcNode = dynamic_cast<FuncDeclNode*>(member.get())) {
+            if (auto funcNode = nodeIf<FuncDeclNode>(member.get())) {
                 // Register method on the class definition
                 auto fn = std::make_shared<BantuFunction>(funcNode->name, funcNode->params, funcNode->body, env_);
                 classDef->addMethod(funcNode->name, Value(std::move(fn)));
@@ -4508,21 +5326,30 @@ private:
 
             auto prevEnv = env_;
             env_ = callEnv;
-            try {
-                for (auto& stmt : fn->body) {
-                    evalNode(stmt);
-                }
-            } catch (const ReturnSignal& sig) {
-                // Constructor return
-            }
+            runStatements(fn->body);
             env_ = prevEnv;
+            finishCall(Value());                 // a constructor's return value is ignored
         }
 
         return Value();
     }
 
     Value instantiateClass(ClassDefinition* classDef, std::vector<Value>& args) {
-        auto* instance = new ClassInstance(classDef);
+        // OWNED, not `new`-and-forget. This used to be a bare
+        // `new ClassInstance(classDef)` with no delete anywhere, so every
+        // object a Bantu program ever created leaked for the life of the
+        // process. Measured before the fix: ~300 bytes per instance, and a
+        // program building 20,000 bplot figures reached 372 MB of resident
+        // memory and climbing. A sua handler creating objects per request grew
+        // without bound until the worker was killed.
+        //
+        // Refcounting frees an instance when the last Value referring to it
+        // goes. It does NOT collect reference CYCLES — two objects pointing at
+        // each other keep each other alive, as in Swift or any other
+        // refcounted runtime without a cycle collector. That is documented
+        // rather than hidden, and it is why bplot's Axes does not hold a
+        // pointer back to its Figure.
+        auto instance = std::make_shared<ClassInstance>(classDef);
 
         // Copy default properties from parent classes (extends chain)
         ClassDefinition* current = classDef->parentClass;
@@ -4556,14 +5383,9 @@ private:
 
             auto prevEnv = env_;
             env_ = callEnv;
-            try {
-                for (auto& stmt : fn->body) {
-                    evalNode(stmt);
-                }
-            } catch (const ReturnSignal& sig) {
-                // Constructor return ignored
-            }
+            runStatements(fn->body);
             env_ = prevEnv;
+            finishCall(Value());                 // a constructor's return value is ignored
             currentClassName_ = savedClassName;
         } else {
             // No explicit constructor — try to call parent constructor
@@ -4583,17 +5405,14 @@ private:
 
                     auto prevEnv = env_;
                     env_ = callEnv;
-                    try {
-                        for (auto& stmt : fn->body) {
-                            evalNode(stmt);
-                        }
-                    } catch (const ReturnSignal& sig) {}
+                    runStatements(fn->body);
                     env_ = prevEnv;
+                    finishCall(Value());
                 }
             }
         }
 
-        return Value(instance);
+        return Value(std::move(instance));
     }
 
     // ════════════════════════════════════════════════════════════
@@ -4608,6 +5427,197 @@ private:
     }
 
     // ════════════════════════════════════════════════════════════
+    // SCALAR MATHS
+    // ════════════════════════════════════════════════════════════
+    //
+    // The language shipped with abs ceil cos floor log max min pow round sin
+    // sqrt tan random and nothing else -- no exp, no atan2, no asin/acos, no
+    // log10, no PI. You could not draw a pie slice, place a log-scale tick or
+    // compute the angle of an arrowhead without writing the series yourself.
+    //
+    // Three properties every function below has, and the older ones do not:
+    //
+    //   1. A non-number argument RAISES, naming the argument and its type.
+    //      sqrt("hello") answers 0 today; exp("hello") says so.
+    //   2. Domain and range behaviour is IEEE 754's, taken straight from libm,
+    //      including the ones people trip over: acos(2) is NaN rather than an
+    //      error, log(0) is -inf, and NaN propagates through everything.
+    //   3. NaN propagates through min/max. A primitive must not silently
+    //      discard a value it was handed; NumPy makes the same split between
+    //      max and nanmax. Callers that want to skip NaN filter first.
+
+    static const char* typeNameOf(const Value& v) {
+        switch (v.type) {
+            case Value::NUMBER: return "number";
+            case Value::STRING: return "string";
+            case Value::BOOL:   return "bool";
+            case Value::NULL_VAL: return "null";
+            case Value::FUNCTION: case Value::NATIVE_FN: return "function";
+            case Value::OBJECT: return "dict";
+            case Value::LIST:   return "list";
+            case Value::CLASS_INSTANCE: return "instance";
+            case Value::CLASS_DEF: return "class";
+            case Value::NATIVE_HANDLE: return "native handle";
+        }
+        return "unknown";
+    }
+
+    // One argument, one double, one message that says what to do about it.
+    static double mathArg(const std::vector<Value>& a, size_t i, const char* who, int arity) {
+        if (a.size() <= i) {
+            ErrorHandler::throwError(std::string(who) + "() needs " + std::to_string(arity) +
+                (arity == 1 ? " argument, got " : " arguments, got ") + std::to_string(a.size()),
+                0, 0, ErrorHandler::RUNTIME_ERROR);
+        }
+        if (!a[i].isNumber()) {
+            ErrorHandler::throwError(std::string(who) + "(): argument " + std::to_string(i + 1) +
+                " must be a number, got " + typeNameOf(a[i]),
+                0, 0, ErrorHandler::RUNTIME_ERROR);
+        }
+        return a[i].numberVal;
+    }
+
+    void registerScalarMath() {
+        // ── Constants ──────────────────────────────────────────────────
+        // Bare identifiers resolve to globals, so PI and $PI both work.
+        // They live in the same namespace as everything else, which means
+        // $PI = 3 replaces the constant for the rest of your program -- the
+        // same one-namespace rule that lets $len = 3 destroy len(). E is the
+        // likeliest name to be shadowed by accident; that is documented
+        // rather than worked around.
+        env_->define("PI",  Value(3.14159265358979323846));
+        env_->define("TAU", Value(6.28318530717958647692));
+        env_->define("E",   Value(2.71828182845904523536));
+        env_->define("INF", Value(std::numeric_limits<double>::infinity()));
+        env_->define("NAN", Value(std::numeric_limits<double>::quiet_NaN()));
+
+        // ── One argument ───────────────────────────────────────────────
+        struct Fn1 { const char* name; double (*fn)(double); };
+        static const Fn1 kFn1[] = {
+            {"exp",    [](double x) { return std::exp(x); }},
+            {"expm1",  [](double x) { return std::expm1(x); }},   // accurate near 0
+            {"log1p",  [](double x) { return std::log1p(x); }},   // accurate near 0
+            {"log2",   [](double x) { return std::log2(x); }},
+            {"log10",  [](double x) { return std::log10(x); }},
+            {"cbrt",   [](double x) { return std::cbrt(x); }},    // defined for negatives, unlike pow(x,1/3)
+            {"asin",   [](double x) { return std::asin(x); }},
+            {"acos",   [](double x) { return std::acos(x); }},
+            {"atan",   [](double x) { return std::atan(x); }},
+            {"sinh",   [](double x) { return std::sinh(x); }},
+            {"cosh",   [](double x) { return std::cosh(x); }},
+            {"tanh",   [](double x) { return std::tanh(x); }},
+            {"asinh",  [](double x) { return std::asinh(x); }},
+            {"acosh",  [](double x) { return std::acosh(x); }},
+            {"atanh",  [](double x) { return std::atanh(x); }},
+            {"trunc",  [](double x) { return std::trunc(x); }},
+            // NaN propagates, matching NumPy's sign(). arctic's col_sign
+            // predates this and answers 0 for NaN; that difference is
+            // documented rather than changed under a shipped library.
+            {"sign",   [](double x) { return std::isnan(x) ? x : (double)((x > 0) - (x < 0)); }},
+            {"degrees",[](double x) { return x * (180.0 / 3.14159265358979323846); }},
+            {"radians",[](double x) { return x * (3.14159265358979323846 / 180.0); }},
+        };
+        for (const Fn1& m : kFn1) {
+            const char* nm = m.name;
+            double (*fn)(double) = m.fn;
+            env_->define(nm, makeNative([nm, fn](std::vector<Value> a) -> Value {
+                return Value(fn(mathArg(a, 0, nm, 1)));
+            }));
+        }
+
+        // ── Two arguments ──────────────────────────────────────────────
+        struct Fn2 { const char* name; double (*fn)(double, double); };
+        static const Fn2 kFn2[] = {
+            // atan2 is the one that matters: it knows which quadrant the point
+            // is in, which atan(y/x) cannot, and it is defined at x == 0.
+            {"atan2",   [](double y, double x) { return std::atan2(y, x); }},
+            // hypot avoids the overflow of sqrt(x*x + y*y) -- hypot(1e200,1e200)
+            // is finite, the naive form is inf.
+            {"hypot",   [](double x, double y) { return std::hypot(x, y); }},
+            {"fmod",    [](double x, double y) { return std::fmod(x, y); }},
+            {"copysign",[](double x, double y) { return std::copysign(x, y); }},
+        };
+        for (const Fn2& m : kFn2) {
+            const char* nm = m.name;
+            double (*fn)(double, double) = m.fn;
+            env_->define(nm, makeNative([nm, fn](std::vector<Value> a) -> Value {
+                double x = mathArg(a, 0, nm, 2);
+                double y = mathArg(a, 1, nm, 2);
+                return Value(fn(x, y));
+            }));
+        }
+
+        // ── Predicates ─────────────────────────────────────────────────
+        // These values were always producible -- log(0) is -inf, sqrt(-1) is
+        // nan, pow(10,400) is inf -- and until now there was no way to TEST
+        // for one. Plotting real data without them means emitting a NaN
+        // coordinate, which browsers render as nothing at all.
+        struct Pred { const char* name; bool (*fn)(double); };
+        static const Pred kPred[] = {
+            {"isnan",    [](double x) { return (bool)std::isnan(x); }},
+            {"isinf",    [](double x) { return (bool)std::isinf(x); }},
+            {"isfinite", [](double x) { return (bool)std::isfinite(x); }},
+        };
+        for (const Pred& m : kPred) {
+            const char* nm = m.name;
+            bool (*fn)(double) = m.fn;
+            env_->define(nm, makeNative([nm, fn](std::vector<Value> a) -> Value {
+                return Value(fn(mathArg(a, 0, nm, 1)));
+            }));
+        }
+
+        // clamp(x, lo, hi) — used constantly for colour channels and
+        // coordinates. lo > hi is a caller bug, not a value to guess at.
+        env_->define("clamp", makeNative([](std::vector<Value> a) -> Value {
+            double x  = mathArg(a, 0, "clamp", 3);
+            double lo = mathArg(a, 1, "clamp", 3);
+            double hi = mathArg(a, 2, "clamp", 3);
+            if (lo > hi) {
+                ErrorHandler::throwError("clamp(): lower bound " + Value(lo).toString() +
+                    " is above upper bound " + Value(hi).toString(), 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            if (std::isnan(x)) return Value(x);
+            return Value(x < lo ? lo : (x > hi ? hi : x));
+        }));
+    }
+
+    // max/min, variadic and list-aware.
+    //
+    // [found] max(1, 2, 9) answered 2. The old bodies read args[0] and args[1]
+    // and ignored everything after -- a silently wrong answer, which is the
+    // failure mode worth caring about. Two-argument calls are unchanged.
+    //
+    // A single list argument is reduced over it, which is what makes computing
+    // the limits of a 100,000-point series one native call instead of a
+    // 100,000-iteration Bantu loop (~100 ms at ~1 us per interpreted step).
+    static Value minmax(const std::vector<Value>& a, bool wantMax) {
+        const char* who = wantMax ? "max" : "min";
+        const std::vector<Value>* items = &a;
+        if (a.size() == 1 && a[0].isList()) items = &a[0].listVal;
+
+        if (items->empty()) {
+            ErrorHandler::throwError(std::string(who) + "() needs at least one number" +
+                (a.size() == 1 ? " -- the list given was empty" : ""),
+                0, 0, ErrorHandler::RUNTIME_ERROR);
+        }
+        double best = 0.0;
+        for (size_t i = 0; i < items->size(); ++i) {
+            const Value& v = (*items)[i];
+            if (!v.isNumber()) {
+                ErrorHandler::throwError(std::string(who) + "(): element " + std::to_string(i + 1) +
+                    " must be a number, got " + typeNameOf(v), 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            double x = v.numberVal;
+            // NaN propagates: once one is seen the answer is NaN, and the
+            // comparisons below would otherwise silently drop it.
+            if (std::isnan(x)) return Value(x);
+            if (i == 0) best = x;
+            else if (wantMax ? (x > best) : (x < best)) best = x;
+        }
+        return Value(best);
+    }
+
+    // ════════════════════════════════════════════════════════════
     // BUILT-IN REGISTRATION
     // ════════════════════════════════════════════════════════════
 
@@ -4617,6 +5627,28 @@ private:
             if (args.empty()) return Value(0.0);
             if (args[0].isString()) return Value((double)args[0].stringVal.size());
             if (args[0].isList()) return Value((double)args[0].listVal.size());
+            // A dict, an ndarray and a column all used to fall through to the 0
+            // below, which is the worst possible answer: `while ($i < len($a))`
+            // over an array never ran and nothing said why. Each now reports
+            // its real length. Everything else keeps answering 0 -- len(null)
+            // is a common idiom and changing it would break working programs.
+            if (args[0].isObject()) {
+                return Value((double)(args[0].objectVal ? args[0].objectVal->size() : 0));
+            }
+            if (args[0].type == Value::NATIVE_HANDLE && args[0].handle) {
+                const auto& reg = handleLenRegistry();
+                auto it = reg.find(args[0].stringVal);
+                if (it != reg.end() && it->second) {
+                    const long long n = it->second(args[0].handle);
+                    if (n < 0) {
+                        ErrorHandler::throwError("len(): a " + args[0].stringVal +
+                            " with no dimensions has no length -- a 0-d array is a single value",
+                            0, 0, ErrorHandler::RUNTIME_ERROR);
+                    }
+                    return Value((double)n);
+                }
+                if (arctic::isColumn(args[0])) return Value((double)arctic::asColumn(args[0])->n);
+            }
             return Value(0.0);
         }));
 
@@ -4702,19 +5734,61 @@ private:
             return Value((double)dist(rng));
         }));
 
+        // ── Scalar maths ────────────────────────────────────────────────
+        // The maths builtins above (abs, sqrt, sin, log, ...) read
+        // args[0].numberVal blind, so sqrt("hello") quietly answers 0. Those
+        // stay as they are -- they are shipped behaviour -- but everything
+        // added here validates, because a wrong number that looks plausible
+        // is worse than a stop that names the problem.
+        registerScalarMath();
+
         env_->define("str", makeNative([](std::vector<Value> args) -> Value {
             if (args.empty()) return Value(std::string(""));
             return Value(args[0].toString());
         }));
 
+        // num(x)            -> the number x holds, or 0 when it holds none
+        // num(x, default)   -> the number x holds, or `default` when it holds none
+        //
+        // This used std::stod inside a catch-all, which gave three plausible
+        // wrong numbers in exactly the code that parses input it did not write:
+        //   num("12abc") -> 12    stod reads the longest PREFIX that parses
+        //   num("1e999") -> 0     the overflow exception was caught as "not a number"
+        //   num(true)    -> 0
+        // Now the WHOLE string must be a decimal number (surrounding whitespace
+        // is fine), overflow is +/-infinity, and a bool is 1 or 0. Unparsable
+        // input still reads 0, so `num($req.query["page"])` keeps working; the
+        // second argument lets a caller tell a real zero from no number at all.
+        //
+        // Hex is refused: strtod accepts "0x10", str() never writes it, and a
+        // query string that means 16 when a user typed 0x10 is a surprise, not a
+        // feature. "inf" and "nan" are accepted, because str() writes them and
+        // num(str($x)) must round-trip.
         env_->define("num", makeNative([](std::vector<Value> args) -> Value {
+            const bool hasDefault = args.size() > 1;
+            const Value none = hasDefault ? args[1] : Value(0.0);
             if (args.empty()) return Value(0.0);
-            if (args[0].isNumber()) return args[0];
-            if (args[0].isString()) {
-                try { return Value(std::stod(args[0].stringVal)); }
-                catch (...) { return Value(0.0); }
-            }
-            return Value(0.0);
+            const Value& v = args[0];
+            if (v.isNumber()) return v;
+            if (v.type == Value::BOOL) return Value(v.boolVal ? 1.0 : 0.0);
+            if (!v.isString()) return none;
+            const std::string& s = v.stringVal;
+            auto space = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; };
+            size_t b = 0, e = s.size();
+            while (b < e && space(s[b])) b++;
+            while (e > b && space(s[e - 1])) e--;
+            if (b == e) return none;
+            const std::string t = s.substr(b, e - b);
+            size_t d = (t[0] == '+' || t[0] == '-') ? 1 : 0;
+            if (d + 1 < t.size() && t[d] == '0' && (t[d + 1] == 'x' || t[d + 1] == 'X')) return none;
+            char* end = nullptr;
+            const double x = std::strtod(t.c_str(), &end);
+            // An embedded NUL stops c_str() short, so this also refuses "12\0junk".
+            if (end != t.c_str() + t.size()) return none;
+            // strtod reports overflow as +/-HUGE_VAL, which IS the right answer:
+            // "1e999" is infinite. Underflow gives the nearest representable
+            // value, also right. So errno is deliberately not consulted.
+            return Value(x);
         }));
 
         env_->define("chr", makeNative([](std::vector<Value> args) -> Value {
@@ -5059,6 +6133,44 @@ private:
                 return bantuBytesToList(out.data(), out.size());
             }));
 
+            // ── The cycle collector, from Bantu ────────────────────────
+            // Reference counting frees an object the moment its last reference
+            // drops; a cycle is freed by the collector instead, at the next
+            // safe point after enough allocation has built up. These three
+            // exist so that behaviour is observable and controllable rather
+            // than folklore -- and so a leak test can assert on a NUMBER
+            // instead of squinting at RSS, which was too coarse to show the
+            // dict cycle at all. Modelled on Python's gc module.
+            //
+            // gc_collect() -> number of objects freed
+            bantu_gc::applyEnvironmentOverride();
+            env_->define("gc_collect", makeNative([](std::vector<Value>) -> Value {
+                return Value((double)bantu_gc::collect());
+            }));
+            // gc_stats() -> {"live","collections","freed","threshold","enabled"}
+            // "live" counts objects that CAN take part in a cycle -- class
+            // instances, dicts, scopes and functions. Lists and numbers are not
+            // counted: a list is held by value, so it cannot be a cycle's node.
+            env_->define("gc_stats", makeNative([](std::vector<Value>) -> Value {
+                const bantu_gc::Registry& r = bantu_gc::registry();
+                ObjectMap m;
+                m["live"]        = Value((double)r.live);
+                m["collections"] = Value((double)r.collections);
+                m["freed"]       = Value((double)r.freed);
+                m["threshold"]   = Value((double)r.threshold);
+                m["enabled"]     = Value(r.enabled);
+                return Value(m);
+            }));
+            // gc_enable(on) -> the PREVIOUS setting, so a caller can restore it.
+            // Turning it off does not turn off gc_collect(); it only stops the
+            // automatic one, which is what a latency-sensitive section wants.
+            env_->define("gc_enable", makeNative([](std::vector<Value> a) -> Value {
+                bantu_gc::Registry& r = bantu_gc::registry();
+                const bool was = r.enabled;
+                if (!a.empty()) r.enabled = a[0].isTruthy();
+                return Value(was);
+            }));
+
             // has_native(name) -> bool. Lets .b modules feature-detect an
             // accelerator and fall back to the pure implementation when a given
             // interpreter build doesn't ship it. Kept in sync with the set above.
@@ -5067,8 +6179,11 @@ private:
                 static const std::set<std::string> kNatives = {
                     "md5","sha1","sha224","sha256","sha384","sha512",
                     "hmac_sha256","hash_file",
-                    "col",  // arctic native column primitives + kernels
-                    "pwa"   // sua.pwa: manifest / service worker / offline
+                    "col",     // arctic native column primitives + kernels
+                    "ndarray", // numba n-dimensional arrays + kernels
+                    "bplot",   // bplot's line/scatter/escape kernels (plot_native.hpp)
+                    "raster",  // bplot's canvas and PNG encoder (raster_native.cpp)
+                    "pwa"      // sua.pwa: manifest / service worker / offline
 #ifdef BANTU_ARROW
                     ,"arrow"  // Parquet + Feather/Arrow-IPC I/O (opt-in build)
 #endif
@@ -5169,6 +6284,234 @@ private:
             // construction + introspection; kernels arrive in Phase 3.
             // Errors from the native layer become plain-language Bantu errors.
             // ════════════════════════════════════════════════════════════
+
+            // Teach print() how to render a column. Without this a handle
+            // stringifies to "<column>", which tells you the type and nothing
+            // about the data.
+            arctic::registerColumnRepr();
+
+            // ════════════════════════════════════════════════════════════
+            // NUMBA N-DIMENSIONAL ARRAYS (`nd_*`)
+            // ------------------------------------------------------------
+            // The atoms the pure-Bantu `numba` library composes: a typed
+            // n-d array over a refcounted buffer, with zero-copy views.
+            // The implementation lives in its own translation unit so it
+            // can be compiled at -O3 while the rest of the interpreter
+            // stays at -O2 (see ndarray_native.hpp for why that matters).
+            //
+            // One wrapper for all of them: any std::exception from the
+            // native layer becomes a catchable Bantu error naming the
+            // builtin, so a bad argument can never kill the process.
+            // ════════════════════════════════════════════════════════════
+            // ── the arctic bridge ───────────────────────────────────────
+            // This is the one place that legitimately sees both namespaces, so
+            // the glue lives here and dataframe_native.hpp and
+            // ndarray_native.hpp never include each other. It works through the
+            // three primitives in ndarray_api.hpp rather than numba's internals,
+            // which is what keeps that wall standing.
+            //
+            // Column -> NdArray is a genuine ZERO-COPY borrow: the array points
+            // at the column's own vector storage and holds the ColumnPtr alive,
+            // so it may outlive the variable the column was bound to. It is
+            // read-only, because arctic documents columns as immutable and
+            // honouring that costs nothing.
+            env_->define("nd_from_column", makeNative([](std::vector<Value> a) -> Value {
+                if (a.empty() || !arctic::isColumn(a[0])) {
+                    ErrorHandler::throwError("nd_from_column: expected an arctic column", 0, 0,
+                                             ErrorHandler::RUNTIME_ERROR);
+                    return Value();
+                }
+                arctic::ColumnPtr c = arctic::asColumn(a[0]);
+                // Every precondition is reported BY NAME: "cannot convert" with
+                // no reason is a permanent support burden.
+                const size_t nulls = arctic::nullCount(*c);
+                if (nulls > 0) {
+                    ErrorHandler::throwError("nd_from_column: the column has " +
+                        std::to_string(nulls) + " nulls and an ndarray has no null mask -- use "
+                        "arctic's fill_null() or drop_nulls() first", 0, 0,
+                        ErrorHandler::RUNTIME_ERROR);
+                    return Value();
+                }
+                if (c->logical != arctic::Logical::NONE) {
+                    ErrorHandler::throwError("nd_from_column: this column carries a datetime, date "
+                        "or categorical overlay that an ndarray cannot represent -- convert it to "
+                        "a plain numeric column first", 0, 0, ErrorHandler::RUNTIME_ERROR);
+                    return Value();
+                }
+                void* data = nullptr;
+                int dt = numba::BORROW_F64;
+                if (c->dtype == arctic::DType::F64)       { data = (void*)c->f64.data(); dt = numba::BORROW_F64; }
+                else if (c->dtype == arctic::DType::I64)  { data = (void*)c->i64.data(); dt = numba::BORROW_I64; }
+                else if (c->dtype == arctic::DType::BOOL) { data = (void*)c->b.data();   dt = numba::BORROW_BOOL; }
+                else {
+                    ErrorHandler::throwError("nd_from_column: only f64, i64 and bool columns can "
+                        "become arrays (a utf8 column has no numeric equivalent)", 0, 0,
+                        ErrorHandler::RUNTIME_ERROR);
+                    return Value();
+                }
+                try {
+                    return numba::borrowVector(data, c->n, dt,
+                                               std::static_pointer_cast<void>(c));
+                } catch (const std::exception& e) {
+                    ErrorHandler::throwError(std::string("nd_from_column: ") + e.what(), 0, 0,
+                                             ErrorHandler::RUNTIME_ERROR);
+                    return Value();
+                }
+            }));
+
+            // NdArray -> Column is a COPY. A Column stores std::vector, which
+            // owns its allocation, so there is no portable way to adopt a
+            // foreign pointer: the asymmetry is structural, not an oversight.
+            env_->define("nd_to_column", makeNative([](std::vector<Value> a) -> Value {
+                std::vector<double> vals;
+                int dt = numba::BORROW_F64;
+                if (a.empty() || !numba::exportVector(a[0], vals, dt)) {
+                    ErrorHandler::throwError("nd_to_column: expected a 1-dimensional ndarray -- a "
+                        "column is a single series of values", 0, 0, ErrorHandler::RUNTIME_ERROR);
+                    return Value();
+                }
+                auto c = std::make_shared<arctic::Column>();
+                c->n = vals.size();
+                c->valid.assign(c->n, 1);
+                if (dt == numba::BORROW_I64) {
+                    c->dtype = arctic::DType::I64;
+                    c->i64.resize(c->n);
+                    for (size_t i = 0; i < c->n; i++) c->i64[i] = (int64_t)vals[i];
+                } else if (dt == numba::BORROW_BOOL) {
+                    c->dtype = arctic::DType::BOOL;
+                    c->b.resize(c->n);
+                    for (size_t i = 0; i < c->n; i++) c->b[i] = vals[i] != 0.0 ? 1 : 0;
+                } else {
+                    c->dtype = arctic::DType::F64;
+                    c->f64 = vals;
+                    // NaN -> null is OPT-IN. Doing it silently would erase the
+                    // difference between "no value" and "not a number", which is
+                    // exactly the information arctic exists to keep.
+                    if (a.size() > 1 && a[1].isTruthy()) {
+                        for (size_t i = 0; i < c->n; i++)
+                            if (std::isnan(c->f64[i])) c->valid[i] = 0;
+                    }
+                }
+                return arctic::wrap(c);
+            }));
+
+            // A list of equal-length columns becomes a (rows, columns) array --
+            // the most-wanted bridge, frame to linear algebra.
+            env_->define("nd_from_frame", makeNative([](std::vector<Value> a) -> Value {
+                if (a.empty() || !a[0].isList() || a[0].listVal.empty()) {
+                    ErrorHandler::throwError("nd_from_frame: expected a non-empty list of columns",
+                                             0, 0, ErrorHandler::RUNTIME_ERROR);
+                    return Value();
+                }
+                const std::vector<Value>& cols = a[0].listVal;
+                std::vector<std::vector<double>> data;
+                size_t rows = 0;
+                for (size_t j = 0; j < cols.size(); j++) {
+                    if (!arctic::isColumn(cols[j])) {
+                        ErrorHandler::throwError("nd_from_frame: entry " + std::to_string(j) +
+                            " is not a column", 0, 0, ErrorHandler::RUNTIME_ERROR);
+                        return Value();
+                    }
+                    arctic::ColumnPtr c = arctic::asColumn(cols[j]);
+                    if (j == 0) rows = c->n;
+                    else if (c->n != rows) {
+                        ErrorHandler::throwError("nd_from_frame: column " + std::to_string(j) +
+                            " has " + std::to_string(c->n) + " rows but column 0 has " +
+                            std::to_string(rows) + " -- every column must be the same length",
+                            0, 0, ErrorHandler::RUNTIME_ERROR);
+                        return Value();
+                    }
+                    if (arctic::nullCount(*c) > 0) {
+                        ErrorHandler::throwError("nd_from_frame: column " + std::to_string(j) +
+                            " has nulls and an ndarray has no null mask", 0, 0,
+                            ErrorHandler::RUNTIME_ERROR);
+                        return Value();
+                    }
+                    std::vector<double> v(c->n);
+                    for (size_t i = 0; i < c->n; i++) {
+                        switch (c->dtype) {
+                            case arctic::DType::F64:  v[i] = c->f64[i]; break;
+                            case arctic::DType::I64:  v[i] = (double)c->i64[i]; break;
+                            case arctic::DType::BOOL: v[i] = c->b[i] ? 1.0 : 0.0; break;
+                            default:
+                                ErrorHandler::throwError("nd_from_frame: column " +
+                                    std::to_string(j) + " is not numeric", 0, 0,
+                                    ErrorHandler::RUNTIME_ERROR);
+                                return Value();
+                        }
+                    }
+                    data.push_back(std::move(v));
+                }
+                try {
+                    return numba::buildMatrix(data);
+                } catch (const std::exception& e) {
+                    ErrorHandler::throwError(std::string("nd_from_frame: ") + e.what(), 0, 0,
+                                             ErrorHandler::RUNTIME_ERROR);
+                    return Value();
+                }
+            }));
+
+            numba::registerBuiltins([this](const char* name, NativeFn fn) {
+                std::string where = name;
+                env_->define(name, makeNative(
+                    [where, fn](std::vector<Value> args) -> Value {
+                        try { return fn(std::move(args)); }
+                        catch (const std::exception& e) {
+                            // Most kernel messages already name the builtin, so
+                            // that a message raised from a shared helper says
+                            // which call produced it. Prefixing unconditionally
+                            // gave "nd_slice: nd_slice: ...".
+                            std::string msg = e.what();
+                            const std::string pfx = where + ": ";
+                            if (msg.size() < pfx.size() ||
+                                msg.compare(0, pfx.size(), pfx) != 0) {
+                                msg = pfx + msg;
+                            }
+                            ErrorHandler::throwError(msg, 0, 0,
+                                                     ErrorHandler::RUNTIME_ERROR);
+                        }
+                        return Value();
+                    }));
+            });
+
+            // bplot's kernels, through the same translation: a bad argument is a
+            // catchable Bantu error naming the builtin, never a process kill.
+            bplot_native::registerBuiltins([this](const char* name, NativeFn fn) {
+                std::string where = name;
+                env_->define(name, makeNative(
+                    [where, fn](std::vector<Value> args) -> Value {
+                        try { return fn(std::move(args)); }
+                        catch (const std::exception& e) {
+                            std::string msg = e.what();
+                            const std::string pfx = where + ": ";
+                            if (msg.size() < pfx.size() ||
+                                msg.compare(0, pfx.size(), pfx) != 0) {
+                                msg = pfx + msg;
+                            }
+                            ErrorHandler::throwError(msg, 0, 0, ErrorHandler::RUNTIME_ERROR);
+                        }
+                        return Value();
+                    }));
+            });
+
+            // bplot's raster backend, through the same translation.
+            bplot_raster::registerBuiltins([this](const char* name, NativeFn fn) {
+                std::string where = name;
+                env_->define(name, makeNative(
+                    [where, fn](std::vector<Value> args) -> Value {
+                        try { return fn(std::move(args)); }
+                        catch (const std::exception& e) {
+                            std::string msg = e.what();
+                            const std::string pfx = where + ": ";
+                            if (msg.size() < pfx.size() ||
+                                msg.compare(0, pfx.size(), pfx) != 0) {
+                                msg = pfx + msg;
+                            }
+                            ErrorHandler::throwError(msg, 0, 0, ErrorHandler::RUNTIME_ERROR);
+                        }
+                        return Value();
+                    }));
+            });
 
             // Run a column op, translating any std::exception into a Bantu error.
             auto colGuard = [](const char* where, std::function<Value()> body) -> Value {
@@ -5462,6 +6805,47 @@ private:
             env_->define("col_neg", makeNative([colGuard](std::vector<Value> a) -> Value {
                 return colGuard("col_neg", [&]() -> Value { return arctic::wrap(arctic::unaryOp(a[0], false)); });
             }));
+            // ── transcendentals ─────────────────────────────────────────
+            // Native, not delegated to numba: delegating would make
+            // series.sqrt() require a numba-capable build, and would lose the
+            // null/NaN distinction arctic maintains and numba does not.
+            {
+                struct MathFn { const char* name; double (*fn)(double); };
+                static const MathFn kMath[] = {
+                    {"col_sqrt",  [](double x) { return std::sqrt(x); }},
+                    {"col_cbrt",  [](double x) { return std::cbrt(x); }},
+                    {"col_exp",   [](double x) { return std::exp(x); }},
+                    {"col_expm1", [](double x) { return std::expm1(x); }},
+                    {"col_log",   [](double x) { return std::log(x); }},
+                    {"col_log1p", [](double x) { return std::log1p(x); }},
+                    {"col_log2",  [](double x) { return std::log2(x); }},
+                    {"col_log10", [](double x) { return std::log10(x); }},
+                    {"col_sin",   [](double x) { return std::sin(x); }},
+                    {"col_cos",   [](double x) { return std::cos(x); }},
+                    {"col_tan",   [](double x) { return std::tan(x); }},
+                    {"col_asin",  [](double x) { return std::asin(x); }},
+                    {"col_acos",  [](double x) { return std::acos(x); }},
+                    {"col_atan",  [](double x) { return std::atan(x); }},
+                    {"col_sinh",  [](double x) { return std::sinh(x); }},
+                    {"col_cosh",  [](double x) { return std::cosh(x); }},
+                    {"col_tanh",  [](double x) { return std::tanh(x); }},
+                    {"col_sign",  [](double x) { return (double)((x > 0) - (x < 0)); }},
+                    {"col_floor", [](double x) { return std::floor(x); }},
+                    {"col_ceil",  [](double x) { return std::ceil(x); }},
+                    {"col_trunc", [](double x) { return std::trunc(x); }},
+                };
+                for (const MathFn& m : kMath) {
+                    const char* nm = m.name;
+                    double (*fn)(double) = m.fn;
+                    env_->define(nm, makeNative([colGuard, nm, fn](std::vector<Value> a) -> Value {
+                        return colGuard(nm, [&]() -> Value {
+                            if (a.empty()) throw std::runtime_error("expected a column");
+                            return arctic::wrap(arctic::mathOp(a[0], fn, nm));
+                        });
+                    }));
+                }
+            }
+
             env_->define("col_abs", makeNative([colGuard](std::vector<Value> a) -> Value {
                 return colGuard("col_abs", [&]() -> Value { return arctic::wrap(arctic::unaryOp(a[0], true)); });
             }));
@@ -5814,14 +7198,50 @@ private:
         // $f = open(path, mode)   modes: "r" read, "w" truncate-write, "a" append
         // read($f) whole file · readline($f) one line · readlines($f) list of lines
         // write($f, text) · close($f) · plus one-shot readfile/writefile/appendfile.
-        env_->define("open", makeNative([](std::vector<Value> args) -> Value {
+        // File modes (bplot B6a, docs/bplot-raster-architecture.md §8).
+        //
+        // Text modes -- "r", "w", "a", also spelled "rt", "wt", "at" -- are the
+        // defaults and behave exactly as before on every platform. The binary
+        // modes "rb", "wb", "ab" set std::ios::binary. Without it, Windows turns
+        // every \n byte written into \r\n and treats 0x1A as end of file when
+        // reading, which corrupts any binary file: a PNG, a zip, a key.
+        //
+        // An UNKNOWN mode raises. It used to fall through to read mode, so
+        // open($path, "wb") silently opened the file for READING and every write
+        // to it failed without a word; "w+", "r+" and "x" did the same.
+        static const auto fileModeFor = [](const char* fn, const std::string& mode,
+                                           const char* allowed) -> std::ios_base::openmode {
+            std::ios_base::openmode m = std::ios::in;
+            bool known = true;
+            if      (mode == "r"  || mode == "rt") m = std::ios::in;
+            else if (mode == "rb")                 m = std::ios::in  | std::ios::binary;
+            else if (mode == "w"  || mode == "wt") m = std::ios::out | std::ios::trunc;
+            else if (mode == "wb")                 m = std::ios::out | std::ios::trunc | std::ios::binary;
+            else if (mode == "a"  || mode == "at") m = std::ios::out | std::ios::app;
+            else if (mode == "ab")                 m = std::ios::out | std::ios::app   | std::ios::binary;
+            else known = false;
+            // `allowed` is the set of leading letters this builtin accepts, so
+            // readfile() refuses "wb" rather than opening a file to truncate it.
+            if (!known || std::string(allowed).find(mode[0]) == std::string::npos) {
+                std::string want;
+                for (const char* c = allowed; *c; ++c) {
+                    if (!want.empty()) want += ", ";
+                    want += std::string("\"") + *c + "\" or \"" + *c + "b\"";
+                }
+                ErrorHandler::throwError(std::string(fn) + ": unknown mode '" + mode +
+                    "' -- use " + want + " (the b forms are binary)", 0, 0, ErrorHandler::FILE_ERROR);
+            }
+            return m;
+        };
+        auto modeArg = [](const std::vector<Value>& args, size_t i, const char* dflt) -> std::string {
+            return (args.size() > i && !args[i].isNull()) ? args[i].toString() : std::string(dflt);
+        };
+
+        env_->define("open", makeNative([modeArg](std::vector<Value> args) -> Value {
             if (args.empty()) ErrorHandler::throwError("open() needs a path", 0, 0, ErrorHandler::FILE_ERROR);
             std::string path = args[0].toString();
-            std::string mode = args.size() > 1 ? args[1].toString() : "r";
-            std::ios_base::openmode m;
-            if (mode == "w")      m = std::ios::out | std::ios::trunc;
-            else if (mode == "a") m = std::ios::out | std::ios::app;
-            else                  m = std::ios::in;   // default "r"
+            std::string mode = modeArg(args, 1, "r");
+            std::ios_base::openmode m = fileModeFor("open()", mode, "rwa");
             std::fstream fs(path, m);
             if (!fs.is_open()) {
                 ErrorHandler::throwError("Cannot open file '" + path + "' (mode " + mode + ")",
@@ -5876,6 +7296,19 @@ private:
             if (it == bantuFileTable().end()) ErrorHandler::throwError("write(): not an open file", 0, 0, ErrorHandler::FILE_ERROR);
             std::string data = args[1].toString();
             it->second << data;
+            // A stream opened for reading refuses the write by setting badbit. It
+            // used to be ignored, so write() reported every byte as written.
+            if (!it->second) {
+                std::string mode;
+                if (args[0].isObject()) {
+                    auto mt = args[0].objectVal->find("mode");
+                    if (mt != args[0].objectVal->end()) mode = mt->second.toString();
+                }
+                it->second.clear();
+                ErrorHandler::throwError("write(): the write failed" +
+                    (mode.empty() ? std::string("") : " -- the file was opened with mode '" + mode + "'") ,
+                    0, 0, ErrorHandler::FILE_ERROR);
+            }
             return Value((double)data.size());
         }));
         env_->define("close", makeNative([fileIdOf](std::vector<Value> args) -> Value {
@@ -5887,25 +7320,34 @@ private:
             bantuFileTable().erase(it);
             return Value(true);
         }));
-        env_->define("readfile", makeNative([](std::vector<Value> args) -> Value {
+        // readfile(path [, "r" | "rb"])
+        env_->define("readfile", makeNative([modeArg](std::vector<Value> args) -> Value {
             if (args.empty()) return Value(std::string(""));
-            std::ifstream fs(args[0].toString());
+            std::ifstream fs(args[0].toString(), fileModeFor("readfile()", modeArg(args, 1, "r"), "r"));
             if (!fs.is_open()) ErrorHandler::throwError("Cannot read file '" + args[0].toString() + "'", 0, 0, ErrorHandler::FILE_ERROR);
             std::stringstream ss; ss << fs.rdbuf();
             return Value(ss.str());
         }));
-        env_->define("writefile", makeNative([](std::vector<Value> args) -> Value {
+        // writefile(path, data [, "w" | "wb"])
+        env_->define("writefile", makeNative([modeArg](std::vector<Value> args) -> Value {
             if (args.size() < 2) return Value(false);
-            std::ofstream fs(args[0].toString(), std::ios::trunc);
+            std::ofstream fs(args[0].toString(), fileModeFor("writefile()", modeArg(args, 2, "w"), "w"));
             if (!fs.is_open()) ErrorHandler::throwError("Cannot write file '" + args[0].toString() + "'", 0, 0, ErrorHandler::FILE_ERROR);
             fs << args[1].toString();
+            // A full disk or a vanished directory fails HERE, and used to be
+            // reported as success.
+            fs.flush();
+            if (!fs) ErrorHandler::throwError("Cannot write file '" + args[0].toString() + "' -- the write failed", 0, 0, ErrorHandler::FILE_ERROR);
             return Value(true);
         }));
-        env_->define("appendfile", makeNative([](std::vector<Value> args) -> Value {
+        // appendfile(path, data [, "a" | "ab"])
+        env_->define("appendfile", makeNative([modeArg](std::vector<Value> args) -> Value {
             if (args.size() < 2) return Value(false);
-            std::ofstream fs(args[0].toString(), std::ios::app);
+            std::ofstream fs(args[0].toString(), fileModeFor("appendfile()", modeArg(args, 2, "a"), "a"));
             if (!fs.is_open()) ErrorHandler::throwError("Cannot append file '" + args[0].toString() + "'", 0, 0, ErrorHandler::FILE_ERROR);
             fs << args[1].toString();
+            fs.flush();
+            if (!fs) ErrorHandler::throwError("Cannot append file '" + args[0].toString() + "' -- the write failed", 0, 0, ErrorHandler::FILE_ERROR);
             return Value(true);
         }));
 
@@ -5929,14 +7371,14 @@ private:
             return Value((double)ms.count());
         }));
 
+        // Variadic, and list-aware: max(1,2,9) is 9 (it used to be 2) and
+        // max($points) walks the list natively. See minmax() above.
         env_->define("max", makeNative([](std::vector<Value> args) -> Value {
-            if (args.size() < 2) return args.empty() ? Value(0.0) : args[0];
-            return Value(std::max(args[0].numberVal, args[1].numberVal));
+            return minmax(args, true);
         }));
 
         env_->define("min", makeNative([](std::vector<Value> args) -> Value {
-            if (args.size() < 2) return args.empty() ? Value(0.0) : args[0];
-            return Value(std::min(args[0].numberVal, args[1].numberVal));
+            return minmax(args, false);
         }));
 
         // env(name) — read a process environment variable.
@@ -5979,6 +7421,263 @@ private:
             return Value(std::move(out));
         }));
 
+        // join(list [, sep]) — the inverse of split(), and the reason it was
+        // added: building a string with `$s = $s + part` in a loop is O(n^2),
+        // because every + copies the whole accumulated string. Measured on an
+        // i7-9750H: 20,000 appends 1,116 ms, 40,000 appends 6,752 ms -- 6.05x
+        // the time for 2x the work. Pushing onto a list and joining once is a
+        // single pass over the parts with one allocation of the final size.
+        //
+        // Non-string elements are stringified as print() would, so
+        // join([1, 2, 3], ",") is "1,2,3". A missing separator means "".
+        env_->define("join", makeNative([](std::vector<Value> a) -> Value {
+            if (a.empty()) return Value(std::string(""));
+            if (!a[0].isList()) {
+                ErrorHandler::throwError(std::string("join(): first argument must be a list, got ") +
+                    typeNameOf(a[0]), 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            std::string sep;
+            if (a.size() > 1 && !a[1].isNull()) {
+                if (!a[1].isString()) {
+                    ErrorHandler::throwError(std::string("join(): separator must be a string, got ") +
+                        typeNameOf(a[1]), 0, 0, ErrorHandler::RUNTIME_ERROR);
+                }
+                sep = a[1].stringVal;
+            }
+            const std::vector<Value>& L = a[0].listVal;
+            if (L.empty()) return Value(std::string(""));
+            // Exact for the all-strings case, which is the one that matters
+            // (SVG fragments, HTML, CSV rows); a small pad covers the rest,
+            // and the string grows amortised if the pad is short.
+            size_t total = sep.size() * (L.size() - 1);
+            for (const Value& v : L) if (v.isString()) total += v.stringVal.size();
+            std::string out;
+            out.reserve(total + L.size() * 4);
+            for (size_t i = 0; i < L.size(); ++i) {
+                if (i) out += sep;
+                if (L[i].isString()) out += L[i].stringVal;
+                else                 out += L[i].toString();
+            }
+            return Value(out);
+        }));
+
+        // sort(list) · sort(list, "desc") · sort(list, cmp)
+        //
+        // Bantu had push, pop, insert, remove, extend and slice, and no way to
+        // ORDER a list — so every median, quantile, boxplot, ranking and "top N"
+        // in every Bantu program was an interpreted sort. This is the same shape
+        // of gap `join` was: a primitive whose absence forces everyone to write
+        // the slow version.
+        //
+        // Returns a NEW list; the argument is untouched. Bantu lists have value
+        // semantics, so a builtin receives a copy and could not sort in place
+        // even if that were wanted.
+        //
+        // NaN SORTS LAST, and that is a correctness requirement rather than a
+        // preference: every comparison with NaN is false, so `a < b` is NOT a
+        // strict weak ordering when NaN is present, and std::sort given one
+        // walks off the end of its range — a genuine out-of-bounds access, not
+        // merely a wrong order. numba's nd_sort already orders NaN last
+        // (lessNaNLast), so the two agree on the same data.
+        //
+        // A USER COMPARATOR gets a hand-written bottom-up merge sort. A comparator
+        // written in Bantu can be non-transitive and no validation catches that;
+        // a merge sort cannot leave its range whatever the comparator answers, so
+        // the worst case is a strangely ordered list instead of memory corruption.
+        env_->define("sort", makeNative([this](std::vector<Value> a) -> Value {
+            if (a.empty() || !a[0].isList()) {
+                ErrorHandler::throwError(std::string("sort(): first argument must be a list, got ") +
+                    (a.empty() ? "nothing" : typeNameOf(a[0])), 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            std::vector<Value> v = a[0].listVal;
+            if (v.size() < 2) return Value(std::move(v));
+
+            // A comparator, an options dict, the "desc" flag, or nothing.
+            bool desc = false;
+            Value cmp;
+            Value keyFn;
+            if (a.size() > 1 && !a[1].isNull()) {
+                if (a[1].isFunction())      cmp = a[1];
+                else if (a[1].isObject()) {
+                    // sort($xs, {"key": fn, "desc": true})
+                    //
+                    // A COMPARATOR is called O(n log n) times; a KEY is called
+                    // n times. At 1-3 us for an interpreted call that is the
+                    // difference between 1.7 million calls and 100,000 on a
+                    // 100k-row list, which is why Python replaced cmp= with
+                    // key= in 3.0 and why this exists.
+                    auto it = a[1].objectVal->find("key");
+                    if (it != a[1].objectVal->end() && !it->second.isNull()) {
+                        if (!it->second.isFunction() && !it->second.isNativeFn()) {
+                            ErrorHandler::throwError(std::string("sort(): \"key\" must be a function, got ") +
+                                typeNameOf(it->second), 0, 0, ErrorHandler::RUNTIME_ERROR);
+                        }
+                        keyFn = it->second;
+                    }
+                    auto dt = a[1].objectVal->find("desc");
+                    if (dt != a[1].objectVal->end()) desc = dt->second.isTruthy();
+                    auto ct = a[1].objectVal->find("cmp");
+                    if (ct != a[1].objectVal->end() && !ct->second.isNull()) {
+                        if (!keyFn.isNull()) {
+                            ErrorHandler::throwError("sort(): pass \"key\" or \"cmp\", not both — a "
+                                "comparator already decides the order, so a key would be ignored.",
+                                0, 0, ErrorHandler::RUNTIME_ERROR);
+                        }
+                        cmp = ct->second;
+                    }
+                }
+                else if (a[1].isString()) {
+                    if (a[1].stringVal == "desc")      desc = true;
+                    else if (a[1].stringVal != "asc") {
+                        ErrorHandler::throwError("sort(): the second argument must be \"asc\", \"desc\" "
+                            "or a comparator function, got \"" + a[1].stringVal + "\"",
+                            0, 0, ErrorHandler::RUNTIME_ERROR);
+                    }
+                } else {
+                    ErrorHandler::throwError(std::string("sort(): the second argument must be \"asc\", "
+                        "\"desc\", a comparator function, or an options dict like "
+                        "{\"key\": fn, \"desc\": true} — got ") + typeNameOf(a[1]),
+                        0, 0, ErrorHandler::RUNTIME_ERROR);
+                }
+            }
+
+            // ── The key path: decorate, sort natively, undecorate ──────────
+            // One call per element, then the ordering happens in C++ on the
+            // keys alone. Keys must be all numbers or all strings for the same
+            // reason the elements must be on the no-comparator path below:
+            // ordering a number against a string has no right answer.
+            if (!keyFn.isNull()) {
+                const size_t n = v.size();
+                std::vector<Value> keys;
+                keys.reserve(n);
+                for (const Value& e : v) keys.push_back(invokeCallable(keyFn, { e }));
+
+                bool kNum = true, kStr = true;
+                for (const Value& k : keys) {
+                    if (!k.isNumber()) kNum = false;
+                    if (!k.isString()) kStr = false;
+                }
+                if (!kNum && !kStr) {
+                    std::string first = typeNameOf(keys[0]), other;
+                    for (const Value& k : keys) {
+                        if (typeNameOf(k) != first) { other = typeNameOf(k); break; }
+                    }
+                    ErrorHandler::throwError("sort(): the key function must return the same type for "
+                        "every element — it returned " + first + " and " + other + ".",
+                        0, 0, ErrorHandler::RUNTIME_ERROR);
+                }
+
+                // Sort an index permutation so the keys move once, not with
+                // every swap of a possibly large element.
+                std::vector<size_t> idx(n);
+                for (size_t i = 0; i < n; ++i) idx[i] = i;
+                if (kNum) {
+                    std::stable_sort(idx.begin(), idx.end(), [&](size_t x, size_t y) {
+                        // NaN last in both directions, exactly as below.
+                        const bool nx = std::isnan(keys[x].numberVal), ny = std::isnan(keys[y].numberVal);
+                        if (nx || ny) return !nx && ny;
+                        return desc ? (keys[y].numberVal < keys[x].numberVal)
+                                    : (keys[x].numberVal < keys[y].numberVal);
+                    });
+                } else {
+                    std::stable_sort(idx.begin(), idx.end(), [&](size_t x, size_t y) {
+                        return desc ? (keys[y].stringVal < keys[x].stringVal)
+                                    : (keys[x].stringVal < keys[y].stringVal);
+                    });
+                }
+                std::vector<Value> out;
+                out.reserve(n);
+                for (size_t i : idx) out.push_back(std::move(v[i]));
+                return Value(std::move(out));
+            }
+
+            if (!cmp.isNull()) {
+                // Bottom-up merge sort, stable, and safe against a comparator
+                // that is not a strict weak ordering.
+                std::vector<Value> buf(v.size());
+                auto before = [&](const Value& x, const Value& y) -> bool {
+                    Value r = invokeCallable(cmp, { x, y });
+                    if (!r.isNumber()) {
+                        ErrorHandler::throwError(std::string("sort(): the comparator must return a "
+                            "number — negative if the first argument comes first, positive if the "
+                            "second does, zero if they tie — got ") + typeNameOf(r),
+                            0, 0, ErrorHandler::RUNTIME_ERROR);
+                    }
+                    return r.numberVal < 0;   // strictly-before keeps it stable
+                };
+                for (size_t width = 1; width < v.size(); width *= 2) {
+                    for (size_t lo = 0; lo < v.size(); lo += 2 * width) {
+                        const size_t mid = std::min(lo + width, v.size());
+                        const size_t hi  = std::min(lo + 2 * width, v.size());
+                        size_t i = lo, j = mid, k = lo;
+                        while (i < mid && j < hi) buf[k++] = before(v[j], v[i]) ? v[j++] : v[i++];
+                        while (i < mid) buf[k++] = v[i++];
+                        while (j < hi)  buf[k++] = v[j++];
+                    }
+                    v.swap(buf);
+                }
+                return Value(std::move(v));
+            }
+
+            // No comparator: numbers numerically, strings lexicographically, and
+            // a mixed list raises. Ordering a number against a string has no
+            // right answer, and choosing one silently is how a sort quietly
+            // produces garbage that looks sorted.
+            bool allNum = true, allStr = true;
+            for (const Value& e : v) {
+                if (!e.isNumber()) allNum = false;
+                if (!e.isString()) allStr = false;
+            }
+            if (!allNum && !allStr) {
+                std::string first = typeNameOf(v[0]), other;
+                for (const Value& e : v) {
+                    if (typeNameOf(e) != first) { other = typeNameOf(e); break; }
+                }
+                ErrorHandler::throwError("sort(): every element must be the same type — this list "
+                    "mixes " + first + " and " + other + ". Pass a comparator function to order a "
+                    "mixed list.", 0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            // "desc" reverses the COMPARISON, not the finished list. Reversing the
+            // list would reverse ties too — destroying the stability the sort just
+            // guaranteed — and would drag NaN to the front, contradicting the rule
+            // above. NaN stays last in both directions: it is not a large value,
+            // it is an absent one.
+            if (allNum) {
+                std::stable_sort(v.begin(), v.end(), [desc](const Value& x, const Value& y) {
+                    // NaN last, and total: see the note above.
+                    const bool nx = std::isnan(x.numberVal), ny = std::isnan(y.numberVal);
+                    if (nx || ny) return !nx && ny;
+                    return desc ? (y.numberVal < x.numberVal) : (x.numberVal < y.numberVal);
+                });
+            } else {
+                std::stable_sort(v.begin(), v.end(), [desc](const Value& x, const Value& y) {
+                    return desc ? (y.stringVal < x.stringVal) : (x.stringVal < y.stringVal);
+                });
+            }
+            return Value(std::move(v));
+        }));
+
+        // reverse(list) · reverse(string) — a new list/string, back to front.
+        env_->define("reverse", makeNative([](std::vector<Value> a) -> Value {
+            if (a.empty()) {
+                ErrorHandler::throwError("reverse(): needs a list or a string",
+                    0, 0, ErrorHandler::RUNTIME_ERROR);
+            }
+            if (a[0].isList()) {
+                std::vector<Value> v = a[0].listVal;
+                std::reverse(v.begin(), v.end());
+                return Value(std::move(v));
+            }
+            if (a[0].isString()) {
+                std::string s = a[0].stringVal;
+                std::reverse(s.begin(), s.end());
+                return Value(s);
+            }
+            ErrorHandler::throwError(std::string("reverse(): needs a list or a string, got ") +
+                typeNameOf(a[0]), 0, 0, ErrorHandler::RUNTIME_ERROR);
+            return Value();
+        }));
+
         // trim(s) — strip whitespace from both ends.
         env_->define("trim", makeNative([](std::vector<Value> args) -> Value {
             if (args.empty() || !args[0].isString()) return Value(std::string(""));
@@ -5990,8 +7689,22 @@ private:
         }));
 
         // contains(s, needle) → bool
+        // contains(string, needle) -> substring test
+        // contains(list, value)     -> membership, with the same equality as ==
+        //
+        // The list form used to fall into the string check and answer false for
+        // EVERY list -- contains([1, 2], 1) was false -- so a membership guard
+        // silently took the wrong branch. Equality is Value::equals, the one
+        // `==` uses, so contains([[1, 2]], [1, 2]) is true exactly when
+        // [[1, 2]][0] == [1, 2] is.
         env_->define("contains", makeNative([](std::vector<Value> args) -> Value {
-            if (args.size() < 2 || !args[0].isString() || !args[1].isString()) return Value(false);
+            if (args.size() < 2) return Value(false);
+            if (args[0].isList()) {
+                for (const Value& e : args[0].listVal)
+                    if (e.equals(args[1])) return Value(true);
+                return Value(false);
+            }
+            if (!args[0].isString() || !args[1].isString()) return Value(false);
             return Value(args[0].stringVal.find(args[1].stringVal) != std::string::npos);
         }));
 
@@ -7888,13 +9601,24 @@ private:
                 return Value(std::move(err));
             }
 
-            // Cycle guard
+            // Already fully loaded: hand back the module itself. This used to
+            // return {"_cached": true, "_path": ...}, so a second
+            // sua.include() of the same file gave you a marker dict instead of
+            // the module -- the same defect the `include` statement had.
+            {
+                auto cached = moduleExports_.find(mod.resolvedPath);
+                if (cached != moduleExports_.end()) return cached->second;
+            }
+            // In loadedModules_ with nothing exported yet: a genuine cycle,
+            // still mid-execution, so there is no finished module to return.
             for (const auto& prev : loadedModules_) {
                 if (prev == mod.resolvedPath) {
-                    ObjectMap cached;
-                    cached["_cached"] = Value(true);
-                    cached["_path"] = Value(mod.resolvedPath);
-                    return Value(std::move(cached));
+                    ObjectMap partial;
+                    partial["error"] = Value(std::string(
+                        "circular sua.include of " + mod.resolvedPath +
+                        " -- it is still loading"));
+                    partial["_path"] = Value(mod.resolvedPath);
+                    return Value(std::move(partial));
                 }
             }
             loadedModules_.push_back(mod.resolvedPath);
@@ -7905,17 +9629,23 @@ private:
             env_ = childEnv;
             filePathStack_.push_back(mod.resolvedPath);
 
-            for (auto& node : mod.ast) evalNode(node);
+            runStatements(mod.ast);
 
             filePathStack_.pop_back();
             env_ = savedEnv;
+            finishCall(Value());                 // a top-level return ends the module
 
             ObjectMap moduleObj;
             for (const auto& [k, v] : childEnv->variables) {
                 moduleObj[k] = v;
             }
             moduleObj["_path"] = Value(mod.resolvedPath);
-            return Value(std::move(moduleObj));
+            // Share one cache with the `include` statement, so whichever form
+            // loads the file first, every later include of it -- by either
+            // form -- gets that same module object.
+            Value moduleVal(std::move(moduleObj));
+            moduleExports_[mod.resolvedPath] = moduleVal;
+            return moduleVal;
         });
 
         // ════════════════════════════════════════════════════════
@@ -8822,13 +10552,29 @@ private:
             return Value();
         }
 
-        // v1.2.2: cycle guard with clearer diagnostic. Tracks the chain
-        // so the user can see exactly which files caused the cycle.
+        // Already fully loaded: bind the SAME namespace object again rather
+        // than returning early. Before this, the guard below returned before
+        // the alias was ever defined, so if two files both did
+        // `include "arctic" as arctic;` the second one's `arctic` was left
+        // unbound and the only clue was a line on stderr. Re-binding the
+        // cached object gives module-singleton semantics, as in Node.
+        {
+            auto cached = moduleExports_.find(mod.resolvedPath);
+            if (cached != moduleExports_.end()) {
+                bindModule(n, cached->second, mod.resolvedPath, /*reused=*/true);
+                return Value();
+            }
+        }
+
+        // In loadedModules_ but with nothing exported yet means we are inside
+        // that module's own execution: a genuine cycle. There is no finished
+        // namespace to bind, so name the file and carry on.
         for (size_t i = 0; i < loadedModules_.size(); ++i) {
             if (loadedModules_[i] == mod.resolvedPath) {
                 if (!quietMode_) {
-                    std::cerr << "  [INCLUDE] Skipping already-loaded module: "
-                              << mod.resolvedPath << "\n";
+                    std::cerr << "  [INCLUDE] Circular include of "
+                              << mod.resolvedPath
+                              << " -- it is still loading, so nothing is bound here.\n";
                 }
                 return Value();
             }
@@ -8844,14 +10590,12 @@ private:
         filePathStack_.push_back(mod.resolvedPath);
         ++includeDepth_;
 
-        Value last;
-        for (auto& node : mod.ast) {
-            last = evalNode(node);
-        }
+        Value last = runStatements(mod.ast);
 
         --includeDepth_;
         filePathStack_.pop_back();
         env_ = savedEnv;
+        last = finishCall(last);                 // a top-level return ends the module
 
         // Build module namespace object from child env's *own* variables
         // (not inherited globals). Excludes builtins.
@@ -8860,24 +10604,35 @@ private:
             moduleObj[k] = v;
         }
 
+        // Cache before binding, so a later include of the same file binds this
+        // very object rather than a copy.
+        Value moduleVal(std::move(moduleObj));
+        moduleExports_[mod.resolvedPath] = moduleVal;
+        bindModule(n, moduleVal, mod.resolvedPath, /*reused=*/false);
+
+        return Value();
+    }
+
+    // Bind a loaded module into the importing scope: its symbols directly, or
+    // the namespace object under an alias.
+    void bindModule(IncludeNode* n, const Value& moduleVal,
+                    const std::string& path, bool reused) {
+        const char* verb = reused ? "Reused " : "Loaded ";
         if (n->alias.empty()) {
-            // Direct include: bring symbols into current scope
-            for (const auto& [k, v] : moduleObj) {
-                env_->define(k, v);
+            if (moduleVal.objectVal) {
+                for (const auto& [k, v] : *moduleVal.objectVal) env_->define(k, v);
             }
             if (!quietMode_) {
-                std::cout << "  [INCLUDE] Loaded " << mod.resolvedPath
-                          << " (" << moduleObj.size() << " symbols)\n";
+                std::cout << "  [INCLUDE] " << verb << path << " ("
+                          << (moduleVal.objectVal ? moduleVal.objectVal->size() : 0)
+                          << " symbols)\n";
             }
         } else {
-            // Namespaced include: bind alias -> module object
-            env_->define(n->alias, Value(std::move(moduleObj)));
+            env_->define(n->alias, moduleVal);
             if (!quietMode_) {
-                std::cout << "  [INCLUDE] Loaded " << mod.resolvedPath
+                std::cout << "  [INCLUDE] " << verb << path
                           << " as '" << n->alias << "'\n";
             }
         }
-
-        return Value();
     }
 };

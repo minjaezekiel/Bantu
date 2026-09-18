@@ -14,14 +14,19 @@ print("");
 $results = [];
 
 def bench($name, $iters, $body) {
-    $t0 = sua.clock();
+    // [fixed] This said sua.clock(), which does not exist and never has, so
+    // bench.b raised on its first benchmark -- meaning benchmarks/run.sh has
+    // been failing, and the numbers published in results.md and README.md came
+    // from a script that no longer runs. clock() is the global, and it already
+    // returns milliseconds, so there is nothing to scale.
+    $t0 = clock();
     $i = 0;
     while ($i < $iters) {
         $body();
         $i += 1;
     }
-    $t1 = sua.clock();
-    $elapsedMs = ($t1 - $t0) * 1000.0;
+    $t1 = clock();
+    $elapsedMs = $t1 - $t0;
     $perOpUs = ($elapsedMs * 1000.0) / $iters;
     $opsPerSec = $iters / ($elapsedMs / 1000.0);
 

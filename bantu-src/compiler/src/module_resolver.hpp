@@ -11,7 +11,12 @@
  *   2. Resolve relative to the *importing* file's directory (preferred).
  *   3. Resolve relative to the current working directory.
  *   4. Try with `.b` extension appended if missing.
- *   5. (v1.2.2) For each directory in $BANTU_PATH (':' on POSIX, ';' on Windows),
+ *   5. For a BARE name (`include "numba"`, not `"./numba.b"`), look in
+ *      `bantu_modules/<name>/` next to the importing file and under the cwd,
+ *      honouring the package's `package.json` "main". This is where
+ *      `bantu add <pkg>` installs, and without it an installed package could
+ *      only be reached by spelling out its full path.
+ *   6. (v1.2.2) For each directory in $BANTU_PATH (':' on POSIX, ';' on Windows),
  *      try `<dir>/<path>` and `<dir>/<path>.b`. Lets users install shared
  *      module libraries outside their project tree.
  *
@@ -34,6 +39,7 @@
 #include <sstream>
 #include <sys/stat.h>
 #include <cstdlib>
+#include <cctype>
 
 #ifdef _WIN32
     #include <direct.h>
@@ -49,6 +55,24 @@ namespace bantu {
 inline bool pathExists(const std::string& p) {
     struct stat buf;
     return stat(p.c_str(), &buf) == 0;
+}
+
+// A module must be a REGULAR FILE. pathExists() also says yes to a directory,
+// and a directory opened as a stream reads as empty -- so `include "bplot"`
+// run from a folder that contains a bplot/ directory parsed an empty file and
+// bound the alias to a module with nothing in it. No error anywhere: the first
+// sign was "figure holds null" at the first call. That is exactly the layout
+// of this repository, and of any project that vendors a package.
+inline bool isRegularFile(const std::string& p) {
+    struct stat buf;
+    if (stat(p.c_str(), &buf) != 0) return false;
+    return (buf.st_mode & S_IFMT) == S_IFREG;
+}
+
+inline bool isDirectory(const std::string& p) {
+    struct stat buf;
+    if (stat(p.c_str(), &buf) != 0) return false;
+    return (buf.st_mode & S_IFMT) == S_IFDIR;
 }
 
 inline std::string dirOf(const std::string& path) {
@@ -124,6 +148,79 @@ inline std::vector<std::string> bantuPathDirs() {
     return splitPathEnv(env);
 }
 
+// ── Installed packages: ./bantu_modules/<name>/ ──────────────────────────────
+// `bantu add <pkg>` installs into ./bantu_modules/<pkg>/, but nothing taught
+// the resolver about that directory, so `include "numba" as np;` did not
+// resolve and every user had to write the full
+// `include "./bantu_modules/numba/numba.b" as np;` instead. This closes that
+// for every installed package at once.
+
+// Read one top-level string field out of a package.json. Deliberately a
+// minimal scanner rather than a JSON parser: these manifests are written by
+// `bantu init` / `bantu publish` and are always a flat object of strings, and
+// package_manager.hpp already reads them the same way. Requiring the key to
+// sit right after '{' or ',' stops a value like "the main entry" in
+// "description" from being mistaken for the "main" key.
+inline std::string readManifestField(const std::string& json, const std::string& key) {
+    const std::string needle = "\"" + key + "\"";
+    size_t from = 0;
+    while (true) {
+        size_t k = json.find(needle, from);
+        if (k == std::string::npos) return "";
+        from = k + needle.size();
+        // The key must be a key, not part of some other string's value.
+        size_t p = k;
+        while (p > 0 && std::isspace((unsigned char)json[p - 1])) p--;
+        if (p == 0 || (json[p - 1] != '{' && json[p - 1] != ',')) continue;
+
+        size_t colon = json.find(':', from);
+        if (colon == std::string::npos) return "";
+        size_t q1 = json.find('"', colon + 1);
+        if (q1 == std::string::npos) return "";
+        size_t q2 = json.find('"', q1 + 1);
+        if (q2 == std::string::npos) return "";
+        return json.substr(q1 + 1, q2 - q1 - 1);
+    }
+}
+
+inline std::string readWholeFile(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return "";
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+// A bare module name: "numba", not "./numba.b" or "../pkg/numba.b". Only bare
+// names look in bantu_modules, so an explicit relative path always means
+// exactly what it says.
+inline bool isBareModuleName(const std::string& p) {
+    if (p.empty()) return false;
+    if (p[0] == '.' || p[0] == '/' || p[0] == '\\') return false;
+    if (p.find('/') != std::string::npos || p.find('\\') != std::string::npos) return false;
+    if (p.size() >= 2 && p[1] == ':') return false;   // Windows drive letter
+    return true;
+}
+
+// Append the candidate entry points for <baseDir>/bantu_modules/<name>/.
+// package.json's "main" wins; the conventional names are tried after it so a
+// package with no manifest still resolves.
+inline void addPackageCandidates(std::vector<std::string>& candidates,
+                                 const std::string& baseDir,
+                                 const std::string& name) {
+    const std::string pkgDir = joinPath(joinPath(baseDir, "bantu_modules"), name);
+    if (!pathExists(pkgDir)) return;
+
+    const std::string manifest = joinPath(pkgDir, "package.json");
+    if (pathExists(manifest)) {
+        const std::string main = readManifestField(readWholeFile(manifest), "main");
+        if (!main.empty()) candidates.push_back(joinPath(pkgDir, main));
+    }
+    candidates.push_back(joinPath(pkgDir, name + ".b"));
+    candidates.push_back(joinPath(pkgDir, "index.b"));
+    candidates.push_back(joinPath(pkgDir, "main.b"));
+}
+
 struct ResolvedModule {
     std::string resolvedPath;   // absolute-ish path that was opened
     std::string source;         // file contents
@@ -157,7 +254,38 @@ inline ResolvedModule resolveAndParse(const std::string& rawPath,
             candidates.push_back(joinPath(getCwd(), withExt));
         }
     }
-    // 5. (v1.2.2) $BANTU_PATH lookup — for shared module libraries
+    // 5. Installed packages: ./bantu_modules/<name>/ for a BARE name.
+    //    Placed after the relative forms so an explicit path always wins, and
+    //    before $BANTU_PATH so a project's own dependency beats a global
+    //    search dir.
+    if (isBareModuleName(rawPath)) {
+        if (!importingFilePath.empty()) {
+            addPackageCandidates(candidates, dirOf(importingFilePath), rawPath);
+        }
+        addPackageCandidates(candidates, getCwd(), rawPath);
+    }
+    // 5b. A bare name that names a DIRECTORY is a package directory: resolve
+    //     inside it exactly as bantu_modules/<name>/ is resolved. This is how
+    //     `include "bplot"` works from a checkout that has bplot/bplot.b, and
+    //     it is Node's convention for require('./dir'). Placed after
+    //     bantu_modules so an installed package still wins over a folder that
+    //     happens to share its name.
+    if (isBareModuleName(rawPath)) {
+        auto addDirPackage = [&](const std::string& baseDir) {
+            const std::string dir = joinPath(baseDir, rawPath);
+            if (!isDirectory(dir)) return;
+            const std::string manifest = joinPath(dir, "package.json");
+            if (isRegularFile(manifest)) {
+                const std::string main = readManifestField(readWholeFile(manifest), "main");
+                if (!main.empty()) candidates.push_back(joinPath(dir, main));
+            }
+            candidates.push_back(joinPath(dir, rawPath + ".b"));
+            candidates.push_back(joinPath(dir, "index.b"));
+        };
+        if (!importingFilePath.empty()) addDirPackage(dirOf(importingFilePath));
+        addDirPackage(getCwd());
+    }
+    // 6. (v1.2.2) $BANTU_PATH lookup — for shared module libraries
     for (const auto& dir : bantuPathDirs()) {
         candidates.push_back(joinPath(dir, rawPath));
         std::string withExt = rawPath;
@@ -169,7 +297,7 @@ inline ResolvedModule resolveAndParse(const std::string& rawPath,
 
     std::string chosen;
     for (const auto& c : candidates) {
-        if (pathExists(c)) { chosen = c; break; }
+        if (isRegularFile(c)) { chosen = c; break; }
     }
 
     if (chosen.empty()) {

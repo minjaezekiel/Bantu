@@ -84,7 +84,21 @@ set(SOURCES
     src/types.cpp
     src/function.cpp
     src/class.cpp
+    src/ndarray_native.cpp
+    src/raster_native.cpp
 )
+
+# The numba kernels are the one translation unit built at -O3; everything else
+# stays at -O2. Not a micro-optimization: GCC 11 (ubuntu:22.04, which builds the
+# production Linux binary) does not enable -ftree-loop-vectorize at -O2, while
+# GCC 12 and Apple Clang do -- so without this the same source vectorizes on a
+# developer's Mac and runs scalar in the binary users download.
+if(MSVC)
+    set_source_files_properties(src/ndarray_native.cpp PROPERTIES COMPILE_OPTIONS "/O2")
+else()
+    set_source_files_properties(src/ndarray_native.cpp
+                                PROPERTIES COMPILE_OPTIONS "-O3;-ftree-vectorize")
+endif()
 
 set(HEADERS
     src/types.hpp

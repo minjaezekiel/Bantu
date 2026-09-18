@@ -11,7 +11,7 @@
 $db = sua.sqlite;
 
 def initDb() {
-    $db.connect("blogsite.db");
+    $db.open("blogsite.db");
     $db.exec("CREATE TABLE IF NOT EXISTS posts ("
         + "id INTEGER PRIMARY KEY AUTOINCREMENT, "
         + "title TEXT NOT NULL, "

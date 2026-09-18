@@ -1,4 +1,5 @@
 #pragma once
+#include <cctype>
 /**
  * Bantu Language - Recursive Descent Parser
  * Transforms token stream into AST
@@ -424,6 +425,19 @@ private:
     std::shared_ptr<ASTNode> parseExpressionStatement() {
         auto expr = parseExpression();
         match(BantuTokenType::SEMICOLON);
+        // The value of a bare expression statement is discarded. Recording that
+        // here -- the one place in the grammar where it is true -- lets the
+        // evaluator skip work whose only purpose is to produce that value.
+        // See CallNode::resultDiscarded.
+        if (auto call = std::dynamic_pointer_cast<CallNode>(expr)) {
+            call->resultDiscarded = true;
+        } else if (auto asn = std::dynamic_pointer_cast<AssignNode>(expr)) {
+            asn->resultDiscarded = true;
+        } else if (auto ixa = std::dynamic_pointer_cast<IndexAssignNode>(expr)) {
+            ixa->resultDiscarded = true;
+        } else if (auto dca = std::dynamic_pointer_cast<DictAssignNode>(expr)) {
+            dca->resultDiscarded = true;
+        }
         return expr;
     }
 
@@ -448,15 +462,15 @@ private:
 
         if (match(BantuTokenType::EQUALS)) {
             auto value = parseAssignment();
-            if (auto varNode = dynamic_cast<VariableNode*>(expr.get())) {
+            if (auto varNode = nodeIf<VariableNode>(expr.get())) {
                 return std::make_shared<AssignNode>(varNode->name, std::move(value), expr->line, expr->col);
             }
             // Handle $arr[$idx] = value
-            if (auto idxNode = dynamic_cast<IndexAccessNode*>(expr.get())) {
+            if (auto idxNode = nodeIf<IndexAccessNode>(expr.get())) {
                 return std::make_shared<IndexAssignNode>(std::move(idxNode->object), std::move(idxNode->index), std::move(value), expr->line, expr->col);
             }
             // Handle $dict["key"] = value
-            if (auto dotNode = dynamic_cast<DotAccessNode*>(expr.get())) {
+            if (auto dotNode = nodeIf<DotAccessNode>(expr.get())) {
                 return std::make_shared<DictAssignNode>(std::move(dotNode->object), dotNode->property, std::move(value), expr->line, expr->col);
             }
             ErrorHandler::throwSyntaxError("Invalid assignment target", expr->line, expr->col);
@@ -478,19 +492,19 @@ private:
             auto value = parseAssignment();
 
             // Target: simple variable — $x op= v
-            if (auto varNode = dynamic_cast<VariableNode*>(expr.get())) {
+            if (auto varNode = nodeIf<VariableNode>(expr.get())) {
                 auto read = std::make_shared<VariableNode>(varNode->name, varNode->line, varNode->col);
                 auto binOp = std::make_shared<BinaryOpNode>(baseOp, read, std::move(value), expr->line, expr->col);
                 return std::make_shared<AssignNode>(varNode->name, std::move(binOp), expr->line, expr->col);
             }
             // Target: list/dict index — $a[i] op= v
-            if (auto idxNode = dynamic_cast<IndexAccessNode*>(expr.get())) {
+            if (auto idxNode = nodeIf<IndexAccessNode>(expr.get())) {
                 auto read = std::make_shared<IndexAccessNode>(idxNode->object, idxNode->index, expr->line, expr->col);
                 auto binOp = std::make_shared<BinaryOpNode>(baseOp, read, std::move(value), expr->line, expr->col);
                 return std::make_shared<IndexAssignNode>(idxNode->object, idxNode->index, std::move(binOp), expr->line, expr->col);
             }
             // Target: object property — $o.k op= v
-            if (auto dotNode = dynamic_cast<DotAccessNode*>(expr.get())) {
+            if (auto dotNode = nodeIf<DotAccessNode>(expr.get())) {
                 auto read = std::make_shared<DotAccessNode>(dotNode->object, dotNode->property, expr->line, expr->col);
                 auto binOp = std::make_shared<BinaryOpNode>(baseOp, read, std::move(value), expr->line, expr->col);
                 return std::make_shared<DictAssignNode>(dotNode->object, dotNode->property, std::move(binOp), expr->line, expr->col);
@@ -614,9 +628,28 @@ private:
                         case BantuTokenType::FROM:
                             propName = advance().value;
                             break;
-                        default:
+                        default: {
+                            // Anything that LOOKS like a bare word is a legal
+                            // property name, whatever the lexer classified it
+                            // as. The explicit list above was maintained by
+                            // hand and was necessarily incomplete: `any` is a
+                            // type keyword, so `$a.any()` failed with "Expected
+                            // property name after '.'", and so did a dict key
+                            // called "number", "string" or "delete" -- latent
+                            // for anyone whose data happened to use one of
+                            // those names. A property name is never ambiguous
+                            // with a keyword, because it can only follow a dot.
+                            const std::string& v = tok.value;
+                            bool wordLike = !v.empty() &&
+                                (std::isalpha(static_cast<unsigned char>(v[0])) || v[0] == '_');
+                            for (size_t ci = 1; wordLike && ci < v.size(); ci++) {
+                                if (!std::isalnum(static_cast<unsigned char>(v[ci])) && v[ci] != '_')
+                                    wordLike = false;
+                            }
+                            if (wordLike) { propName = advance().value; break; }
                             ErrorHandler::throwSyntaxError("Expected property name after '.'", tok.line, tok.col);
                             break;
+                        }
                     }
                 }
                 expr = std::make_shared<DotAccessNode>(std::move(expr), propName, current().line, current().col);

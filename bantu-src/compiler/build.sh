@@ -75,6 +75,8 @@ SOURCES=(
     src/types.cpp
     src/function.cpp
     src/class.cpp
+    src/ndarray_native.cpp
+    src/raster_native.cpp
     src/evaluator.cpp
     src/main.cpp
 )
@@ -129,8 +131,19 @@ for src in "${SOURCES[@]}"; do
     obj="build/$(basename "${src%.cpp}").o"
     echo
     echo "── Compiling $src ──"
+    # The numba kernels are the one translation unit built at -O3; everything
+    # else stays at -O2. This matters most HERE: the production binary is built
+    # in ubuntu:22.04, whose GCC 11 does not enable -ftree-loop-vectorize at -O2
+    # (GCC 12 does), while the macOS build's Apple Clang does. Without this, a
+    # kernel benchmarked on a Mac would get NEON and this binary -- the one
+    # users download -- would get a scalar loop for the same source.
+    # Unquoted on purpose; these flags contain no spaces.
+    kernel_flags=""
+    case "$src" in
+        */ndarray_native.cpp) kernel_flags="-O3 -ftree-vectorize" ;;
+    esac
     # Use -Wall but NOT -Werror — we want warnings, not failures.
-    if g++ "${CPP_FLAGS[@]}" -Wall -c "$src" -o "$obj" 2>&1; then
+    if g++ "${CPP_FLAGS[@]}" $kernel_flags -Wall -c "$src" -o "$obj" 2>&1; then
         echo "[PASS] $src -> $obj ($(wc -c <"$obj") bytes)"
         OBJECTS+=( "$obj" )
     else

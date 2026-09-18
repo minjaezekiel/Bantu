@@ -182,6 +182,48 @@ $df.query("email != null");
 (Left-to-right; there is no `and`/`or` precedence and no parentheses yet — chain `.filter()` calls
 for complex logic.)
 
+## Plotting
+
+A frame or a series draws itself with [bplot](bplot-architecture.md):
+
+```bantu
+include "arctic" as ac;
+include "bplot" as plt;
+
+$df = ac.dataframe({
+    "month": ["Jan", "Feb", "Mar", "Apr"],
+    "dar":   [66, 61, 118, 290],
+    "arusha": [53, 70, 145, 330]
+}, null);
+
+$df.plot({"kind": "bar", "x": "month", "title": "Rainfall (mm)"});
+plt.savefig("rain.svg");
+```
+
+| option | meaning |
+|---|---|
+| `kind` | `line` (default), `bar`, `barh`, `scatter`, `hist`, `box`, `step` |
+| `x` | the column for the x axis; default is the row number |
+| `y` | a column name or a list of names; default is **every numeric column** except `x` |
+| `title` | a title; axis labels default to the column names |
+
+`$series.plot()` draws one column against its row number. Columns and series also go straight into
+any bplot call — `plt.plot($df.get("day"), $df.get("sales"))` — and render exactly as the same data
+would from a list.
+
+Three things worth knowing:
+
+- **arctic loads bplot only when you plot.** The include happens inside `plot()`, on the first call,
+  so a program that never draws never pays for it; without bplot installed, `plot()` raises
+  `install it with bantu add bplot`. It shares bplot's current figure, so `plt.savefig()` writes what
+  `$df.plot()` drew.
+- **A null is a gap**, never a zero; a **datetime** column becomes a date axis on its own.
+- **Naming a text column in `y` raises**, naming the column and its type. Only the default
+  selection skips text columns, because nobody asked for those.
+
+A million rows plot in about a quarter of a second: the columns stay native until they become pixels,
+rather than being copied into Bantu lists.
+
 ## Notes
 - **Immutable & chainable:** operations never modify their input.
 - **Column order** from `arctic.dataframe({...})` follows dict iteration; use `.select([...])` to fix

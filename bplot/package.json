@@ -1,0 +1,6 @@
+{
+  "name": "bplot",
+  "version": "1.1.0",
+  "main": "bplot.b",
+  "description": "Data visualisation for Bantu, in the shape of matplotlib, emitting SVG. plot, scatter, bar, hist, boxplot, violin, errorbar, fill_between, step, stem and pie; log, symlog and date axes; subplots, twin and shared axes, tight_layout; heatmap, imshow, pcolormesh, contour and colorbars with the published viridis, plasma and coolwarm tables; three style sheets. Takes Bantu lists, numba ndarrays and arctic columns, Series and DataFrames, and renders the same document from each; numeric data stays native, so a million-row column draws in about a quarter of a second. Ticks match matplotlib's own choices. Every text node and attribute is escaped with no raw-SVG hatch, because SVG is an executable document format."
+}

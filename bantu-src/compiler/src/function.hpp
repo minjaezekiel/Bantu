@@ -6,10 +6,16 @@
 #include "types.hpp"
 #include "ast.hpp"
 #include "environment.hpp"
+#include "gc.hpp"
+#include <memory>
 #include <vector>
 #include <string>
 
-class BantuFunction {
+// Tracked by the cycle collector: `closure` is the edge that closes a cycle
+// between a scope and the function named in it, and between an instance and a
+// method bound to it. See gc.hpp.
+class BantuFunction : public bantu_gc::Tracked<bantu_gc::Kind::Func>,
+                      public std::enable_shared_from_this<BantuFunction> {
 public:
     std::string name;
     std::vector<std::string> params;
