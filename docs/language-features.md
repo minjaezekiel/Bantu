@@ -215,6 +215,18 @@ Both answered silently wrong for the containers they did not know about:
 fired, with nothing to say why. `len` of anything else — a number, `null` — still answers `0`,
 because `len(null)` is a common guard and changing it would break working programs.
 
+### `+` joins two lists (fixed)
+
+```bantu
+$l = [1, 2] + [3];        // [1, 2, 3]
+$p = [0] + $point;        // a new list; neither operand changes
+```
+
+`[1, 2] + [3]` used to read the numeric value of both lists and silently answer `0` — which then
+indexed as `null`, so the mistake surfaced far from where it was made. Two lists now concatenate,
+as in Python, into a new list (value semantics: neither operand is touched). Only list `+` list
+changed; `+` with a list on one side and anything else on the other behaves as before.
+
 ### `&&` and `||` now short-circuit (fixed)
 
 They did not, and that was a real defect rather than a quirk. The universal guard idiom

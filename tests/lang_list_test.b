@@ -250,6 +250,31 @@ eq(contains("hello", "ell"), true, "the string form is unchanged");
 eq(contains("hello", "xyz"), false, "and still answers false when absent");
 eq(contains(42, 4), false, "a non-container still answers false");
 
+// ── + joins two lists ────────────────────────────────────────────────────
+// It used to read numberVal from both and silently answer 0.
+eq([1, 2] + [3], [1, 2, 3], "list + list concatenates");
+eq([] + [], [], "two empty lists give an empty list");
+eq([] + [7], [7], "an empty left operand");
+eq([[1, 2]] + [[3]], [[1, 2], [3]], "nested lists stay nested");
+$cl = [1];
+$cr = [2];
+$cj = $cl + $cr;
+push($cj, 9);
+eq($cl, [1], "the left operand is not changed");
+eq($cr, [2], "the right operand is not changed");
+eq(len([0] + [1, 2]), 3, "the result has both lengths");
+eq(([0] + [5, 6])[2], 6, "and indexes as a list, not as null");
+eq("a" + "b", "ab", "string + string is unchanged");
+eq(1 + 2, 3, "number + number is unchanged");
+$big = [];
+$ci = 0;
+while ($ci < 50000) { push($big, $ci); $ci = $ci + 1; }
+$ct = clock();
+$both = $big + $big;
+eq(len($both), 100000, "two 50,000-element lists join");
+eq($both[99999], 49999, "with the right last element");
+ok(clock() - $ct < 1000, "in well under a second");
+
 print("");
 print("========================================");
 print("  PASS: " + str($R.pass) + "   FAIL: " + str($R.fail));

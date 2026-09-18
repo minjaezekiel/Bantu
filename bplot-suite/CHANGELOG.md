@@ -822,3 +822,44 @@ render itself all compared before and after):
 The 1100×800 dashboard sample, same bytes as before: SVG 78 → **37 ms**; PNG at 96 dpi 124 → **71 ms**,
 at 144 dpi 215 → **118 ms**, at 300 dpi 468 → **368 ms**.
 
+### B6 in CI — byte identity observed on three platforms
+
+- **[test]** The first CI run on this branch, and the first time Linux or Windows had compiled any of
+  it. After the fixes below, run 35357689330 on `9b211ba` is green on every job, and **the corpus's
+  eight SHA-256s — recorded on an Intel Mac — matched on Linux (GCC, x86-64), Windows (MSVC) and
+  macOS-14 (Apple clang, arm64)**. `has_native("raster")` is unconditional, so the corpus cannot have
+  passed by skipping. Three operating systems, three compilers, two CPU architectures, one file.
+
+### Solved defects encountered
+
+- **[bug fix] The Windows build did not compile.** Three branch hints on the interpreter's hot path
+  (operator dispatch, from numba's Phase 4) used `__builtin_expect`, which MSVC does not have
+  (C3861), and no local build could see it. They now use `BANTU_UNLIKELY` from
+  `platform_compat.hpp`, the header that already holds this tree's compiler differences. On GCC and
+  Clang it is the same builtin, so the measured hot path is unchanged.
+- **[bug fix] The MSVC fallback for signed overflow overflowed.** `mulOverflows` multiplied and then
+  divided back to check, and the multiply is itself the undefined behaviour. It now checks before
+  multiplying (CERT INT32-C), and agrees with `__builtin_mul_overflow` under UBSan on 676 edge pairs:
+  ±2⁶³, ±2³², and either side of √2⁶³.
+- **[bug fix] CI's AST tag check listed its source files by hand** and had missed
+  `raster_native.cpp`, so it failed at link time. It globs `src/*.cpp` now.
+
+### The generators, in Bantu
+
+- **[feature]** `scripts/gen_circle_tables.b` and `scripts/gen_font_tables.b` replace the two Python
+  generators, which are deleted. The font generator includes a TrueType reader in Bantu (`head`,
+  `maxp`, `hhea`, `hmtx`, `loca`, format-4 `cmap`, `glyf` simple and composite glyphs) that walks
+  contours the way fontTools' pen protocol does. **Each generator regenerates its committed header
+  byte for byte**, apart from the line naming the generator. The font generator takes **0.4 s** and
+  no longer depends on fontTools.
+- **[test]** Differential: on all twelve DejaVu Sans, Sans Mono and Serif faces matplotlib ships
+  (4,105–5,101 segments each), the Python original and the Bantu reader produce identical headers.
+  Both refuse the two Display faces, which lack the glyphs. `tests/gen_tables_test.sh` reruns both
+  generators against the committed headers, and checks that a file that is not a font is refused
+  with nothing written. It runs in the Linux and macOS jobs. The font half needs DejaVu Sans beside
+  its licence, and says when it has skipped.
+- **[bug fix] `[0] + [1, 2]` was `0`.** Found while writing the font reader: `+` on two lists read
+  the numeric value of both and silently answered `0`, which then indexed as `null` far from the
+  mistake. Two lists now concatenate, as in Python (`docs/language-features.md`).
+  `tests/lang_list_test.b` has 13 new assertions, including joining two 50,000-element lists. The
+  branch sits inside the existing non-number path, so number arithmetic is untouched.

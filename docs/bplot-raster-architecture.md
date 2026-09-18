@@ -121,9 +121,9 @@ sRGB, and the PNG should look like the SVG, not like a physically-better image n
 
 **The font is DejaVu Sans, embedded.** 210 glyphs — ASCII, Latin-1, and the symbols charts actually
 use (`° µ × − – — … ± ≤ ≥ ≈ ≠ ∞ € ™ ☀`), plus `U+FFFD` for anything else — as **4,105 outline
-segments, about 41 KB** of integer data in `raster_font.hpp`. A generator script, run at authoring time
-with fontTools, writes the table; nothing parses a font at run time, which is the font-file parsing the
-roadmap defers. Accented letters are *composites* in TrueType (a base glyph plus an accent), so the
+segments, about 41 KB** of integer data in `raster_font.hpp`. A generator written in Bantu
+(`scripts/gen_font_tables.b`, a small TrueType reader) writes the table at authoring time; nothing
+parses a font at run time, which is the font-file parsing the roadmap defers. Accented letters are *composites* in TrueType (a base glyph plus an accent), so the
 generator decomposes them — the first version did not, and `ö ç à ÿ` rendered blank (see the CHANGELOG).
 DejaVu's licence (Bitstream Vera and Arev terms) permits redistribution with its notices, and the header
 carries them in full.
@@ -300,21 +300,26 @@ and the native surface it adds is size-capped, validated and sanitiser-tested (�
 
 ## 14. The tooling, and the Python in this repository
 
-Two generators live in `scripts/`, and they are the only Python this work adds:
+Two generators live in `scripts/`, both in Bantu:
 
-| script | produces | why Python today |
+| script | produces | reads |
 |---|---|---|
-| `gen_circle_tables.py` | `raster_tables.hpp` — cos and sin at fixed angles, as Q30 integers | nothing more than `cos`, `sin` and a file write; **a direct translation to Bantu** |
-| `gen_font_tables.py` | `raster_font.hpp` — the embedded glyph outlines | reading a TrueType file needs a parser Bantu does not have yet |
+| `gen_circle_tables.b` | `raster_tables.hpp` — cos and sin at fixed angles, as Q30 integers | nothing: `cos`, `sin`, `hypot` |
+| `gen_font_tables.b` | `raster_font.hpp` — the embedded glyph outlines | a TrueType file: `head`, `maxp`, `hhea`, `hmtx`, `loca`, format-4 `cmap`, `glyf` (simple and offset composites) |
 
-Both are **authoring-time tools**: they are run once, by hand, and their *output* is
-checked in. No build step runs them, and nothing at run time touches Python — the interpreter has no
-dependency on it, and neither does a user's program.
+Both are **authoring-time tools**: they are run once, by hand, and their *output* is checked in. No
+build step runs them, and nothing at run time depends on them.
 
-**They are meant to become Bantu.** The circle tables need only what the language already has. The
-font tables need a Bantu reader for a TrueType file's `glyf`, `loca`, `cmap` and `hmtx` tables —
-which became possible only in B6a, when binary file reads started working. Until then the generated
-headers are the contract, and they are readable and reproducible either way.
+They began as Python (fontTools for the font) and were translated once binary file reads worked (B6a).
+The translation was held to the only standard that proves it: **each regenerates its committed
+header byte for byte**, apart from the line naming the generator. The font reader was also run
+beside the original on all twelve DejaVu Sans, Sans Mono and Serif faces that matplotlib ships —
+4,105 to 5,101 segments each, composites included — and matched on every one, in about a second per
+face. `tests/gen_tables_test.sh` reruns both generators and requires the committed bytes, so neither
+can rot unnoticed. The circle check runs wherever the suite does. The font check needs
+DejaVu Sans beside its licence file, as matplotlib ships it, and says it skipped when that is absent.
+Anything the reader does not handle — a scaled or point-matched component, cubic outlines, a font
+without a (3,1) format-4 `cmap`, a missing glyph — raises, and writes nothing.
 
 **One piece of Python is deliberately staying.** `tests/bplot_png_test.sh` decodes our PNGs with
 Pillow and our deflate streams with Python's `zlib`, and `tests/run_doc_examples.sh` uses Python only
@@ -332,6 +337,6 @@ Reimplementing them in Bantu would turn an independent check into a mirror of th
 - **Colour management.** Plain sRGB with no embedded profile, as browsers assume for SVG.
 - **Kerning and complex scripts.** Advance widths only; right-to-left and shaped scripts render as
   individual glyphs or as `U+FFFD`.
-- **Observed byte identity before CI runs.** Linux and Windows cannot be checked on this machine — the
-  Docker daemon is installed but not running — so the three-platform gate is proven by CI, not by the
-  author.
+- **Identity with a compiler or platform CI does not run.** Byte identity is *observed* on Linux
+  (GCC, x86-64), Windows (MSVC, x86-64) and macOS (Apple clang, arm64), against hashes recorded on
+  x86-64 macOS; anything else is expected to match, and the corpus is how to find out.

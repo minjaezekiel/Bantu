@@ -231,7 +231,7 @@ non-numeric column selected.
 | every sample executed | ✅ `tests/run_samples.sh`, and `server.b` by `tests/bplot_sua_test.sh` |
 | `bantu add bplot` → `include "bplot"` in a clean project | ✅ `tests/bplot_package_test.sh`, 17 checks, in a throwaway `HOME`: publish, add, include, a DataFrame drawn through arctic's lazy include from `bantu_modules/`, the installed copy byte-identical to its source, the installed smoke test green, and arctic without bplot naming `bantu add bplot` |
 | the sua example serves a real chart | ✅ `tests/bplot_sua_test.sh`, 15 checks: `image/svg+xml` with a CSP and `nosniff`, parses as XML, a hostile query-string title escaped, **40 concurrent requests each receiving only its own chart**, and still serving afterwards |
-| CI green on three platforms | ⚠️ **wired, not yet observed.** The new gates are in the Linux and macOS jobs and the Windows job now runs bplot's smoke test, but no CI run has happened on this branch — carried forward, as it has been since B1 |
+| CI green on three platforms | ✅ **observed** on `9b211ba` (run 35357689330): Linux, macOS and Windows all green, including bplot's smoke test and the PNG corpus on Windows. The first push failed on two portability defects no local build could see (see "B6 in CI" in the CHANGELOG) |
 
 **Three defects found and fixed while building it:**
 - **numba's documented examples had never been run.** Its roadmap recorded "every documented example
@@ -264,12 +264,12 @@ identity rules out, the integer rasteriser, the embedded font, the encoder, and 
       - [x] **B6e** — `BPlotRaster`, `savefig(".png", {dpi})`, `to_png()`, PNG from sua, and
             `bp_stroke_path`; layout measured by the backend that draws
       - [x] **B6f** — the byte-identity corpus (`tests/bplot_png_corpus_test.b`, all three CI jobs), a
-            4000×3000 at 300 dpi stress gate, sanitisers, records. The Linux and Windows matches are
-            wired but not yet observed: CI has not run since the corpus was recorded on macOS.
-- [ ] **convert the authoring-time generators to Bantu** — `scripts/gen_circle_tables.py` is a direct
-      translation; `scripts/gen_font_tables.py` needs a Bantu TrueType reader (`glyf`, `loca`, `cmap`,
-      `hmtx`), which binary file reads made possible in B6a. Neither is part of the build, and the
-      Python in `tests/` stays: its value is being a decoder we did not write
+            4000×3000 at 300 dpi stress gate, sanitisers, records. All eight hashes, recorded on an
+            Intel Mac, **matched in CI on Linux (GCC), Windows (MSVC) and macOS-14 (Apple Silicon)**.
+- [x] **convert the authoring-time generators to Bantu** — `scripts/gen_circle_tables.b` and
+      `scripts/gen_font_tables.b` (a TrueType reader) regenerate their headers byte for byte, gated by
+      `tests/gen_tables_test.sh`. The Python in `tests/` stays: its value is being a decoder we did
+      not write
 - [x] **binary-safe file writes** — `open()`/`writefile()`/`appendfile()` accept `"wb"/"rb"/"ab"` and
       set `std::ios::binary`; today `open(path,"wb")` falls through the mode chain and silently opens
       the file for *reading* — **done as B6a**, with `readfile()` too, unknown modes raising instead of

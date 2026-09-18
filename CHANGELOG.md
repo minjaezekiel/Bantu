@@ -9,6 +9,12 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] bplot's generators are Bantu, not Python.** `scripts/gen_circle_tables.b` and
+  `scripts/gen_font_tables.b`, a TrueType reader, replace the Python scripts that wrote
+  `raster_tables.hpp` and `raster_font.hpp`. Each regenerates its header byte for byte, and on all
+  twelve DejaVu faces matplotlib ships the font reader's output matches the fontTools original.
+  `tests/gen_tables_test.sh` holds them to the committed bytes. bplot's PNG corpus is also now
+  **observed byte-identical in CI on Linux (GCC), Windows (MSVC) and macOS (arm64)**.
 - **[feature] A cycle collector, so objects that refer to each other are freed too.** Reference
   counting frees a Bantu object the moment its last reference drops, but it cannot free a **cycle**
   — and three ordinary things made one, two of which the user never wrote:
@@ -209,6 +215,11 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Fixed
 
+- **[bug fix] `+` on two lists concatenates them.** It read the numeric value of both lists and
+  silently answered `0`. `[1, 2] + [3]` is now `[1, 2, 3]`, a new list with neither operand
+  touched, as in Python. Only list `+` list changed. The branch sits in the existing non-number path,
+  so number arithmetic is untouched. See `docs/language-features.md`; 13 assertions in
+  `tests/lang_list_test.b`.
 - **[bug fix] The Windows build compiles again.** Three branch hints on the interpreter's hot path used
   `__builtin_expect`, which MSVC does not have (C3861). They now go through `BANTU_UNLIKELY` in
   `platform_compat.hpp`, which is the same builtin on GCC and Clang and no hint on MSVC. The MSVC

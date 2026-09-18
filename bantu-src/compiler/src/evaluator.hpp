@@ -3307,6 +3307,15 @@ private:
                     }
                 }
             }
+            // `[1] + [2, 3]` read numberVal from both lists and silently gave
+            // 0. Two lists now concatenate, as in Python. Both operands are
+            // this frame's own copies, so their elements are moved, not copied.
+            if (n->op == BantuTokenType::PLUS && left.isList() && right.isList()) {
+                std::vector<Value> out = std::move(left.listVal);
+                out.insert(out.end(), std::make_move_iterator(right.listVal.begin()),
+                           std::make_move_iterator(right.listVal.end()));
+                return Value(std::move(out));
+            }
         }
 
         switch (n->op) {
