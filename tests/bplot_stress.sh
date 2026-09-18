@@ -257,6 +257,56 @@ else
     echo "  --    could not measure RSS on this platform; skipping the B4 memory gate"
 fi
 
+# ── B6f: a 12-megapixel PNG ─────────────────────────────────────────────
+# 1280x960 units at 300 dpi is 4000x3000 pixels: a print-sized dashboard with
+# a 100,000-point line, a 20,000-point scatter, a 500x500 heatmap with a
+# colorbar and a pie. Before B6f this took 51.6 s -- the rasteriser scanned
+# every edge on every sub-scanline, every `return` in the interpreter was a C++
+# exception, and the heatmap encoder was interpreted. It is ~2.3 s now; the
+# gates leave room for a slow CI runner and still catch that class of regression.
+echo "-- B6f: a 4000x3000 PNG at 300 dpi --"
+cat > "$TMP/big.b" <<BEOF
+include "./bplot/bplot.b" as plt;
+\$f = plt.figure(1280, 960);
+\$x = nd_linspace(0, 100, 100000, null);
+\$a = \$f.subplot(2, 2, 1);
+\$a.plot(\$x, nd_sin(\$x, null), {"label": "sin"});
+\$a.setTitle("100,000 points"); \$a.setLegend(true); \$a.setGrid(true);
+nd_seed(7);
+\$b = \$f.subplot(2, 2, 2);
+\$b.scatter(nd_random_normal([20000], 0, 1, null), nd_random_normal([20000], 0, 1, null), {"size": 2});
+\$gi = nd_reshape(nd_arange(0, 500, 1, null), [500, 1]);
+\$gj = nd_reshape(nd_arange(0, 500, 1, null), [1, 500]);
+\$c = \$f.subplot(2, 2, 3);
+\$c.imshow(nd_multiply(nd_sin(nd_divide(\$gi, 40, null), null), nd_cos(nd_divide(\$gj, 25, null), null), null), {"cmap": "viridis"});
+\$c.colorbar({"label": "value"});
+\$d = \$f.subplot(2, 2, 4);
+\$d.pie([48, 27, 15, 10], {"labels": ["direct", "search", "social", "other"], "percent": true});
+\$f.tight_layout(true);
+\$t = clock();
+\$f.savefig("$TMP/big.png", {"dpi": 300});
+print("BIGMS " + str(floor(clock() - \$t)));
+BEOF
+if /usr/bin/time -l true >/dev/null 2>&1; then
+    /usr/bin/time -l "$BANTU" -q run "$TMP/big.b" > "$TMP/big.log" 2>&1
+    BIG_RSS="$(awk '/maximum resident/ { print int($1/1024) }' "$TMP/big.log")"
+else
+    /usr/bin/time -v "$BANTU" -q run "$TMP/big.b" > "$TMP/big.log" 2>&1
+    BIG_RSS="$(awk '/Maximum resident/ { print int($NF) }' "$TMP/big.log")"
+fi
+BIG_MS="$(sed -n 's/^BIGMS //p' "$TMP/big.log")"
+echo "        4000x3000 at 300 dpi: ${BIG_MS:-?} ms to render, ${BIG_RSS:-?} KB peak for the whole process, $(wc -c < "$TMP/big.png" 2>/dev/null | tr -d ' ') bytes"
+check "$([ -n "$BIG_MS" ] && [ "$BIG_MS" -lt 30000 ] && echo 1 || echo 0)" "a 12-megapixel dashboard renders in under 30 s"
+if [ -n "${BIG_RSS:-}" ] && [ "$BIG_RSS" -gt 0 ]; then
+    check "$([ "$BIG_RSS" -lt 600000 ] && echo 1 || echo 0)" "and the whole process peaks under 600 MB"
+fi
+check "$([ "$(head -c 8 "$TMP/big.png" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "89504e470d0a1a0a" ] && echo 1 || echo 0)" "and it is a PNG"
+PYB="$(command -v python3 || true)"
+if [ -n "$PYB" ] && "$PYB" -c "import PIL" >/dev/null 2>&1; then
+    check "$("$PYB" -c "from PIL import Image;import sys;im=Image.open(sys.argv[1]);im.load();print(1 if im.size==(4000,3000) else 0)" "$TMP/big.png")" \
+          "which Pillow decodes, fully, as 4000x3000"
+fi
+
 # ── The gate that cannot be written in Bantu ─────────────────────────────
 if [ -z "$PY" ]; then
     echo "  --    no python found; skipping the XML well-formedness gate"

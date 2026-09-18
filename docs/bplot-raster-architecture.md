@@ -67,15 +67,25 @@ SVG user unit, so a figure's pixel size is `width × dpi / 96` — and the roadm
 
 ## 4. The rasteriser
 
-**Signed-area coverage accumulation**, the technique of `font-rs` and `stb_truetype`'s newer path,
-in integers:
+**Sixteen sub-scanlines per pixel row, with exact coverage along x**, in integers — the trade
+`stb_truetype`'s first rasteriser made:
 
-1. Every shape is flattened to line segments in Q24.8.
-2. Each segment adds its signed area to an accumulation buffer, cell by cell, with exact integer
-   arithmetic at 8-bit subpixel resolution.
-3. A running sum across each row gives each pixel's coverage.
-4. **Nonzero** winding, the SVG default and the only rule bplot relies on; even-odd is available for
-   completeness.
+1. Every shape is flattened to line segments in Q24.8, clipped to the clip rectangle with integer
+   Sutherland–Hodgman (crossings that would overflow 64 bits bisect instead; §10).
+2. For each sub-scanline, every edge crossing it gives an `(x, direction)`; the crossings are sorted,
+   and the **nonzero** winding rule — the SVG default and the only rule bplot relies on — selects the
+   covered spans.
+3. Each span adds its exact horizontal extent, in 1/256 of a pixel, to the row's coverage. Vertical
+   resolution is 1/16 of a pixel and horizontal 1/256, so a near-vertical edge — a bar, an axis — is as
+   smooth as an 8-bit channel can show.
+4. **An active edge table** keeps the work proportional to the crossings, not to the shape: edges are
+   sorted by their top, enter when the scanline reaches them and leave once it has passed. Testing
+   every edge on every sub-scanline — the first version — cost edges × rows × 16, and a 4000×3000
+   figure with a heatmap took 51 s (B6f, see the CHANGELOG). The crossings found are the same set,
+   sorted the same way, so the pixels are byte-identical.
+
+Checked against analytic areas: an axis-aligned rectangle, a triangle and a clipped square come out
+exact, and a circle matches the inscribed polygon it is.
 
 **One mask per shape, composited once.** A stroked polyline is its segments, its joins and its caps
 — pieces that overlap. Rasterising them into a single coverage mask and compositing that mask once is
@@ -258,12 +268,12 @@ if it came from a stranger — because inside a sua handler, it may have:
 
 | step | lands | gate |
 |---|---|---|
-| **B6a** | binary-safe `open`/`readfile`/`writefile`/`appendfile`; unknown modes raise | every byte 0–255, NUL runs and CR/LF round-trip in binary mode; text mode unchanged; `"x"` raises |
-| **B6b** | the canvas handle, rectangle fills, the PNG encoder with filtering and deflate | Pillow and zlib decode every PNG to the exact canvas bytes; deflate beats stored blocks by ≥ 10× on chart-like images; size caps raise |
-| **B6c** | the rasteriser: polygons, strokes with joins, caps and dashes, circles, the path parser, clipping | coverage of known shapes within ±1/255 of analytic area; semi-transparent strokes do not darken at joints; degenerate input draws nothing and raises nothing |
-| **B6d** | text: the font-table generator, glyph rendering, rotation, measurement | every embedded glyph renders; anchors and rotation land where the metrics say; invalid UTF-8 is `U+FFFD` |
-| **B6e** | `BPlotRaster`, `savefig(".png", {dpi})`, `to_png()`, PNG from sua, docs | every chart kind renders to a PNG that decodes; `samples/bplot/` gains PNG output; the sua sample can serve PNG |
-| **B6f** | the byte-identity corpus in all three CI jobs; stress; sanitisers; records | **SHA-256 of a fixed corpus of PNGs, committed as literals, matched on Linux, macOS and Windows**; 4000×3000 at 300 dpi within time and memory gates; ASan + UBSan clean over the suite and the fuzz |
+| **B6a** ✅ | binary-safe `open`/`readfile`/`writefile`/`appendfile`; unknown modes raise | every byte 0–255, NUL runs and CR/LF round-trip in binary mode; text mode unchanged; `"x"` raises |
+| **B6b** ✅ | the canvas handle, rectangle fills, the PNG encoder with filtering and deflate | Pillow and zlib decode every PNG to the exact canvas bytes; deflate beats stored blocks by ≥ 10× on chart-like images; size caps raise |
+| **B6c** ✅ | the rasteriser: polygons, strokes with joins, caps and dashes, circles, the path parser, clipping | coverage of known shapes within ±1/255 of analytic area; semi-transparent strokes do not darken at joints; degenerate input draws nothing and raises nothing |
+| **B6d** ✅ | text: the font-table generator, glyph rendering, rotation, measurement | every embedded glyph renders; anchors and rotation land where the metrics say; invalid UTF-8 is `U+FFFD` |
+| **B6e** ✅ | `BPlotRaster`, `savefig(".png", {dpi})`, `to_png()`, PNG from sua, docs | every chart kind renders to a PNG that decodes; `samples/bplot/` gains PNG output; the sua sample can serve PNG |
+| **B6f** ✅ | the byte-identity corpus in all three CI jobs; stress; sanitisers; records | **SHA-256 of a fixed corpus of PNGs, committed as literals, matched on Linux, macOS and Windows**; 4000×3000 at 300 dpi within time and memory gates; ASan + UBSan clean over the suite and the fuzz |
 
 ## 13. The six questions
 

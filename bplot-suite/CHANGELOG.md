@@ -773,3 +773,52 @@ B6. The original wording is kept in the roadmap alongside the correction, and B6
   `.jpg` raises where `.png` used to.
 - **[test]** The raster fuzz strokes hostile and far-off paths too — clean under ASan + UBSan.
 
+### B6f — the byte-identity gate, and a 12-megapixel stress test
+
+- **[feature]** `tests/bplot_png_corpus_test.b`: eight PNGs — rectangles, polygons, arcs and
+  translucency; strokes with dashes, caps and stroked paths; text in every anchor, at −90°, 30° and
+  −45°, with Latin-1, symbols and an invalid byte; far-off coordinates; and whole figures (a line chart
+  with legend and grid at 96 and 150 dpi, a 2×2 grid of bar + twin, scatter + error bars, histogram
+  and pie, a heatmap with a hole and a colorbar at 120 dpi) — each checked against a recorded SHA-256.
+  Linux and macOS run it through the `tests/*.b` glob; the Windows job runs it explicitly and
+  annotates each mismatch. **A mismatch on one platform is a byte-identity defect, never a reason to
+  re-record**; the file says so, and says how to re-record after an intended change.
+  - Recorded on macOS. The same eight hashes come out of an ASan build at `-O1`, which is evidence the
+    output does not depend on optimisation level; **the Linux and Windows matches are wired but not
+    yet observed**, because CI has not run since.
+- **[feature]** `tests/bplot_stress.sh` renders a 1280×960 dashboard at 300 dpi — 4000×3000 pixels:
+  a 100,000-point line with legend and grid, a 20,000-point scatter, a 500×500 heatmap with colorbar,
+  a pie — and gates it at under 30 s and 600 MB for the whole process, with Pillow decoding it fully.
+  Measured: **2.2 s, 220 MB, 914 KB**.
+
+### Solved defects encountered
+
+The stress test's first run took **51.6 s**. Three causes, each fixed at the root, each leaving
+every existing output byte-identical (the PNG gate's `8f8754ee…`, the corpus and the 12-megapixel
+render itself all compared before and after):
+
+- **[bug fix] The rasteriser tested every edge on every sub-scanline.** An imshow colour is one path
+  of thousands of cell rectangles spanning the panel, so the cost was edges × rows × 16. An **active
+  edge table** — edges sorted by their top, entering and leaving as the scanline passes — makes it
+  follow the crossings. 51.6 → 17.6 s.
+- **[bug fix] Every `return` and `continue` in the interpreter was a C++ exception** — 8.9 µs each on
+  macOS. The profile of the remaining 17.6 s was dominated by the unwinder, not by drawing. Fixed in
+  the interpreter as its own change (root `CHANGELOG.md`, `docs/control-flow-architecture.md`): every
+  Bantu program is faster, `benchmarks/bench.b` 5.4×. 17.6 → 8.9 s.
+- **[bug fix] The heatmap encoder was interpreted per colour run.** A 256×256 grid of real data is
+  ~30,000 runs at ~230 µs each through six helper calls. `bp_grid_paths` (plot_native.hpp) is that
+  loop in C++, under the same rules as the other bplot kernels: it is handed pixel edges already
+  transformed in Bantu, so no multiply-add can be fused, and it does only exact operations and the
+  shared `fmt2`. `tests/bplot_layout_test.b` requires it to produce the same bytes as the pure path
+  for varied data with NaN holes, a flat grid and uneven `pcolormesh` edges. 8.9 → 2.2 s.
+- **[bug fix] `BPlotRaster.circle` formatted with `str()`**, which keeps six significant digits — a
+  marker at x = 12,345.678 would have been drawn at 12,345.7. It uses `_px`, as the SVG backend does.
+- **[docs] `docs/bplot-raster-architecture.md` §4 described the wrong rasteriser** — signed-area
+  accumulation, which was the plan, not what B6c built. It now describes the sixteen sub-scanlines,
+  exact x coverage and the active edge table.
+
+### Dashboard timings, after B6f
+
+The 1100×800 dashboard sample, same bytes as before: SVG 78 → **37 ms**; PNG at 96 dpi 124 → **71 ms**,
+at 144 dpi 215 → **118 ms**, at 300 dpi 468 → **368 ms**.
+

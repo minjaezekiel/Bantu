@@ -47,6 +47,18 @@ All notable changes to the Bantu programming language are documented in this fil
   [`docs/object-lifetime-architecture.md`](docs/object-lifetime-architecture.md). Tests:
   `tests/lang_gc_test.b` (55 assertions) and `tests/gc_stress.sh` (19 checks).
 
+- **[feature] The same bplot figure is the same PNG file on every platform — gated in CI.**
+  `tests/bplot_png_corpus_test.b` renders eight PNGs (every primitive, text in every anchor and
+  rotation, far-off coordinates, whole figures at three dpi values) and checks each SHA-256 against a
+  recorded literal; Linux and macOS run it with every suite, and the Windows job runs it explicitly.
+  A 4000×3000 dashboard at 300 dpi renders in 2.2 s at a 220 MB peak, gated in
+  `tests/bplot_stress.sh` — it took 51.6 s before B6f.
+
+- **[patch] The rasteriser keeps an active edge table**, so its cost follows the crossings rather
+  than every edge on every sub-scanline; and **bplot's heatmap encoder runs natively**
+  (`bp_grid_paths`), byte-identical to the pure-Bantu path it replaces, which stays as the oracle.
+  A 500×500 heatmap of real data went from 7 s to 0.2 s as SVG.
+
 - **[feature] bplot writes PNG.** `savefig("chart.png", {"dpi": 150})` and `to_png(dpi)` draw any
   figure through the native raster backend — the same figure is the same file on Linux, macOS and
   Windows — and `samples/bplot/server.b` serves `/chart.png` beside `/chart.svg`. Text is measured by

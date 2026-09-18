@@ -924,6 +924,17 @@ inline Mask rasterise(const std::vector<ContourQ8>& contours,
     m.h = y1 - m.y0;
     m.cov.assign((size_t)(m.w * m.h), 0);
 
+    // An ACTIVE EDGE TABLE: edges sorted by their top, entering when the
+    // scanline reaches them and leaving once it has passed. Testing every edge
+    // on every sub-scanline cost edges x rows x 16 -- a 4000x3000 figure with
+    // a heatmap (thousands of cell edges per colour, each spanning the panel)
+    // took 51 s. The crossings found are the same set, and they are sorted
+    // below regardless, so the pixels are byte-identical.
+    std::sort(edges.begin(), edges.end(),
+              [](const EdgeQ8& a, const EdgeQ8& b) { return a.y0 < b.y0; });
+    size_t nextEdge = 0;
+    std::vector<const EdgeQ8*> active;
+
     // Crossings of one sub-scanline, as (x, direction).
     std::vector<std::pair<int64_t, int>> xs;
     for (int64_t py = m.y0; py < y1; py++) {
@@ -931,11 +942,14 @@ inline Mask rasterise(const std::vector<ContourQ8>& contours,
         for (int k = 0; k < kSubScanlines; k++) {
             // The centre of this sub-scanline, in Q8.
             const int64_t sy = py * 256 + (2 * k + 1) * 256 / (2 * kSubScanlines);
+            while (nextEdge < edges.size() && edges[nextEdge].y0 <= sy) active.push_back(&edges[nextEdge++]);
             xs.clear();
-            for (const EdgeQ8& e : edges) {
-                if (sy < e.y0 || sy >= e.y1) continue;
+            for (size_t i = 0; i < active.size();) {
+                const EdgeQ8& e = *active[i];
+                if (sy >= e.y1) { active[i] = active.back(); active.pop_back(); continue; }
                 const int64_t x = e.x0 + divRound((e.x1 - e.x0) * (sy - e.y0), e.y1 - e.y0);
                 xs.push_back({x, e.dir});
+                i++;
             }
             if (xs.size() < 2) continue;
             std::sort(xs.begin(), xs.end());        // by x, then direction: deterministic

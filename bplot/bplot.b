@@ -1422,10 +1422,12 @@ class BPlotRaster {
         bp_stroke_polyline($this.cv, [$x1, $y1, $x2, $y2], _hex6($stroke), $sw, null, null, false);
         return $this;
     }
+    // Formatted with _px, as the SVG backend formats it: str() keeps only six
+    // significant digits, which would move a marker at x = 12345.678.
     def circle($cx, $cy, $r, $fill) {
-        bp_fill_path($this.cv, "M " + str($cx - $r) + " " + str($cy) + " a " + str($r) + " " + str($r) +
-                     " 0 1 0 " + str(2 * $r) + " 0 a " + str($r) + " " + str($r) + " 0 1 0 " +
-                     str(0 - 2 * $r) + " 0 Z", _hex6($fill), null);
+        bp_fill_path($this.cv, "M " + _px($cx - $r) + " " + _px($cy) + " a " + _px($r) + " " + _px($r) +
+                     " 0 1 0 " + _px(2 * $r) + " 0 a " + _px($r) + " " + _px($r) + " 0 1 0 " +
+                     _px(0 - 2 * $r) + " 0 Z", _hex6($fill), null);
         return $this;
     }
     def polyline($pts, $stroke, $sw, $dash) {
@@ -3570,7 +3572,9 @@ def _flushCells($bk, $buckets, $cmap) {
         $idx = num($k);
         $col = $_CM_BAD;
         if ($idx >= 0) { $col = _cmap($cmap, $idx / 255); }
-        $bk.path(join($buckets[$k], ""), $col, null, null);
+        $d = $buckets[$k];
+        if (type($d) == "list") { $d = join($d, ""); }
+        $bk.path($d, $col, null, null);
         $i = $i + 1;
     }
     return null;
@@ -3580,6 +3584,18 @@ def _drawGridCells($bk, $ax, $a, $T, $xedges, $yedges) {
     $rows = $a["rows"];
     $vmin = $a["vmin"];
     $vmax = $a["vmax"];
+    if ($_NAT["on"]) {
+        // bp_grid_paths is the loop below in C++ (plot_native.hpp). The edges
+        // go in as pixels, transformed here, exactly as the loop transforms them.
+        $xpx = [];
+        $i = 0;
+        while ($i < len($xedges)) { push($xpx, _TX($T, $xedges[$i])); $i = $i + 1; }
+        $ypx = [];
+        $i = 0;
+        while ($i < len($yedges)) { push($ypx, _TY($T, $yedges[$i])); $i = $i + 1; }
+        _flushCells($bk, bp_grid_paths($rows, $vmin, $vmax, $xpx, $ypx), $a["cmap"]);
+        return null;
+    }
     $buckets = {};
     $r = 0;
     while ($r < $a["h"]) {

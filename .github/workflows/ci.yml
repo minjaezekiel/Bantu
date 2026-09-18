@@ -284,3 +284,11 @@ jobs:
           "$bin" run bplot/bplot_test.b | tee bplot.out
           grep -q 'RESULT: ALL GREEN' bplot.out || {
             echo "::error::bplot smoke test failed on Windows"; exit 1; }
+          # The byte-identity gate: the same PNGs, hash for hash, as the Linux
+          # and macOS jobs (which run it through the tests/*.b glob). A
+          # mismatch here alone is a platform-dependent byte -- MSVC, the CRT
+          # or text-mode I/O -- not a reason to re-record the hashes.
+          "$bin" run tests/bplot_png_corpus_test.b | tee corpus.out
+          grep -q 'RESULT: ALL GREEN' corpus.out || {
+            grep 'FAIL' corpus.out | while read -r l; do echo "::error::png corpus: $l"; done
+            exit 1; }

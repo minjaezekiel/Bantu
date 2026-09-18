@@ -34,6 +34,7 @@
 
 #include <cmath>
 #include <functional>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -191,6 +192,69 @@ inline void registerBuiltins(const DefineFn& define) {
             d += arc; d += md2; d += ",0";
         }
         return Value(d);
+    });
+
+    // bp_grid_paths(rows, vmin, vmax, xpx, ypx) -> {colour index: path d}
+    //
+    // bplot.b's _drawGridCells loop, verbatim: quantise each cell to one of 256
+    // colours (or -1 for no data), merge horizontal runs of one colour, and add
+    // each run as an `M x y h w v h h -w Z` subpath to its colour's path. The
+    // cell EDGES arrive in pixels, transformed in Bantu, so nothing here is a
+    // multiply followed by an add that a compiler could fuse. A 256x256 grid of
+    // real data is ~30,000 runs: 7 s interpreted, milliseconds here.
+    define("bp_grid_paths", [](std::vector<Value> a) -> Value {
+        if (a.size() < 5 || !a[0].isList() || !a[1].isNumber() || !a[2].isNumber() ||
+            !a[3].isList() || !a[4].isList()) {
+            throw std::runtime_error("bp_grid_paths(rows, vmin, vmax, xpx, ypx): rows and edges are lists, vmin and vmax numbers");
+        }
+        const std::vector<Value>& rows = a[0].listVal;
+        const double vmin = a[1].numberVal, vmax = a[2].numberVal;
+        auto edges = [](const Value& v, const char* what) {
+            std::vector<double> e;
+            e.reserve(v.listVal.size());
+            for (const Value& x : v.listVal) {
+                if (!x.isNumber()) throw std::runtime_error(std::string("bp_grid_paths: every ") + what + " edge must be a number");
+                e.push_back(x.numberVal);
+            }
+            return e;
+        };
+        const std::vector<double> xe = edges(a[3], "x"), ye = edges(a[4], "y");
+        const size_t h = rows.size();
+        if (ye.size() != h + 1) throw std::runtime_error("bp_grid_paths: needs one more y edge than rows");
+        // _cellIndex: -1 for no data, 128 for a flat range, else round(clamp(t) * 255).
+        auto cellIndex = [&](const Value& v) -> int {
+            if (!v.isNumber() || !std::isfinite(v.numberVal)) return -1;
+            if (vmax <= vmin) return 128;
+            double t = (v.numberVal - vmin) / (vmax - vmin);
+            t = t < 0 ? 0 : (t > 1 ? 1 : t);
+            return (int)std::round(t * 255);
+        };
+        std::map<int, std::string> buckets;
+        for (size_t r = 0; r < h; r++) {
+            if (!rows[r].isList()) throw std::runtime_error("bp_grid_paths: every row must be a list");
+            const std::vector<Value>& row = rows[r].listVal;
+            const size_t w = row.size();
+            if (xe.size() != w + 1) throw std::runtime_error("bp_grid_paths: needs one more x edge than columns");
+            const double yA = ye[r], yB = ye[r + 1];
+            size_t c = 0;
+            while (c < w) {
+                const int idx = cellIndex(row[c]);
+                size_t c2 = c + 1;
+                while (c2 < w && cellIndex(row[c2]) == idx) c2++;
+                // _cellRect, with its hairline overlap.
+                const double xA = xe[c], xB = xe[c2];
+                const double x = std::min(xA, xB), y = std::min(yA, yB);
+                const double rw = std::fabs(xB - xA) + 0.5, rh = std::fabs(yB - yA) + 0.5;
+                std::string& d = buckets[idx];
+                d += 'M'; fmt2(d, x); d += ' '; fmt2(d, y);
+                d += 'h'; fmt2(d, rw); d += 'v'; fmt2(d, rh);
+                d += 'h'; fmt2(d, 0.0 - rw); d += 'Z';
+                c = c2;
+            }
+        }
+        ObjectMap out;
+        for (auto& kv : buckets) out[std::to_string(kv.first)] = Value(std::move(kv.second));
+        return Value(std::move(out));
     });
 
     // bp_escape(s) -> s with & < > " ' escaped and control bytes other than

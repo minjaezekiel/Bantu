@@ -275,12 +275,19 @@ labels nothing at all, and an axis with no labels is not a chart anyone can read
 
 | output | time | file |
 |---|---|---|
-| SVG | 78 ms | 25,386 bytes |
-| PNG at 96 dpi | 124 ms | 77,041 bytes |
-| PNG at 144 dpi | 215 ms | 125,327 bytes |
-| PNG at 300 dpi | 468 ms | 290,196 bytes |
+| SVG | 37 ms | 25,386 bytes |
+| PNG at 96 dpi | 71 ms | 77,041 bytes |
+| PNG at 144 dpi | 118 ms | 125,327 bytes |
+| PNG at 300 dpi | 368 ms | 290,196 bytes |
 
-A tick label is 0.13 ms to draw at 96 dpi.
+A tick label is 0.1 ms to draw at 96 dpi. A print-sized dashboard — 4000×3000 pixels at 300 dpi, with a
+100,000-point line, a 20,000-point scatter, a 500×500 heatmap and a pie — renders in **2.2 s**, and the
+whole process peaks at 220 MB; `tests/bplot_stress.sh` holds it to that.
+
+**The same figure is the same file everywhere.** `tests/bplot_png_corpus_test.b` renders eight PNGs —
+every primitive, text in every anchor and rotation, far-off coordinates, and whole figures at three
+dpi values — and checks each SHA-256 against a recorded literal, in the Linux, macOS and Windows CI
+jobs alike.
 
 ---
 

@@ -263,6 +263,9 @@ identity rules out, the integer rasteriser, the embedded font, the encoder, and 
             (`bp_text`, `bp_text_width`, `raster_font.hpp`)
       - [x] **B6e** — `BPlotRaster`, `savefig(".png", {dpi})`, `to_png()`, PNG from sua, and
             `bp_stroke_path`; layout measured by the backend that draws
+      - [x] **B6f** — the byte-identity corpus (`tests/bplot_png_corpus_test.b`, all three CI jobs), a
+            4000×3000 at 300 dpi stress gate, sanitisers, records. The Linux and Windows matches are
+            wired but not yet observed: CI has not run since the corpus was recorded on macOS.
 - [ ] **convert the authoring-time generators to Bantu** — `scripts/gen_circle_tables.py` is a direct
       translation; `scripts/gen_font_tables.py` needs a Bantu TrueType reader (`glyf`, `loca`, `cmap`,
       `hmtx`), which binary file reads made possible in B6a. Neither is part of the build, and the

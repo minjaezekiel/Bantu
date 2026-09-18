@@ -410,6 +410,37 @@ raisesWith(def() { plt._cmap("nonesuch", 0.5); }, "viridis, plasma, coolwarm, gr
 //  5. imshow, heatmap, pcolormesh, contour
 // ════════════════════════════════════════════════════════════════════════
 print("");
+print("-- the native cell encoder draws exactly what the pure one does --");
+// bp_grid_paths is _drawGridCells in C++. The pure path stays the oracle:
+// the same grids, rendered both ways, must be the same bytes.
+def gridSvg($kind, $z, $native) {
+    $was = plt._useNative($native);
+    $f = plt.figure(420, 320);
+    $a = $f.addAxes();
+    if ($kind == "imshow") { $a.imshow($z, {"cmap": "viridis"}); }
+    if ($kind == "mesh") { $a.pcolormesh([0, 1, 3, 6, 10], [0, 2, 3, 7], $z, {"cmap": "plasma"}); }
+    $svg = $f.to_svg();
+    plt._useNative($was);
+    return $svg;
+}
+$zv = [];
+$i = 0;
+while ($i < 40) {
+    $row = [];
+    $j = 0;
+    while ($j < 60) { push($row, sin($i / 7) * cos($j / 5) + $j / 100); $j = $j + 1; }
+    push($zv, $row);
+    $i = $i + 1;
+}
+$zv[3][4] = NAN;
+$zv[10][0] = NAN;
+$zv[10][1] = NAN;
+eq(gridSvg("imshow", $zv, true), gridSvg("imshow", $zv, false), "imshow of varied data with NaN holes: native and pure are byte-identical");
+eq(gridSvg("imshow", [[5, 5], [5, 5]], true), gridSvg("imshow", [[5, 5], [5, 5]], false), "a flat grid too");
+eq(gridSvg("mesh", [[1, 2, 3, 4], [4, 3, NAN, 1], [0, 9, 2, 2]], true),
+   gridSvg("mesh", [[1, 2, 3, 4], [4, 3, NAN, 1], [0, 9, 2, 2]], false), "and pcolormesh with uneven edges");
+
+print("");
 print("-- imshow: orientation, extent and limits --");
 $f = plt.figure(600, 400);
 $a = $f.addAxes();
