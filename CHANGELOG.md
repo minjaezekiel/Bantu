@@ -227,6 +227,12 @@ All notable changes to the Bantu programming language are documented in this fil
   guards against — and now checks before multiplying; it agrees with `__builtin_mul_overflow` on 676
   edge pairs under UBSan. CI's AST tag check globs `src/*.cpp` instead of a hand-kept list that had
   missed `raster_native.cpp`.
+- **[bug fix] CI and release workflows run on supported runners and actions.** `actions/checkout@v4`,
+  `upload-artifact@v4`, `download-artifact@v4` and `action-gh-release@v2` target the deprecated
+  Node 20; they are now v7, v7, v8 and v3, all Node 24. The release job's `macos-13` Intel runner is
+  retired, so a version tag could not build the x64 macOS package; it is `macos-15-intel` now, and
+  `macos-14` (deprecated) is `macos-15`. `ubuntu-latest` is pinned to `ubuntu-24.04`, so the move to
+  Ubuntu 26 (from 2026-10-19) happens as a deliberate change, not mid-release.
 - **[bug fix] `return`, `break` and `continue` no longer cost a C++ exception.** They were thrown
   and caught, and a throw walks the stack with the unwinder: **8.9 µs per `return`** against 1.2 µs
   for the whole rest of a call, and the same again for every `continue`. They are now a pending signal

@@ -26,9 +26,9 @@ on:
 jobs:
   # ── Linux: build + the whole test suite ────────────────────────────────
   linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libcurl4-openssl-dev libffi-dev
@@ -149,9 +149,9 @@ jobs:
 
   # ── Linux: the opt-in build, which is C++20 ───────────────────────────
   linux-sodium:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install deps
         run: |
           sudo apt-get update
@@ -187,9 +187,9 @@ jobs:
 
   # ── macOS: the platform this was developed on ─────────────────────────
   macos:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build
         run: bash bantu-src/compiler/build-mac.sh
       - name: Suites
@@ -235,7 +235,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install sqlite3 + curl (vcpkg)
         shell: bash
         run: vcpkg install sqlite3:x64-windows-static curl:x64-windows-static

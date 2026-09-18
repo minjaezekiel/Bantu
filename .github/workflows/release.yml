@@ -27,9 +27,9 @@ permissions:
 jobs:
   # ── Linux (native build via build.sh) ──────────────────────────────────
   linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev libcurl4-openssl-dev
       - name: Build
@@ -39,7 +39,7 @@ jobs:
           mkdir -p out
           cp bantu-src/compiler/build/bantu bantu
           tar -czf out/bantu-linux-x64.tar.gz bantu
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: out/*
@@ -49,13 +49,13 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: macos-14   # Apple silicon
+          - runner: macos-15         # Apple silicon
             arch: arm64
-          - runner: macos-13   # Intel
+          - runner: macos-15-intel   # Intel
             arch: x64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build
         run: bash bantu-src/compiler/build-mac.sh
       - name: Resolve version
@@ -68,7 +68,7 @@ jobs:
           tar -czf out/bantu-macos-${{ matrix.arch }}.tar.gz bantu
           bash scripts/installers/build-macos-pkg.sh ./bantu "${{ steps.v.outputs.version || '0.0.0' }}"
           cp dist/*.pkg out/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-${{ matrix.arch }}
           path: out/*
@@ -77,7 +77,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install sqlite3 + curl (vcpkg)
         shell: bash
         run: vcpkg install sqlite3:x64-windows-static curl:x64-windows-static
@@ -106,7 +106,7 @@ jobs:
           Compress-Archive -Force -Path bantu.exe -DestinationPath out/bantu-windows-x64.zip
           ./scripts/installers/build-windows-msi.ps1 -Binary ./bantu.exe -Version "${{ steps.v.outputs.version }}" -Arch x64
           Copy-Item dist/*.msi out/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: out/*
@@ -114,9 +114,9 @@ jobs:
   # ── Assemble the GitHub Release ────────────────────────────────────────
   release:
     needs: [linux, macos, windows]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Flatten
@@ -125,7 +125,7 @@ jobs:
           find artifacts -type f -exec cp {} release/ \;
           ls -la release
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: release/*
           generate_release_notes: true
