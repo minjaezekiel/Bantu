@@ -2423,9 +2423,11 @@ static Value bantuPushUnsubscribeHandler(std::vector<Value> args) {
 // SIGNALS FOR CONTROL FLOW
 // ════════════════════════════════════════════════════════════════
 
+// Thrown only on the rare legacy path: a break/continue that escapes the
+// function it was written in (see Evaluator::finishCall). return, and break
+// and continue inside their own loop, are a pending signal, not a throw.
 struct BreakSignal {};
 struct ContinueSignal {};
-struct ReturnSignal { Value value; };
 
 // ════════════════════════════════════════════════════════════════
 // EVALUATOR CLASS
@@ -2482,16 +2484,13 @@ public:
     Value evaluate(std::vector<std::shared_ptr<ASTNode>>& program) {
         Value result;
         try {
-            for (auto& node : program) {
-                result = evalNode(node);
-            }
+            result = runStatements(program);
         } catch (const BreakSignal&) {
             ErrorHandler::throwRuntimeError("'break' used outside of a loop");
         } catch (const ContinueSignal&) {
             ErrorHandler::throwRuntimeError("'continue' used outside of a loop");
-        } catch (const ReturnSignal&) {
-            // A top-level `return` simply ends the program.
         }
+        finishProgram();   // a top-level `return` simply ends the program
         return result;
     }
 
@@ -2502,19 +2501,16 @@ public:
         filePathStack_.push_back(path);
         Value result;
         try {
-            for (auto& node : program) {
-                result = evalNode(node);
-            }
+            result = runStatements(program);
         } catch (const BreakSignal&) {
             if (!filePathStack_.empty()) filePathStack_.pop_back();
             ErrorHandler::throwRuntimeError("'break' used outside of a loop");
         } catch (const ContinueSignal&) {
             if (!filePathStack_.empty()) filePathStack_.pop_back();
             ErrorHandler::throwRuntimeError("'continue' used outside of a loop");
-        } catch (const ReturnSignal&) {
-            // A top-level `return` simply ends the file.
         }
         if (!filePathStack_.empty()) filePathStack_.pop_back();
+        finishProgram();   // a top-level `return` simply ends the file
         return result;
     }
 
@@ -2526,6 +2522,68 @@ public:
 private:
     std::shared_ptr<Environment> env_;
     std::shared_ptr<Environment> globalEnv_;
+
+    // ── Control flow as a pending signal ─────────────────────────────
+    // return / break / continue set flow_ and return normally; statement
+    // lists stop at the first statement that leaves it set, loops consume
+    // Break and Continue, calls consume Return. They used to be C++
+    // exceptions: 8.9 us per `return` against 1.2 us for the whole rest of
+    // a call. Design: docs/control-flow-architecture.md.
+    enum class Flow : uint8_t { Normal, Break, Continue, Return };
+    Flow  flow_ = Flow::Normal;
+    Value flowValue_;
+
+    // Runs a statement list up to the first pending signal. The value is the
+    // last statement's -- what a function without `return` has always returned.
+    Value runStatements(std::vector<std::shared_ptr<ASTNode>>& body) {
+        Value last;
+        for (auto& stmt : body) {
+            last = evalNode(stmt);
+            if (flow_ != Flow::Normal) break;
+        }
+        return last;
+    }
+
+    // At a function boundary, after the caller's scope is restored: the call's
+    // result, consuming a pending return. A break or continue that escaped the
+    // function takes the legacy exception path to the caller's loop -- odd,
+    // but it is existing behaviour, and it is not the common path.
+    Value finishCall(Value last) {
+        switch (flow_) {
+            case Flow::Normal:   return last;
+            case Flow::Return: {
+                flow_ = Flow::Normal;
+                Value v = std::move(flowValue_);
+                flowValue_ = Value();
+                return v;
+            }
+            case Flow::Break:    flow_ = Flow::Normal; throw BreakSignal{};
+            case Flow::Continue: flow_ = Flow::Normal; throw ContinueSignal{};
+        }
+        return last;
+    }
+
+    // After a loop body: true to go round again. Consumes break and continue;
+    // leaves a return pending for the function around the loop.
+    bool loopGoesOn() {
+        switch (flow_) {
+            case Flow::Normal:   return true;
+            case Flow::Continue: flow_ = Flow::Normal; return true;
+            case Flow::Break:    flow_ = Flow::Normal; return false;
+            case Flow::Return:   return false;
+        }
+        return false;
+    }
+
+    // At the top of a program or file: a return ends it; a stray break or
+    // continue is the same error it always was.
+    void finishProgram() {
+        const Flow f = flow_;
+        flow_ = Flow::Normal;
+        flowValue_ = Value();
+        if (f == Flow::Break)    ErrorHandler::throwRuntimeError("'break' used outside of a loop");
+        if (f == Flow::Continue) ErrorHandler::throwRuntimeError("'continue' used outside of a loop");
+    }
 
     // v1.2.1: stack of file paths being executed (for relative include resolution)
     std::vector<std::string> filePathStack_;
@@ -2596,8 +2654,8 @@ private:
             case NodeKind::DotAccess:   return evalDotAccess(NODE(DotAccess, DotAccessNode));
             case NodeKind::IndexAccess: return evalIndexAccess(NODE(IndexAccess, IndexAccessNode));
             case NodeKind::TryCatch:    return evalTryCatch(NODE(TryCatch, TryCatchNode));
-            case NodeKind::Break:       throw BreakSignal{};
-            case NodeKind::Continue:    throw ContinueSignal{};
+            case NodeKind::Break:       flow_ = Flow::Break;    return Value();
+            case NodeKind::Continue:    flow_ = Flow::Continue; return Value();
             case NodeKind::Throw:       return evalThrow(NODE(Throw, ThrowNode));
             case NodeKind::Switch:      return evalSwitch(NODE(Switch, SwitchNode));
             case NodeKind::ClassDecl:   return evalClassDecl(NODE(ClassDecl, ClassDeclNode));
@@ -2646,8 +2704,8 @@ private:
         if (auto n = dynamic_cast<DotAccessNode*>(node.get())) return evalDotAccess(n);
         if (auto n = dynamic_cast<IndexAccessNode*>(node.get())) return evalIndexAccess(n);
         if (auto n = dynamic_cast<TryCatchNode*>(node.get()))  return evalTryCatch(n);
-        if (dynamic_cast<BreakNode*>(node.get()))              throw BreakSignal{};
-        if (dynamic_cast<ContinueNode*>(node.get()))           throw ContinueSignal{};
+        if (dynamic_cast<BreakNode*>(node.get()))              { flow_ = Flow::Break;    return Value(); }
+        if (dynamic_cast<ContinueNode*>(node.get()))           { flow_ = Flow::Continue; return Value(); }
         if (auto n = dynamic_cast<ThrowNode*>(node.get()))     return evalThrow(n);
         if (auto n = dynamic_cast<SwitchNode*>(node.get()))    return evalSwitch(n);
         if (auto n = dynamic_cast<ClassDeclNode*>(node.get())) return evalClassDecl(n);
@@ -3331,16 +3389,12 @@ private:
         if (condition.isTruthy()) {
             auto prevEnv = env_;
             env_ = std::make_shared<Environment>(env_);
-            for (auto& stmt : n->body) {
-                evalNode(stmt);
-            }
+            runStatements(n->body);
             env_ = prevEnv;
         } else {
             auto prevEnv = env_;
             env_ = std::make_shared<Environment>(env_);
-            for (auto& stmt : n->elseBody) {
-                evalNode(stmt);
-            }
+            runStatements(n->elseBody);
             env_ = prevEnv;
         }
         return Value();
@@ -3355,16 +3409,15 @@ private:
             auto prevEnv = env_;
             env_ = std::make_shared<Environment>(env_);
             try {
-                for (auto& stmt : n->body) {
-                    evalNode(stmt);
-                }
-            } catch (const BreakSignal&) {
+                runStatements(n->body);
+            } catch (const BreakSignal&) {       // escaped from a called function
                 env_ = prevEnv;
                 break;
             } catch (const ContinueSignal&) {
                 // continue to next iteration
             }
             env_ = prevEnv;
+            if (!loopGoesOn()) break;
         }
         return Value();
     }
@@ -3381,16 +3434,15 @@ private:
             auto savedEnv = env_;
             env_ = loopEnv;
             try {
-                for (auto& stmt : n->body) {
-                    evalNode(stmt);
-                }
-            } catch (const BreakSignal&) {
+                runStatements(n->body);
+            } catch (const BreakSignal&) {       // escaped from a called function
                 env_ = savedEnv;
                 break;
             } catch (const ContinueSignal&) {
                 // continue
             }
             env_ = savedEnv;
+            if (!loopGoesOn()) break;            // continue still runs the update
             evalNode(n->update);
             safety++;
         }
@@ -3413,19 +3465,19 @@ private:
             env_->define(n->varName, a);
             if (twoVars) env_->define(n->valueVar, b);
             try {
-                for (auto& stmt : n->body) evalNode(stmt);
-            } catch (const BreakSignal&) {
+                runStatements(n->body);
+            } catch (const BreakSignal&) {       // escaped from a called function
                 env_ = prevEnv;
                 return false;
             } catch (const ContinueSignal&) {
                 env_ = prevEnv;
                 return true;
             } catch (...) {
-                env_ = prevEnv;   // return / error → restore scope and propagate
+                env_ = prevEnv;   // an error: restore scope and propagate
                 throw;
             }
             env_ = prevEnv;
-            return true;
+            return loopGoesOn();
         };
 
         if (iterable.isList()) {
@@ -3456,7 +3508,7 @@ private:
     // ════════════════════════════════════════════════════════════
 
     // Call a Bantu function Value with arguments. Returns the function's
-    // return value (or null). Catches ReturnSignal internally.
+    // return value (or null). Consumes a pending return (finishCall).
     Value bantuCallFunction(Value callee, std::vector<Value> args) {
         if (callee.isNativeFn()) {
             return callee.nativeFn(std::move(args));
@@ -3476,18 +3528,15 @@ private:
             env_ = callEnv;
             Value result;
             try {
-                for (auto& stmt : fn->body) {
-                    result = evalNode(stmt);
-                }
-            } catch (const ReturnSignal& sig) {
-                result = sig.value;
+                result = runStatements(fn->body);
             } catch (const std::exception& e) {
                 env_ = prevEnv;
+                flow_ = Flow::Normal;            // nothing pending survives an error
                 std::cerr << "  [SERVER] Handler error: " << e.what() << "\n";
                 return Value();
             }
             env_ = prevEnv;
-            return result;
+            return finishCall(result);
         }
         return Value();
     }
@@ -4443,8 +4492,9 @@ private:
     }
 
     Value evalReturn(ReturnNode* n) {
-        Value val = evalNode(n->value);
-        throw ReturnSignal{val};
+        flowValue_ = evalNode(n->value);
+        flow_ = Flow::Return;
+        return Value();
     }
 
     // Resolve an assignable slot (variable / list element / dict entry) to a
@@ -4584,16 +4634,9 @@ private:
 
             auto prevEnv = env_;
             env_ = callEnv;
-            Value result;
-            try {
-                for (auto& stmt : fn->body) {
-                    result = evalNode(stmt);
-                }
-            } catch (const ReturnSignal& sig) {
-                result = sig.value;
-            }
+            Value result = runStatements(fn->body);
             env_ = prevEnv;
-            return result;
+            return finishCall(result);
         }
 
         ErrorHandler::throwRuntimeError("Cannot call a value that is not a function");
@@ -5087,14 +5130,14 @@ private:
         auto prevEnv = env_;
         try {
             env_ = std::make_shared<Environment>(prevEnv);
-            for (auto& stmt : n->tryBody) evalNode(stmt);
+            runStatements(n->tryBody);
             env_ = prevEnv;
         }
         catch (const BantuThrow& t) {
             // A Bantu `throw <expr>` — bind the catch var to the thrown value.
             env_ = std::make_shared<Environment>(prevEnv);
             env_->define(n->catchVar, t.value);
-            for (auto& stmt : n->catchBody) evalNode(stmt);
+            runStatements(n->catchBody);
             env_ = prevEnv;
         }
         catch (const BantuError& e) {
@@ -5105,19 +5148,20 @@ private:
             err["type"]    = Value(e.typeName);
             err["line"]    = Value((double)e.line);
             env_->define(n->catchVar, Value(std::move(err)));
-            for (auto& stmt : n->catchBody) evalNode(stmt);
+            runStatements(n->catchBody);
             env_ = prevEnv;
         }
         catch (const std::exception& e) {
             // Any other C++ exception — bind its message string.
             env_ = std::make_shared<Environment>(prevEnv);
             env_->define(n->catchVar, Value(std::string(e.what())));
-            for (auto& stmt : n->catchBody) evalNode(stmt);
+            runStatements(n->catchBody);
             env_ = prevEnv;
         }
         catch (...) {
-            // break/continue/return must not be swallowed by try/catch —
-            // restore scope and let them reach the enclosing loop/function.
+            // A break/continue that escaped a called function must not be
+            // swallowed by try/catch -- restore scope and let it reach the
+            // enclosing loop. (Signals raised here are pending, not thrown.)
             env_ = prevEnv;
             throw;
         }
@@ -5138,7 +5182,7 @@ private:
             auto prevEnv = env_;
             env_ = std::make_shared<Environment>(prevEnv);
             try {
-                for (auto& stmt : body) evalNode(stmt);
+                runStatements(body);
             } catch (...) { env_ = prevEnv; throw; }
             env_ = prevEnv;
         };
@@ -5273,14 +5317,9 @@ private:
 
             auto prevEnv = env_;
             env_ = callEnv;
-            try {
-                for (auto& stmt : fn->body) {
-                    evalNode(stmt);
-                }
-            } catch (const ReturnSignal& sig) {
-                // Constructor return
-            }
+            runStatements(fn->body);
             env_ = prevEnv;
+            finishCall(Value());                 // a constructor's return value is ignored
         }
 
         return Value();
@@ -5335,14 +5374,9 @@ private:
 
             auto prevEnv = env_;
             env_ = callEnv;
-            try {
-                for (auto& stmt : fn->body) {
-                    evalNode(stmt);
-                }
-            } catch (const ReturnSignal& sig) {
-                // Constructor return ignored
-            }
+            runStatements(fn->body);
             env_ = prevEnv;
+            finishCall(Value());                 // a constructor's return value is ignored
             currentClassName_ = savedClassName;
         } else {
             // No explicit constructor — try to call parent constructor
@@ -5362,12 +5396,9 @@ private:
 
                     auto prevEnv = env_;
                     env_ = callEnv;
-                    try {
-                        for (auto& stmt : fn->body) {
-                            evalNode(stmt);
-                        }
-                    } catch (const ReturnSignal& sig) {}
+                    runStatements(fn->body);
                     env_ = prevEnv;
+                    finishCall(Value());
                 }
             }
         }
@@ -9589,10 +9620,11 @@ private:
             env_ = childEnv;
             filePathStack_.push_back(mod.resolvedPath);
 
-            for (auto& node : mod.ast) evalNode(node);
+            runStatements(mod.ast);
 
             filePathStack_.pop_back();
             env_ = savedEnv;
+            finishCall(Value());                 // a top-level return ends the module
 
             ObjectMap moduleObj;
             for (const auto& [k, v] : childEnv->variables) {
@@ -10549,14 +10581,12 @@ private:
         filePathStack_.push_back(mod.resolvedPath);
         ++includeDepth_;
 
-        Value last;
-        for (auto& node : mod.ast) {
-            last = evalNode(node);
-        }
+        Value last = runStatements(mod.ast);
 
         --includeDepth_;
         filePathStack_.pop_back();
         env_ = savedEnv;
+        last = finishCall(last);                 // a top-level return ends the module
 
         // Build module namespace object from child env's *own* variables
         // (not inherited globals). Excludes builtins.

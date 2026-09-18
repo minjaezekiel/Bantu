@@ -407,8 +407,10 @@ struct Token {
 //                   the top-level/parser can recover instead of looping.
 //   * BantuThrow  — a value thrown by a Bantu `throw <expr>;` statement. Carries
 //                   the thrown Value so the catch block receives it verbatim.
-// (BreakSignal/ContinueSignal/ReturnSignal are deliberately NOT std::exception,
-//  so they pass through try/catch untouched — see evaluator.hpp.)
+// (return, break and continue are not exceptions at all -- they are a pending
+//  signal in the Evaluator; see docs/control-flow-architecture.md. The legacy
+//  BreakSignal/ContinueSignal are deliberately NOT std::exception, so they pass
+//  through try/catch untouched.)
 
 // A structured, position-carrying error. `what()` returns a formatted message.
 struct BantuError : std::exception {

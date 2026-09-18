@@ -197,6 +197,16 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Fixed
 
+- **[bug fix] `return`, `break` and `continue` no longer cost a C++ exception.** They were thrown
+  and caught, and a throw walks the stack with the unwinder: **8.9 µs per `return`** against 1.2 µs
+  for the whole rest of a call, and the same again for every `continue`. They are now a pending signal
+  that each statement list checks between statements, and that loops and calls consume. A call that
+  returns costs what one that does not costs: 100,000 returning calls **891 → 145 ms**, 100,000
+  continued iterations **887 → 71 ms**, `benchmarks/bench.b` **35.7 → 6.7 s**. No syntax or semantics
+  change — `tests/lang_control_flow_test.b` (35 assertions, every construct) passes before and after,
+  and so does every suite. Found by bplot's 4000×3000 stress figure, whose profile was dominated by the
+  unwinder. Design: [`docs/control-flow-architecture.md`](docs/control-flow-architecture.md).
+
 - **[bug fix] Every object a Bantu program created leaked.** `new ClassName()` allocated an instance
   that **nothing ever deleted**, so instances accumulated for the life of the process — measured at
   ~300 bytes each, and a program building 20,000 plotting figures reached **372 MB** of resident
