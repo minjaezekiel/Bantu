@@ -209,6 +209,13 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Fixed
 
+- **[bug fix] The Windows build compiles again.** Three branch hints on the interpreter's hot path used
+  `__builtin_expect`, which MSVC does not have (C3861). They now go through `BANTU_UNLIKELY` in
+  `platform_compat.hpp`, which is the same builtin on GCC and Clang and no hint on MSVC. The MSVC
+  fallback for `mulOverflows` multiplied first and checked after — itself the signed overflow it
+  guards against — and now checks before multiplying; it agrees with `__builtin_mul_overflow` on 676
+  edge pairs under UBSan. CI's AST tag check globs `src/*.cpp` instead of a hand-kept list that had
+  missed `raster_native.cpp`.
 - **[bug fix] `return`, `break` and `continue` no longer cost a C++ exception.** They were thrown
   and caught, and a throw walks the stack with the unwinder: **8.9 µs per `return`** against 1.2 µs
   for the whole rest of a call, and the same again for every `continue`. They are now a pending signal

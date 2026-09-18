@@ -3270,7 +3270,7 @@ private:
         // logical operators at all, best-of-5 in both orderings: 540/541 ms
         // without the guard against 535/533 ms with it. The cost is below the
         // noise floor.
-        if (__builtin_expect((unsigned)((int)n->op - (int)BantuTokenType::AND) <= 1u, 0)) {
+        if (BANTU_UNLIKELY((unsigned)((int)n->op - (int)BantuTokenType::AND) <= 1u)) {
             const bool leftTrue = evalNode(n->left).isTruthy();
             if (n->op == BantuTokenType::AND) {
                 if (!leftTrue) return Value(false);
@@ -3294,7 +3294,7 @@ private:
         // against zero: one compare and one well-predicted branch, rather than
         // two short-circuited compares. Measured: the two-compare form cost
         // 2.66% on a 1M arithmetic loop, over the phase's 2% budget.
-        if (__builtin_expect(((int)left.type | (int)right.type) != (int)Value::NUMBER, 0)) {
+        if (BANTU_UNLIKELY(((int)left.type | (int)right.type) != (int)Value::NUMBER)) {
             if (left.type == Value::NATIVE_HANDLE || right.type == Value::NATIVE_HANDLE) {
                 numba::Op nop;
                 if (numbaOpOf(n->op, nop)) {
@@ -3366,7 +3366,7 @@ private:
             case BantuTokenType::MINUS:
                 // -$a on an array negates element-wise. Previously this read
                 // numberVal and produced -0 for any handle.
-                if (__builtin_expect(operand.type == Value::NATIVE_HANDLE, 0)) {
+                if (BANTU_UNLIKELY(operand.type == Value::NATIVE_HANDLE)) {
                     Value out;
                     try {
                         if (numba::dispatchNegate(operand, out)) return out;

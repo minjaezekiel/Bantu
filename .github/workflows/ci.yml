@@ -63,10 +63,12 @@ jobs:
           # See docs/interpreter-performance.md.
           set -e
           mkdir -p /tmp/chk
-          for s in lexer parser ast types function class ndarray_native evaluator main; do
+          # Every translation unit, by glob: a hand-kept list here missed
+          # raster_native.cpp and failed at link time.
+          for f in bantu-src/compiler/src/*.cpp; do
             g++ -std=c++17 -O1 -pthread -I bantu-src/compiler/src \
                 -DBANTU_FFI -DBANTU_CHECK_NODEKIND \
-                -c bantu-src/compiler/src/$s.cpp -o /tmp/chk/$s.o
+                -c "$f" -o "/tmp/chk/$(basename "${f%.cpp}").o"
           done
           g++ -std=c++17 -O1 -pthread /tmp/chk/*.o -o /tmp/bantu-checked \
               -lsqlite3 -l:libcurl.so.4 -lffi -ldl -lpthread

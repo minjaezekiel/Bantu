@@ -175,10 +175,15 @@ inline bool mulOverflows(ptrdiff_t a, ptrdiff_t b, ptrdiff_t* out) {
 #if defined(__GNUC__) || defined(__clang__)
     return __builtin_mul_overflow(a, b, out);
 #else
-    if (a == 0 || b == 0) { *out = 0; return false; }
-    const ptrdiff_t r = a * b;                 // MSVC: wraps, no UB trap available
-    if (r / b != a) return true;
-    *out = r;
+    // Checked BEFORE multiplying (CERT INT32-C): multiplying first and dividing
+    // back is itself the signed overflow this exists to prevent.
+    constexpr ptrdiff_t MX = PTRDIFF_MAX, MN = PTRDIFF_MIN;
+    if (a > 0) {
+        if (b > 0 ? a > MX / b : b < MN / a) return true;
+    } else if (a < 0) {
+        if (b > 0 ? a < MN / b : b < MX / a) return true;
+    }
+    *out = a * b;
     return false;
 #endif
 }
