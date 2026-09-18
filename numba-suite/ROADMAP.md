@@ -72,7 +72,7 @@ See `docs/numba-security.md`.
 | Shape ops as **views** | `nd_reshape/transpose/T/ravel/flatten/swapaxes/moveaxis/expand_dims/squeeze/slice/broadcast_to/flip` | ✅ | ✅ **zero-copy proved two ways** — `nd_base_id` compares the real buffer address, and a write through one handle is read through another. reshape+transpose of 10M: **0 ms**; strided slice: **0 ms** | [x] |
 | **Security: shape-product overflow + allocation ceiling** | checked multiplication for every product; ceiling default 2 GiB, `nd_max_bytes(n)`; `broadcast_to` is `writable=false`; every index bounds-checked with the axis and extent named | ✅ 19 adversarial cases, each also asserting the message names what was wrong | ✅ **180,000 bad calls all raised catchably**, RSS +80 KB, process correct afterwards | [x] |
 | Lifetime | `shared_ptr` RAII; a view keeps its base alive | ✅ a slice returned from a function whose base went out of scope still reads correctly | ✅ 200k arrays **RSS +8 KB**; 200k view chains **RSS +24 KB** | [x] |
-| `np.help()`, `np.info($a)` | deferred to Phase 6 with the rest of the `numba.b` façade | — | — | [~] |
+| `np.help()`, `np.info($a)` | shipped in Phase 6 with the `numba.b` façade (`numba/numba.b`) | — | — | [x] |
 
 One correction made during the work: `nd_is_view` first asked only "do I cover the whole buffer?",
 which a transposed view does — so it reported a transpose as an independent array. It now asks

@@ -253,7 +253,7 @@ non-numeric column selected.
 **Design:** [`docs/bplot-raster-architecture.md`](../docs/bplot-raster-architecture.md) — what byte
 identity rules out, the integer rasteriser, the embedded font, the encoder, and the six steps B6a–B6f.
 
-- [ ] `bp_*`: scanline anti-aliased polygon fill, stroke-to-path, deflate, CRC32, PNG
+- [x] `bp_*`: scanline anti-aliased polygon fill, stroke-to-path, deflate, CRC32, PNG
       - [x] **B6b** — the canvas, rectangle fills with exact fractional coverage, deflate with
             dynamic Huffman codes, CRC-32, Adler-32 and the PNG encoder
             (`tests/bplot_raster_test.b`, `tests/bplot_png_test.sh`)
@@ -275,7 +275,7 @@ identity rules out, the integer rasteriser, the embedded font, the encoder, and 
       the file for *reading* — **done as B6a**, with `readfile()` too, unknown modes raising instead of
       opening for reading, and failed writes raising instead of reporting success
       (`tests/lang_file_test.b`)
-- [ ] `savefig("x.png", {"dpi": 150})`
+- [x] `savefig("x.png", {"dpi": 150})` — B6e, with `to_png($dpi)`
 
 **Gate:** PNG validated by an external decoder; **byte-identical output on Linux, macOS and
 Windows** — the test that proves the binary-mode fix and that cannot pass by accident.
