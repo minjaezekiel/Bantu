@@ -84,6 +84,34 @@ static uint32_t asDpi(const std::vector<Value>& a, size_t i, const char* fn) {
     return (uint32_t)d;
 }
 
+// A flat list of numbers -- [x0, y0, x1, y1, ...] -- as device-space points.
+// Capped, because the list came from a Bantu program that may be serving a
+// request.
+static const size_t kMaxPathPoints = 4000000;
+
+static ContourQ8 pointsOf(const std::vector<Value>& a, size_t i, const char* fn, uint32_t dpi) {
+    if (a.size() <= i || !a[i].isList()) {
+        throw std::runtime_error(std::string(fn) + ": points must be a flat list [x0, y0, x1, y1, ...]");
+    }
+    const std::vector<Value>& v = a[i].listVal;
+    if (v.size() % 2 != 0) {
+        throw std::runtime_error(std::string(fn) + ": points must come in pairs, got " +
+                                 std::to_string(v.size()) + " numbers");
+    }
+    if (v.size() / 2 > kMaxPathPoints) {
+        throw std::runtime_error(std::string(fn) + ": more than " + std::to_string(kMaxPathPoints) + " points");
+    }
+    ContourQ8 out;
+    out.reserve(v.size() / 2);
+    for (size_t k = 0; k + 1 < v.size(); k += 2) {
+        if (!v[k].isNumber() || !v[k + 1].isNumber()) {
+            throw std::runtime_error(std::string(fn) + ": every point must be a number");
+        }
+        out.push_back(PointQ8{ toQ8(centi(v[k].numberVal), dpi), toQ8(centi(v[k + 1].numberVal), dpi) });
+    }
+    return out;
+}
+
 static Value bytesValue(const std::vector<uint8_t>& v) {
     return Value(std::string((const char*)v.data(), v.size()));
 }
@@ -218,6 +246,76 @@ void registerBuiltins(const DefineFn& define) {
         f.flush();
         if (!f) throw std::runtime_error("bp_png_save: the write to '" + a[1].stringVal + "' failed");
         return Value((double)png.size());
+    });
+
+    // bp_fill_polygon(canvas, [x0, y0, x1, y1, ...], colour [, opacity])
+    // Nonzero winding, as SVG fills by default.
+    define("bp_fill_polygon", [](std::vector<Value> a) -> Value {
+        auto c = asCanvas(a, 0, "bp_fill_polygon");
+        Rgb col{0, 0, 0};
+        if (!parseColour(a, 2, "bp_fill_polygon", col)) return Value(false);
+        const uint32_t alpha = isAbsent(a, 3) ? 255u : alpha8(asNumber(a, 3, "bp_fill_polygon", "opacity"));
+        std::vector<ContourQ8> contours{ pointsOf(a, 1, "bp_fill_polygon", c->dpi) };
+        if (contours[0].size() < 3) return Value(false);
+        compositeMask(*c, rasterise(contours, c->clipX0, c->clipY0, c->clipX1, c->clipY1), col, alpha);
+        return Value(true);
+    });
+
+    // bp_stroke_polyline(canvas, points, colour, width [, opacity] [, dash] [, roundCap])
+    // The whole stroke -- segments, joins and caps -- is one mask, composited
+    // once, so a translucent line does not darken at every joint.
+    define("bp_stroke_polyline", [](std::vector<Value> a) -> Value {
+        auto c = asCanvas(a, 0, "bp_stroke_polyline");
+        Rgb col{0, 0, 0};
+        if (!parseColour(a, 2, "bp_stroke_polyline", col)) return Value(false);
+        const double w = asNumber(a, 3, "bp_stroke_polyline", "width");
+        if (w <= 0) return Value(false);                    // a zero-width stroke draws nothing
+        const uint32_t alpha = isAbsent(a, 4) ? 255u : alpha8(asNumber(a, 4, "bp_stroke_polyline", "opacity"));
+        const bool roundCap = isAbsent(a, 6) ? true : a[6].isTruthy();
+        const ContourQ8 pts = pointsOf(a, 1, "bp_stroke_polyline", c->dpi);
+        if (pts.size() < 2) return Value(false);
+
+        std::vector<int64_t> pattern;
+        if (!isAbsent(a, 5)) {
+            if (!a[5].isString()) throw std::runtime_error("bp_stroke_polyline: a dash must be a string like \"6,4\"");
+            const std::string& d = a[5].stringVal;
+            size_t i = 0;
+            while (i < d.size()) {
+                while (i < d.size() && (d[i] == ',' || d[i] == ' ')) i++;
+                if (i >= d.size()) break;
+                const char* start = d.c_str() + i;
+                char* end = nullptr;
+                const double v = std::strtod(start, &end);
+                if (end == start) throw std::runtime_error("bp_stroke_polyline: a dash must be numbers, like \"6,4\"");
+                i += (size_t)(end - start);
+                if (v <= 0) throw std::runtime_error("bp_stroke_polyline: a dash length must be positive");
+                pattern.push_back(toQ8(centi(v), c->dpi));
+            }
+            if (pattern.size() == 1) pattern.push_back(pattern[0]);
+        }
+
+        const int64_t widthQ8 = toQ8(centi(w), c->dpi);
+        std::vector<ContourQ8> pieces;
+        for (const auto& run : applyDash(pts, pattern)) {
+            strokeContours(run, widthQ8, roundCap, pieces);
+        }
+        if (pieces.empty()) return Value(false);
+        compositeMask(*c, rasterise(pieces, c->clipX0, c->clipY0, c->clipX1, c->clipY1), col, alpha);
+        return Value(true);
+    });
+
+    // bp_fill_path(canvas, "M ... Z", colour [, opacity])
+    define("bp_fill_path", [](std::vector<Value> a) -> Value {
+        auto c = asCanvas(a, 0, "bp_fill_path");
+        if (a.size() < 2 || !a[1].isString()) throw std::runtime_error("bp_fill_path: the path must be a string");
+        Rgb col{0, 0, 0};
+        if (!parseColour(a, 2, "bp_fill_path", col)) return Value(false);
+        const uint32_t alpha = isAbsent(a, 3) ? 255u : alpha8(asNumber(a, 3, "bp_fill_path", "opacity"));
+        PathParser parser(a[1].stringVal, c->dpi);
+        const std::vector<ContourQ8> contours = parser.parse(kMaxPathPoints);
+        if (contours.empty()) return Value(false);
+        compositeMask(*c, rasterise(contours, c->clipX0, c->clipY0, c->clipX1, c->clipY1), col, alpha);
+        return Value(true);
     });
 
     // The pieces of the encoder, exposed so tests can check them against

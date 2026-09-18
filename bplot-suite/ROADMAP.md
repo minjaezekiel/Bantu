@@ -257,9 +257,14 @@ identity rules out, the integer rasteriser, the embedded font, the encoder, and 
       - [x] **B6b** — the canvas, rectangle fills with exact fractional coverage, deflate with
             dynamic Huffman codes, CRC-32, Adler-32 and the PNG encoder
             (`tests/bplot_raster_test.b`, `tests/bplot_png_test.sh`)
-      - [ ] B6c — the rasteriser: polygons, strokes, caps, joins, dashes, circles, path parsing
+      - [x] **B6c** — the rasteriser: polygons, strokes with caps and joins, dashes, circles, arcs
+            and the path parser (`bp_fill_polygon`, `bp_stroke_polyline`, `bp_fill_path`)
       - [ ] B6d — text: the embedded font, glyph rendering, rotation, measurement
       - [ ] B6e — `BPlotRaster`, `savefig(".png", {dpi})`, `to_png()`, PNG from sua
+- [ ] **convert the authoring-time generators to Bantu** — `scripts/gen_circle_tables.py` is a direct
+      translation; `scripts/gen_font_tables.py` needs a Bantu TrueType reader (`glyf`, `loca`, `cmap`,
+      `hmtx`), which binary file reads made possible in B6a. Neither is part of the build, and the
+      Python in `tests/` stays: its value is being a decoder we did not write
 - [x] **binary-safe file writes** — `open()`/`writefile()`/`appendfile()` accept `"wb"/"rb"/"ab"` and
       set `std::ios::binary`; today `open(path,"wb")` falls through the mode chain and silently opens
       the file for *reading* — **done as B6a**, with `readfile()` too, unknown modes raising instead of

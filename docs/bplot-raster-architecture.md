@@ -250,7 +250,32 @@ here.
 **Secure?** A PNG is the format that removes SVG's executable-content risk for user-influenced charts,
 and the native surface it adds is size-capped, validated and sanitiser-tested (§10).
 
-## 14. What this does not promise
+## 14. The tooling, and the Python in this repository
+
+Two generators live in `scripts/`, and they are the only Python this work adds:
+
+| script | produces | why Python today |
+|---|---|---|
+| `gen_circle_tables.py` | `raster_tables.hpp` — cos and sin at fixed angles, as Q30 integers | nothing more than `cos`, `sin` and a file write; **a direct translation to Bantu** |
+| `gen_font_tables.py` | `raster_font.hpp` — the embedded glyph outlines | reading a TrueType file needs a parser Bantu does not have yet |
+
+Both are **authoring-time tools**: they are run once, by hand, and their *output* is
+checked in. No build step runs them, and nothing at run time touches Python — the interpreter has no
+dependency on it, and neither does a user's program.
+
+**They are meant to become Bantu.** The circle tables need only what the language already has. The
+font tables need a Bantu reader for a TrueType file's `glyf`, `loca`, `cmap` and `hmtx` tables —
+which became possible only in B6a, when binary file reads started working. Until then the generated
+headers are the contract, and they are readable and reproducible either way.
+
+**One piece of Python is deliberately staying.** `tests/bplot_png_test.sh` decodes our PNGs with
+Pillow and our deflate streams with Python's `zlib`, and `tests/run_doc_examples.sh` uses Python only
+to check XML. The whole value of those gates is that the decoder is one **we did not write**.
+Reimplementing them in Bantu would turn an independent check into a mirror of the thing it checks.
+
+---
+
+## 15. What this does not promise
 
 - **That it looks identical to the SVG.** Same geometry to a hundredth of a pixel; different font
   rendering, since a browser rasterises the SVG with its own fonts and anti-aliasing.

@@ -47,6 +47,14 @@ All notable changes to the Bantu programming language are documented in this fil
   [`docs/object-lifetime-architecture.md`](docs/object-lifetime-architecture.md). Tests:
   `tests/lang_gc_test.b` (55 assertions) and `tests/gc_stress.sh` (19 checks).
 
+- **[feature] The rasteriser: polygons, strokes and SVG path data, all in integers.**
+  `bp_fill_polygon`, `bp_stroke_polyline` (caps, joins, dashes) and `bp_fill_path` draw with sixteen
+  sub-scanlines of anti-aliasing and exact coverage along x. Circles and arcs step around **embedded
+  integer tables** rather than calling `cos`, `sin` or `atan2`, which differ in the last bit between
+  platforms and would break byte-identical output. Coverage was checked against analytic areas: a
+  rectangle, a triangle and a clipped shape come out exact — and that check found a real defect, in
+  which every stroke had a hole at its caps and joins because its pieces wound in opposite directions.
+
 - **[feature] A raster canvas and a PNG encoder, written from scratch.** `bp_canvas_new`,
   `bp_fill_rect`, `bp_png` and `bp_png_save` draw into an RGB canvas and encode it — including a
   deflate implementation (LZ77 with dynamic Huffman codes), CRC-32, Adler-32 and adaptive PNG row

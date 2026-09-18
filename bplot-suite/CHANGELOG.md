@@ -621,3 +621,50 @@ B6. The original wording is kept in the roadmap alongside the correction, and B6
 - **[test]** `tests/bplot_raster_test.b` — 67 assertions: exact pixel values for coverage, blending,
   clipping and dpi scaling; the PNG signature byte by byte; known-answer CRC-32 and Adler-32; and
   every size cap, bad colour, non-finite coordinate and out-of-range pixel read raising by name.
+
+### B6c — the rasteriser
+
+- **[feature]** Polygons, strokes and paths: `bp_fill_polygon`, `bp_stroke_polyline` (round or butt
+  caps, round joins, dashes) and `bp_fill_path`. Anti-aliasing is sixteen sub-scanlines per row with
+  **exact coverage along x**, so a near-vertical edge — a bar, an axis — is as smooth as an 8-bit
+  channel can show.
+- **[feature]** Circles and arcs come from **embedded integer tables** (`scripts/gen_circle_tables.py`
+  → `raster_tables.hpp`), and an arc steps between two table indices found by cross products. No
+  `cos`, `sin` or `atan2` is called at any point, because libm disagrees in the last bit between
+  platforms and a byte-identical PNG cannot afford it. Vertices are the table scaled by the radius
+  rather than a vector rotated repeatedly, so nothing drifts.
+- **[feature]** The path parser takes exactly what bplot emits — `M m L l H h V v A a Z z` — and an
+  **unsupported command raises, naming it**, because a silently skipped command is a silently wrong
+  picture.
+- **[feature]** Polygons are clipped with integer Sutherland-Hodgman rather than having their
+  coordinates clamped, which would bend an edge's slope at the canvas boundary.
+
+### Checked against analytic areas
+
+| shape | coverage | expected |
+|---|---|---|
+| a 40×30 rectangle | **1200.000** | 1200 — exact |
+| a triangle, base 60, height 40 | **1200.000** | 1200 — exact |
+| the same square clipped to a 10-px band | **300.000** | 300 — exact |
+| a circle of radius 25 | 1960.431 | 1960.34, the inscribed 64-gon it is (chord error 0.03 px) |
+| a stroked diagonal with round caps | 238.515 | ~238.8 |
+
+### Solved defect encountered
+
+- **[bug fix] Every stroke had a hole at its caps and joins.** The segment quadrilateral and the cap
+  and join circles wound in opposite directions, so under the nonzero rule their overlap summed to
+  zero. A stroked diagonal measured **226.25** against an analytic 238.8 — the caps contributing
+  exactly nothing — and a polyline that doubled back would have grown the same hole at every join,
+  since a quadrilateral's orientation follows its segment's direction. Every stroke piece is now
+  given the same orientation before rasterising. Found by comparing coverage with the analytic area,
+  which is precisely what that check exists for; `tests/bplot_raster_test.b` now probes the join of a
+  reversing polyline directly.
+
+### Tests
+
+- **[test]** `tests/bplot_raster_test.b` — **106 assertions** (67 before): polygon fills and winding
+  independence, stroke widths, caps, joins and translucency, dashes, each of the three path shapes
+  bplot actually emits (a cell with relative `h`/`v`, a pie slice with an absolute arc, a scatter
+  circle as two relative half-arcs), multi-subpath fills, and every malformed path raising by name.
+- **[test]** The PNG gate is unchanged and its sha256 is identical, which is the evidence that adding
+  the rasteriser altered no encoder byte.

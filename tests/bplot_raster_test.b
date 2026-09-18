@@ -159,6 +159,121 @@ $n = bp_png_save($p, $path);
 eq($n, len($png), "bp_png_save writes the same bytes bp_png returns");
 ok(readfile($path, "rb") == $png, "and the file holds them, byte for byte");
 
+print("── polygons ──────────────────────────────────────────────────────");
+
+// A 20x10 rectangle as a polygon: every interior pixel is the fill, and the
+// area is exact because the edges land on pixel boundaries.
+$pg = bp_canvas_new(40, 20, null, "#ffffff");
+bp_fill_polygon($pg, [5, 5, 25, 5, 25, 15, 5, 15], "#1f77b4", null);
+eq(bp_canvas_pixel($pg, 15, 10), "#1f77b4", "a polygon fills its inside");
+eq(bp_canvas_pixel($pg, 4, 10), "#ffffff", "and nothing outside it");
+eq(bp_canvas_pixel($pg, 25, 10), "#ffffff", "its far edge is exclusive, like a rectangle's");
+
+// A triangle, whose diagonal must be anti-aliased rather than stepped.
+$tri = bp_canvas_new(20, 20, null, "#ffffff");
+bp_fill_polygon($tri, [0, 0, 20, 0, 0, 20], "#000000", null);
+eq(bp_canvas_pixel($tri, 2, 2), "#000000", "inside the triangle");
+eq(bp_canvas_pixel($tri, 17, 17), "#ffffff", "outside it");
+// Probe a pixel the hypotenuse actually crosses. The edge is the line
+// x + y = 20, so pixel (10, 10) touches it only at a corner and is correctly
+// empty; (9, 10) is the one the edge cuts in half.
+eq(bp_canvas_pixel($tri, 10, 10), "#ffffff", "a pixel the edge only touches at a corner stays empty");
+$edgePix = bp_canvas_pixel($tri, 9, 10);
+ok($edgePix != "#000000" && $edgePix != "#ffffff",
+   "and a pixel the edge cuts is a partial value, not a staircase step");
+
+// Winding: a polygon drawn the other way round fills the same pixels.
+$cw = bp_canvas_new(20, 20, null, "#ffffff");
+bp_fill_polygon($cw, [2, 2, 12, 2, 12, 12, 2, 12], "#000000", null);
+$ccw = bp_canvas_new(20, 20, null, "#ffffff");
+bp_fill_polygon($ccw, [2, 12, 12, 12, 12, 2, 2, 2], "#000000", null);
+ok(bp_canvas_raw($cw) == bp_canvas_raw($ccw), "the direction a polygon is written in does not change it");
+
+bp_fill_polygon($pg, [1, 1, 2, 2], "#000000", null);
+eq(bp_canvas_pixel($pg, 1, 1), "#ffffff", "two points are not a polygon, and draw nothing");
+
+print("── strokes ───────────────────────────────────────────────────────");
+
+$ln = bp_canvas_new(40, 20, null, "#ffffff");
+bp_stroke_polyline($ln, [5, 10, 35, 10], "#000000", 4, null, null, null);
+eq(bp_canvas_pixel($ln, 20, 10), "#000000", "a stroke covers its centre");
+eq(bp_canvas_pixel($ln, 20, 7), "#ffffff", "and stops at its half-width");
+eq(bp_canvas_pixel($ln, 20, 9), "#000000", "which is 2 px above the centre line");
+
+// The defect the draft's area check caught: a join between segments that wind
+// opposite ways used to cancel to nothing, leaving a hole.
+$zz = bp_canvas_new(60, 40, null, "#ffffff");
+bp_stroke_polyline($zz, [10, 10, 50, 10, 10, 30], "#000000", 8, null, null, null);
+eq(bp_canvas_pixel($zz, 50, 10), "#000000", "the join at a reversal is filled, not holed");
+eq(bp_canvas_pixel($zz, 30, 10), "#000000", "and so is the segment either side of it");
+
+// Round caps stick out past the end; butt caps do not.
+$rc = bp_canvas_new(30, 20, null, "#ffffff");
+bp_stroke_polyline($rc, [10, 10, 20, 10], "#000000", 8, null, null, true);
+$bc = bp_canvas_new(30, 20, null, "#ffffff");
+bp_stroke_polyline($bc, [10, 10, 20, 10], "#000000", 8, null, null, false);
+eq(bp_canvas_pixel($rc, 7, 10), "#000000", "a round cap reaches beyond the end point");
+eq(bp_canvas_pixel($bc, 7, 10), "#ffffff", "a butt cap does not");
+
+// A translucent stroke must not darken where its pieces overlap.
+$tr = bp_canvas_new(40, 40, null, "#ffffff");
+bp_stroke_polyline($tr, [5, 20, 20, 20, 35, 20], "#000000", 10, 0.5, null, true);
+eq(bp_canvas_pixel($tr, 20, 20), bp_canvas_pixel($tr, 10, 20),
+   "a translucent stroke is one mask: the join is no darker than the line");
+
+bp_stroke_polyline($tr, [5, 5, 35, 5], "#000000", 0, null, null, null);
+eq(bp_canvas_pixel($tr, 20, 5), "#ffffff", "a zero-width stroke draws nothing");
+
+print("── dashes ────────────────────────────────────────────────────────");
+
+$ds = bp_canvas_new(40, 10, null, "#ffffff");
+bp_stroke_polyline($ds, [0, 5, 40, 5], "#000000", 4, null, "6,6", false);
+eq(bp_canvas_pixel($ds, 2, 5), "#000000", "a dash starts drawn");
+eq(bp_canvas_pixel($ds, 8, 5), "#ffffff", "then leaves a gap");
+eq(bp_canvas_pixel($ds, 14, 5), "#000000", "then draws again");
+raises(def() { bp_stroke_polyline($ds, [0, 5, 9, 5], "#000000", 2, null, "bad", null); },
+       "dash must be numbers", "a dash that is not numbers raises");
+raises(def() { bp_stroke_polyline($ds, [0, 5, 9, 5], "#000000", 2, null, "0,4", null); },
+       "positive", "a zero dash length raises");
+
+print("── paths ─────────────────────────────────────────────────────────");
+
+// The three shapes bplot actually emits: a cell (relative h/v), a pie slice
+// (absolute arc) and a scatter circle (two relative half-arcs).
+$pa = bp_canvas_new(40, 40, null, "#ffffff");
+bp_fill_path($pa, "M5 5h20v10h-20Z", "#2ca02c", null);
+eq(bp_canvas_pixel($pa, 15, 10), "#2ca02c", "a cell path, drawn with relative h and v");
+eq(bp_canvas_pixel($pa, 26, 10), "#ffffff", "and it ends where it says");
+
+$pie = bp_canvas_new(60, 60, null, "#ffffff");
+bp_fill_path($pie, "M 30 30 L 55 30 A 25 25 0 0 1 30 55 Z", "#d62728", null);
+eq(bp_canvas_pixel($pie, 45, 40), "#d62728", "a quarter-circle slice is filled inside");
+eq(bp_canvas_pixel($pie, 12, 12), "#ffffff", "and empty in the opposite quarter");
+eq(bp_canvas_pixel($pie, 45, 20), "#ffffff", "and empty above it");
+
+$sc = bp_canvas_new(40, 40, null, "#ffffff");
+bp_fill_path($sc, "M14.00,20.00a6.00,6.00 0 1,0 12.00,0a6.00,6.00 0 1,0 -12.00,0", "#9467bd", null);
+eq(bp_canvas_pixel($sc, 20, 20), "#9467bd", "a scatter circle, as two relative half-arcs");
+eq(bp_canvas_pixel($sc, 20, 13), "#ffffff", "with nothing beyond its radius");
+eq(bp_canvas_pixel($sc, 20, 15), "#9467bd", "and everything inside it");
+
+$multi = bp_canvas_new(40, 20, null, "#ffffff");
+bp_fill_path($multi, "M2 2h8v8h-8ZM20 2h8v8h-8Z", "#000000", null);
+eq(bp_canvas_pixel($multi, 5, 5), "#000000", "a path with two subpaths fills the first");
+eq(bp_canvas_pixel($multi, 23, 5), "#000000", "and the second");
+eq(bp_canvas_pixel($multi, 15, 5), "#ffffff", "and not the gap between them");
+
+raises(def() { bp_fill_path($pa, "M0 0 Q 5 5 10 0 Z", "#000000", null); },
+       "unsupported command 'Q'", "an unsupported path command raises, naming it");
+raises(def() { bp_fill_path($pa, "M0 0 L", "#000000", null); },
+       "expected a number", "a truncated path raises");
+raises(def() { bp_fill_path($pa, "10 10 20 20", "#000000", null); },
+       "expected a command letter", "a path with no command raises");
+raises(def() { bp_fill_polygon($pa, [1, 2, 3], "#000000", null); },
+       "pairs", "an odd number of coordinates raises");
+raises(def() { bp_fill_polygon($pa, [1, "two", 3, 4], "#000000", null); },
+       "must be a number", "a non-numeric coordinate raises");
+
 print("── hostile and impossible arguments ──────────────────────────────");
 
 raises(def() { bp_canvas_new(0, 10, null, null); }, "positive", "a zero width raises");
