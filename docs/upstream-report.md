@@ -8,7 +8,7 @@ sync works", 2026-09-06). Not `main` — `main` predates the `def($req, $res)` p
 cannot run any of the reproducers below.
 
 Everything here was reproduced by building `upstream/sua.udp-feature` unmodified in a worktree and
-running it on macOS 24.6.
+running it on macOS 15.7.9 (Darwin 24.6).
 
 ---
 
@@ -116,7 +116,7 @@ trivial remote kill — rather than as a fix for the crash.
 
 ## What we did on our side, offered if useful
 
-`minjaezekiel/Bantu`, branch `upstream-sync`. Thread-per-connection replaced with a single-threaded
+`minjaezekiel/Bantu`, on `main` (https://github.com/minjaezekiel/Bantu). Thread-per-connection replaced with a single-threaded
 event loop (kqueue / epoll / poll behind one interface, no new dependency), which removes findings 2
 and 3 by construction: one thread owns every connection, so there is no shared interpreter state to
 race on and every lock could be deleted rather than added.
