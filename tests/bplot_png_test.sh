@@ -171,6 +171,49 @@ check "$(cmp -s "$TMP/chart.png" "$TMP/again.png" && echo 1 || echo 0)" \
 SUM1="$("$PY" -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$TMP/chart.png")"
 echo "        chart.png sha256 $SUM1"
 
+# ── bplot figures as PNG (B6e) ───────────────────────────────────────────
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cat > "$TMP/fig.b" <<BEOF
+include "$ROOT/bplot/bplot.b" as plt;
+\$f = plt.figure(320, 200);
+\$a = \$f.addAxes();
+\$a.plot([1, 2, 3, 4], [1, 4, 2, 3], {"label": "y"});
+\$a.setTitle("a line");
+\$f.savefig("$TMP/line.png", null);
+\$f.savefig("$TMP/line2x.png", {"dpi": 192});
+print("SAME " + str(readfile("$TMP/line.png", "rb") == \$f.to_png(96)));
+// A 50/50 pie from twelve o'clock, counter-clockwise as matplotlib draws it:
+// the FIRST slice must be the left half.
+\$p = plt.figure(200, 200);
+\$pa = \$p.addAxes();
+\$pa.pie([50, 50], {"colors": ["#ff0000", "#0000ff"], "start": 90});
+\$p.savefig("$TMP/pie.png", null);
+BEOF
+if "$BANTU" -q run "$TMP/fig.b" > "$TMP/fig.log" 2>&1; then
+    check "$(grep -q 'SAME true' "$TMP/fig.log" && echo 1 || echo 0)" "to_png() returns exactly the bytes savefig(\".png\") writes"
+    if [ "$HAVE_PIL" = "1" ]; then
+        "$PY" - "$TMP" > "$TMP/fig.out" 2>&1 <<'EOF'
+import os, sys
+from PIL import Image
+tmp = sys.argv[1]
+a = Image.open(os.path.join(tmp, "line.png")); b = Image.open(os.path.join(tmp, "line2x.png"))
+print("SIZE", a.size == (320, 200) and b.size == (640, 400))
+im = Image.open(os.path.join(tmp, "pie.png")).convert("RGB")
+w, h = im.size
+px = im.load()
+red = [x for y in range(h) for x in range(w) if px[x, y] == (255, 0, 0)]
+blue = [x for y in range(h) for x in range(w) if px[x, y] == (0, 0, 255)]
+ok = bool(red) and bool(blue) and max(red) <= min(blue) + 2 and abs(len(red) - len(blue)) < 0.02 * len(red)
+print("PIE", ok, len(red), len(blue))
+EOF
+        check "$(grep -q 'SIZE True' "$TMP/fig.out" && echo 1 || echo 0)" "a figure's PNG is its size at 96 dpi, and twice that at 192"
+        check "$(grep -q 'PIE True' "$TMP/fig.out" && echo 1 || echo 0)" "a 50/50 pie from twelve o'clock puts its first slice on the left, as two equal halves"
+    fi
+else
+    bad "bplot could not render a figure to PNG"
+    tail -20 "$TMP/fig.log"
+fi
+
 echo ""
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

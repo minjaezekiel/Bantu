@@ -47,6 +47,21 @@ All notable changes to the Bantu programming language are documented in this fil
   [`docs/object-lifetime-architecture.md`](docs/object-lifetime-architecture.md). Tests:
   `tests/lang_gc_test.b` (55 assertions) and `tests/gc_stress.sh` (19 checks).
 
+- **[feature] bplot writes PNG.** `savefig("chart.png", {"dpi": 150})` and `to_png(dpi)` draw any
+  figure through the native raster backend — the same figure is the same file on Linux, macOS and
+  Windows — and `samples/bplot/server.b` serves `/chart.png` beside `/chart.svg`. Text is measured by
+  the backend doing the drawing, so a PNG's gutters fit its own font, and an SVG and a PNG rendered at
+  once on two sua threads are each byte-identical to a lone render.
+
+- **[bug fix] bplot pie slices were drawn as their mirror image.** Slices run counter-clockwise on
+  screen, but each arc was emitted with SVG's clockwise sweep flag, so every slice bulged the wrong
+  way about its chord — in the SVG as well as the PNG. Found the first time a pie was rasterised.
+
+- **[bug fix] bplot twin axes drew their data in the wrong rectangle under `tight_layout`.** Each axes
+  was measured for its own labels and the twin kept the box it measured, so a `twinx` line sat
+  shifted by about a category and escaped the frame. Host and twin now share one rectangle with room
+  for both sets of labels.
+
 - **[feature] Text on the raster canvas, in an embedded font.** `bp_text` and `bp_text_width` draw
   and measure DejaVu Sans (210 glyphs: ASCII, Latin-1 and the symbols charts use) from integer outline
   tables, with no hinting and no system font, so a label is the same pixels on every platform. Anchors

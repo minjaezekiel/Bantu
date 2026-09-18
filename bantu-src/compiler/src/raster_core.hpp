@@ -1119,7 +1119,9 @@ class PathParser {
 public:
     PathParser(const std::string& d, uint32_t dpi) : s_(d), dpi_(dpi) {}
 
-    std::vector<ContourQ8> parse(size_t maxPoints) {
+    // forStroke keeps open subpaths of two or more points, and closes a Z'd
+    // one by returning to its start, so the result can be stroked as polylines.
+    std::vector<ContourQ8> parse(size_t maxPoints, bool forStroke = false) {
         std::vector<ContourQ8> out;
         ContourQ8 cur;
         int64_t cx = 0, cy = 0, sx = 0, sy = 0;
@@ -1131,7 +1133,8 @@ public:
             }
             cur.push_back(PointQ8{x, y});
         };
-        auto flush = [&]() { if (cur.size() >= 3) out.push_back(cur); cur.clear(); };
+        const size_t keep = forStroke ? 2 : 3;
+        auto flush = [&]() { if (cur.size() >= keep) out.push_back(cur); cur.clear(); };
 
         while (!atEnd()) {
             const char c = s_[i_];
@@ -1184,6 +1187,7 @@ public:
                     break;
                 }
                 case 'Z': case 'z': {
+                    if (forStroke && !cur.empty()) push(sx, sy);
                     flush();
                     cx = sx; cy = sy;
                     break;

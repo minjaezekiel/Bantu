@@ -327,6 +327,32 @@ void registerBuiltins(const DefineFn& define) {
         return Value(true);
     });
 
+    // bp_stroke_path(canvas, "M ... ", colour, width [, opacity])
+    // Each subpath is stroked as a polyline with round caps and joins -- what
+    // bplot asks SVG for -- and the whole path is one mask.
+    define("bp_stroke_path", [](std::vector<Value> a) -> Value {
+        auto c = asCanvas(a, 0, "bp_stroke_path");
+        if (a.size() < 2 || !a[1].isString()) throw std::runtime_error("bp_stroke_path: the path must be a string");
+        Rgb col{0, 0, 0};
+        if (!parseColour(a, 2, "bp_stroke_path", col)) return Value(false);
+        const double w = asNumber(a, 3, "bp_stroke_path", "width");
+        if (w <= 0) return Value(false);
+        const uint32_t alpha = isAbsent(a, 4) ? 255u : alpha8(asNumber(a, 4, "bp_stroke_path", "opacity"));
+        PathParser parser(a[1].stringVal, c->dpi);
+        const int64_t widthQ8 = std::min<int64_t>(toQ8(centi(w), c->dpi), (int64_t)1 << 24);
+        const int64_t g = ((int64_t)1 << 27) + widthQ8;
+        std::vector<ContourQ8> pieces;
+        for (const auto& sub : parser.parse(kMaxPathPoints, true)) {
+            for (const auto& run : clipPolyline(sub, c->clipX0 * 256 - g, c->clipY0 * 256 - g,
+                                                     c->clipX1 * 256 + g, c->clipY1 * 256 + g)) {
+                strokeContours(run, widthQ8, true, pieces);
+            }
+        }
+        if (pieces.empty()) return Value(false);
+        compositeMask(*c, rasterise(pieces, c->clipX0, c->clipY0, c->clipX1, c->clipY1), col, alpha);
+        return Value(true);
+    });
+
     // bp_text(canvas, x, y, text, size, colour [, anchor] [, rotate] [, opacity])
     // The same arguments as the SVG backend's text(): (x, y) is the start of the
     // BASELINE, anchor is "start" | "middle" | "end", rotate is degrees clockwise

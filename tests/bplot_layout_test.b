@@ -224,6 +224,25 @@ approx($a.viewLimitsShared("x", $f.sharedLimits(0, "x"))[1],
 // The y axes stay independent — that is the whole point of a twin.
 ok($a.viewLimits("y")[1] < $b.viewLimits("y")[1], "but their y axes are independent");
 
+// Under tight_layout each axes is measured for its own labels -- and until
+// B6e a twin kept the box IT measured, so its data was drawn in a different
+// rectangle from the frame, shifted and escaping it (the dashboard sample
+// showed it). Host and twin must still be one rectangle, with room for both.
+$tf = plt.figure(700, 450);
+$ta = $tf.addAxes();
+$ta.bar(["Jan", "Feb", "Mar"], [10, 200, 3000], null);
+$ta.setYLabel("rainfall (mm)");
+$tb = $tf.twinx($ta);
+$tb.plot(["Jan", "Feb", "Mar"], [23.5, 27, 28], null);
+$tb.setYLabel("temperature (C)");
+$tf.tight_layout(true);
+$tsvg = $tf.to_svg();
+eq([$tb.left, $tb.top, $tb.w, $tb.h], [$ta.left, $ta.top, $ta.w, $ta.h], "under tight_layout the twin keeps its host's exact rectangle");
+$clips = split($tsvg, "<clipPath id=");
+eq(len($clips), 3, "two axes, two clip paths");
+eq(split(split($clips[1], "<rect")[1], "/>")[0], split(split($clips[2], "<rect")[1], "/>")[0],
+   "and both clip to the same rectangle");
+
 print("");
 print("-- shared axes take the UNION, and sharing is transitive --");
 $f = plt.figure(900, 300);

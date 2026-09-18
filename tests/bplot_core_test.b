@@ -299,8 +299,8 @@ raises(def() { $f = plt.figure(300, 200); $a = $f.addAxes(); $a.setXLim(5, 1); r
        "an inverted xlim raises");
 raises(def() { $f = plt.figure(300, 200); $a = $f.addAxes(); $a.setYLim(1, NAN); return 0; },
        "a NaN limit raises");
-raises(def() { $f = plt.figure(300, 200); return $f.savefig("chart.png"); },
-       "savefig to .png raises, saying raster output is not in this release");
+raises(def() { $f = plt.figure(300, 200); return $f.savefig("chart.jpg"); },
+       "savefig to an unknown format raises (.svg and .png are the two)");
 raises(def() { $f = plt.figure(300, 200); return $f.savefig(""); },
        "an empty path raises");
 

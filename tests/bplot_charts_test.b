@@ -498,6 +498,11 @@ eq(len($ax.artists[0]["colors"]), 3, "one colour per slice");
 $fg = plt.figure(400, 400); $fg.addAxes().pie([1,1,1], null);
 $svg = $fg.to_svg();
 has($svg, "<path", "pie emits arc paths");
+// A quarter from twelve o'clock to nine o'clock runs counter-clockwise on
+// screen, which is SVG's NEGATIVE-angle direction: sweep flag 0. It was 1
+// until B6e, and every slice was drawn as its mirror about the chord.
+eq(plt._arcPath(100, 100, 50, PI / 2, PI), "M 100.00 100.00 L 100.00 50.00 A 50.00 50.00 0 0 0 50.00 100.00 Z",
+   "a slice arc sweeps counter-clockwise on screen (sweep flag 0)");
 // The frame is the only unfilled, stroked rect; the other two rects in any
 // document are the background and the clip path.
 hasnt($svg, "fill=\"none\" stroke=\"#888888\"", "and no axes frame");

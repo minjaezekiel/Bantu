@@ -274,6 +274,25 @@ raises(def() { bp_fill_polygon($pa, [1, 2, 3], "#000000", null); },
 raises(def() { bp_fill_polygon($pa, [1, "two", 3, 4], "#000000", null); },
        "must be a number", "a non-numeric coordinate raises");
 
+print("── stroked paths (B6e) ───────────────────────────────────────────");
+
+// Contour lines and pie edges are paths with a stroke. An OPEN subpath of two
+// points must draw -- a fill would discard it -- and Z must return to the start.
+$sp = bp_canvas_new(40, 40, null, "#ffffff");
+eq(bp_stroke_path($sp, "M 5 10 L 35 10", "#000000", 2, null), true, "an open two-point subpath strokes");
+eq(bp_canvas_pixel($sp, 20, 9), "#000000", "along its length");
+eq(bp_canvas_pixel($sp, 20, 20), "#ffffff", "and nowhere else");
+bp_stroke_path($sp, "M 5 20 h 30 v 15 Z", "#ff0000", 2, null);
+eq(bp_canvas_pixel($sp, 20, 27), "#ff0000", "Z closes back to the start: the diagonal is drawn");
+eq(bp_canvas_pixel($sp, 30, 25), "#ffffff", "and the inside is not filled");
+bp_stroke_path($sp, "M 2.5 2 L 2.5 38 M 37.5 2 L 37.5 38", "#0000ff", 1, null);   // centred on pixel 2
+eq(bp_canvas_pixel($sp, 2, 20), "#0000ff", "each subpath is its own polyline");
+eq(bp_canvas_pixel($sp, 20, 3), "#ffffff", "with no line joining one to the next");
+eq(bp_stroke_path($sp, "M 1 1 L 9 9", "#000000", 0, null), false, "zero width draws nothing");
+eq(bp_stroke_path($sp, "M 1 1 L 9 9", "none", 1, null), false, "and so does none");
+raises(def() { bp_stroke_path($sp, "M 1 1 Q 2 2 3 3", "#000000", 1, null); }, "unsupported command", "an unsupported command raises by name");
+raises(def() { bp_stroke_path($sp, 5, "#000000", 1, null); }, "string", "a non-string path raises");
+
 print("── far-off coordinates keep their slope (B6d defect) ─────────────");
 
 // A point up to 1e8 units away reaches ~2^40 in Q8; the clip crossing and a

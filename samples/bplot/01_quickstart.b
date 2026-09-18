@@ -20,3 +20,9 @@ plt.grid(true);
 plt.legend(true);
 plt.savefig("/tmp/bplot_quickstart2.svg");
 print("wrote /tmp/bplot_quickstart2.svg");
+
+// The same call writes a PNG when the name ends in .png. dpi is optional:
+// 96 draws one pixel per unit, the SVG's own size; 192 is twice as sharp.
+plt.plot([1, 2, 3, 4, 5], [2, 4, 9, 3, 7]);
+plt.savefig("/tmp/bplot_quickstart.png", {"dpi": 192});
+print("wrote /tmp/bplot_quickstart.png");

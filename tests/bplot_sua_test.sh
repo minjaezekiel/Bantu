@@ -68,6 +68,39 @@ check "$([ -s "$TMP/evil.svg" ] && ! grep -q '<script' "$TMP/evil.svg" && echo 1
 check "$(grep -c '&lt;/text&gt;&lt;script&gt;' "$TMP/evil.svg")" "the title is there, escaped"
 check "$(wellformed "$TMP/evil.svg" && echo 1 || echo 0)" "and the document still parses"
 
+echo "-- the chart as a PNG --"
+CODE="$(curl -s -D "$TMP/hp.txt" -o "$TMP/chart.png" -w '%{http_code}' "http://127.0.0.1:$PORT/chart.png")"
+check "$([ "$CODE" = "200" ] && echo 1 || echo 0)" "GET /chart.png answers 200"
+check "$(grep -ciE '^content-type: image/png' "$TMP/hp.txt" | awk '{print ($1 > 0) ? 1 : 0}')" "as image/png"
+check "$([ "$(head -c 8 "$TMP/chart.png" | od -An -tx1 | tr -d ' \n')" = "89504e470d0a1a0a" ] && echo 1 || echo 0)" \
+      "the body starts with the PNG signature, every byte intact"
+PYBIN="$(command -v python3 || true)"
+if [ -n "$PYBIN" ] && "$PYBIN" -c "import PIL" >/dev/null 2>&1; then
+    check "$("$PYBIN" -c "from PIL import Image;import sys;print(1 if Image.open(sys.argv[1]).size==(760,420) else 0)" "$TMP/chart.png")" \
+          "and Pillow decodes it at the figure's 760x420"
+fi
+
+# Layout is measured by the backend doing the drawing, not by a process-wide
+# flag -- so a PNG and an SVG rendered at once on two threads must each come
+# out exactly as they do alone.
+echo "-- PNG and SVG rendered concurrently are each what they are alone --"
+curl -s -o "$TMP/lone.svg" "http://127.0.0.1:$PORT/chart.svg?title=mixed"
+curl -s -o "$TMP/lone.png" "http://127.0.0.1:$PORT/chart.png?title=mixed"
+PIDS=""
+for n in $(seq 1 12); do
+    curl -s --max-time 60 -o "$TMP/m$n.svg" "http://127.0.0.1:$PORT/chart.svg?title=mixed" &
+    PIDS="$PIDS $!"
+    curl -s --max-time 60 -o "$TMP/m$n.png" "http://127.0.0.1:$PORT/chart.png?title=mixed" &
+    PIDS="$PIDS $!"
+done
+wait $PIDS 2>/dev/null
+DIFF=0
+for n in $(seq 1 12); do
+    cmp -s "$TMP/m$n.svg" "$TMP/lone.svg" || DIFF=$((DIFF+1))
+    cmp -s "$TMP/m$n.png" "$TMP/lone.png" || DIFF=$((DIFF+1))
+done
+check "$([ "$DIFF" = "0" ] && echo 1 || echo 0)" "24 mixed concurrent renders are byte-identical to the lone ones ($DIFF differ)"
+
 echo "-- 40 concurrent requests, each with its own title --"
 PIDS=""
 for n in $(seq 1 40); do

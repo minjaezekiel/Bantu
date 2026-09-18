@@ -66,6 +66,22 @@ plt.savefig("rain_vs_temp.svg");
 Text on an axis makes it categorical, so the months need no conversion. `savefig` writes the file
 and starts a fresh figure.
 
+### PNG
+
+The same call writes a PNG when the name ends in `.png`. The dpi is optional: 96 draws one pixel per
+unit, the size the SVG has; 192 is twice as sharp.
+
+```bantu
+include "bplot" as plt;
+plt.bar(["Jan", "Feb", "Mar"], [66, 61, 118]);
+plt.title("rainfall");
+plt.savefig("rain.png", {"dpi": 192});
+```
+
+`to_png($dpi)` returns the bytes instead, for a response body. The PNG is drawn by bplot's own
+rasteriser in an embedded font, so **the same figure is the same file on Linux, macOS and Windows**
+([how](bplot-raster-architecture.md)).
+
 ### Distributions
 
 ```bantu
@@ -193,6 +209,11 @@ the whole process, so two requests using them at once would draw into each other
 `tests/bplot_sua_test.sh` sends forty concurrent requests with different titles and checks every one
 gets only its own.
 
+**A PNG is one method away.** The sample also serves `/chart.png`, with `$res.type("image/png")` and
+`$res.send($fig.to_png(null))`. Layout is measured by the backend doing the drawing, never by a
+process-wide setting, so an SVG and a PNG rendered at once on two threads are each byte-identical to
+what they are alone — the same test checks twenty-four of them.
+
 ---
 
 ## SVG is an executable document format
@@ -213,7 +234,7 @@ bplot makes that impossible **through bplot**:
 
 What bplot cannot do is make SVG stop being an executable format. So when a chart contains anything
 user-influenced, also serve it with the `Content-Security-Policy` header above, or from a separate
-origin. The native raster backend (PNG), which removes the question entirely, is the next phase.
+origin — or serve a PNG (`/chart.png` in the sample), which is pixels and carries nothing to execute.
 
 ---
 
@@ -249,6 +270,18 @@ labels nothing at all, and an axis with no labels is not a chart anyone can read
 
 **Memory is reclaimed.** Building and dropping 6,000 figures leaves resident memory flat.
 
+**PNG costs a render on the server.** The four-panel dashboard in `samples/bplot/04_dashboard.b`
+(1100×800, bars, a twin axis, a filled step chart, a heatmap with a colorbar, a pie):
+
+| output | time | file |
+|---|---|---|
+| SVG | 78 ms | 25,386 bytes |
+| PNG at 96 dpi | 124 ms | 77,041 bytes |
+| PNG at 144 dpi | 215 ms | 125,327 bytes |
+| PNG at 300 dpi | 468 ms | 290,196 bytes |
+
+A tick label is 0.13 ms to draw at 96 dpi.
+
 ---
 
 ## Things worth knowing before you hit them
@@ -265,8 +298,10 @@ labels nothing at all, and an axis with no labels is not a chart anyone can read
 - **Scatter above 1,000 points is one `<path>`**, not one element per point. It looks identical; it
   is what keeps a large scatter openable. A million-point scatter is still a 61 MB document — that
   size belongs in a PNG.
-- **Labels are measured, not rendered.** `tight_layout` estimates text width from Helvetica's metrics.
-  A different font renders slightly wider or narrower.
+- **Labels are measured by the backend.** An SVG is laid out with Helvetica's widths, because its font
+  is whatever the viewer's browser picks for `sans-serif`; a different font renders slightly wider or
+  narrower. A PNG is laid out with the widths of the font it draws, DejaVu Sans, so its gutters are
+  exact. The same figure's SVG and PNG can therefore place a gutter a few pixels apart.
 
 ---
 
@@ -282,9 +317,11 @@ labels nothing at all, and an axis with no labels is not a chart anyone can read
 
 ## Caveats, plainly
 
-- **SVG only, for now.** PNG output is the next phase. Until then a chart is a document a browser
-  renders, and a very large scatter is a very large document.
-- **Fonts are estimated, not loaded.** Layout uses a built-in table of Helvetica widths.
+- **PNG text is one font.** DejaVu Sans, embedded: ASCII, Latin-1 and the symbols charts use
+  (`° µ × − – — … ± ≤ ≥ ≈ ≠ ∞ € ™ ☀`). Anything else draws as `�`. No bold, no italic.
+- **PNG rotation snaps to 1.4° steps.** 0°, 45° and 90° are exact; 30° draws at 29.5°.
+- **A PNG has an opaque background.** No transparency in this release.
+- **SVG fonts are estimated, not loaded.** SVG layout uses a built-in table of Helvetica widths.
 - **Charts are drawn when saved.** Nothing is rendered until `savefig`, `show` or `to_svg`, so an error
   in the data — a zero on a log axis — surfaces there rather than at the `plot` call.
 - **It is not matplotlib.** The names and the tick choices match; the thousands of options do not. If

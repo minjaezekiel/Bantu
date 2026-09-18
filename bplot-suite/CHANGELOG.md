@@ -721,3 +721,55 @@ B6. The original wording is kept in the roadmap alongside the correction, and B6
 - **[test]** The raster fuzz gains 150 trials of random-byte text at random sizes, anchors and angles,
   and shapes with points up to 10⁸ away — clean under ASan + UBSan.
 
+### B6e — bplot draws PNG
+
+- **[feature]** `savefig("chart.png", {"dpi": 150})`, `$fig.to_png(dpi)` and `plt.to_png(dpi)`. dpi
+  defaults to 96, one pixel per unit — the SVG's size. An unknown extension still raises, now naming
+  `.svg` and `.png`.
+- **[feature]** `BPlotRaster` implements the SVG backend's thirteen methods with the same arguments,
+  one `bp_*` builtin per call, so no artist knows which backend it is drawing to — the design B1 set
+  up for exactly this. `#rgb` colours are expanded for the native side.
+- **[feature]** `bp_stroke_path`: a path's subpaths stroked as polylines with round caps and joins,
+  one mask. Contour lines and the white edge between pie slices are stroked paths, and a fill would
+  have discarded their open two-point subpaths.
+- **[feature]** **Layout asks the backend.** Each backend has `textWidth()` — Helvetica's table for
+  SVG, DejaVu's advances for PNG — and `tight_layout` and legends call the one they draw with. The
+  first draft used a process-wide flag; it was replaced before commit because sua runs handlers on
+  their own threads, and a PNG in flight would have changed a concurrent SVG's layout.
+- **[feature]** `samples/bplot/server.b` serves `/chart.png`, and turns on `tight_layout`; the
+  quickstart and dashboard samples also write PNGs; `docs/bplot.md` gains a PNG section, the
+  timings below, and caveats replacing "SVG only".
+- **Speed** — the 1100×800 dashboard: SVG 78 ms / 25 KB; PNG 124 ms / 77 KB at 96 dpi, 215 ms /
+  125 KB at 144 dpi, 468 ms / 290 KB at 300 dpi.
+
+### Solved defects encountered
+
+- **[bug fix] Every pie slice was drawn as its mirror about the chord (since B2).** `_arcPath`
+  advances angles counter-clockwise on screen (`y = cy - r sin a`), as matplotlib's pie does, but
+  emitted sweep flag `1`, which in SVG's y-down space is clockwise. A browser then takes the other
+  centre, and each slice bulged the wrong way — confirmed by rendering the SVG through macOS Quick
+  Look, not only through our own rasteriser. The B2 tests checked labels and element counts, never
+  where a slice's pixels land. Now: sweep flag `0`; `tests/bplot_charts_test.b` pins the exact arc
+  string, and `tests/bplot_png_test.sh` has Pillow check that a 50/50 pie from twelve o'clock puts its
+  first slice on the left as two equal halves.
+- **[bug fix] Twin axes drew in a different rectangle from their host under `tight_layout`.** Each
+  axes was tightened for its own labels, and nothing made a twin follow its host afterwards — in the
+  dashboard sample the temperature line sat a month to the left and ran outside the frame. The twin
+  now records its host as an index (a reference would be a cycle, per the figure's sharing notes),
+  and after tightening both take the larger pad on every side. The existing twin test ran without
+  `tight_layout`, which is why this went unseen; the new one uses it, and fails on the old code.
+
+### Tests
+
+- **[test]** `tests/bplot_raster_test.b` — **153 assertions** (142): stroked paths — open subpaths,
+  `Z` closing, separate subpaths, zero width, `none`, bad commands.
+- **[test]** `tests/bplot_png_test.sh` — **6 checks** (3): `to_png()` is exactly what `savefig`
+  writes; a figure is its size at 96 dpi and twice that at 192 (Pillow); the pie orientation.
+- **[test]** `tests/bplot_sua_test.sh` — **20 checks** (15): `/chart.png` is 200, `image/png`, an
+  intact signature and a 760×420 image; and **24 mixed PNG and SVG renders at once are each
+  byte-identical to a lone render**.
+- **[test]** `tests/bplot_layout_test.b` — host and twin keep one rectangle and one clip under
+  `tight_layout`; `tests/bplot_charts_test.b` — the arc's sweep flag; `tests/bplot_core_test.b` —
+  `.jpg` raises where `.png` used to.
+- **[test]** The raster fuzz strokes hostile and far-off paths too — clean under ASan + UBSan.
+

@@ -84,6 +84,8 @@ $ax4.setTitle("traffic sources");
 $fig.tight_layout(true);
 $path = $fig.savefig("/tmp/bplot_dashboard.svg");
 print("wrote " + $path);
+// And as a PNG, laid out for the font the PNG draws with.
+print("wrote " + $fig.savefig("/tmp/bplot_dashboard.png", {"dpi": 144}));
 
 // ── The same dashboard in the dark style ─────────────────────────────────
 // A style is process-wide, like the current figure. Set it once at start-up;

@@ -261,7 +261,8 @@ identity rules out, the integer rasteriser, the embedded font, the encoder, and 
             and the path parser (`bp_fill_polygon`, `bp_stroke_polyline`, `bp_fill_path`)
       - [x] **B6d** — text: the embedded font, glyph rendering, rotation, measurement
             (`bp_text`, `bp_text_width`, `raster_font.hpp`)
-      - [ ] B6e — `BPlotRaster`, `savefig(".png", {dpi})`, `to_png()`, PNG from sua
+      - [x] **B6e** — `BPlotRaster`, `savefig(".png", {dpi})`, `to_png()`, PNG from sua, and
+            `bp_stroke_path`; layout measured by the backend that draws
 - [ ] **convert the authoring-time generators to Bantu** — `scripts/gen_circle_tables.py` is a direct
       translation; `scripts/gen_font_tables.py` needs a Bantu TrueType reader (`glyf`, `loca`, `cmap`,
       `hmtx`), which binary file reads made possible in B6a. Neither is part of the build, and the

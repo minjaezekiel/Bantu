@@ -1,8 +1,9 @@
 // ════════════════════════════════════════════════════════════════════════
 //  bplot — charts served over HTTP by sua.
 //
-//  A chart is drawn per request and sent as image/svg+xml, with a title
-//  taken from the query string -- which is to say, from a stranger.
+//  A chart is drawn per request and sent as image/svg+xml -- or as
+//  image/png from /chart.png -- with a title taken from the query string,
+//  which is to say, from a stranger.
 //
 //  Two rules make that safe, and both are shown here:
 //
@@ -35,7 +36,10 @@ def chartFor($title) {
     $ax.setTitle($title);
     $ax.setYLabel("rainfall (mm)");
     $ax.setGrid(true);
-    return $fig.to_svg();
+    // Measured by the backend that draws it, so the SVG and the PNG each get
+    // gutters for their own font -- and concurrent renders cannot interfere.
+    $fig.tight_layout(true);
+    return $fig;
 }
 
 sua.server.get("/chart.svg", def($req, $res) {
@@ -44,13 +48,24 @@ sua.server.get("/chart.svg", def($req, $res) {
     $res.set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'");
     $res.set("X-Content-Type-Options", "nosniff");
     $res.type("image/svg+xml; charset=utf-8");
-    $res.send(chartFor($title));
+    $res.send(chartFor($title).to_svg());
+});
+
+// The same chart as a PNG: pixels, not a document, so there is nothing in it
+// to execute -- but it costs a render on the server rather than the browser.
+sua.server.get("/chart.png", def($req, $res) {
+    $title = $req.query["title"];
+    if ($title == null || $title == "") { $title = "Monthly rainfall, Dar es Salaam"; }
+    $res.set("X-Content-Type-Options", "nosniff");
+    $res.type("image/png");
+    $res.send(chartFor($title).to_png(null));
 });
 
 sua.server.get("/", def($req, $res) {
     $res.type("text/html; charset=utf-8");
     $res.send("<!doctype html><meta charset=\"utf-8\"><title>bplot on sua</title>" +
-              "<h1>Rainfall</h1><img src=\"/chart.svg\" alt=\"Monthly rainfall\" width=\"760\" height=\"420\">");
+              "<h1>Rainfall</h1><img src=\"/chart.svg\" alt=\"Monthly rainfall\" width=\"760\" height=\"420\">" +
+              "<h2>The same chart as a PNG</h2><img src=\"/chart.png\" alt=\"Monthly rainfall\" width=\"760\" height=\"420\">");
 });
 
 print("bplot charts on http://127.0.0.1:" + str($port) + "/");

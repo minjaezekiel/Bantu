@@ -192,12 +192,29 @@ plt.plot([1, 2, 3], [2, 4, 9]);
 plt.savefig("chart.png");                     // extension chooses the backend
 plt.savefig("print.png", {"dpi": 300});       // 3.125x the pixels, and a pHYs chunk saying so
 
-$png = $fig.to_png({"dpi": 144});             // bytes, for serving
+$png = $fig.to_png(144);                      // bytes, for serving; null means 96
 ```
 
-Underneath, `BPlotRaster` in `bplot.b` implements the backend method set by calling `bp_canvas_*`
-builtins on a native canvas handle — refcounted like every other handle, so a canvas is freed when the
-last reference drops. The builtins stay documented and callable, and bplot is what uses them.
+Underneath, `BPlotRaster` in `bplot.b` implements the SVG backend's method set — thirteen methods, same
+arguments — with one `bp_*` builtin per call on a native canvas handle, refcounted like every other
+handle, so a canvas is freed when the last reference drops:
+
+| builtin | draws |
+|---|---|
+| `bp_canvas_new(w, h, dpi, bg)`, `bp_canvas_clip`, `bp_canvas_info`, `bp_canvas_pixel`, `bp_canvas_raw` | the canvas |
+| `bp_fill_rect`, `bp_fill_polygon`, `bp_fill_path` | fills, nonzero |
+| `bp_stroke_polyline(…, width, opacity, dash, roundCap)`, `bp_stroke_path` | strokes, one mask each |
+| `bp_text(…, size, colour, anchor, rotate, opacity)`, `bp_text_width` | text, and its measurement |
+| `bp_png`, `bp_png_save`, and `bp_zlib` / `bp_crc32` / `bp_adler32` for tests | the file |
+
+**Layout asks the backend.** Each backend has `textWidth(text, size)` — Helvetica's table for SVG,
+`bp_text_width` for PNG — and `tight_layout` and legends call it on the backend they are drawing to.
+A process-wide "measuring for PNG" flag was the first draft and was rejected before it shipped: sua
+runs handlers on their own threads, so a PNG render in flight would have changed a concurrent SVG's
+layout. `tests/bplot_sua_test.sh` renders twenty-four of each at once and requires every one to be
+byte-identical to a lone render.
+
+The builtins stay documented and callable, and bplot is what uses them.
 
 ## 10. Security
 

@@ -172,6 +172,10 @@ def _decimalsFor($step) {
 }
 
 // Width of a string at a given font size, in pixels.
+// Helvetica's advances: what the SVG backend measures with, since an SVG's
+// font is whatever the viewer's browser picks for sans-serif. Layout asks the
+// BACKEND (textWidth), never a global, so a PNG and an SVG rendered at once on
+// two sua threads cannot change each other's layout.
 def _textWidth($s, $size) {
     $t = str($s);
     $u = 0;
@@ -1378,6 +1382,90 @@ class BPlotSvg {
     }
 
     def render() { return join($this.parts, "\n"); }
+    def textWidth($s, $size) { return _textWidth($s, $size); }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  The raster backend (B6e)
+//
+//  The same method set as BPlotSvg, over the native canvas: every call is one
+//  bp_* builtin with the SVG backend's own arguments, so the PNG draws the
+//  SVG's numbers. There is no markup here, so nothing to escape -- the
+//  natives validate colours and numbers themselves.
+// ════════════════════════════════════════════════════════════════════════
+def _hex6($c) {
+    if ($c == null) { return "none"; }
+    if (len($c) == 4 && $c[0] == "#") { return "#" + $c[1] + $c[1] + $c[2] + $c[2] + $c[3] + $c[3]; }
+    return $c;
+}
+
+class BPlotRaster {
+    def init($w, $h, $dpi) {
+        $this.w = $w;
+        $this.h = $h;
+        $this.cv = bp_canvas_new($w, $h, $dpi, "#ffffff");
+        $this.clipRect = null;
+    }
+    def open() { return $this; }
+    def close() { return $this; }
+
+    def rect($x, $y, $w, $h, $fill, $stroke, $sw) {
+        bp_fill_rect($this.cv, $x, $y, $w, $h, _hex6($fill), null);
+        if ($stroke != null) {
+            bp_stroke_polyline($this.cv, [$x, $y, $x + $w, $y, $x + $w, $y + $h, $x, $y + $h, $x, $y],
+                               _hex6($stroke), $sw, null, null, true);
+        }
+        return $this;
+    }
+    // SVG's <line> has butt caps.
+    def line($x1, $y1, $x2, $y2, $stroke, $sw) {
+        bp_stroke_polyline($this.cv, [$x1, $y1, $x2, $y2], _hex6($stroke), $sw, null, null, false);
+        return $this;
+    }
+    def circle($cx, $cy, $r, $fill) {
+        bp_fill_path($this.cv, "M " + str($cx - $r) + " " + str($cy) + " a " + str($r) + " " + str($r) +
+                     " 0 1 0 " + str(2 * $r) + " 0 a " + str($r) + " " + str($r) + " 0 1 0 " +
+                     str(0 - 2 * $r) + " 0 Z", _hex6($fill), null);
+        return $this;
+    }
+    def polyline($pts, $stroke, $sw, $dash) {
+        if (len($pts) < 4) { return $this; }
+        bp_stroke_polyline($this.cv, $pts, _hex6($stroke), $sw, null, $dash, true);
+        return $this;
+    }
+    def polygon($pts, $fill, $stroke, $sw, $opacity) {
+        if (len($pts) < 6) { return $this; }
+        bp_fill_polygon($this.cv, $pts, _hex6($fill), $opacity);
+        if ($stroke != null) {
+            $ring = $pts;
+            push($ring, $pts[0]);
+            push($ring, $pts[1]);
+            bp_stroke_polyline($this.cv, $ring, _hex6($stroke), $sw, null, null, true);
+        }
+        return $this;
+    }
+    def path($d, $fill, $stroke, $sw) {
+        bp_fill_path($this.cv, $d, _hex6($fill), null);
+        if ($stroke != null) { bp_stroke_path($this.cv, $d, _hex6($stroke), $sw, null); }
+        return $this;
+    }
+    def text($x, $y, $s, $size, $fill, $anchor, $rotate) {
+        bp_text($this.cv, $x, $y, str($s), $size, _hex6($fill), $anchor, $rotate, null);
+        return $this;
+    }
+    // One clip per axes: clip() records it, groupOpen() applies it.
+    def clip($x, $y, $w, $h) { $this.clipRect = [$x, $y, $w, $h]; return "raster"; }
+    def groupOpen($clip) {
+        if ($clip != null && $this.clipRect != null) {
+            $r = $this.clipRect;
+            bp_canvas_clip($this.cv, $r[0], $r[1], $r[2], $r[3]);
+        }
+        return $this;
+    }
+    def groupClose() { bp_canvas_clip($this.cv, null, null, null, null); return $this; }
+    def render() { return bp_png($this.cv); }
+    // The font this backend draws, DejaVu Sans, which is wider than Helvetica.
+    def textWidth($s, $size) { return bp_text_width(str($s), $size); }
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1447,6 +1535,9 @@ class BPlotAxes {
         // twin, which draws only its own y ticks -- the frame is drawn once,
         // because a doubled 1px stroke is visible and reads as a bug.
         $this.side = "left";
+        // A twin's host, as an INDEX into the figure's axes list: a reference
+        // would be a cycle (see the sharing notes on BPlotFigure).
+        $this.hostIdx = null;
     }
 
     def applyPads() {
@@ -2940,6 +3031,7 @@ class BPlotFigure {
         $tw.pads = $ax.pads;
         $tw.applyPads();
         $tw.side = "right";
+        $tw.hostIdx = $this.indexOf($ax);
         $this.shareX($ax, $tw);
         return $tw;
     }
@@ -2949,6 +3041,7 @@ class BPlotFigure {
         $tw.pads = $ax.pads;
         $tw.applyPads();
         $tw.side = "top";
+        $tw.hostIdx = $this.indexOf($ax);
         $this.shareY($ax, $tw);
         return $tw;
     }
@@ -2987,8 +3080,18 @@ class BPlotFigure {
         return $this;
     }
 
-    def to_svg() {
-        $bk = new BPlotSvg($this.w, $this.h);
+    def to_svg() { return $this.draw(new BPlotSvg($this.w, $this.h)); }
+
+    // The PNG, as bytes. dpi defaults to 96: one pixel per unit, the SVG's size.
+    def to_png($dpi) {
+        if (!has_native("raster")) {
+            throw "bplot.to_png: this interpreter has no raster backend -- save as .svg instead";
+        }
+        if ($dpi == null) { $dpi = 96; }
+        return $this.draw(new BPlotRaster($this.w, $this.h, $dpi));
+    }
+
+    def draw($bk) {
         $bk.open();
         $bk.rect(0, 0, $this.w, $this.h, $_STYLE["bg"], null, null);
         // tight_layout runs HERE, not when it was called, because the labels
@@ -2996,7 +3099,23 @@ class BPlotFigure {
         if ($this.tight) {
             $i = 0;
             while ($i < len($this.axesList)) {
-                _tightenAxes($this.axesList[$i], $this.sharedLimits($i, "x"), $this.sharedLimits($i, "y"));
+                _tightenAxes($bk, $this.axesList[$i], $this.sharedLimits($i, "x"), $this.sharedLimits($i, "y"));
+                $i = $i + 1;
+            }
+            // A twin and its host are ONE rectangle. Each was measured for its
+            // own labels, so both take the larger pad on every side.
+            $i = 0;
+            while ($i < len($this.axesList)) {
+                $tw = $this.axesList[$i];
+                if ($tw.hostIdx != null) {
+                    $host = $this.axesList[$tw.hostIdx];
+                    $p = [max($host.pads[0], $tw.pads[0]), max($host.pads[1], $tw.pads[1]),
+                          max($host.pads[2], $tw.pads[2]), max($host.pads[3], $tw.pads[3])];
+                    $host.pads = $p;
+                    $host.applyPads();
+                    $tw.pads = $p;
+                    $tw.applyPads();
+                }
                 $i = $i + 1;
             }
         }
@@ -3010,13 +3129,19 @@ class BPlotFigure {
         return $bk.render();
     }
 
-    def savefig($path) {
+    // savefig("chart.svg") or savefig("chart.png", {"dpi": 150}).
+    def savefig($path, $opts) {
         if ($path == null || type($path) != "string" || len($path) == 0) {
             throw "bplot.savefig: needs a file path";
         }
+        if (_endsWith($path, ".png")) {
+            $dpi = null;
+            if ($opts != null) { $dpi = $opts["dpi"]; }
+            writefile($path, $this.to_png($dpi), "wb");
+            return $path;
+        }
         if (!_endsWith($path, ".svg")) {
-            throw "bplot.savefig: only .svg is supported in this release, got '" + $path +
-                  "' -- PNG output lands with the raster backend";
+            throw "bplot.savefig: save as .svg or .png, got '" + $path + "'";
         }
         writefile($path, $this.to_svg());
         return $path;
@@ -3197,7 +3322,7 @@ def _axisTicks($ax, $which, $lim0) {
 // estimate; an overestimate is whitespace, an underestimate is a collision.
 // That asymmetry is why an approximate metrics table is good enough to be
 // useful, and it is deliberate rather than sloppy.
-def _tightenAxes($ax, $xshare, $yshare) {
+def _tightenAxes($bk, $ax, $xshare, $yshare) {
     // Measure against the CURRENT box, then re-inset the cell. Measuring is
     // not perfectly self-consistent -- moving the box can change the ticks,
     // which changes the widest label -- so this runs twice, which in practice
@@ -3212,7 +3337,7 @@ def _tightenAxes($ax, $xshare, $yshare) {
         $ywidest = 0;
         $i = 0;
         while ($i < len($yt["labels"])) {
-            $w = _textWidth($yt["labels"][$i], 11);
+            $w = $bk.textWidth($yt["labels"][$i], 11);
             if ($w > $ywidest) { $ywidest = $w; }
             $i = $i + 1;
         }
@@ -3236,7 +3361,7 @@ def _tightenAxes($ax, $xshare, $yshare) {
         // and, in a grid, the right-hand column looks cropped.
         $right = 14;
         if (len($xt["labels"]) > 0) {
-            $half = _textWidth($xt["labels"][len($xt["labels"]) - 1], 11) / 2;
+            $half = $bk.textWidth($xt["labels"][len($xt["labels"]) - 1], 11) / 2;
             if ($half + 8 > $right) { $right = $half + 8; }
         }
         if ($ax.side == "right") {
@@ -4175,6 +4300,10 @@ def _drawStem($bk, $ax, $a, $T) {
 // A pie slice is an SVG arc: move to the centre, line to the start of the arc,
 // sweep, close. `large` must be set past 180 degrees or the renderer takes the
 // short way round and draws the complement of the slice.
+// Angles grow counter-clockwise ON SCREEN (y = cy - r sin a), as matplotlib's
+// pie does. In SVG's y-down space that is the NEGATIVE-angle direction, so the
+// sweep flag is 0. It was 1 until B6e, and every slice was drawn as the mirror
+// arc about its chord -- in the SVG as much as in the PNG.
 def _arcPath($cx, $cy, $r, $a0, $a1) {
     $x0 = $cx + $r * cos($a0);
     $y0 = $cy - $r * sin($a0);
@@ -4184,7 +4313,7 @@ def _arcPath($cx, $cy, $r, $a0, $a1) {
     if (abs($a1 - $a0) > PI) { $large = 1; }
     return "M " + _px($cx) + " " + _px($cy) +
            " L " + _px($x0) + " " + _px($y0) +
-           " A " + _px($r) + " " + _px($r) + " 0 " + _fmt($large, 0) + " 1 " +
+           " A " + _px($r) + " " + _px($r) + " 0 " + _fmt($large, 0) + " 0 " +
            _px($x1) + " " + _px($y1) + " Z";
 }
 
@@ -4290,7 +4419,7 @@ def _drawLegend($bk, $ax, $x1, $y0) {
     $wMax = 0;
     $i = 0;
     while ($i < len($entries)) {
-        $w = _textWidth($entries[$i][0], $fs);
+        $w = $bk.textWidth($entries[$i][0], $fs);
         if ($w > $wMax) { $wMax = $w; }
         $i = $i + 1;
     }
@@ -4442,7 +4571,8 @@ def style($name) {
 }
 
 def to_svg()        { return gcf().to_svg(); }
-def savefig($path)  { $p = gcf().savefig($path); clf(); return $p; }
+def to_png($dpi)    { return gcf().to_png($dpi); }
+def savefig($path, $opts) { $p = gcf().savefig($path, $opts); clf(); return $p; }
 
 // There is no exec, no system and no shell builtin in Bantu, so there is
 // nothing to hand a file to. show() writes it and tells you where it is.
@@ -4455,7 +4585,7 @@ def show($path) {
 
 // ── Discoverability ──────────────────────────────────────────────────────
 def help() {
-    print("bplot — data visualisation for Bantu (SVG)");
+    print("bplot — data visualisation for Bantu (SVG and PNG)");
     print("");
     print("  Three lines to a chart:");
     print("    include \"bplot\" as plt;");
@@ -4483,7 +4613,8 @@ def help() {
     print("  Style         style(\"default\" | \"dark\" | \"print\")");
     print("  Decoration    title(s)   xlabel(s)   ylabel(s)   axis(\"off\")");
     print("                grid(on)   legend(on)  xlim(lo, hi)   ylim(lo, hi)");
-    print("  Output        savefig(path)   to_svg()   show(path)   clf()");
+    print("  Output        savefig(path)   savefig(\"x.png\", {\"dpi\": 150})");
+    print("                to_svg()   to_png(dpi)   show(path)   clf()");
     print("  Objects       figure(w, h) -> $fig;  $fig.addAxes() -> $ax");
     print("                every plt.* call above is $ax.<the same thing>");
     print("");
