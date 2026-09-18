@@ -1,7 +1,8 @@
-# Upstream report — draft for review before sending
+# Upstream report
 
-**Status: NOT SENT.** Nothing has been pushed to `AsseySilivestir/Bantu` and no issue or PR has been
-opened. This file is the text to review first.
+**Status: SENT on 2026-09-18** as https://github.com/AsseySilivestir/Bantu/issues/6 — findings 1–4
+and the offer below. The one-line SIGPIPE PR (step 2) has not been opened; nothing has been pushed to
+`AsseySilivestir/Bantu`.
 
 Target branch: **`sua.udp-feature`** (`1f8d973`, "fix: multi-threaded HTTP accept loop — WebSocket
 sync works", 2026-09-06). Not `main` — `main` predates the `def($req, $res)` parameter syntax and
