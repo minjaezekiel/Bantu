@@ -294,10 +294,19 @@ void registerBuiltins(const DefineFn& define) {
             if (pattern.size() == 1) pattern.push_back(pattern[0]);
         }
 
-        const int64_t widthQ8 = toQ8(centi(w), c->dpi);
+        // A stroke wider than 65,536 pixels covers any canvas this can make.
+        const int64_t widthQ8 = std::min<int64_t>(toQ8(centi(w), c->dpi), (int64_t)1 << 24);
+        // Clip to a guard box half a million pixels beyond the clip before
+        // anything squares a length (raster_core.hpp, clipPolyline). ponytail: a
+        // dash pattern restarts where a line enters the guard box -- only for a
+        // line reaching that far off the canvas.
+        const int64_t g = ((int64_t)1 << 27) + widthQ8;
         std::vector<ContourQ8> pieces;
-        for (const auto& run : applyDash(pts, pattern)) {
-            strokeContours(run, widthQ8, roundCap, pieces);
+        for (const auto& inside : clipPolyline(pts, c->clipX0 * 256 - g, c->clipY0 * 256 - g,
+                                                    c->clipX1 * 256 + g, c->clipY1 * 256 + g)) {
+            for (const auto& run : applyDash(inside, pattern)) {
+                strokeContours(run, widthQ8, roundCap, pieces);
+            }
         }
         if (pieces.empty()) return Value(false);
         compositeMask(*c, rasterise(pieces, c->clipX0, c->clipY0, c->clipX1, c->clipY1), col, alpha);
@@ -316,6 +325,54 @@ void registerBuiltins(const DefineFn& define) {
         if (contours.empty()) return Value(false);
         compositeMask(*c, rasterise(contours, c->clipX0, c->clipY0, c->clipX1, c->clipY1), col, alpha);
         return Value(true);
+    });
+
+    // bp_text(canvas, x, y, text, size, colour [, anchor] [, rotate] [, opacity])
+    // The same arguments as the SVG backend's text(): (x, y) is the start of the
+    // BASELINE, anchor is "start" | "middle" | "end", rotate is degrees clockwise
+    // about (x, y). Invalid UTF-8 and characters the font lacks draw as U+FFFD.
+    define("bp_text", [](std::vector<Value> a) -> Value {
+        auto c = asCanvas(a, 0, "bp_text");
+        const double x = asNumber(a, 1, "bp_text", "x");
+        const double y = asNumber(a, 2, "bp_text", "y");
+        if (a.size() < 4 || !a[3].isString()) throw std::runtime_error("bp_text: the text must be a string");
+        const double size = asNumber(a, 4, "bp_text", "size");
+        Rgb col{0, 0, 0};
+        if (!parseColour(a, 5, "bp_text", col)) return Value(false);
+        int anchor = 0;
+        if (!isAbsent(a, 6)) {
+            const std::string an = a[6].isString() ? a[6].stringVal : "";
+            if (an == "middle") anchor = 1;
+            else if (an == "end") anchor = 2;
+            else if (an != "start") throw std::runtime_error("bp_text: anchor must be \"start\", \"middle\" or \"end\"");
+        }
+        // Degrees to a step of the 256-entry circle table, from the same
+        // hundredths every coordinate goes through: integer from here on.
+        const int rot = isAbsent(a, 7) ? 0
+            : (int)(divRound(centi(asNumber(a, 7, "bp_text", "rotate")) % 36000 * 256, 36000) % 256);
+        const uint32_t alpha = isAbsent(a, 8) ? 255u : alpha8(asNumber(a, 8, "bp_text", "opacity"));
+
+        const std::vector<uint32_t> cps = decodeUtf8(a[3].stringVal);
+        if (cps.size() > kMaxTextChars) {
+            throw std::runtime_error("bp_text: more than " + std::to_string(kMaxTextChars) + " characters");
+        }
+        const int64_t sizeQ8 = toQ8(centi(size), c->dpi);
+        if (sizeQ8 > kMaxFontQ8) throw std::runtime_error("bp_text: a font over 4096 pixels tall");
+        if (sizeQ8 <= 0 || cps.empty()) return Value(false);
+        const uint32_t dpi = c->dpi;
+        const std::vector<ContourQ8> contours =
+            textContours(cps, toQ8(centi(x), dpi), toQ8(centi(y), dpi), sizeQ8, anchor, rot);
+        if (contours.empty()) return Value(false);            // all spaces
+        compositeMask(*c, rasterise(contours, c->clipX0, c->clipY0, c->clipX1, c->clipY1), col, alpha);
+        return Value(true);
+    });
+
+    // bp_text_width(text, size) -> the advance in USER units, for layout. It
+    // measures the font the PNG draws with, which is wider than the SVG's.
+    define("bp_text_width", [](std::vector<Value> a) -> Value {
+        if (a.empty() || !a[0].isString()) throw std::runtime_error("bp_text_width: the text must be a string");
+        const double size = asNumber(a, 1, "bp_text_width", "size");
+        return Value((double)textAdvance(decodeUtf8(a[0].stringVal)) * size / kFontUnitsPerEm);
     });
 
     // The pieces of the encoder, exposed so tests can check them against

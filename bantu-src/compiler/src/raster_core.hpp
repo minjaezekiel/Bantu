@@ -21,6 +21,7 @@
 //      the input alone.
 // ════════════════════════════════════════════════════════════════════════════
 
+#include "raster_font.hpp"
 #include "raster_tables.hpp"
 
 #include <algorithm>
@@ -787,6 +788,37 @@ inline int64_t divRound(int64_t num, int64_t den) {
 //
 // Sutherland-Hodgman against a rectangle, in integers. Clamping coordinates
 // instead would change an edge's slope and bend the shape at the canvas edge.
+
+// Where segment a-b crosses the line axis == limit. The exact rational when its
+// product fits in 64 bits -- every coordinate a real figure produces. A point
+// can be up to ~2^40 away in Q8 (kMaxCoord at the top dpi), where that product
+// would overflow, so beyond 2^31 it BISECTS instead: halving only adds and
+// shifts, cannot overflow, and lands within one Q8 unit of the true crossing.
+// (No __int128: the Windows build is MSVC.)
+inline PointQ8 crossAt(PointQ8 a, PointQ8 b, int axis, int64_t limit) {
+    const int64_t av = axis == 0 ? a.x : a.y, bv = axis == 0 ? b.x : b.y;
+    const int64_t t = bv - av;
+    if (t == 0) return a;
+    const int64_t ao = axis == 0 ? a.y : a.x, bo = axis == 0 ? b.y : b.x;
+    const int64_t span = bo - ao, reach = limit - av;
+    const int64_t kFit = (int64_t)1 << 31;
+    if (span > -kFit && span < kFit && reach > -kFit && reach < kFit) {
+        const int64_t o = ao + divRound(span * reach, t);
+        return axis == 0 ? PointQ8{limit, o} : PointQ8{o, limit};
+    }
+    // Keep lo on a's side of the line and hi on b's until they meet.
+    PointQ8 lo = a, hi = b;
+    const bool aBelow = av < limit;
+    for (int i = 0; i < 64; i++) {
+        const PointQ8 mid{ lo.x + (hi.x - lo.x) / 2, lo.y + (hi.y - lo.y) / 2 };
+        const int64_t mv = axis == 0 ? mid.x : mid.y;
+        if (mv == limit || (mid.x == lo.x && mid.y == lo.y)) { lo = mid; break; }
+        if ((mv < limit) == aBelow) lo = mid; else hi = mid;
+    }
+    const int64_t o = axis == 0 ? lo.y : lo.x;
+    return axis == 0 ? PointQ8{limit, o} : PointQ8{o, limit};
+}
+
 inline ContourQ8 clipEdge(const ContourQ8& in, int axis, int64_t limit, bool keepGreater) {
     ContourQ8 out;
     if (in.empty()) return out;
@@ -794,22 +826,49 @@ inline ContourQ8 clipEdge(const ContourQ8& in, int axis, int64_t limit, bool kee
         const int64_t v = axis == 0 ? p.x : p.y;
         return keepGreater ? v >= limit : v <= limit;
     };
-    auto cross = [&](const PointQ8& a, const PointQ8& b) -> PointQ8 {
-        const int64_t av = axis == 0 ? a.x : a.y, bv = axis == 0 ? b.x : b.y;
-        const int64_t t = bv - av;
-        if (t == 0) return a;
-        const int64_t ao = axis == 0 ? a.y : a.x, bo = axis == 0 ? b.y : b.x;
-        const int64_t o = ao + divRound((bo - ao) * (limit - av), t);
-        return axis == 0 ? PointQ8{limit, o} : PointQ8{o, limit};
-    };
     for (size_t i = 0; i < in.size(); i++) {
         const PointQ8& a = in[i];
         const PointQ8& b = in[(i + 1) % in.size()];
         const bool ina = inside(a), inb = inside(b);
         if (ina) out.push_back(a);
-        if (ina != inb) out.push_back(cross(a, b));
+        if (ina != inb) out.push_back(crossAt(a, b, axis, limit));
     }
     return out;
+}
+
+// An OPEN polyline clipped to a box: the runs of it that lie inside. Strokes go
+// through this before anything squares a length, so every coordinate a stroke
+// sees is inside the box -- which is what keeps dx*dx, and a cap's radius times
+// the circle table, inside 64 bits.
+inline std::vector<std::vector<PointQ8>> clipPolyline(const std::vector<PointQ8>& pts,
+                                                      int64_t x0, int64_t y0, int64_t x1, int64_t y1) {
+    std::vector<std::vector<PointQ8>> runs;
+    std::vector<PointQ8> cur;
+    for (size_t i = 0; i + 1 < pts.size(); i++) {
+        PointQ8 a = pts[i], b = pts[i + 1];
+        bool keep = true;
+        const int64_t lim[4] = { x0, x1, y0, y1 };
+        for (int e = 0; e < 4 && keep; e++) {
+            const int axis = e / 2;
+            const bool greater = (e % 2) == 0;
+            auto in = [&](const PointQ8& p) {
+                const int64_t v = axis == 0 ? p.x : p.y;
+                return greater ? v >= lim[e] : v <= lim[e];
+            };
+            const bool ia = in(a), ib = in(b);
+            if (!ia && !ib) keep = false;
+            else if (!ia) a = crossAt(a, b, axis, lim[e]);
+            else if (!ib) b = crossAt(a, b, axis, lim[e]);
+        }
+        if (!keep) continue;
+        if (cur.empty() || cur.back().x != a.x || cur.back().y != a.y) {
+            if (cur.size() >= 2) runs.push_back(cur);
+            cur.assign(1, a);
+        }
+        cur.push_back(b);
+    }
+    if (cur.size() >= 2) runs.push_back(cur);
+    return runs;
 }
 
 inline ContourQ8 clipToBox(const ContourQ8& c, int64_t x0, int64_t y0, int64_t x1, int64_t y1) {
@@ -1018,6 +1077,13 @@ inline int sectorOf(int64_t vx, int64_t vy, int n, const int32_t* ct, const int3
 inline void appendArc(ContourQ8& cur, int64_t x0, int64_t y0, int64_t x1, int64_t y1,
                       int64_t r, bool large, bool sweep) {
     const int64_t dx = x1 - x0, dy = y1 - y0;
+    // ponytail: an arc spanning more than ~2 million pixels draws as its chord.
+    // Squaring anything larger would overflow, and no canvas is a hundredth of that.
+    const int64_t kArcLimit = (int64_t)1 << 29;
+    if (dx <= -kArcLimit || dx >= kArcLimit || dy <= -kArcLimit || dy >= kArcLimit || r >= kArcLimit) {
+        cur.push_back(PointQ8{x1, y1});
+        return;
+    }
     const uint64_t chord2 = (uint64_t)(dx * dx + dy * dy);
     if (chord2 == 0 || r <= 0) { cur.push_back(PointQ8{x1, y1}); return; }
     const int64_t chord = (int64_t)isqrt64(chord2);
@@ -1203,6 +1269,122 @@ inline std::vector<std::vector<PointQ8>> applyDash(const std::vector<PointQ8>& p
     }
     if (on && cur.size() >= 2) runs.push_back(cur);
     return runs;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Text (B6d)
+//
+//  DejaVu Sans from raster_font.hpp, drawn through the same rasteriser as every
+//  other shape: no hinting, no system font, so the pixels are a function of the
+//  string alone. Positions are summed in FONT UNITS and scaled once per point,
+//  so a long label does not drift by a rounding per glyph.
+// ════════════════════════════════════════════════════════════════════════════
+
+constexpr size_t kMaxTextChars = 2000;           // keeps the pen times the size inside 64 bits
+constexpr int64_t kMaxFontQ8 = (int64_t)1 << 20; // 4096 px
+constexpr int kQuadSteps = 8;    // ponytail: fixed curve subdivision; make it size-aware if
+                                 // glyphs over ~200 px ever show facets
+
+// UTF-8 to code points. Anything malformed -- a stray continuation byte, a
+// truncated sequence, an overlong form, a surrogate -- becomes U+FFFD, one per
+// bad byte, rather than an error: a label is never worth failing a figure over.
+inline std::vector<uint32_t> decodeUtf8(const std::string& s) {
+    std::vector<uint32_t> out;
+    size_t i = 0;
+    while (i < s.size()) {
+        const uint8_t b = (uint8_t)s[i];
+        int n = 0;
+        uint32_t cp = 0, min = 0;
+        if (b < 0x80)                { out.push_back(b); i++; continue; }
+        else if ((b & 0xE0) == 0xC0) { n = 1; cp = b & 0x1F; min = 0x80; }
+        else if ((b & 0xF0) == 0xE0) { n = 2; cp = b & 0x0F; min = 0x800; }
+        else if ((b & 0xF8) == 0xF0) { n = 3; cp = b & 0x07; min = 0x10000; }
+        else                         { out.push_back(0xFFFD); i++; continue; }
+        bool ok = i + (size_t)n < s.size();
+        for (int k = 1; ok && k <= n; k++) {
+            const uint8_t c = (uint8_t)s[i + k];
+            if ((c & 0xC0) != 0x80) ok = false; else cp = (cp << 6) | (c & 0x3F);
+        }
+        if (!ok || cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+            out.push_back(0xFFFD); i++; continue;
+        }
+        out.push_back(cp);
+        i += (size_t)n + 1;
+    }
+    return out;
+}
+
+// The glyph for a code point, or U+FFFD's. ponytail: linear scan of 210
+// entries; a sorted table if strings ever get long enough to matter.
+inline const int32_t* glyphFor(uint32_t cp) {
+    const int32_t* fallback = nullptr;
+    for (const auto& g : kGlyphIndex) {
+        if ((uint32_t)g[0] == cp) return g;
+        if (g[0] == 0xFFFD) fallback = g;
+    }
+    return fallback;
+}
+
+// Width in font units: the sum of the advances.
+inline int64_t textAdvance(const std::vector<uint32_t>& cps) {
+    int64_t u = 0;
+    for (uint32_t cp : cps) u += glyphFor(cp)[3];
+    return u;
+}
+
+// Outlines for a string whose baseline starts at (x, y) in Q8, `anchor` 0/1/2
+// for start/middle/end, rotated clockwise (SVG's sense, y down) by
+// rotStep * 360/256 degrees about (x, y).
+//
+// ponytail: rotation snaps to the circle table's 256 steps (1.4 degrees), which
+// is invisible on a tick label and needs no trigonometry. Integer CORDIC is the
+// upgrade if an exact angle is ever needed.
+inline std::vector<ContourQ8> textContours(const std::vector<uint32_t>& cps, int64_t x, int64_t y,
+                                           int64_t sizeQ8, int anchor, int rotStep) {
+    std::vector<ContourQ8> out;
+    const int64_t upm = kFontUnitsPerEm;
+    const int64_t total = textAdvance(cps);
+    int64_t pen = anchor == 1 ? -total / 2 : anchor == 2 ? -total : 0;   // font units
+    const int k = ((rotStep % 256) + 256) % 256;
+    const int64_t c = kCos256[k], s = kSin256[k];
+
+    // A point in font units times `den`, relative to the pen, into device Q8.
+    auto place = [&](int64_t fx, int64_t fy, int64_t den) -> PointQ8 {
+        const int64_t dx = divRound((fx + pen * den) * sizeQ8, upm * den);
+        const int64_t dy = divRound(-fy * sizeQ8, upm * den);       // font y is up
+        if (k == 0) return PointQ8{x + dx, y + dy};
+        return PointQ8{x + divRound(dx * c - dy * s, (int64_t)1 << 30),
+                       y + divRound(dx * s + dy * c, (int64_t)1 << 30)};
+    };
+
+    for (uint32_t cp : cps) {
+        const int32_t* g = glyphFor(cp);
+        ContourQ8 cur;
+        int64_t px = 0, py = 0;
+        for (int32_t i = g[1]; i < g[1] + g[2]; i++) {
+            const int16_t* seg = kGlyphSegments[i];
+            if (seg[0] == 0) {
+                if (cur.size() >= 3) out.push_back(std::move(cur));
+                cur.clear();
+                px = seg[1]; py = seg[2];
+                cur.push_back(place(px, py, 1));
+            } else if (seg[0] == 1) {
+                px = seg[1]; py = seg[2];
+                cur.push_back(place(px, py, 1));
+            } else {
+                // B(t) = (N-i)^2 P0 + 2i(N-i) C + i^2 P1, all over N^2: exact integers.
+                const int64_t N = kQuadSteps, cx = seg[1], cy = seg[2], ex = seg[3], ey = seg[4];
+                for (int64_t t = 1; t <= N; t++) {
+                    const int64_t a = (N - t) * (N - t), b = 2 * t * (N - t), d = t * t;
+                    cur.push_back(place(a * px + b * cx + d * ex, a * py + b * cy + d * ey, N * N));
+                }
+                px = ex; py = ey;
+            }
+        }
+        if (cur.size() >= 3) out.push_back(std::move(cur));
+        pen += g[3];
+    }
+    return out;
 }
 
 } // namespace bplot_raster

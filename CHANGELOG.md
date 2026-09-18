@@ -47,6 +47,17 @@ All notable changes to the Bantu programming language are documented in this fil
   [`docs/object-lifetime-architecture.md`](docs/object-lifetime-architecture.md). Tests:
   `tests/lang_gc_test.b` (55 assertions) and `tests/gc_stress.sh` (19 checks).
 
+- **[feature] Text on the raster canvas, in an embedded font.** `bp_text` and `bp_text_width` draw
+  and measure DejaVu Sans (210 glyphs: ASCII, Latin-1 and the symbols charts use) from integer outline
+  tables, with no hinting and no system font, so a label is the same pixels on every platform. Anchors
+  and rotation take the same arguments as the SVG backend's `text()`; invalid UTF-8 and missing
+  characters draw as `U+FFFD`.
+
+- **[bug fix] Raster coordinates far outside the canvas overflowed 64-bit arithmetic.** A point up to
+  10⁸ units away reached ~2⁴⁰ in fixed point, and the clip crossing and a stroke's squared length
+  multiplied two such values. Crossings now bisect when the exact product would not fit, and strokes are
+  clipped to a guard box before any length is squared. Output for ordinary figures is unchanged.
+
 - **[feature] The rasteriser: polygons, strokes and SVG path data, all in integers.**
   `bp_fill_polygon`, `bp_stroke_polyline` (caps, joins, dashes) and `bp_fill_path` draw with sixteen
   sub-scanlines of anti-aliasing and exact coverage along x. Circles and arcs step around **embedded

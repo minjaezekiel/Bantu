@@ -36,7 +36,7 @@ Byte identity rules out, specifically:
 | hazard | where it would bite | how the design removes it |
 |---|---|---|
 | **fused multiply-add (FMA)** | `x * a + b` may be contracted into one instruction on arm64 (Apple clang contracts within an expression; GCC contracts across statements), rounding differently from two separate operations | pixel-deciding arithmetic is **integer**; the only floating-point step is one quantisation per coordinate (§3) |
-| **libm transcendental functions** | `sin`, `cos`, `atan2`, `pow` are not correctly rounded and differ in the last bit between glibc, Apple's libm and the MSVC CRT | **no libm call touches geometry**: circles and arcs use integer tables generated once and embedded (§5); text rotation uses integer CORDIC (§6) |
+| **libm transcendental functions** | `sin`, `cos`, `atan2`, `pow` are not correctly rounded and differ in the last bit between glibc, Apple's libm and the MSVC CRT | **no libm call touches geometry**: circles and arcs use integer tables generated once and embedded (§5); text rotation snaps to the same table (§6) |
 | **the system zlib** | Linux distributions ship different zlib versions, and zlib does not promise identical compressed output across versions | **a deflate implementation of our own**, whose output is a pure function of its input (§7) |
 | **system fonts** | different fonts, versions and hinting on every machine | **one embedded font**, rendered by our own code with no hinting (§6) |
 | **text-mode file writes** | Windows turns every `\n` byte of a PNG into `\r\n` | **binary-safe file I/O** (§8) |
@@ -109,20 +109,36 @@ sRGB, and the PNG should look like the SVG, not like a physically-better image n
 
 ## 6. Text
 
-**The font is DejaVu Sans, embedded.** 211 glyphs — ASCII, Latin-1, and the symbols charts actually
-use (`° µ × − – — … ± ≤ ≥ ≈ ≠ ∞ € ™ ☀`), plus `U+FFFD` for anything else — as 3,493 outline points,
-about **13 KB** of integer data. A generator script, run at authoring time with fontTools, writes the
-table into a header; nothing parses a font at run time, which is the font-file parsing the roadmap
-defers. DejaVu's licence (Bitstream Vera and Arev terms) permits redistribution with its notices, and
-the header carries them in full.
+**The font is DejaVu Sans, embedded.** 210 glyphs — ASCII, Latin-1, and the symbols charts actually
+use (`° µ × − – — … ± ≤ ≥ ≈ ≠ ∞ € ™ ☀`), plus `U+FFFD` for anything else — as **4,105 outline
+segments, about 41 KB** of integer data in `raster_font.hpp`. A generator script, run at authoring time
+with fontTools, writes the table; nothing parses a font at run time, which is the font-file parsing the
+roadmap defers. Accented letters are *composites* in TrueType (a base glyph plus an accent), so the
+generator decomposes them — the first version did not, and `ö ç à ÿ` rendered blank (see the CHANGELOG).
+DejaVu's licence (Bitstream Vera and Arev terms) permits redistribution with its notices, and the header
+carries them in full.
 
-**No hinting, no system font, no FreeType.** Glyph outlines are quadratic curves, flattened by fixed
-integer subdivision and drawn through the same rasteriser as everything else. Hinting is what makes
-text rendering differ between platforms, and it is the first thing a byte-identical renderer gives up.
+**No hinting, no system font, no FreeType.** Each quadratic is flattened into 8 segments by exact
+integer Bernstein weights — `(N−t)²·P0 + 2t(N−t)·C + t²·P1` over `N²` — and the whole string is one
+coverage mask through the same rasteriser as every other shape. Positions are summed in **font units**
+and scaled once per point, so a long label does not drift by a rounding per glyph. Hinting is what
+makes text rendering differ between platforms, and it is the first thing a byte-identical renderer gives
+up.
 
-**Rotation**: multiples of 90° are exact integer transforms. Any other angle uses a rotation computed
-by **integer CORDIC** from the degree value — deterministic on every platform, where `cos(θ)` from
-libm is not.
+**Rotation** snaps to the 256-step circle table already embedded for arcs — 1.40625° steps, so 90°, 45°
+and 0° are exact and 30° draws at 29.53°, which no eye can tell on a tick label. That reuses data rather
+than adding a CORDIC; CORDIC is the upgrade if an exact arbitrary angle is ever needed. The degree value
+goes through the same hundredths as every coordinate, so the step it lands on is integer arithmetic.
+
+**UTF-8** is decoded strictly: a stray continuation byte, a truncated sequence, an overlong form or a
+surrogate becomes `U+FFFD`, one per bad byte, and a character the font lacks draws as `U+FFFD` too.
+A label is never worth failing a figure over. Measurement (`bp_text_width`) uses the same decoder, so
+width and drawing agree on every input.
+
+**Limits**: 2,000 characters and a 4,096-pixel font. Together they keep the pen position times the size
+— and that times the Q30 rotation — inside 64 bits.
+
+**Speed**: 0.13 ms for a six-character tick label at 96 dpi, 0.25 ms at 300 dpi.
 
 **Layout measures the font that will be drawn.** DejaVu Sans is wider than the Helvetica table the SVG
 path measures with — **13.5% on a typical label**, and 636 against 556 units for every digit. A PNG
@@ -190,9 +206,14 @@ if it came from a stranger — because inside a sua handler, it may have:
 
 - **Canvas size**: width and height at most 32,767 and at most 2²⁸ pixels (about 1 GB of RGB), with
   **checked multiplication**. `bp_canvas_new(100000, 100000)` raises; it does not allocate.
-- **Coordinates**: non-finite values raise. Finite values far outside the canvas are clipped in
-  integer space before rasterising, and Q24.8 covers ±8 million pixels, so no coordinate bplot can send
-  overflows.
+- **Coordinates**: non-finite values raise; finite ones are held to ±10⁸ user units, which at 2,400 dpi
+  is about 2⁴⁰ in Q24.8. Products of two such values do not fit in 64 bits, and B6c's first version
+  multiplied them — UBSan found the clip crossing and a stroke's squared length overflowing (solved in
+  B6d, see the CHANGELOG). Now: a clip crossing uses the exact rational only when its product fits,
+  and **bisects** otherwise, which only adds; strokes are clipped to a guard box half a million pixels
+  beyond the canvas before any length is squared; stroke width is capped at 65,536 pixels; an arc
+  spanning more than 2²⁹ Q8 draws as its chord. No `__int128`, because the Windows build is MSVC. Each
+  of these only changes output for geometry millions of pixels away, so every existing PNG is unchanged.
 - **Path data**: the parser accepts exactly `M m L l H h V v A a Z z`, rejects anything else by name,
   has no recursion, and caps the flattened point count.
 - **Text**: length is capped, and invalid UTF-8 renders as `U+FFFD` rather than being trusted.

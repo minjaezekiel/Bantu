@@ -274,6 +274,133 @@ raises(def() { bp_fill_polygon($pa, [1, 2, 3], "#000000", null); },
 raises(def() { bp_fill_polygon($pa, [1, "two", 3, 4], "#000000", null); },
        "must be a number", "a non-numeric coordinate raises");
 
+print("── far-off coordinates keep their slope (B6d defect) ─────────────");
+
+// A point up to 1e8 units away reaches ~2^40 in Q8; the clip crossing and a
+// stroke's squared length used to overflow 64 bits there (UBSan found both).
+$far = bp_canvas_new(100, 100, null, "#ffffff");
+bp_stroke_polyline($far, [0, 0, 100000000, 50000000], "#ff0000", 2, null, null, false);
+eq(bp_canvas_pixel($far, 60, 30), "#ff0000", "a line to a point 1e8 away keeps its slope of 1/2 on the canvas");
+eq(bp_canvas_pixel($far, 60, 60), "#ffffff", "and does not bend toward the clamped corner");
+$far2 = bp_canvas_new(100, 100, 2400, "#ffffff");
+bp_fill_polygon($far2, [0 - 100000000, 0 - 100000000, 100000000, 0 - 100000000, 0, 100000000], "#00ff00", null);
+eq(bp_canvas_pixel($far2, 1250, 1250), "#00ff00", "a triangle 1e8 wide at 2400 dpi fills the canvas");
+bp_fill_path($far2, "M -99999999 10 L 99999999 10 L 99999999 20 L -99999999 20 Z", "#0000ff", null);
+eq(bp_canvas_pixel($far2, 1250, 375), "#0000ff", "a path spanning 1e8 either way fills its band");
+bp_stroke_polyline($far2, [0 - 100000000, 50, 100000000, 50], "#000000", 4, null, "5,5", true);
+ok(true, "a dashed stroke 2e8 long finishes");
+
+print("── text ──────────────────────────────────────────────────────────");
+
+// The bounding box of every pixel that is not the white background.
+def inkBox($cv) {
+    $info = bp_canvas_info($cv);
+    $w = $info["width"];
+    $raw = bp_canvas_raw($cv);
+    $box = {"n": 0, "x0": $w, "y0": $info["height"], "x1": 0 - 1, "y1": 0 - 1};
+    $i = 0;
+    while ($i < len($raw)) {
+        if (ord($raw[$i]) != 255 || ord($raw[$i + 1]) != 255 || ord($raw[$i + 2]) != 255) {
+            $p = $i / 3;
+            $y = floor($p / $w);
+            $x = $p - $y * $w;
+            $box["n"] = $box["n"] + 1;
+            if ($x < $box["x0"]) { $box["x0"] = $x; }
+            if ($x > $box["x1"]) { $box["x1"] = $x; }
+            if ($y < $box["y0"]) { $box["y0"] = $y; }
+            if ($y > $box["y1"]) { $box["y1"] = $y; }
+        }
+        $i = $i + 3;
+    }
+    return $box;
+}
+def textRaw($s, $rot) {
+    $cv = bp_canvas_new(60, 40, null, "#ffffff");
+    bp_text($cv, 10, 28, $s, 20, "#000000", null, $rot, null);
+    return bp_canvas_raw($cv);
+}
+def utf8($cp) {
+    if ($cp < 128) { return chr($cp); }
+    if ($cp < 2048) { return chr(192 + floor($cp / 64)) + chr(128 + $cp % 64); }
+    return chr(224 + floor($cp / 4096)) + chr(128 + floor($cp / 64) % 64) + chr(128 + $cp % 64);
+}
+
+// Every embedded glyph draws ink, and draws itself rather than falling back.
+$cps = [];
+$k = 33;
+while ($k < 127) { push($cps, $k); $k = $k + 1; }
+$k = 161;
+while ($k < 256) { push($cps, $k); $k = $k + 1; }
+each ($e in [8211, 8212, 8216, 8217, 8220, 8221, 8226, 8230, 8722, 8364, 8482, 8776, 8800, 8804, 8805, 8734, 956, 9728]) { push($cps, $e); }
+$blank = textRaw("", null);
+$fffd = textRaw(utf8(65533), null);
+$inked = 0;
+$own = 0;
+each ($cp in $cps) {
+    $r = textRaw(utf8($cp), null);
+    if ($r != $blank) { $inked = $inked + 1; }
+    if ($r != $fffd) { $own = $own + 1; }
+}
+eq($inked, len($cps), "every one of " + str(len($cps)) + " embedded glyphs draws ink");
+eq($own, len($cps), "and each draws its own shape, not U+FFFD");
+ok($fffd != $blank, "U+FFFD itself draws");
+eq(textRaw("   ", null), $blank, "spaces draw nothing");
+ok(textRaw("ö", null) != textRaw("o", null), "an accented letter carries its accent (composites are decomposed)");
+
+// Invalid UTF-8 and characters the font lacks become U+FFFD, one per bad byte.
+eq(textRaw("a" + chr(255) + "b", null), textRaw("a" + utf8(65533) + "b", null), "a stray 0xFF byte draws as U+FFFD");
+eq(textRaw(chr(226), null), $fffd, "a truncated sequence draws as U+FFFD");
+eq(textRaw(chr(192) + chr(128), null), textRaw(utf8(65533) + utf8(65533), null), "an overlong NUL is two replacement characters");
+eq(textRaw(utf8(20013), null), $fffd, "a character the font lacks (U+4E2D) draws as U+FFFD");
+
+// Measurement: DejaVu's advances, 2048 units to the em.
+ok(abs(bp_text_width("Hello", 10) - 5191 * 10 / 2048) < 0.000000001, "\"Hello\" at size 10 is 5191/2048 of an em per unit size");
+eq(bp_text_width("", 10), 0, "the empty string is zero wide");
+eq(bp_text_width("0123456789", 1), 10 * 1303 / 2048, "every digit is 1303 units: tabular figures");
+eq(bp_text_width(chr(255), 10), bp_text_width(utf8(65533), 10), "measurement agrees with drawing on invalid bytes");
+
+// Anchors land where the measurement says.
+$an = bp_canvas_new(200, 40, null, "#ffffff");
+bp_text($an, 100, 30, "HIH", 20, "#000000", "middle", null, null);
+$b = inkBox($an);
+ok(abs(($b["x0"] + $b["x1"] + 1) / 2 - 100) <= 1, "a middle-anchored symmetric label is centred on x");
+$an2 = bp_canvas_new(200, 40, null, "#ffffff");
+bp_text($an2, 150, 30, "HIH", 20, "#000000", "end", null, null);
+$b2 = inkBox($an2);
+ok($b2["x1"] < 150 && $b2["x1"] >= 147, "an end-anchored label ends at x, less H's right bearing");
+eq($b2["y1"], 29, "the baseline is y: capitals sit on the row above it");
+
+// Rotation turns about (x, y), clockwise as SVG's rotate() does.
+$ro = bp_canvas_new(60, 100, null, "#ffffff");
+bp_text($ro, 30, 90, "HHHH", 12, "#000000", null, 0 - 90, null);
+$b3 = inkBox($ro);
+ok($b3["x1"] <= 30 && $b3["y1"] <= 90, "rotated -90, a label runs UP from its anchor, to the left of it");
+ok(($b3["y1"] - $b3["y0"]) > 3 * ($b3["x1"] - $b3["x0"]), "and is tall and narrow");
+eq(textRaw("Ab", 360), textRaw("Ab", null), "rotating by 360 degrees is no rotation");
+ok(textRaw("Ab", 45) != textRaw("Ab", null), "rotating by 45 degrees changes the pixels");
+
+// Colour, opacity, clip, determinism.
+$op = bp_canvas_new(60, 40, null, "#ffffff");
+bp_text($op, 10, 28, "Ab", 20, "#000000", null, null, 0);
+eq(bp_canvas_raw($op), $blank, "opacity 0 draws nothing");
+$cl = bp_canvas_new(60, 40, null, "#ffffff");
+bp_canvas_clip($cl, 0, 0, 20, 40);
+bp_text($cl, 10, 28, "WWWW", 20, "#000000", null, null, null);
+ok(inkBox($cl)["x1"] < 20, "text respects the clip");
+eq(textRaw("Temperature (°C)", 30), textRaw("Temperature (°C)", 30), "the same text renders to the same bytes");
+eq(bp_text($op, 10, 28, "Ab", 20, "none", null, null, null), false, "colour \"none\" draws nothing and says so");
+eq(bp_text($op, 10, 28, "Ab", 0, "#000000", null, null, null), false, "size 0 draws nothing");
+
+raises(def() { bp_text($op, 0, 0, 7, 10, "#000000", null, null, null); }, "string", "non-string text raises");
+raises(def() { bp_text($op, 0, 0, "a", 10, "#000000", "left", null, null); }, "anchor", "an unknown anchor raises, naming the three");
+raises(def() { bp_text($op, 0, 0, "a", 5000, "#000000", null, null, null); }, "4096", "a font over 4096 pixels raises");
+$long = "";
+$k = 0;
+while ($k < 2001) { $long = $long + "a"; $k = $k + 1; }
+raises(def() { bp_text($op, 0, 0, $long, 10, "#000000", null, null, null); }, "2000", "more than 2000 characters raises");
+raises(def() { bp_text($op, 0, 0, "a", NAN, "#000000", null, null, null); }, "finite", "a NaN size raises");
+raises(def() { bp_text_width(null, 10); }, "string", "measuring null raises");
+
 print("── hostile and impossible arguments ──────────────────────────────");
 
 raises(def() { bp_canvas_new(0, 10, null, null); }, "positive", "a zero width raises");

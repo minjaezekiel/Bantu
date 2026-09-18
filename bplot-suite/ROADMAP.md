@@ -259,7 +259,8 @@ identity rules out, the integer rasteriser, the embedded font, the encoder, and 
             (`tests/bplot_raster_test.b`, `tests/bplot_png_test.sh`)
       - [x] **B6c** — the rasteriser: polygons, strokes with caps and joins, dashes, circles, arcs
             and the path parser (`bp_fill_polygon`, `bp_stroke_polyline`, `bp_fill_path`)
-      - [ ] B6d — text: the embedded font, glyph rendering, rotation, measurement
+      - [x] **B6d** — text: the embedded font, glyph rendering, rotation, measurement
+            (`bp_text`, `bp_text_width`, `raster_font.hpp`)
       - [ ] B6e — `BPlotRaster`, `savefig(".png", {dpi})`, `to_png()`, PNG from sua
 - [ ] **convert the authoring-time generators to Bantu** — `scripts/gen_circle_tables.py` is a direct
       translation; `scripts/gen_font_tables.py` needs a Bantu TrueType reader (`glyf`, `loca`, `cmap`,

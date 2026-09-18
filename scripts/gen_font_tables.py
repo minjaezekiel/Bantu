@@ -28,7 +28,7 @@ every machine.
 
 WHAT IS INCLUDED
 ASCII, Latin-1, and the symbols charts actually use, plus U+FFFD for anything
-else. About 210 glyphs and 3,500 points: roughly 13 KB of data.
+else. 210 glyphs and 4,105 segments: about 41 KB of integer data.
 
 LICENCE
 DejaVu Sans is (c) Bitstream (Bitstream Vera terms) with Arev additions
@@ -75,7 +75,7 @@ def main():
     ttf = sys.argv[1]
 
     from fontTools.ttLib import TTFont
-    from fontTools.pens.recordingPen import RecordingPen
+    from fontTools.pens.recordingPen import DecomposingRecordingPen
 
     font = TTFont(ttf)
     upm = font["head"].unitsPerEm
@@ -92,7 +92,10 @@ def main():
     points, entries = [], []
     for cp in CODEPOINTS:
         name = cmap[cp]
-        pen = RecordingPen()
+        # Decomposing: accented letters (o-dieresis, c-cedilla, ...) are
+        # COMPOSITES in TrueType, a base glyph plus an accent. A plain recording
+        # pen hands back addComponent, which this loop would drop -- a blank.
+        pen = DecomposingRecordingPen(glyphs)
         glyphs[name].draw(pen)
         start = len(points)
         ops = 0
@@ -106,22 +109,33 @@ def main():
             elif op == "qCurveTo":
                 # TrueType curves are quadratic; fontTools may hand back an
                 # implied-on-curve run, so expand it into single segments.
-                pts = [tuple(round(v) for v in p) if p else None for p in args]
-                prev = points[-1][1:3] if points else (0, 0)
+                pts = [tuple(round(v) for v in p) for p in args if p is not None]
+                if args[-1] is None:
+                    # A contour with no on-curve point at all: every point is a
+                    # control, and the on-curve points are the midpoints between
+                    # them, cyclically. It needs its own move, to the first one.
+                    mid = lambda a, b: ((a[0] + b[0]) // 2, (a[1] + b[1]) // 2)
+                    start_pt = mid(pts[-1], pts[0])
+                    points.append((0,) + start_pt)
+                    ops += 1
+                    for i, ctrl in enumerate(pts):
+                        end = mid(ctrl, pts[(i + 1) % len(pts)])
+                        points.append((2, ctrl[0], ctrl[1], end[0], end[1]))
+                        ops += 1
+                    continue
                 for i in range(len(pts) - 1):
                     ctrl = pts[i]
                     nxt = pts[i + 1]
-                    if nxt is None:      # closing back to the contour start
-                        continue
                     end = nxt if i + 2 == len(pts) else (
                         (ctrl[0] + nxt[0]) // 2, (ctrl[1] + nxt[1]) // 2)
                     points.append((2, ctrl[0], ctrl[1], end[0], end[1]))
                     ops += 1
-                    prev = end
             elif op in ("closePath", "endPath"):
                 continue
             elif op == "curveTo":
                 raise SystemExit("cubic outlines are not supported; this expects a TrueType font")
+            else:
+                raise SystemExit(f"unhandled pen operation {op!r} in {name}")
         entries.append((cp, start, ops, hmtx[name][0]))
 
     out = sys.stdout
