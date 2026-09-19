@@ -9,6 +9,14 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] A UDP server is two lines, and multicast works.** `sua.udp.bind(port, def($packet) {
+  ... })` registers a handler; `$packet` carries `from`, `data` and `reply(bytes)`. `sua.udp.listen()`
+  serves them for a UDP-only program, and `sua.server.listen(port)` serves them alongside HTTP on the
+  same loop — one process for a signaling server and a TURN relay, which is what the original feature
+  request described. `join_group`/`leave_group` cover IPv4 and IPv6, and the portability traps are
+  refused with messages that name the fix: joining an unbound socket, and mismatching the group's
+  family against the socket's. Design in `docs/sua-udp-server-design.md`; 17 assertions in
+  `tests/sua_udp_server_test.sh`, including real multicast delivery.
 - **[feature] The sua server keeps connections open.** HTTP/1.1 reuses a connection unless the
   request says `Connection: close`; HTTP/1.0 closes unless it asks to keep. Every response now states
   which it did — the missing header was its own defect, since a client following the spec reused a

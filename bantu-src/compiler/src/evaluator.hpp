@@ -1106,6 +1106,18 @@ static std::unordered_map<int, BantuUdpSocket>& bantuUdpSocketTable() {
 }
 static std::atomic<int> bantuNextUdpId{1};
 
+// Sockets registered by sua.udp.bind(port, handler). Keyed by fd, because the
+// event loop reports readiness by fd and nothing else.
+// See docs/sua-udp-server-design.md.
+struct BantuUdpServer {
+    int   id = 0;         // its entry in bantuUdpSocketTable()
+    Value handler;        // def($packet) { ... }
+};
+static std::unordered_map<int, BantuUdpServer>& bantuUdpServers() {
+    static std::unordered_map<int, BantuUdpServer> table;
+    return table;
+}
+
 // ─── SHA-1 (for WebSocket handshake, RFC 6455) ────────────────────
 // We need SHA1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11") → base64
 // for the Sec-WebSocket-Accept header. ~50 lines of inline SHA1.
@@ -4068,6 +4080,80 @@ private:
         return false;
     }
 
+    // Every datagram queued on a callback UDP socket, not just one: a single
+    // readable event can cover many, and leaving them queued adds latency to
+    // each one behind. See docs/sua-udp-server-design.md.
+    void bantuUdpServePackets(int fd) {
+        auto sit = bantuUdpServers().find(fd);
+        if (sit == bantuUdpServers().end()) return;
+        // Copied, not referenced: a handler can create or close UDP sockets,
+        // which rehashes the table out from under this entry.
+        Value handler = sit->second.handler;
+        for (;;) {
+            // Above the 65507 bytes a UDP datagram can carry, so a packet is
+            // never silently truncated.
+            std::vector<uint8_t> buf(65536);
+            struct sockaddr_storage peer;
+            socklen_t plen = sizeof(peer);
+            ssize_t n = recvfrom(fd, (char*)buf.data(), (int)buf.size(), 0,
+                                 (struct sockaddr*)&peer, &plen);
+            if (n < 0) return;          // drained, or an error: nothing more to read now
+            buf.resize((size_t)n);
+            const std::string from = bantuUdpFormatAddr(&peer);
+
+            ObjectMap pkt;
+            pkt["from"] = Value(from);
+            pkt["data"] = bantuBytesToValue(buf);
+            // Replying is what a UDP server spends its life doing. The peer
+            // address is captured as the kernel gave it, so the reply needs no
+            // re-parse of the "host:port" string and cannot disagree with it.
+            pkt["reply"] = makeNative([fd, peer, plen, from](std::vector<Value> args) -> Value {
+                if (args.empty())
+                    ErrorHandler::throwError("$packet.reply(bytes) needs the bytes to send",
+                                             0, 0, ErrorHandler::RUNTIME_ERROR);
+                std::vector<uint8_t> out = bantuValueToBytes(args[0]);
+                ssize_t sent = sendto(fd, (const char*)out.data(), (int)out.size(), 0,
+                                      (const struct sockaddr*)&peer, plen);
+                if (sent < 0)
+                    ErrorHandler::throwError("$packet.reply to " + from + ": sendto() failed: " +
+                                             bantuUdpErrStr(), 0, 0, ErrorHandler::RUNTIME_ERROR);
+                return Value((double)sent);
+            });
+
+            // A UDP server's peers are unauthenticated by definition, so one
+            // malformed datagram that trips a handler costs that datagram and
+            // nothing else. A Bantu handler's own error is reported and
+            // swallowed inside bantuCallFunction; this catch is what stops a
+            // native one from unwinding through the loop.
+            try {
+                bantuCallFunction(handler, {Value(std::move(pkt))});
+            } catch (const std::exception& e) {
+                std::cerr << "  [UDP] handler error (from " << from << "): " << e.what() << "\n";
+            }
+        }
+    }
+
+    // Serve registered UDP sockets, forever. Used by sua.udp.listen() for a
+    // program that speaks only UDP; when the HTTP server runs, its loop serves
+    // these sockets instead and this is never called.
+    void bantuUdpServeForever() {
+        auto backend = bantu_loop::makeBackend();
+        for (auto& entry : bantuUdpServers()) backend->add(entry.first, true, false);
+        std::cout << "  [UDP] serving " << bantuUdpServers().size()
+                  << " socket(s) (event loop: " << backend->name() << ")\n";
+        std::cout.flush();
+        std::vector<bantu_loop::Event> events;
+        while (true) {
+            int n = backend->wait(events, 1000);
+            if (n < 0) {
+                std::cerr << "  [UDP] event wait failed: " << strerror(errno) << "\n";
+                return;
+            }
+            for (const auto& ev : events)
+                if (ev.readable) bantuUdpServePackets(ev.fd);
+        }
+    }
+
     // Serve every complete request sitting in this connection's read buffer.
     //
     // Stops at a suspended handler: its response is written when it finishes,
@@ -4682,6 +4768,10 @@ private:
         auto backend = bantu_loop::makeBackend();
         bantuLoopBackend = backend.get();
         backend->add(sock, true, false);
+        // UDP sockets registered with sua.udp.bind(port, handler) are served by
+        // this loop too: one process, one thread, HTTP and UDP together, which
+        // is the signaling-plus-TURN case the feature request described.
+        for (auto& entry : bantuUdpServers()) backend->add(entry.first, true, false);
         if (bantu_co::sched().started())
             backend->add(bantu_co::sched().wakeFd(), true, false);
         if (bantuBus.fd >= 0) {
@@ -4794,6 +4884,14 @@ private:
                 // bus is: this fd is a wake pipe, not a client.
                 if (bantu_co::sched().started() && ev.fd == bantu_co::sched().wakeFd()) {
                     bantu_co::sched().drainWake();
+                    continue;
+                }
+
+                // ── a callback UDP socket ──
+                // Checked before the connection table: a datagram socket is
+                // not a client connection and must never be treated as one.
+                if (!bantuUdpServers().empty() && bantuUdpServers().count(ev.fd)) {
+                    if (ev.readable) bantuUdpServePackets(ev.fd);
                     continue;
                 }
 
@@ -10346,6 +10444,68 @@ private:
         udpObj["bind"] = makeNative([udpIdOf](std::vector<Value> args) -> Value {
             if (args.size() < 2)
                 ErrorHandler::throwError("sua.udp.bind(sock, addr) needs 2 args", 0, 0, ErrorHandler::RUNTIME_ERROR);
+
+            // ─── sua.udp.bind(port | "host:port", def($packet) {...}) ───
+            // The server form. Told apart from bind($sock, addr) by its first
+            // argument -- a number or an address string here, a socket handle
+            // there -- so one verb covers both without either being ambiguous.
+            if ((args[0].isNumber() || args[0].isString()) &&
+                (args[1].isFunction() || args[1].isNativeFn())) {
+                std::string host = "0.0.0.0";
+                int port = 0;
+                if (args[0].isNumber()) {
+                    port = (int)args[0].numberVal;
+                } else {
+                    auto hp = bantuUdpParseAddr(args[0].toString());
+                    if (hp.first.empty())
+                        ErrorHandler::throwError(
+                            "sua.udp.bind: address must be 'host:port', or give the port alone",
+                            0, 0, ErrorHandler::RUNTIME_ERROR);
+                    host = hp.first;
+                    port = hp.second;
+                }
+                bantuUdpCheckPort(port, "sua.udp.bind");
+
+                const bool v6 = host.find(':') != std::string::npos;
+                const int family = v6 ? AF_INET6 : AF_INET;
+                int fd = (int)socket(family, SOCK_DGRAM, 0);
+                if (fd < 0)
+                    ErrorHandler::throwError(std::string("sua.udp.bind: socket() failed: ") +
+                                             bantuUdpErrStr(), 0, 0, ErrorHandler::RUNTIME_ERROR);
+                int yes = 1;
+                setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+
+                struct sockaddr_storage ss;
+                socklen_t sslen = 0;
+                std::string err;
+                if (bantuUdpResolve(host, port, &ss, &sslen, family, &err) != 0) {
+                    BANTU_CLOSE_SOCKET(fd);
+                    ErrorHandler::throwError("sua.udp.bind: " + err, 0, 0, ErrorHandler::RUNTIME_ERROR);
+                }
+                if (::bind(fd, (struct sockaddr*)&ss, sslen) < 0) {
+                    std::string why = bantuUdpErrStr();
+                    BANTU_CLOSE_SOCKET(fd);
+                    ErrorHandler::throwError("sua.udp.bind: bind() failed on port " +
+                                             std::to_string(port) + ": " + why,
+                                             0, 0, ErrorHandler::RUNTIME_ERROR);
+                }
+                // Non-blocking, so draining the queue ends at the last datagram
+                // instead of parking the loop on the next recvfrom.
+                bantu_loop::setNonBlocking(fd);
+
+                const int id = bantuNextUdpId++;
+                bantuUdpSocketTable()[id] = BantuUdpSocket{fd, family, true};
+                BantuUdpServer srv;
+                srv.id = id;
+                srv.handler = args[1];
+                bantuUdpServers()[fd] = std::move(srv);
+
+                ObjectMap handle;
+                handle["__udp"] = Value((double)id);
+                handle["family"] = Value(std::string(v6 ? "ipv6" : "ipv4"));
+                handle["bound"] = Value(true);
+                return Value(std::move(handle));
+            }
             BantuUdpSocket* entry = nullptr;
             int id = udpIdOf(args[0], &entry);
             if (id < 0 || !entry || entry->fd < 0)
@@ -10378,6 +10538,97 @@ private:
                 (*args[0].objectVal)["bound"] = Value(true);
             return Value(true);
         });
+
+        // sua.udp.listen() — serve every socket registered with the callback
+        // form of bind(), forever. A program that also runs sua.server.listen()
+        // never needs this: that loop serves the same sockets.
+        udpObj["listen"] = makeNative([this](std::vector<Value> args) -> Value {
+            (void)args;
+            if (bantuUdpServers().empty())
+                ErrorHandler::throwError(
+                    "sua.udp.listen: no UDP server registered -- call "
+                    "sua.udp.bind(port, def($packet) { ... }) first",
+                    0, 0, ErrorHandler::RUNTIME_ERROR);
+            if (bantuLoopBackend)
+                ErrorHandler::throwError(
+                    "sua.udp.listen: the sua server is already running and is "
+                    "serving these sockets; remove this call",
+                    0, 0, ErrorHandler::RUNTIME_ERROR);
+            bantuUdpServeForever();
+            return Value();
+        });
+
+        // sua.udp.join_group($sock, "224.0.0.251", interface?) — multicast.
+        // leave_group takes the same arguments; both share one implementation
+        // because they differ only in the socket option they set.
+        auto groupOp = [udpIdOf](std::vector<Value> args, bool join) -> Value {
+            const char* who = join ? "sua.udp.join_group" : "sua.udp.leave_group";
+            if (args.size() < 2)
+                ErrorHandler::throwError(std::string(who) +
+                                         "(sock, group, [interface]) needs at least 2 args",
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            BantuUdpSocket* entry = nullptr;
+            int id = udpIdOf(args[0], &entry);
+            if (id < 0 || !entry || entry->fd < 0)
+                ErrorHandler::throwError(std::string(who) + ": not a valid socket handle",
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            // Joining an unbound socket succeeds on Linux and fails on macOS.
+            // Refusing it everywhere is the portable answer, and the message
+            // names the fix rather than leaving the caller with EINVAL.
+            if (!entry->bound)
+                ErrorHandler::throwError(std::string(who) +
+                                         ": bind the socket first, e.g. "
+                                         "sua.udp.bind($sock, \"0.0.0.0:5353\")",
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            const std::string group = args[1].toString();
+            const std::string iface = (args.size() > 2 && !args[2].isNull())
+                                    ? args[2].toString() : std::string();
+            const bool groupV6 = group.find(':') != std::string::npos;
+            if (groupV6 != (entry->family == AF_INET6))
+                ErrorHandler::throwError(std::string(who) + ": " + group + " is an IPv" +
+                                         (groupV6 ? "6" : "4") + " group but the socket is IPv" +
+                                         (entry->family == AF_INET6 ? "6" : "4") +
+                                         " -- create it with sua.udp.socket({\"family\": \"" +
+                                         (groupV6 ? "ipv6" : "ipv4") + "\"})",
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            int rc = 0;
+            if (entry->family == AF_INET6) {
+                struct ipv6_mreq mreq;
+                memset(&mreq, 0, sizeof(mreq));
+                if (inet_pton(AF_INET6, group.c_str(), &mreq.ipv6mr_multiaddr) != 1)
+                    ErrorHandler::throwError(std::string(who) + ": " + group +
+                                             " is not an IPv6 address", 0, 0,
+                                             ErrorHandler::RUNTIME_ERROR);
+                // An IPv6 interface is named by index; 0 lets the kernel pick.
+                mreq.ipv6mr_interface = iface.empty() ? 0 : (unsigned)atoi(iface.c_str());
+                rc = setsockopt(entry->fd, IPPROTO_IPV6,
+                                join ? IPV6_JOIN_GROUP : IPV6_LEAVE_GROUP,
+                                (const char*)&mreq, sizeof(mreq));
+            } else {
+                struct ip_mreq mreq;
+                memset(&mreq, 0, sizeof(mreq));
+                if (inet_pton(AF_INET, group.c_str(), &mreq.imr_multiaddr) != 1)
+                    ErrorHandler::throwError(std::string(who) + ": " + group +
+                                             " is not an IPv4 address", 0, 0,
+                                             ErrorHandler::RUNTIME_ERROR);
+                if (iface.empty()) {
+                    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+                } else if (inet_pton(AF_INET, iface.c_str(), &mreq.imr_interface) != 1) {
+                    ErrorHandler::throwError(std::string(who) + ": interface " + iface +
+                                             " is not an IPv4 address", 0, 0,
+                                             ErrorHandler::RUNTIME_ERROR);
+                }
+                rc = setsockopt(entry->fd, IPPROTO_IP,
+                                join ? IP_ADD_MEMBERSHIP : IP_DROP_MEMBERSHIP,
+                                (const char*)&mreq, sizeof(mreq));
+            }
+            if (rc < 0)
+                ErrorHandler::throwError(std::string(who) + " " + group + ": " + bantuUdpErrStr(),
+                                         0, 0, ErrorHandler::RUNTIME_ERROR);
+            return Value(true);
+        };
+        udpObj["join_group"]  = makeNative([groupOp](std::vector<Value> a) { return groupOp(a, true); });
+        udpObj["leave_group"] = makeNative([groupOp](std::vector<Value> a) { return groupOp(a, false); });
 
         // sua.udp.send_to($sock, "host:port", dataBytes) → number of bytes sent.
         // `dataBytes` is a list of integers 0-255 (matching Bantu's existing byte
@@ -10591,6 +10842,12 @@ private:
             int id = udpIdOf(args.empty() ? Value() : args[0], &entry);
             if (id < 0 || !entry) return Value(false);
             if (entry->fd >= 0) {
+                // Unregistered first: leaving a dead fd in the server table
+                // would have the loop dispatch on a number the kernel may have
+                // already handed to something else.
+                if (bantuLoopBackend && bantuUdpServers().count(entry->fd))
+                    bantuLoopBackend->del(entry->fd);
+                bantuUdpServers().erase(entry->fd);
                 BANTU_CLOSE_SOCKET(entry->fd);
                 entry->fd = -1;
             }

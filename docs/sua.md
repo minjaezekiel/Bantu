@@ -696,6 +696,10 @@ packet and not hold a connection open. Bytes are Bantu's usual representation �
 0–255, the same as the hash/crypto modules use.
 
 ```bantu
+sua.udp.bind(port, handler)           // -> handle; the server form, below
+sua.udp.listen()                      // serve every bound handler, forever
+sua.udp.join_group($sock, group, interface?)    // multicast
+sua.udp.leave_group($sock, group, interface?)
 sua.udp.socket(opts?)                 // -> handle; opts: {"family": "ipv4"|"ipv6", "nonblocking": bool}
 sua.udp.bind($sock, "host:port")      // port 0 = let the OS choose
 sua.udp.send_to($sock, "host:port", $bytes)   // -> bytes sent
@@ -704,6 +708,48 @@ sua.udp.getsockname($sock)            // -> "host:port"
 sua.udp.close($sock)                  // safe to call twice
 sua.udp.send("host:port", $bytes, opts?)      // one-shot: socket, send, await reply, close
 ```
+
+### A server, in two lines
+
+```bantu
+sua.udp.bind(3478, def($packet) {
+    print("recv " + str(len($packet.data)) + " bytes from " + $packet.from);
+    $packet.reply($packet.data);      // straight back to the sender
+});
+sua.udp.listen();
+```
+
+`$packet` carries `from` (`"host:port"`), `data` (the datagram as bytes) and `reply(bytes)`, which
+sends to the same peer on the same socket. `bind` takes a port, or an address string like
+`"127.0.0.1:3478"` to listen on one interface, and returns the socket handle so you can `close` it
+or join a multicast group.
+
+**One loop serves everything.** If the program also calls `sua.server.listen(port)`, that loop
+serves these sockets too — HTTP and UDP in one process, one thread. `sua.udp.listen()` is for a
+program that speaks only UDP, and calling it while the HTTP server runs is an error rather than a
+second loop over the same sockets.
+
+Handlers run on the loop thread, like HTTP handlers, so a slow one delays the next datagram. A
+handler that raises costs that datagram and nothing else: the error is logged and the next packet is
+served. `sua.server.workers(n)` does **not** shard UDP sockets — the kernel would hand each datagram
+to an arbitrary worker, which breaks any protocol keeping per-peer state, and STUN and TURN both do.
+
+### Multicast
+
+```bantu
+$s = sua.udp.socket({});
+sua.udp.bind($s, "0.0.0.0:5353");                      // bind the wildcard, then join
+sua.udp.join_group($s, "224.0.0.251");                 // mDNS
+```
+
+The third argument names an interface — an address for IPv4, an index for IPv6 — and defaults to
+letting the kernel choose. For a sender on the same host, naming the interface explicitly
+(`join_group($s, $group, "127.0.0.1")`) is what makes loopback delivery work on macOS.
+
+Bind the wildcard address, not the group address: binding the group works on macOS and BSD and
+fails on Linux. The socket must be bound before joining — unbound joins succeed on Linux and fail on
+macOS, so sua refuses them everywhere. An IPv6 group needs a socket created with
+`{"family": "ipv6"}`, and a mismatch says which is which rather than returning a bare error.
 
 ### A round trip
 
