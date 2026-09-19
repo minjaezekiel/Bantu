@@ -112,6 +112,7 @@ jobs:
           export BANTU=./bantu-src/compiler/build/bantu
           fail=0
           for s in tests/event_loop_test.sh \
+                   tests/sua_http11_test.sh \
                    tests/sua_ws_security_test.sh \
                    tests/sua_pwa_http_test.sh \
                    tests/sua_http_all_test.sh \
@@ -206,6 +207,7 @@ jobs:
             fi
           done
           for s in tests/event_loop_test.sh tests/sua_ws_security_test.sh \
+                   tests/sua_http11_test.sh \
                    tests/sua_pwa_http_test.sh tests/sua_suspend_test.sh \
                    tests/sua_memory_test.sh tests/sua_timeout_test.sh \
                    tests/sua_workers_test.sh \

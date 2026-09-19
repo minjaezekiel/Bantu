@@ -9,6 +9,27 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] The sua server keeps connections open.** HTTP/1.1 reuses a connection unless the
+  request says `Connection: close`; HTTP/1.0 closes unless it asks to keep. Every response now states
+  which it did — the missing header was its own defect, since a client following the spec reused a
+  connection the server was about to close. Pipelined requests are answered in order, and a
+  suspended handler holds the next one back rather than letting it overtake. Idle connections that
+  have already answered get their own timeout class, `keep_alive_timeout_ms` (default 65 s), so the
+  10 s slowloris window for connections that have sent nothing is unchanged. Measured on one worker:
+  **35,000 req/s against 18–24k**, a small static file 17.9k → 31.5k, and a 2 MB file 79 → 520 req/s
+  (162 MB/s → 1.07 GB/s). Design in `docs/sua-http11-design.md`; 32 assertions in
+  `tests/sua_http11_test.sh`.
+- **[feature] Static files are cacheable and seekable.** Every file carries an `ETag` and
+  `Last-Modified` from its size and modification time, so `If-None-Match` and `If-Modified-Since` are
+  answered `304` with no body. `Range` requests are answered `206` and impossible ones `416`, which
+  is what video seeking and resumable downloads need. Files up to 1 MB are cached in memory, up to
+  16 MB in total, revalidated against size and mtime on every hit so an edited file is never stale.
+  The body no longer passes through a stringstream on its way out: four copies became one.
+- **[feature] Chunked request bodies are decoded.** `Transfer-Encoding: chunked` used to reach the
+  handler as `null`, with no error — a silent loss of any streamed upload. The chunk framing is
+  walked rather than searched for its terminator, because a chunk's own payload can contain
+  `0\r\n\r\n`, and the decoded size is checked against `max_body_bytes` as it grows.
+
 - **[feature] bplot's generators are Bantu, not Python.** `scripts/gen_circle_tables.b` and
   `scripts/gen_font_tables.b`, a TrueType reader, replace the Python scripts that wrote
   `raster_tables.hpp` and `raster_font.hpp`. Each regenerates its header byte for byte, and on all
@@ -215,6 +236,20 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Fixed
 
+- **[bug fix] `HEAD` no longer returns a body**, which RFC 7231 §4.3.2 forbids and which, on a reused
+  connection, would be read as the start of the next response. It is served by the matching `GET`
+  route unless a `HEAD` route was registered for that path, and `$req.method` still reports `HEAD`.
+- **[bug fix] A known path with an unregistered method answers `405`** with an `Allow` header, not
+  `404` — the path was right, only the verb was wrong.
+- **[bug fix] Path parameters are percent-decoded.** `/user/a%20b` handed the handler the literal
+  `a%20b`. Static file names are decoded too, and the traversal check now runs after decoding, where
+  `%2e%2e` is visible as `..`.
+- **[bug fix] Absolute-form request targets route correctly.** `GET http://host/path`, which RFC 7230
+  §5.3.2 requires every server to accept, answered `404`.
+- **[bug fix] A request with both `Content-Length` and `Transfer-Encoding` is refused with `400`.**
+  It used to hang until the connection timed out. The two headers disagree about where the body
+  ends, which is the shape of a request-smuggling attempt against a proxy in front, so the
+  connection closes rather than guessing.
 - **[bug fix] `+` on two lists concatenates them.** It read the numeric value of both lists and
   silently answered `0`. `[1, 2] + [3]` is now `[1, 2, 3]`, a new list with neither operand
   touched, as in Python. Only list `+` list changed. The branch sits in the existing non-number path,

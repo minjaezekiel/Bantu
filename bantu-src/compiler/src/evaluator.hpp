@@ -31,6 +31,7 @@
 #include "webpush.hpp"          // RFC 8188/8291/8292 Web Push (pulls in p256.hpp + aes_gcm.hpp)
 #include <iostream>
 #include <fstream>
+#include <sys/stat.h>   // file size + mtime, for static-file validators
 #include <sstream>
 #include <chrono>
 #include <thread>
@@ -198,6 +199,12 @@ struct BantuServerLimits {
     int    maxConnectionsPerIp = 0;             // 0 = unlimited
     int    headerTimeoutMs  = 10000;            // slowloris defence
     int    idleTimeoutMs    = 300000;           // reap dead peers
+    // How long a connection that has ALREADY answered may sit idle waiting for
+    // the next request. Its own class, because the reaper's early exit is only
+    // valid while every connection in a list shares one timeout. A connection
+    // that has not answered yet stays on headerTimeoutMs, so opening a socket
+    // and going quiet still costs 10s, not this. See docs/sua-http11-design.md.
+    int    keepAliveTimeoutMs = 65000;
     size_t maxWsFrameBytes  = 1024 * 1024;      // single WebSocket frame
     size_t maxWsMessageBytes= 8 * 1024 * 1024;  // reassembled, across continuations
     bool   wsCheckOrigin    = true;             // reject cross-site WS upgrades
@@ -321,12 +328,21 @@ struct BantuConn {
     // discarded instead of being written to a stranger's socket.
     uint64_t    serial = 0;
     int         pending = 0;     // suspended handlers holding this connection
+    // Has this connection answered at least one request? Only then does it
+    // count as an idle keep-alive connection rather than one still owing its
+    // first request, which is what keeps the slowloris timeout meaningful.
+    bool        served = false;
     // Position in the idle-ordered list below. Kept per connection so that
     // moving one to the back on activity is O(1).
     std::list<int>::iterator lruIt;
     bool        lruLinked = false;
-    bool        lruWs = false;   // which list lruIt belongs to
+    int         lruClass = 0;    // which list lruIt belongs to; see BantuIdleClass
 };
+
+// Timeout classes. One list each, because the reaper stops at the first entry
+// still inside its timeout -- an early exit that is only correct while a list's
+// entries all share one deadline.
+enum BantuIdleClass { BANTU_IDLE_HTTP = 0, BANTU_IDLE_WS = 1, BANTU_IDLE_KEEP = 2 };
 static std::unordered_map<int, BantuConn> bantuConns;
 static uint64_t bantuConnSerialSeq = 0;
 
@@ -348,6 +364,8 @@ static uint64_t bantuConnSerialSeq = 0;
 // strictly cheaper and cannot get out of order.
 static std::list<int> bantuIdleHttp;
 static std::list<int> bantuIdleWs;
+// Connections that have answered and are waiting for their next request.
+static std::list<int> bantuIdleKeep;
 // Connections a handler asked to close, checked once their output drains.
 // Kept explicitly so that closing one does not need a scan either.
 //
@@ -358,23 +376,47 @@ static std::list<int> bantuIdleWs;
 // closed innocent connections: 24 of 3,000 requests failed that way.
 static std::vector<std::pair<int, uint64_t>> bantuClosingQueue;
 
+// Connections that finished a response while more pipelined requests sat in
+// their read buffer. The loop pumps them after each event batch: no readable
+// event is coming for bytes that already arrived, so without this the client
+// would wait forever for its second answer. Paired with the serial for the
+// same reason the closing queue is.
+static std::vector<std::pair<int, uint64_t>> bantuResumeQueue;
+
+static std::list<int>& bantuIdleList(int cls) {
+    if (cls == BANTU_IDLE_WS)   return bantuIdleWs;
+    if (cls == BANTU_IDLE_KEEP) return bantuIdleKeep;
+    return bantuIdleHttp;
+}
+
+// Which deadline this connection is currently living under. A connection that
+// has answered and holds no partial request is waiting on the client, so it
+// gets the keep-alive timeout; one still owing its first request, or holding
+// half of one, stays on the short header timeout.
+static int bantuIdleClassOf(const BantuConn& c) {
+    if (c.isWs) return BANTU_IDLE_WS;
+    if (c.served && c.in.empty()) return BANTU_IDLE_KEEP;
+    return BANTU_IDLE_HTTP;
+}
+
 static void bantuIdleUnlink(BantuConn& c) {
     if (!c.lruLinked) return;
-    (c.lruWs ? bantuIdleWs : bantuIdleHttp).erase(c.lruIt);
+    bantuIdleList(c.lruClass).erase(c.lruIt);
     c.lruLinked = false;
 }
 
 // Move to the back of its list: it is now the most recently active.
 static void bantuIdleTouch(BantuConn& c) {
-    std::list<int>& lst = c.isWs ? bantuIdleWs : bantuIdleHttp;
-    if (c.lruLinked && c.lruWs == c.isWs) {
+    const int cls = bantuIdleClassOf(c);
+    std::list<int>& lst = bantuIdleList(cls);
+    if (c.lruLinked && c.lruClass == cls) {
         lst.splice(lst.end(), lst, c.lruIt);   // O(1), keeps lruIt valid
         return;
     }
-    bantuIdleUnlink(c);                        // upgraded HTTP -> WebSocket
+    bantuIdleUnlink(c);                        // changed class: HTTP -> WS, or -> keep-alive
     c.lruIt = lst.insert(lst.end(), c.fd);
     c.lruLinked = true;
-    c.lruWs = c.isWs;
+    c.lruClass = cls;
 }
 static bantu_loop::Backend* bantuLoopBackend = nullptr;
 
@@ -412,9 +454,8 @@ static void bantuConnWriteN(int fd, const char* data, size_t n) {
 static void bantuConnWrite(int fd, const std::string& sv) { bantuConnWriteN(fd, sv.data(), sv.size()); }
 
 // Content-Length from an already-complete header block, 0 when absent or
-// malformed. Digits are parsed by hand rather than with stoull, matching
-// bantuReadBody -- that avoids a glibc 2.38 symbol dependency the project
-// deliberately does not take.
+// malformed. Digits are parsed by hand rather than with stoull, which avoids a
+// glibc 2.38 symbol dependency the project deliberately does not take.
 static size_t bantuContentLengthOf(const std::string& buf, size_t headerEnd) {
     std::string h = buf.substr(0, headerEnd);
     for (auto& ch : h) ch = (char)std::tolower((unsigned char)ch);
@@ -431,12 +472,279 @@ static size_t bantuContentLengthOf(const std::string& buf, size_t headerEnd) {
     return any ? v : 0;
 }
 
+// ─── Static-file helpers ───────────────────────────────────────────────────
+// Size and modification time, or false when the path is not a regular file.
+static bool bantuFileStamp(const std::string& path, uint64_t& mtime, uint64_t& size) {
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_stat64(path.c_str(), &st) != 0) return false;
+    if (st.st_mode & _S_IFDIR) return false;
+#else
+    struct stat st;
+    if (::stat(path.c_str(), &st) != 0) return false;
+    if (S_ISDIR(st.st_mode)) return false;
+#endif
+    mtime = (uint64_t)st.st_mtime;
+    size  = (uint64_t)st.st_size;
+    return true;
+}
+
+// IMF-fixdate, e.g. "Sun, 06 Nov 1994 08:49:37 GMT". The day and month names
+// are spelled out here rather than taken from strftime, whose %a and %b follow
+// the process locale -- a server in a French locale would emit "dim." and no
+// client would parse it.
+static std::string bantuHttpDate(uint64_t epochSecs) {
+    static const char* kDay[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    static const char* kMon[] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                 "Jul","Aug","Sep","Oct","Nov","Dec"};
+    time_t t = (time_t)epochSecs;
+    struct tm g;
+#ifdef _WIN32
+    if (gmtime_s(&g, &t) != 0) return "";
+#else
+    if (!gmtime_r(&t, &g)) return "";
+#endif
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s, %02d %s %04d %02d:%02d:%02d GMT",
+             kDay[g.tm_wday % 7], g.tm_mday, kMon[g.tm_mon % 12], g.tm_year + 1900,
+             g.tm_hour, g.tm_min, g.tm_sec);
+    return buf;
+}
+
+// Days since the epoch for a civil date. Howard Hinnant's algorithm, used
+// because timegm is POSIX-only and _mkgmtime is the Windows spelling.
+static int64_t bantuDaysFromCivil(int64_t y, unsigned m, unsigned d) {
+    y -= (m <= 2);
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+// An IMF-fixdate back to epoch seconds; 0 when it cannot be read, which makes
+// an unparsable If-Modified-Since simply fail to match.
+static uint64_t bantuHttpDateParse(const std::string& s) {
+    static const char* kMon[] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                 "Jul","Aug","Sep","Oct","Nov","Dec"};
+    size_t comma = s.find(", ");
+    if (comma == std::string::npos || s.size() < comma + 22) return 0;
+    const char* p = s.c_str() + comma + 2;
+    int day = 0, year = 0, hh = 0, mm = 0, ss = 0;
+    char mon[4] = {0, 0, 0, 0};
+    if (sscanf(p, "%d %3s %d %d:%d:%d", &day, mon, &year, &hh, &mm, &ss) != 6) return 0;
+    int month = 0;
+    for (int i = 0; i < 12; i++) if (std::string(kMon[i]) == mon) { month = i + 1; break; }
+    if (!month || day < 1 || day > 31) return 0;
+    int64_t days = bantuDaysFromCivil(year, (unsigned)month, (unsigned)day);
+    return (uint64_t)(days * 86400 + hh * 3600 + mm * 60 + ss);
+}
+
+// Files held in memory, keyed by path and validated against size and mtime on
+// every hit, so an edited file is never served stale.
+struct BantuStaticEntry { uint64_t mtime = 0; uint64_t size = 0; std::string data; };
+static std::unordered_map<std::string, BantuStaticEntry> bantuStaticCache;
+static size_t bantuStaticCacheBytes = 0;
+static const size_t kBantuStaticMaxFile = 1024 * 1024;        // per file
+static const size_t kBantuStaticBudget  = 16 * 1024 * 1024;   // all files
+
+static const std::string* bantuStaticCacheGet(const std::string& path, uint64_t mtime, uint64_t size) {
+    auto it = bantuStaticCache.find(path);
+    if (it == bantuStaticCache.end()) return nullptr;
+    if (it->second.mtime != mtime || it->second.size != size) {
+        bantuStaticCacheBytes -= it->second.data.size();
+        bantuStaticCache.erase(it);
+        return nullptr;
+    }
+    return &it->second.data;
+}
+
+static void bantuStaticCachePut(const std::string& path, uint64_t mtime, uint64_t size,
+                                const std::string& data) {
+    if (data.size() > kBantuStaticMaxFile) return;
+    // ponytail: over budget clears the whole cache rather than evicting in
+    // order. A static directory that outgrows the budget wants a CDN, not a
+    // better policy here; swap in LRU if that ever stops being true.
+    if (bantuStaticCacheBytes + data.size() > kBantuStaticBudget) {
+        bantuStaticCache.clear();
+        bantuStaticCacheBytes = 0;
+    }
+    BantuStaticEntry e;
+    e.mtime = mtime;
+    e.size = size;
+    e.data = data;
+    bantuStaticCacheBytes += e.data.size();
+    bantuStaticCache[path] = std::move(e);
+}
+
+// "bytes=0-99" / "bytes=100-" / "bytes=-500". Returns 206 for a range to
+// serve, 416 for one that cannot be satisfied, 200 to ignore the header.
+static int bantuParseByteRange(const std::string& hdr, size_t total, size_t& from, size_t& to) {
+    if (hdr.rfind("bytes=", 0) != 0) return 200;
+    std::string spec = hdr.substr(6);
+    size_t dash = spec.find('-');
+    if (dash == std::string::npos) return 200;
+    std::string a = spec.substr(0, dash), b = spec.substr(dash + 1);
+    auto digits = [](const std::string& v) {
+        if (v.empty()) return false;
+        for (char ch : v) if (ch < '0' || ch > '9') return false;
+        return true;
+    };
+    if (total == 0) return 416;
+    if (a.empty()) {                       // last N bytes
+        if (!digits(b)) return 200;
+        size_t n = (size_t)strtoull(b.c_str(), nullptr, 10);
+        if (n == 0) return 416;
+        from = (n >= total) ? 0 : total - n;
+        to = total - 1;
+        return 206;
+    }
+    if (!digits(a)) return 200;
+    from = (size_t)strtoull(a.c_str(), nullptr, 10);
+    if (from >= total) return 416;
+    if (b.empty()) to = total - 1;
+    else {
+        if (!digits(b)) return 200;
+        to = (size_t)strtoull(b.c_str(), nullptr, 10);
+        if (to >= total) to = total - 1;
+    }
+    if (to < from) return 416;
+    return 206;
+}
+
+// A header's value from an already-complete header block, lowercased, or "".
+// Line-oriented on purpose: searching the block for "transfer-encoding:" as a
+// substring would also match it inside another header's value.
+static std::string bantuHeaderValueLower(const std::string& buf, size_t headerEnd,
+                                         const std::string& name) {
+    size_t pos = buf.find("\r\n");
+    if (pos == std::string::npos || pos >= headerEnd) return "";
+    pos += 2;
+    while (pos < headerEnd) {
+        size_t eol = buf.find("\r\n", pos);
+        if (eol == std::string::npos || eol > headerEnd) eol = headerEnd;
+        size_t colon = buf.find(':', pos);
+        if (colon != std::string::npos && colon < eol) {
+            std::string k = buf.substr(pos, colon - pos);
+            for (auto& ch : k) ch = (char)std::tolower((unsigned char)ch);
+            while (!k.empty() && (k.back() == ' ' || k.back() == '\t')) k.pop_back();
+            if (k == name) {
+                std::string v = buf.substr(colon + 1, eol - colon - 1);
+                for (auto& ch : v) ch = (char)std::tolower((unsigned char)ch);
+                while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(v.begin());
+                while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
+                return v;
+            }
+        }
+        if (eol >= headerEnd) break;
+        pos = eol + 2;
+    }
+    return "";
+}
+
+// How a request is framed, decided once -- the loop needs it to know when the
+// request is complete, and the handler needs the same answer to read the body.
+// See docs/sua-http11-design.md §2.
+struct BantuReqFrame {
+    bool   complete = false;
+    bool   chunked  = false;
+    bool   bad      = false;   // 400: the framing itself is unusable
+    bool   tooLarge = false;   // 413: a body over maxBodyBytes
+    size_t need     = 0;       // total request bytes, once complete
+    size_t bodySize = 0;       // decoded body length
+};
+
+// Walks chunk framing from `pos`. Never searches for the terminator as bytes:
+// a chunk's payload may contain "0\r\n\r\n" verbatim, and treating that as the
+// end is exactly how a smuggled request gets through. `out` collects the
+// decoded body when it is non-null.
+static BantuReqFrame bantuWalkChunks(const std::string& buf, size_t pos, size_t maxBody,
+                                     std::string* out) {
+    BantuReqFrame f;
+    f.chunked = true;
+    size_t total = 0;
+    while (true) {
+        size_t eol = buf.find("\r\n", pos);
+        if (eol == std::string::npos) return f;                 // incomplete
+        size_t end = buf.find(';', pos);                        // chunk extensions
+        if (end == std::string::npos || end > eol) end = eol;
+        size_t size = 0;
+        bool any = false;
+        for (size_t i = pos; i < end; i++) {
+            char ch = buf[i];
+            int d;
+            if (ch >= '0' && ch <= '9')      d = ch - '0';
+            else if (ch >= 'a' && ch <= 'f') d = ch - 'a' + 10;
+            else if (ch >= 'A' && ch <= 'F') d = ch - 'A' + 10;
+            else if (ch == ' ' || ch == '\t') continue;
+            else { f.bad = true; return f; }
+            size = size * 16 + (size_t)d;
+            any = true;
+            // Checked per digit, so a 16-digit size cannot overflow on the way
+            // to being rejected.
+            if (size > maxBody) { f.tooLarge = true; return f; }
+        }
+        if (!any) { f.bad = true; return f; }
+        pos = eol + 2;
+        if (size == 0) {
+            // Last chunk. Trailers, if any, run to the empty line that ends them.
+            while (true) {
+                size_t tEol = buf.find("\r\n", pos);
+                if (tEol == std::string::npos) return f;          // incomplete
+                bool empty = (tEol == pos);
+                pos = tEol + 2;
+                if (empty) break;
+            }
+            f.complete = true;
+            f.need = pos;
+            f.bodySize = total;
+            return f;
+        }
+        if (total + size > maxBody) { f.tooLarge = true; return f; }
+        if (buf.size() < pos + size + 2) return f;                // incomplete
+        if (out) out->append(buf, pos, size);
+        total += size;
+        pos += size + 2;
+    }
+}
+
+static BantuReqFrame bantuFrameRequest(const std::string& buf, size_t headerEnd, size_t maxBody) {
+    const std::string te = bantuHeaderValueLower(buf, headerEnd, "transfer-encoding");
+    const bool chunked = te.find("chunked") != std::string::npos;
+    const bool hasCl   = !bantuHeaderValueLower(buf, headerEnd, "content-length").empty();
+    // Both framings at once is the shape of a request-smuggling attempt against
+    // a proxy in front, which will side with one header while we side with the
+    // other. Refusing is the only answer that cannot be smuggled through.
+    if (chunked && hasCl) { BantuReqFrame f; f.bad = true; return f; }
+    if (chunked) return bantuWalkChunks(buf, headerEnd + 4, maxBody, nullptr);
+    if (!te.empty() && te != "identity") { BantuReqFrame f; f.bad = true; return f; }
+
+    BantuReqFrame f;
+    const size_t cl = bantuContentLengthOf(buf, headerEnd);
+    if (cl > maxBody) { f.tooLarge = true; return f; }
+    f.need = headerEnd + 4 + cl;
+    f.bodySize = cl;
+    f.complete = buf.size() >= f.need;
+    return f;
+}
+
 // Graceful close: finish writing what is queued, then drop.
 static void bantuConnClose(int fd) {
     auto it = bantuConns.find(fd);
     if (it == bantuConns.end()) { CLOSE_SOCKET(fd); return; }
     it->second.closing = true;
     bantuClosingQueue.emplace_back(fd, it->second.serial);
+}
+
+// One request answered. The connection stays open when the request asked for
+// persistence, and moves to the keep-alive timeout class now that it has
+// served something. Otherwise it closes as soon as the response drains.
+static void bantuConnMarkServed(int fd, bool keepAlive) {
+    auto it = bantuConns.find(fd);
+    if (it == bantuConns.end()) { if (!keepAlive) CLOSE_SOCKET(fd); return; }
+    it->second.served = true;
+    if (keepAlive) bantuIdleTouch(it->second);
+    else bantuConnClose(fd);
 }
 
 // Live connection count, for the cap. Incremented on accept, decremented when
@@ -3631,68 +3939,70 @@ private:
         return Value::objectRef(std::move(resObjPtr));
     }
 
-    // Read entire request body (handles Content-Length, returns the body string).
-    // Reads from the already-recv'd buffer first, then tops up from the socket.
-    std::string bantuReadBody(int sock, const std::string& initialBuf, size_t headerEnd) {
-        std::string body;
-        if (headerEnd != std::string::npos && headerEnd + 4 <= initialBuf.size()) {
-            body = initialBuf.substr(headerEnd + 4);
-        }
-        // Look for Content-Length in the headers
-        std::string headersLower = initialBuf.substr(0, headerEnd);
-        // lowercase copy
-        for (auto& c : headersLower) c = std::tolower(c);
-        size_t clPos = headersLower.find("content-length:");
-        if (clPos == std::string::npos) return body;
-        size_t valStart = clPos + 15;
-        size_t valEnd = headersLower.find("\r\n", valStart);
-        if (valEnd == std::string::npos) return body;
-        std::string clStr = headersLower.substr(valStart, valEnd - valStart);
-        // trim
-        while (!clStr.empty() && (clStr.front()==' '||clStr.front()=='\t')) clStr.erase(clStr.begin());
-        while (!clStr.empty() && (clStr.back()==' '||clStr.back()=='\t'||clStr.back()=='\r')) clStr.pop_back();
-        size_t contentLength = 0;
-        // Manual parse of content-length (avoids std::stoull → __isoc23_strtoull@GLIBC_2.38)
-        contentLength = 0;
-        bool ok = !clStr.empty();
-        for (char c : clStr) {
-            if (c < '0' || c > '9') { ok = false; break; }
-            contentLength = contentLength * 10 + (size_t)(c - '0');
-        }
-        if (!ok) return body;
-        // Keep reading until we have the full body
-        while (body.size() < contentLength) {
-            char buf[8192];
-            ssize_t n = recv(sock, buf, std::min((size_t)8192, contentLength - body.size()), 0);
-            if (n <= 0) break;
-            body.append(buf, n);
-        }
-        return body;
-    }
-
     // Serve a static file from one of the configured static dirs.
     // Returns true if a file was served (response sent on socket).
-    bool bantuServeStaticFile(int sock, const std::string& requestPath) {
+    //
+    // Conditional requests, ranges and a small cache live here rather than in
+    // the handler path because static files are the responses that actually get
+    // large: before this, a 2 MB asset was re-read and copied four times on
+    // every request, and a browser that already had it got all of it again.
+    // See docs/sua-http11-design.md §3.
+    bool bantuServeStaticFile(int sock, const std::string& requestPath,
+                              const ObjectMap& headers, bool isHead, bool keepAlive) {
         if (bantuServerStatic.empty()) return false;
-        // Strip leading slash
-        std::string rel = requestPath;
+        // Decoded first: a browser sends "/a%20b.css" for a file named "a b.css".
+        std::string rel = bantuUrlDecode(requestPath);
         if (!rel.empty() && rel[0] == '/') rel = rel.substr(1);
         if (rel.empty()) rel = "index.html";
+        // Traversal check AFTER decoding, which is where "%2e%2e" is visible.
+        if (rel.find("..") != std::string::npos) return false;
         // Try each static dir
         for (const auto& dir : bantuServerStatic) {
             std::string filePath = dir;
             if (!filePath.empty() && filePath.back() == '/') filePath.pop_back();
             filePath += "/" + rel;
-            // Prevent path traversal
             if (filePath.find("..") != std::string::npos) continue;
-            std::ifstream f(filePath, std::ios::binary);
-            if (!f.good()) continue;
-            std::stringstream ss;
-            ss << f.rdbuf();
-            std::string content = ss.str();
+
+            uint64_t mtime = 0, fsize = 0;
+            if (!bantuFileStamp(filePath, mtime, fsize)) continue;
 
             std::string ct = bantu_mime::for_path(filePath);
             bool isHtml = ct.rfind("text/html", 0) == 0;
+
+            // The validator is the file's identity: change either its size or
+            // its modification time and every cached copy stops matching.
+            std::string etag = "\"" + std::to_string(fsize) + "-" + std::to_string(mtime) + "\"";
+            std::string inm = headers.count("if-none-match")
+                ? headers.at("if-none-match").toString() : "";
+            std::string ims = headers.count("if-modified-since")
+                ? headers.at("if-modified-since").toString() : "";
+            bool fresh = (!inm.empty() && inm.find(etag) != std::string::npos);
+            if (!fresh && inm.empty() && !ims.empty())
+                fresh = (bantuHttpDateParse(ims) >= mtime);
+            if (fresh) {
+                std::ostringstream nm;
+                nm << "HTTP/1.1 304 Not Modified\r\n"
+                   << "ETag: " << etag << "\r\n"
+                   << "Last-Modified: " << bantuHttpDate(mtime) << "\r\n"
+                   << "Access-Control-Allow-Origin: *\r\n"
+                   << "Server: Bantu-Sua/1.2\r\n"
+                   << "Connection: " << (keepAlive ? "keep-alive" : "close") << "\r\n\r\n";
+                bantuConnWrite(sock, nm.str());
+                return true;
+            }
+
+            const std::string* cached = bantuStaticCacheGet(filePath, mtime, fsize);
+            std::string loaded;
+            if (!cached) {
+                std::ifstream f(filePath, std::ios::binary);
+                if (!f.good()) continue;
+                loaded.resize((size_t)fsize);
+                if (fsize) f.read(&loaded[0], (std::streamsize)fsize);
+                // Truncated to what was actually read: the file can shrink
+                // between the stat above and this read.
+                loaded.resize((size_t)f.gcount());
+            }
+            std::string content = cached ? *cached : std::move(loaded);
 
             // With auto_inject on, patch the PWA <head> block into served HTML so
             // an existing app becomes installable without editing its templates.
@@ -3710,25 +4020,124 @@ private:
             bool noCache = ct.rfind("application/manifest+json", 0) == 0
                         || (isHtml && bantuPwaConfig.configured);
 
+            // Cached AFTER any injection, so the work is done once, and keyed
+            // on size and mtime so an edited file is never served stale.
+            if (!cached) bantuStaticCachePut(filePath, mtime, fsize, content);
+
+            // A single byte range: what video seeking and resumable downloads
+            // ask for. Multiple ranges are answered whole, which the spec
+            // allows and which is what most servers do.
+            size_t from = 0, to = content.size() ? content.size() - 1 : 0;
+            int status = 200;
+            std::string rangeHdr = headers.count("range") ? headers.at("range").toString() : "";
+            if (!rangeHdr.empty() && rangeHdr.find(',') == std::string::npos) {
+                int r = bantuParseByteRange(rangeHdr, content.size(), from, to);
+                if (r == 416) {
+                    std::ostringstream bad;
+                    bad << "HTTP/1.1 416 Range Not Satisfiable\r\n"
+                        << "Content-Range: bytes */" << content.size() << "\r\n"
+                        << "Content-Length: 0\r\n"
+                        << "Connection: " << (keepAlive ? "keep-alive" : "close") << "\r\n\r\n";
+                    bantuConnWrite(sock, bad.str());
+                    return true;
+                }
+                if (r == 206) status = 206;
+            }
+            const size_t sendLen = (status == 206) ? (to - from + 1) : content.size();
+
             std::ostringstream resp;
-            resp << "HTTP/1.1 200 OK\r\n";
+            resp << "HTTP/1.1 " << status << (status == 206 ? " Partial Content\r\n" : " OK\r\n");
             resp << "Content-Type: " << ct << "\r\n";
-            resp << "Content-Length: " << content.size() << "\r\n";
+            resp << "Content-Length: " << sendLen << "\r\n";
+            if (status == 206)
+                resp << "Content-Range: bytes " << from << "-" << to << "/" << content.size() << "\r\n";
+            resp << "Accept-Ranges: bytes\r\n";
+            resp << "ETag: " << etag << "\r\n";
+            resp << "Last-Modified: " << bantuHttpDate(mtime) << "\r\n";
             resp << "Access-Control-Allow-Origin: *\r\n";
             resp << "Cache-Control: " << (noCache ? "no-cache" : "public, max-age=300") << "\r\n";
             resp << "Server: Bantu-Sua/1.2\r\n";
-            resp << "\r\n" << content;
+            resp << "Connection: " << (keepAlive ? "keep-alive" : "close") << "\r\n";
+            resp << "\r\n";
+            // Headers and body are queued separately: putting the body through
+            // the stream as well was one of the four copies this removed.
             bantuConnWrite(sock, resp.str());
+            if (!isHead && sendLen) bantuConnWriteN(sock, content.data() + from, sendLen);
             return true;
         }
         return false;
+    }
+
+    // Serve every complete request sitting in this connection's read buffer.
+    //
+    // Stops at a suspended handler: its response is written when it finishes,
+    // and a pipelining client matches responses to requests by ORDER alone, so
+    // letting the next request overtake it would hand the client the wrong
+    // answer. The connection is re-pumped from the resume queue instead.
+    //
+    // A loop rather than recursion: a client can pipeline thousands of requests
+    // into one buffer, and recursion there is a stack overflow reachable from
+    // the network. See docs/sua-http11-design.md §1.
+    void bantuPumpConn(int fd, uint64_t now) {
+        for (;;) {
+            auto it = bantuConns.find(fd);
+            if (it == bantuConns.end()) return;
+            BantuConn& c = it->second;
+            if (c.isWs || c.closing || c.pending > 0) return;
+
+            // The header cap applies whether or not the terminator has arrived.
+            // Checking only while still searching would let an oversized-but-
+            // complete header block straight through, which is how it regressed.
+            size_t he = c.in.find("\r\n\r\n");
+            if (he != std::string::npos && he > bantuLimits.maxHeaderBytes)
+                he = std::string::npos;
+            if (he == std::string::npos) {
+                if (c.in.size() > bantuLimits.maxHeaderBytes) {
+                    bantuConnWrite(fd, std::string(
+                        "HTTP/1.1 431 Request Header Fields Too Large\r\n"
+                        "Content-Length: 0\r\nConnection: close\r\n\r\n"));
+                    bantuConnClose(fd);
+                }
+                return;
+            }
+
+            const BantuReqFrame f = bantuFrameRequest(c.in, he, bantuLimits.maxBodyBytes);
+            // Framing the server cannot trust ends the connection: anything
+            // still in the buffer might be a second request smuggled inside
+            // the first, and there is no safe way to tell.
+            if (f.bad) {
+                bantuConnWrite(fd, std::string(
+                    "HTTP/1.1 400 Bad Request\r\n"
+                    "Content-Length: 0\r\nConnection: close\r\n\r\n"));
+                bantuConnClose(fd);
+                return;
+            }
+            if (f.tooLarge) {
+                bantuConnWrite(fd, std::string(
+                    "HTTP/1.1 413 Payload Too Large\r\n"
+                    "Content-Length: 0\r\nConnection: close\r\n\r\n"));
+                bantuConnClose(fd);
+                return;
+            }
+            if (!f.complete) return;
+
+            std::string request = c.in.substr(0, f.need);
+            c.in.erase(0, f.need);
+            bantuDispatchRequest(fd, request, f);
+            // bantuConns may have rehashed while the handler ran (a handler can
+            // open connections), so the reference above is no longer safe.
+            auto again = bantuConns.find(fd);
+            if (again == bantuConns.end()) return;
+            again->second.lastActive = now;
+            bantuIdleTouch(again->second);
+        }
     }
 
     // Handle a single HTTP request — parse, route, call Bantu handler, respond.
     // Handle ONE complete request. The event loop has already read the whole
     // header block (and body, if any) into `request`, so nothing here blocks --
     // which is what allows a single thread to serve every connection.
-    void bantuDispatchRequest(int sock, const std::string& request) {
+    void bantuDispatchRequest(int sock, const std::string& request, const BantuReqFrame& frame) {
 
         // Parse request line: METHOD PATH HTTP/1.1
         size_t firstSp = request.find(' ');
@@ -3741,6 +4150,35 @@ private:
         std::string method = request.substr(0, firstSp);
         std::string fullPath = request.substr(firstSp + 1, secondSp - firstSp - 1);
 
+        // Absolute-form target: "GET http://host/path HTTP/1.1". Every server
+        // has to accept it (RFC 7230 §5.3.2); the authority is dropped and the
+        // path is what routes.
+        if (fullPath.rfind("http://", 0) == 0 || fullPath.rfind("https://", 0) == 0) {
+            size_t slash = fullPath.find('/', fullPath.find("//") + 2);
+            fullPath = (slash == std::string::npos) ? "/" : fullPath.substr(slash);
+        }
+
+        // Persistence, decided per request from the request itself: HTTP/1.1
+        // keeps the connection unless asked to close, HTTP/1.0 closes unless
+        // asked to keep. RFC 7230 §6.3.
+        size_t verEnd = request.find("\r\n");
+        std::string version = (verEnd == std::string::npos)
+            ? std::string() : request.substr(secondSp + 1, verEnd - secondSp - 1);
+        const bool http11 = version.find("HTTP/1.1") != std::string::npos;
+        size_t hdrEndForConn = request.find("\r\n\r\n");
+        std::string connHdr = (hdrEndForConn == std::string::npos)
+            ? std::string() : bantuHeaderValueLower(request, hdrEndForConn, "connection");
+        bool keepAlive = http11 ? (connHdr.find("close") == std::string::npos)
+                                : (connHdr.find("keep-alive") != std::string::npos);
+
+        // HEAD is answered without a body -- sending one is forbidden (RFC 7231
+        // §4.3.2) and, now that connections are reused, it would desynchronise
+        // every later response on the socket. Which route serves it is decided
+        // at match time: an explicitly registered HEAD route wins, otherwise
+        // the GET route does the work.
+        const bool isHead = (method == "HEAD");
+        const std::string origMethod = method;
+
         // Split path and query
         std::string path = fullPath;
         std::string queryStr;
@@ -3752,7 +4190,18 @@ private:
 
         // Find end of headers
         size_t headerEnd = request.find("\r\n\r\n");
-        std::string body = bantuReadBody(sock, request, (headerEnd != std::string::npos) ? headerEnd : request.size());
+        // The loop framed this request before handing it over, so the body is
+        // entirely in `request`; nothing here reads from the socket. A chunked
+        // body is decoded by the same walk that measured it.
+        std::string body;
+        if (headerEnd != std::string::npos) {
+            if (frame.chunked) {
+                body.reserve(frame.bodySize);
+                bantuWalkChunks(request, headerEnd + 4, bantuLimits.maxBodyBytes, &body);
+            } else if (headerEnd + 4 <= request.size()) {
+                body = request.substr(headerEnd + 4);
+            }
+        }
 
         // Parse headers into a map (lowercase keys)
         ObjectMap headers;
@@ -3857,6 +4306,25 @@ private:
         bool suspendable = false;   // this route opted into suspension
         std::vector<std::string> pathParts = bantuSplitPath(path);
 
+        // A HEAD route registered for this path serves it; otherwise the GET
+        // route does, which is what every client expects and what makes
+        // sua.server.head() worth registering only when the two must differ.
+        if (isHead) {
+            bool headRoute = false;
+            for (auto& route : bantuServerRoutes) {
+                if (route.method != "HEAD") continue;
+                std::vector<std::string> rp = bantuSplitPath(route.path);
+                if (rp.size() != pathParts.size()) continue;
+                bool same = true;
+                for (size_t i = 0; i < rp.size() && same; i++) {
+                    if (!rp[i].empty() && rp[i][0] == ':') continue;
+                    if (rp[i] != pathParts[i]) same = false;
+                }
+                if (same) { headRoute = true; break; }
+            }
+            if (!headRoute) method = "GET";
+        }
+
         // First pass: exact match
         for (auto& route : bantuServerRoutes) {
             if (route.method == method && route.path == path) {
@@ -3876,7 +4344,10 @@ private:
                 ObjectMap trial;
                 for (size_t i = 0; i < routeParts.size(); i++) {
                     if (!routeParts[i].empty() && routeParts[i][0] == ':') {
-                        trial[routeParts[i].substr(1)] = Value(pathParts[i]);
+                        // Decoded, so /user/a%20b reaches the handler as "a b".
+                        // Decoding the whole path before matching would instead
+                        // let %2f invent path segments that were never sent.
+                        trial[routeParts[i].substr(1)] = Value(bantuUrlDecode(pathParts[i]));
                     } else if (routeParts[i] != pathParts[i]) {
                         ok = false;
                         break;
@@ -3908,8 +4379,8 @@ private:
         // are served as static files, not as SPA fallback.
         if (!found && method == "GET") {
             // Try static files first — if served, we're done.
-            if (bantuServeStaticFile(sock, path)) {
-                bantuConnClose(sock);
+            if (bantuServeStaticFile(sock, path, headers, isHead, keepAlive)) {
+                bantuConnMarkServed(sock, keepAlive);
                 return;
             }
         }
@@ -3936,13 +4407,35 @@ private:
             }
         }
 
-        // If no route matched, try static files for non-GET methods (rare but possible)
+        // Nothing matched, but does this path exist under another method? Then
+        // the honest answer is 405 with the methods it does accept, not 404 --
+        // a 404 tells a client the path is wrong when only the verb was.
+        std::string allow;
+        if (!found) {
+            for (auto& route : bantuServerRoutes) {
+                std::vector<std::string> routeParts = bantuSplitPath(route.path);
+                if (routeParts.size() != pathParts.size()) continue;
+                bool same = true;
+                for (size_t i = 0; i < routeParts.size() && same; i++) {
+                    if (!routeParts[i].empty() && routeParts[i][0] == ':') continue;
+                    if (routeParts[i] != pathParts[i]) same = false;
+                }
+                if (!same) continue;
+                if (allow.find(route.method) != std::string::npos) continue;
+                if (!allow.empty()) allow += ", ";
+                allow += route.method;
+            }
+            // HEAD was rewritten to GET above, so a GET route implies it.
+            if (allow.find("GET") != std::string::npos) allow += ", HEAD";
+        }
 
         // Build $req and $res
         auto state = std::make_shared<BantuHttpResponseState>();
         Value resVal = bantuBuildResObject(state);
         ObjectMap reqObj;
-        reqObj["method"] = Value(method);
+        // The method the client sent, not the one that matched: a handler
+        // serving a HEAD should be able to tell.
+        reqObj["method"] = Value(origMethod);
         reqObj["path"] = Value(path);
         reqObj["url"] = Value(fullPath);
         reqObj["params"] = Value(std::move(params));
@@ -3969,7 +4462,7 @@ private:
         }
 
         auto respond = [this, sock, serial, state, reqVal, resVal, matchedHandler,
-                        found, method, path]() {
+                        found, method, path, allow, isHead, keepAlive]() {
             if (found && (matchedHandler.isFunction() || matchedHandler.isNativeFn())) {
                 try {
                     bantuCallFunction(matchedHandler, {reqVal, resVal});
@@ -3979,6 +4472,16 @@ private:
                     state->body = std::string("{\"error\":\"Internal server error: ") + e.what() + "\"}";
                     state->contentType = "application/json; charset=utf-8";
                 }
+            } else if (!found && !allow.empty()) {
+                state->status = 405;
+                state->headers["Allow"] = allow;
+                ObjectMap errObj;
+                errObj["error"] = Value(std::string("Method not allowed"));
+                errObj["path"] = Value(path);
+                errObj["method"] = Value(method);
+                errObj["allow"] = Value(allow);
+                state->body = bantuJsonStringify(Value(std::move(errObj)));
+                state->contentType = "application/json; charset=utf-8";
             } else if (!found) {
                 state->status = 404;
                 ObjectMap errObj;
@@ -4012,9 +4515,22 @@ private:
                 resp << k << ": " << v << "\r\n";
             }
             resp << "Server: Bantu-Sua/1.2\r\n";
-            resp << "\r\n" << state->body;
+            // Always stated. Its absence was its own defect: an HTTP/1.1 client
+            // may reuse a connection by default, and reusing one the server was
+            // about to close costs a failed request and a retry.
+            resp << "Connection: " << (keepAlive ? "keep-alive" : "close") << "\r\n";
+            resp << "\r\n";
+            // HEAD keeps the Content-Length it would have sent, and sends no
+            // body. On a reused connection a body here would be read as the
+            // start of the next response.
+            if (!isHead) resp << state->body;
             bantuConnWrite(sock, resp.str());
-            bantuConnClose(sock);
+            bantuConnMarkServed(sock, keepAlive);
+            // A handler that suspended held the pump back; anything pipelined
+            // behind it is still buffered and needs the loop to come back.
+            auto after = bantuConns.find(sock);
+            if (after != bantuConns.end() && !after->second.closing && !after->second.in.empty())
+                bantuResumeQueue.emplace_back(sock, after->second.serial);
         };
 
         // A full pool falls back to running inline. That is the behaviour of
@@ -4359,43 +4875,12 @@ private:
                     if (c.isWs) {
                         if (!bantuWsProcess(c)) c.closing = true;
                     } else {
-                        // An HTTP request is dispatched only once the whole
-                        // header block (and any declared body) has arrived --
-                        // the fix for header blocks split across segments.
-                        size_t he = c.in.find("\r\n\r\n");
-                        // The size cap applies whether or not the terminator has
-                        // arrived. Checking only while still searching would let
-                        // an oversized-but-complete header block straight
-                        // through, which is exactly how this regressed.
-                        if (he != std::string::npos && he > bantuLimits.maxHeaderBytes)
-                            he = std::string::npos;
-                        if (he == std::string::npos) {
-                            if (c.in.size() > bantuLimits.maxHeaderBytes) {
-                                bantuConnWrite(c.fd, std::string(
-                                    "HTTP/1.1 431 Request Header Fields Too Large\r\n"
-                                    "Content-Length: 0\r\nConnection: close\r\n\r\n"));
-                                c.closing = true;
-                            }
-                        } else {
-                            size_t need = he + 4 + bantuContentLengthOf(c.in, he);
-                            if (need > bantuLimits.maxBodyBytes + he + 4) {
-                                bantuConnWrite(c.fd, std::string(
-                                    "HTTP/1.1 413 Payload Too Large\r\n"
-                                    "Content-Length: 0\r\nConnection: close\r\n\r\n"));
-                                c.closing = true;
-                            } else if (c.in.size() >= need) {
-                                std::string request = c.in.substr(0, need);
-                                c.in.erase(0, need);
-                                bantuDispatchRequest(c.fd, request);
-                                // bantuConns may have rehashed while the handler
-                                // ran (a handler can open connections), so the
-                                // reference above is no longer safe to use.
-                                auto again = bantuConns.find(ev.fd);
-                                if (again == bantuConns.end()) continue;
-                                again->second.lastActive = now;
-                                bantuIdleTouch(again->second);
-                            }
-                        }
+                        // Every complete request in the buffer, not just the
+                        // first: with persistent connections a client may
+                        // pipeline several into one write, and nothing else
+                        // would wake us to serve the rest.
+                        bantuPumpConn(ev.fd, now);
+                        if (bantuConns.find(ev.fd) == bantuConns.end()) continue;
                     }
                     if (peerClosed) {
                         auto again = bantuConns.find(ev.fd);
@@ -4434,6 +4919,20 @@ private:
                 loopState.restore();
             }
 
+            // ── connections with pipelined requests still buffered ──
+            // Bounded per pass: pumping one can enqueue it again, and a client
+            // that pipelines endlessly must not be able to hold the loop here
+            // while every other connection waits.
+            if (!bantuResumeQueue.empty()) {
+                std::vector<std::pair<int, uint64_t>> rq;
+                rq.swap(bantuResumeQueue);
+                for (auto& entry : rq) {
+                    auto found = bantuConns.find(entry.first);
+                    if (found == bantuConns.end() || found->second.serial != entry.second) continue;
+                    bantuPumpConn(entry.first, bantu_loop::nowMs());
+                }
+            }
+
             for (int fd : doomed) dropConn(fd);
             doomed.clear();
 
@@ -4463,6 +4962,7 @@ private:
             };
             reapIdle(bantuIdleHttp, (uint64_t)bantuLimits.headerTimeoutMs);
             reapIdle(bantuIdleWs,   (uint64_t)bantuLimits.idleTimeoutMs);
+            reapIdle(bantuIdleKeep, (uint64_t)bantuLimits.keepAliveTimeoutMs);
 
             // Connections a handler asked to close, collected once their
             // output has drained. Re-queued while still draining, so a client
@@ -8148,6 +8648,7 @@ private:
                 num("max_connections_per_ip", bantuLimits.maxConnectionsPerIp);
                 num("header_timeout_ms",    bantuLimits.headerTimeoutMs);
                 num("idle_timeout_ms",      bantuLimits.idleTimeoutMs);
+                num("keep_alive_timeout_ms", bantuLimits.keepAliveTimeoutMs);
                 num("max_ws_frame_bytes",   bantuLimits.maxWsFrameBytes);
                 num("max_ws_message_bytes", bantuLimits.maxWsMessageBytes);
                 num("max_suspended_handlers", bantuLimits.maxSuspendedHandlers);
@@ -8169,6 +8670,7 @@ private:
             out["max_connections_per_ip"] = Value((double)bantuLimits.maxConnectionsPerIp);
             out["header_timeout_ms"]    = Value((double)bantuLimits.headerTimeoutMs);
             out["idle_timeout_ms"]      = Value((double)bantuLimits.idleTimeoutMs);
+            out["keep_alive_timeout_ms"] = Value((double)bantuLimits.keepAliveTimeoutMs);
             out["max_ws_frame_bytes"]   = Value((double)bantuLimits.maxWsFrameBytes);
             out["max_ws_message_bytes"] = Value((double)bantuLimits.maxWsMessageBytes);
             out["max_suspended_handlers"] = Value((double)bantuLimits.maxSuspendedHandlers);

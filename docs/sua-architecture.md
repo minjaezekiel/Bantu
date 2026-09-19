@@ -119,6 +119,10 @@ struct Connection {
 ```
 
 An HTTP connection walks `ReadingHeaders → ReadingBody → Dispatching → Writing → keepalive|close`.
+The `keepalive` half of that last step was designed here but not built until the HTTP/1.1 work of
+2026-09-19: every response closed the connection instead. What the loop does now — when it keeps a
+connection, how pipelined requests stay in order, and which timeout an idle one lives under — is in
+`docs/sua-http11-design.md`.
 A WebSocket connection is simply one that stays registered and re-enters on each readable frame.
 This is the whole reason a WS connection costs ~4 KB instead of ~8 MB.
 

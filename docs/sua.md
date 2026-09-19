@@ -52,6 +52,14 @@ There are no wildcards, regex routes, route prefixes, or trailing-slash normalis
 
 **Routes beat static files.** Static files are only consulted for a GET that matched no route.
 
+`:param` values are percent-decoded, so `/user/a%20b` reaches the handler as `a b`.
+
+**`HEAD` is served by the matching `GET` route**, with the headers it would have sent and no body.
+Register `sua.server.head(...)` only when a `HEAD` needs to differ from its `GET`.
+
+**A known path with an unregistered method answers `405`** with an `Allow` header listing the
+methods it does accept, rather than `404`.
+
 ## `$req` — the request
 
 | Field | Type | Notes |
@@ -117,6 +125,15 @@ GIF, WebP, AVIF, ICO, WASM, PDF, WOFF/WOFF2/TTF/OTF, MP4/WebM, MP3/OGG/WAV, CSV,
 Anything else is `application/octet-stream`.
 
 HTML and `.webmanifest` are served `no-cache`; everything else gets `public, max-age=300`.
+
+Every file carries an `ETag` and `Last-Modified` built from its size and modification time, so
+`If-None-Match` and `If-Modified-Since` are answered `304` with no body — a browser reloading a page
+it already has transfers headers instead of megabytes. `Range` requests are answered `206`, which is
+what video seeking and resumable downloads need, and an impossible range gets `416`.
+
+Files up to 1 MB are held in memory, up to 16 MB in total, and every hit re-checks size and
+modification time, so an edited file is never served stale. File names are percent-decoded, and the
+traversal check runs after decoding, where `%2e%2e` is visible as `..`.
 
 ---
 
@@ -493,6 +510,24 @@ whether a broadcast worked; use it as a local hint, or count acknowledgements fr
 
 Multi-worker mode is POSIX-only; on Windows it logs a notice and runs single-worker.
 
+### Persistent connections
+
+Connections are reused. HTTP/1.1 keeps one open unless the request says `Connection: close`;
+HTTP/1.0 closes unless it asks to keep. Every response states which it did, and pipelined requests
+are answered in order. Nothing in a handler changes.
+
+An idle connection that has already answered is dropped after `keep_alive_timeout_ms` (default
+65 s). One that has not answered yet still gets `header_timeout_ms` (10 s), so opening a socket and
+saying nothing costs the same as before.
+
+```bantu
+sua.server.limits({"keep_alive_timeout_ms": 30000});
+```
+
+Measured on one worker, trivial JSON handler, Apple silicon: **35,000 req/s** on reused
+connections against 18–24k when every request opened its own. A small static file went from 17.9k
+to 31.5k req/s, and a 2 MB file from 79 to 520 req/s (162 MB/s to 1.07 GB/s).
+
 ### Limits and stats
 
 ```bantu
@@ -785,7 +820,9 @@ These are real constraints of the current implementation, not oversights to work
   response.
 - **Request headers are capped at 64 KB** (configurable via `sua.server.limits`). A larger header
   block gets `431 Request Header Fields Too Large` — it is no longer silently truncated.
-- **No chunked transfer-encoding** on requests — only `Content-Length` is honoured.
+- **A request that sends both `Content-Length` and `Transfer-Encoding` is refused with `400`**, and
+  the connection closes. The two disagree about where the body ends, which is what request smuggling
+  exploits, so neither answer is safe to guess.
 - **Unrecognised status codes render as `OK`** in the status line, though the numeric code is
   correct.
 - **No SSE.** WebSockets *are* supported (`sua.ws.*`, RFC 6455: masking enforced, continuation
