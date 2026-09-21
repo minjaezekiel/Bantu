@@ -911,8 +911,15 @@ inline std::string bantuJsonStringify(const Value& v) {
 
 // ─── Minimal JSON parser (for parsing request bodies) ───
 // Returns a Value (object/list/string/number/bool/null). On error returns null.
+// NESTING IS BOUNDED. bantuJsonParseValue recurses once per `{` or `[`, so
+// without a limit a request body of nothing but `[[[[...` walks off the native
+// stack: measured here, 10,000 levels parsed fine and 20,000 died with SIGSEGV,
+// exit 139 -- roughly 20 KB of input to kill the process, from any client, on a
+// route that does nothing more than read $req.body. 256 is far past anything a
+// real document nests and far short of the stack.
+static const int kBantuJsonMaxDepth = 256;
 inline Value bantuJsonParse(const std::string& s, size_t& pos);
-inline Value bantuJsonParseValue(const std::string& s, size_t& pos);
+inline Value bantuJsonParseValue(const std::string& s, size_t& pos, int depth = 0);
 inline void bantuJsonSkipWs(const std::string& s, size_t& pos) {
     while (pos < s.size() && (s[pos]==' '||s[pos]=='\t'||s[pos]=='\n'||s[pos]=='\r')) pos++;
 }
@@ -950,7 +957,14 @@ inline std::string bantuJsonParseStringRaw(const std::string& s, size_t& pos) {
     if (pos < s.size()) pos++; // skip closing quote
     return out;
 }
-inline Value bantuJsonParseValue(const std::string& s, size_t& pos) {
+inline Value bantuJsonParseValue(const std::string& s, size_t& pos, int depth) {
+    if (depth > kBantuJsonMaxDepth) {
+        ErrorHandler::throwRuntimeError("json.parse: nesting deeper than " +
+                                        std::to_string(kBantuJsonMaxDepth) +
+                                        " levels -- this is hostile input, not a "
+                                        "document. Wrap json.parse in try/catch to "
+                                        "reject it.");
+    }
     bantuJsonSkipWs(s, pos);
     if (pos >= s.size()) return Value();
     char c = s[pos];
@@ -967,7 +981,7 @@ inline Value bantuJsonParseValue(const std::string& s, size_t& pos) {
             std::string key = bantuJsonParseStringRaw(s, pos);
             bantuJsonSkipWs(s, pos);
             if (pos < s.size() && s[pos] == ':') pos++;
-            Value val = bantuJsonParseValue(s, pos);
+            Value val = bantuJsonParseValue(s, pos, depth + 1);
             obj[key] = val;
             bantuJsonSkipWs(s, pos);
             if (pos < s.size() && s[pos] == ',') { pos++; continue; }
@@ -982,7 +996,7 @@ inline Value bantuJsonParseValue(const std::string& s, size_t& pos) {
         bantuJsonSkipWs(s, pos);
         if (pos < s.size() && s[pos] == ']') { pos++; return Value(std::move(lst)); }
         while (pos < s.size()) {
-            Value val = bantuJsonParseValue(s, pos);
+            Value val = bantuJsonParseValue(s, pos, depth + 1);
             lst.push_back(val);
             bantuJsonSkipWs(s, pos);
             if (pos < s.size() && s[pos] == ',') { pos++; continue; }
@@ -2853,6 +2867,39 @@ private:
     Flow  flow_ = Flow::Normal;
     Value flowValue_;
 
+    // ── Call depth ───────────────────────────────────────────────────
+    // Every Bantu call is a real C++ recursion through evalNode, so an
+    // unbounded one walks off the native stack: measured here, a plain
+    // `def f($n) { return 1 + f($n - 1); }` survived 3,000 frames and died
+    // at 3,200 with SIGSEGV -- no message, no catch, exit 139. That is
+    // reachable from any script, and from a sua handler it takes the worker
+    // process with it. Windows is far worse: its default thread stack is
+    // 1 MB against 8 MB here, so the same program dies around 400.
+    //
+    // So the limit is a NUMBER WE CHOOSE rather than one the stack imposes,
+    // set low enough to hold on the smallest platform stack and high enough
+    // that no reasonable recursive algorithm reaches it. It raises an
+    // ordinary catchable Bantu error, which is the whole point: a program
+    // can `try` around a recursive descent and recover.
+    // ponytail: one counter, not a stack-pointer probe -- portable, and the
+    // cost is an increment against a call that already allocates a scope.
+    static const int kMaxCallDepth = 1000;
+    int callDepth_ = 0;
+    struct CallDepthGuard {
+        Evaluator* e;
+        explicit CallDepthGuard(Evaluator* ev) : e(ev) {
+            if (++e->callDepth_ > kMaxCallDepth) {
+                e->callDepth_--;                 // this frame never entered
+                ErrorHandler::throwRuntimeError(
+                    "Maximum call depth of " + std::to_string(kMaxCallDepth) +
+                    " exceeded -- this is usually infinite recursion. If the "
+                    "recursion is genuine, rewrite it as a loop with an "
+                    "explicit stack.");
+            }
+        }
+        ~CallDepthGuard() { e->callDepth_--; }
+    };
+
     // Runs a statement list up to the first pending signal. The value is the
     // last statement's -- what a function without `return` has always returned.
     Value runStatements(std::vector<std::shared_ptr<ASTNode>>& body) {
@@ -3839,6 +3886,7 @@ private:
     // Call a Bantu function Value with arguments. Returns the function's
     // return value (or null). Consumes a pending return (finishCall).
     Value bantuCallFunction(Value callee, std::vector<Value> args) {
+        CallDepthGuard depth(this);
         if (callee.isNativeFn()) {
             return callee.nativeFn(std::move(args));
         }
@@ -4327,7 +4375,10 @@ private:
             std::string ct = headers.count("content-type") ? headers["content-type"].toString() : "";
             if (ct.find("json") != std::string::npos) {
                 size_t pos = 0;
-                bodyVal = bantuJsonParse(body, pos);
+                // Over-nested bodies are hostile input, not a server fault: the
+                // handler sees $req.body as null and answers for itself.
+                try { bodyVal = bantuJsonParse(body, pos); }
+                catch (const std::exception&) { bodyVal = Value(); }
             } else {
                 bodyVal = Value(body);
             }
@@ -5206,6 +5257,7 @@ private:
     // for the callback case, where the caller knows which argument was wrong and
     // says so itself.
     Value invokeCallable(const Value& callee, std::vector<Value> args) {
+        CallDepthGuard depth(this);
         if (callee.isNativeFn()) {
             return callee.nativeFn(std::move(args));
         }
@@ -5933,6 +5985,7 @@ private:
     }
 
     Value instantiateClass(ClassDefinition* classDef, std::vector<Value>& args) {
+        CallDepthGuard depth(this);
         // OWNED, not `new`-and-forget. This used to be a bare
         // `new ClassInstance(classDef)` with no delete anywhere, so every
         // object a Bantu program ever created leaked for the life of the
@@ -9261,7 +9314,8 @@ private:
                 ss << in.rdbuf();
                 std::string text = ss.str();
                 size_t pos = 0;
-                Value parsed = bantuJsonParse(text, pos);
+                Value parsed;
+                try { parsed = bantuJsonParse(text, pos); } catch (const std::exception&) {}
                 if (parsed.isObject()) {
                     auto pk = parsed.objectVal->find("public_key");
                     auto sk = parsed.objectVal->find("private_key");

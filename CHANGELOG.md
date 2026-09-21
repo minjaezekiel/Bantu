@@ -244,6 +244,25 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Fixed
 
+- **[bug fix] SECURITY: a 20 KB request body could kill the sua server.** `json.parse` recursed once
+  per `{` or `[` with no depth limit, so a body of nothing but `[[[[...` walked off the native stack.
+  Against the shipped v1.3.0 build, a 200 KB `POST` to a route whose handler only reads `$req.body`
+  ended the process with **SIGSEGV (exit 139)** — an empty reply to that request and connection
+  refused to every request after it. No handshake, no credentials, no route logic: any client could
+  do it, and a reverse proxy would not see it coming. Nesting is now capped at 256 levels, which is
+  far past any real document, and exceeding it raises a catchable Bantu error naming the limit and
+  the fix. The sua request-body parse and the Web Push keypair read catch it internally — hostile
+  input is not a server fault, so the handler simply sees `$req.body` as null and answers for itself.
+  Verified end to end: the same bomb now returns normally and the next request is served.
+- **[bug fix] Runaway recursion raises instead of crashing.** No call-depth guard existed anywhere in
+  the evaluator, so every Bantu call being a real C++ recursion meant `def f($n) { return 1 + f($n - 1); }`
+  survived 3,000 frames and died at 3,200 with **SIGSEGV (exit 139)** — no message, and no `try` that
+  could catch it. From a sua handler it took the worker with it, and Windows was far worse: a 1 MB
+  default thread stack against 8 MB on macOS puts the cliff near 400 frames. Calls are now capped at
+  1,000 deep — a number chosen to hold on the smallest platform stack rather than one the stack
+  imposes — and the limit raises an ordinary catchable error, so a recursive descent can be wrapped
+  in `try` and recovered from. Functions, methods, constructors and mutually recursive pairs all
+  count against the same limit. 21 assertions in `tests/lang_depth_test.b`.
 - **[bug fix] `HEAD` no longer returns a body**, which RFC 7231 §4.3.2 forbids and which, on a reused
   connection, would be read as the start of the next response. It is served by the matching `GET`
   route unless a `HEAD` route was registered for that path, and `$req.method` still reports `HEAD`.

@@ -78,6 +78,34 @@ def maybe($x) {
 }
 ```
 
+### Calls are limited to 1,000 deep (fixed)
+```bantu
+def countdown($n) {
+    if ($n <= 0) { return 0; }
+    return 1 + countdown($n - 1);
+}
+
+countdown(900)          // 900 — fine
+
+try { countdown(100000); }
+catch ($e) { print($e.message); }
+// Maximum call depth of 1000 exceeded -- this is usually infinite recursion.
+// If the recursion is genuine, rewrite it as a loop with an explicit stack.
+```
+Every Bantu call is a real C++ recursion, so an unbounded one used to walk off the native
+stack: measured on macOS, 3,000 frames survived and 3,200 died with **SIGSEGV** — no message,
+and no `try` that could catch it. From a sua handler it took the worker process with it, and
+Windows was worse still, since its default thread stack is 1 MB against 8 MB here.
+
+The limit is therefore **a number we choose, not one the stack imposes** — low enough to hold
+on the smallest platform stack, high enough that no reasonable recursive algorithm reaches it.
+Functions, methods, constructors and mutually recursive pairs all count against it, and
+exceeding it raises an ordinary catchable error rather than ending the process.
+
+If you hit it with genuine recursion rather than a missing base case, rewrite the function as a
+loop with an explicit stack — a list you `push` onto and `pop` from does the same job with no
+depth limit at all.
+
 ## Collections
 
 ### Dict iteration (new — Python style)
@@ -358,6 +386,32 @@ A single list argument now walks the list natively, which is how you take the ra
 **NaN propagates** — `max(1, NAN, 3)` is `NaN`, matching NumPy's `max` (as opposed to its
 separate `nanmax`). A primitive should not silently discard a value it was handed; filter
 first if you want NaN skipped.
+
+### Bit operations are 32-bit
+
+Bantu has no `&`, `|`, `^`, `<<` or `>>` operators. The work is done by builtins, and they
+operate on **unsigned 32-bit integers**, like JavaScript's bitwise operators:
+
+```bantu
+band(12, 10)        // 8
+bor(12, 10)         // 14
+bxor(12, 10)        // 6
+shl(1, 31)          // 2147483648
+shr(256, 4)         // 16
+
+shl(1, 32)          // 1   — NOT 4294967296
+shl(1, 40)          // 256 — NOT 1099511627776
+```
+
+Both operands are truncated to `uint32`, and the shift count is masked to its low 5 bits, so a
+shift of 32 is a shift of 0 and a shift of 40 is a shift of 8. This is deliberate and matches
+JavaScript, but it means **64-bit bit manipulation is not expressible in Bantu** — 64-bit
+hashes, checksums, packed flags and bitboards have to be split into two 32-bit halves by hand,
+or done natively. Anything in the standard library that needs 64-bit words (SHA-512, for
+instance) computes them in C++ for exactly this reason.
+
+Note also that numbers are `float64` throughout, so integers are exact only to 2^53:
+`9007199254740993` prints as `9007199254740992`.
 
 ## Strings
 
