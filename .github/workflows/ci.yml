@@ -131,6 +131,9 @@ jobs:
                    tests/bplot_sua_test.sh \
                    tests/bplot_png_test.sh \
                    tests/gen_tables_test.sh \
+                   tests/lang_module_cwd_test.sh \
+                   tests/webrtc_chat_test.sh \
+                   tests/lang_module_stress.sh \
                    tests/run_samples.sh; do
             echo "── $s ──"
             if out=$(bash "$s" 2>&1); then
@@ -222,6 +225,9 @@ jobs:
                    tests/bplot_sua_test.sh \
                    tests/bplot_png_test.sh \
                    tests/gen_tables_test.sh \
+                   tests/lang_module_cwd_test.sh \
+                   tests/webrtc_chat_test.sh \
+                   tests/lang_module_stress.sh \
                    tests/run_samples.sh; do
             if out=$(bash "$s" 2>&1); then
               echo "$out"

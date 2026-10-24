@@ -1,7 +1,7 @@
 {
   "name": "webrtc-chat",
-  "version": "1.2.2",
-  "description": "WebRTC chat demo with Sua signaling server",
+  "version": "1.0.0",
+  "description": "Messaging, voice and video calls between browsers, signalled by a Bantu server over WebSockets",
   "entry": "server.b",
   "dependencies": {}
 }
