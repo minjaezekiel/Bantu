@@ -286,33 +286,32 @@ function handle(f) {
       sysMessage('You joined as ' + f.self.name + '.');
       break;
 
-    case 'roster': {
-      const before = new Set(state.peers.map((p) => p.id));
-      state.peers = f.peers || [];
-      const now = new Set(state.peers.map((p) => p.id));
-      for (const p of state.peers) if (!before.has(p.id) && p.id !== state.self.id) sysMessage(p.name + ' is online.');
-      for (const id of before) if (!now.has(id) && id !== state.self.id) sysMessage(peerNameCache(id) + ' went offline.');
-      rememberNames();
-      /* The server does not model calls, so nobody sends `bye` for a peer that
-         simply vanished. The roster is the signal -- but an id is only stable
-         for the lifetime of a socket.
-         [found] After either side reconnected, the peer came back under a NEW
-         id, the old id was gone from the roster, and this ended a call whose
-         audio and video were still flowing perfectly. A call is now re-bound
-         to the peer's new id by name, and only ended when nobody by that name
-         is left. */
-      if (state.call && !now.has(state.call.peerId)) {
-        const same = state.peers.find((p) => p.name === state.call.peerName);
-        if (same) {
-          state.call.peerId = same.id;          // reconnected under a new id
-        } else {
-          endCall(state.call.peerName + ' left', { notify: false });
-        }
-      }
-      if (state.dm && !now.has(state.dm)) setDm(null);
-      renderRoster();
+    /* Presence arrives as a DELTA. The server sends the whole roster only in
+       the welcome: broadcasting it on every join cost O(n^2) bytes and, in a
+       room of a few hundred, filled the server's per-connection send queue
+       until it started dropping peers to defend itself. See the note in
+       server.b.
+
+       All three frames end in the same applyRoster(), so the call re-binding
+       below -- which is the subtle part -- has exactly one implementation. */
+    case 'join':
+      if (!f.peer) break;
+      applyRoster(
+        state.peers.some((p) => p.id === f.peer.id)
+          ? state.peers.map((p) => (p.id === f.peer.id ? f.peer : p))   /* rename */
+          : state.peers.concat([f.peer])
+      );
       break;
-    }
+
+    case 'leave':
+      applyRoster(state.peers.filter((p) => p.id !== f.id));
+      break;
+
+    /* A full roster is still accepted: it is the cheapest possible resync and
+       an older server sends nothing else. */
+    case 'roster':
+      applyRoster(f.peers || []);
+      break;
 
     case 'chat':
       addMessage({
@@ -340,6 +339,35 @@ function handle(f) {
       sysMessage('Server: ' + f.message);
       break;
   }
+}
+
+/* Replace the roster with `next` and react to what changed: who arrived, who
+   left, and whether a call or DM was pointing at any of them. */
+function applyRoster(next) {
+  const selfId = state.self ? state.self.id : null;
+  const before = new Set(state.peers.map((p) => p.id));
+  state.peers = next;
+  const now = new Set(state.peers.map((p) => p.id));
+  for (const p of state.peers) if (!before.has(p.id) && p.id !== selfId) sysMessage(p.name + ' is online.');
+  for (const id of before) if (!now.has(id) && id !== selfId) sysMessage(peerNameCache(id) + ' went offline.');
+  rememberNames();
+  /* The server does not model calls, so nobody sends `bye` for a peer that
+     simply vanished. Presence is the signal -- but an id is only stable for
+     the lifetime of a socket.
+     [found] After either side reconnected, the peer came back under a NEW id,
+     the old id was gone, and this ended a call whose audio and video were
+     still flowing perfectly. A call is now re-bound to the peer's new id by
+     name, and only ended when nobody by that name is left. */
+  if (state.call && !now.has(state.call.peerId)) {
+    const same = state.peers.find((p) => p.name === state.call.peerName);
+    if (same) {
+      state.call.peerId = same.id;            // reconnected under a new id
+    } else {
+      endCall(state.call.peerName + ' left', { notify: false });
+    }
+  }
+  if (state.dm && !now.has(state.dm)) setDm(null);
+  renderRoster();
 }
 
 /* Names of peers who have left are still needed for one message, so the last

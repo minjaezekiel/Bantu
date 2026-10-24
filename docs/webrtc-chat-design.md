@@ -77,7 +77,9 @@ the server stamps `from` on what it forwards, so a client can never forge a send
 |---|---|---|---|
 | `hello` | → server | `name` | announce yourself; answered with `welcome` |
 | `welcome` | → client | `self`, `peers` | your assigned id, and who else is here |
-| `roster` | → client | `peers` | sent to everyone whenever presence changes |
+| `join` | → client | `peer` | one peer arrived (or renamed); the whole room is told |
+| `leave` | → client | `id` | one peer went |
+| `roster` | → client | `peers` | a full resync; still accepted, no longer sent |
 | `chat` | both | `text`, `to?` | room-wide when `to` is absent, direct when present |
 | `offer` | both | `to`, `sdp`, `media` | a call is being placed (`media`: `audio` or `video`) |
 | `answer` | both | `to`, `sdp` | the callee accepted |
@@ -93,6 +95,37 @@ impersonate another in chat or inject an `answer` into someone else's call.
 **Unknown recipients are reported, not dropped.** A `to` that is not connected gets an `error`
 frame back. Silence here reads exactly like a network failure and is the single most confusing
 thing to debug in a signalling server.
+
+**Presence is a delta, and the full roster is sent once.** The `welcome` carries the whole peer
+list — the only moment a client has nothing to patch — and after that a join or a leave is one
+small frame.
+
+This is not a micro-optimisation; the alternative does not degrade gracefully. Broadcasting the
+whole roster on every presence change is O(n²) bytes per change and O(n³) for a room filling up.
+Measured on one laptop: at 400 peers the server held **254 MB**, which is 635 KB of *queued roster
+frames per connection*. At 800 peers each roster frame is ~27 KB, so 800 joins queue ~21 MB per
+connection — far past sua's 4 MB per-connection backpressure cap, at which point sua closes the
+socket to protect its own memory. **519 of 800 peers were dropped.** In a browser that is "it
+connects, and then everyone keeps going offline", which is how it was first reported and which
+looks nothing like a broadcast-size problem.
+
+A delta is ~50 bytes regardless of room size, so a join costs 50n instead of 34n²: at 800 peers,
+40 KB instead of 21 MB.
+
+| peers | before | after |
+|---|---|---|
+| 300 | 154.7 MB, 29 dropped | 10.1 MB, 0 dropped |
+| 400 | 254 MB, 0 dropped (p99 welcome 603 ms) | 12.8 MB, 0 dropped (p99 232 ms) |
+| 800 | **519 of 800 dropped** | 26.5 MB, 0 dropped |
+| 3,200 | — | 202.8 MB, 0 dropped, p50 RTT 141 ms |
+
+The sample caps the room at 1,000 (`MAX_PEERS`), which is where one laptop is still comfortable
+rather than where it starts to swap. `tests/webrtc_chat_stress.sh` asserts the shape of this — all
+peers connect, all stay connected, all can still send — rather than the absolute numbers, so it
+fails on a reintroduced O(n²) broadcast but not on a slower machine.
+
+**A client is never told about its own arrival.** The `welcome` already named it, and a client that
+adds itself to its own roster offers you a button to call yourself.
 
 **The relay is stateless about calls.** The server does not model "a call" — it has no idea whether
 an `offer` was answered. Call state lives in the two browsers, which are the only parties who know
@@ -208,6 +241,23 @@ protocol is driven over a real WebSocket by a stdlib Python client — two peers
 `hello`/`welcome`/`roster`, relay chat room-wide and directly, carry an `offer`/`answer`/`ice`
 sequence between them, get `error` for an unknown recipient, fail to forge `from`, and see the
 roster shrink when one disconnects. That covers everything the server is responsible for.
+
+Three more suites cover what the first live test and the stress test turned up:
+
+- `tests/webrtc_chat_stress.sh` — fills the room and asserts no peer is dropped while it fills.
+  Fails against the full-roster broadcast; see §3.
+- `tests/webrtc_tls_proxy_test.sh` — a silent TCP socket must not stop the TLS front end serving
+  anyone else. Fails against the version that ran the handshake on the accept thread.
+- `tests/sua_ws_security_test.sh` — reserved opcodes, the per-IP cap and the `allowed_hosts` check,
+  including the self-consistent `Origin`/`Host` pair that DNS rebinding produces.
+
+An abuse pass was also run by hand against the running server — cross-site and Host-spoofed
+upgrades, unmasked and RSV-set frames, a frame claiming 2 GiB, a 12 MB fragmented message, forged
+`from` on chat and on `offer`, frames before `hello`, a display name full of markup and control
+bytes, non-object JSON, bogus `to` values, eight path-traversal shapes against the static root, a
+header flood, slowloris, an absurd `Content-Length`, 300 sockets from one address, and 500 `hello`
+frames down one socket. Everything was refused or survived; the three things that were not are the
+CHANGELOG entries above.
 
 What it cannot cover is the browser half — `getUserMedia`, ICE, and whether audio is audible — so
 the README carries an explicit manual script for the two-browser test and the phone test, with the

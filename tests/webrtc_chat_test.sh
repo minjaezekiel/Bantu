@@ -198,24 +198,28 @@ b = WS(); b.send({"type": "hello", "name": "bob"})
 wb = b.expect("welcome"); B = wb["self"]["id"]
 check("a joiner sees who is already here",
       sorted(p["name"] for p in wb["peers"]), ["alice", "bob"])
-def roster_with(ws, n, timeout=6):
-    """The next roster frame listing n peers.
+# Presence is a DELTA: one small frame per event, and the full roster only in
+# the welcome.
+#
+# [found] The server used to broadcast the WHOLE roster to every peer on every
+# join and leave -- O(n^2) bytes per event. Measured: 400 peers held 254 MB of
+# queued roster frames, and at 800 the per-connection 4 MB backpressure cap
+# tripped and sua closed 519 of the 800 sockets to defend itself. From a
+# browser that is "everyone keeps going offline". With deltas, 3,200 peers held
+# 203 MB and not one was dropped.
+j = a.expect("join")
+check("a join is announced as a delta, not a whole roster", j["peer"]["name"], "bob")
+check("the delta carries the joiner's id", j["peer"]["id"], B)
 
-    A roster is broadcast on every presence change, so alice's socket already
-    holds the one from her OWN hello (just herself) before the one that
-    followed bob's. Waiting for the size wanted is the difference between
-    asserting on presence and asserting on arrival order."""
-    end = time.time() + timeout
-    last = None
-    while time.time() < end:
-        last = ws.expect("roster", timeout=max(0.2, end - time.time()))
-        if len(last["peers"]) == n:
-            return last
-    raise AssertionError("no roster of %d peers; last was %r" % (n, last))
-
-ra = roster_with(a, 2)
-check("everyone is told when someone joins",
-      sorted(p["name"] for p in ra["peers"]), ["alice", "bob"])
+# A joiner must not be told about itself: the welcome already named it, and a
+# client that adds itself to its own roster shows itself as someone to call.
+def own_join_frame():
+    try:
+        f = b.expect("join", timeout=1.0)
+    except Exception:
+        return "none"           # a timeout IS the expected outcome here
+    return f["peer"]["id"]
+check("a joiner is not told about its own arrival", own_join_frame(), "none")
 
 print("\n-- chat --")
 a.send({"type": "chat", "text": "hello room"})
@@ -302,6 +306,23 @@ print("\n-- leaving --")
 # browsers that is a roster full of ghosts of yourself.
 time.sleep(0.6)
 b.close()
+# Every peer that connected and closed earlier in this run queued a `leave`
+# of its own on alice's socket, so the FIRST leave frame is not bob's. The one
+# being asserted about is the one naming bob's id.
+def leave_for(peer_id, timeout=6):
+    end = time.time() + timeout
+    seen = []
+    while time.time() < end:
+        try:
+            f = a.expect("leave", timeout=max(0.2, end - time.time()))
+        except Exception:
+            break
+        seen.append(f["id"])
+        if f["id"] == peer_id:
+            return peer_id
+    return "no leave for %s; saw %s" % (peer_id, seen)
+
+lv_id = leave_for(B)
 deadline = time.time() + 6
 names = None
 while time.time() < deadline:
@@ -310,6 +331,7 @@ while time.time() < deadline:
         break
     time.sleep(0.2)
 check("a peer that disconnects is removed", names, ["alice"])
+check("and the departure is announced as a delta", lv_id, B)
 
 a.close()
 deadline = time.time() + 6
