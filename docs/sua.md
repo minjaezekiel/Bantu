@@ -874,4 +874,23 @@ These are real constraints of the current implementation, not oversights to work
 - **No SSE.** WebSockets *are* supported (`sua.ws.*`, RFC 6455: masking enforced, continuation
   frames reassembled, UTF-8 validated, `Origin` checked on upgrade). The dead implementation in
   `server.hpp` is unrelated and still unused.
+- **No TLS on the server.** `sua.server` has no certificate option of any kind; `sua.http`'s TLS
+  settings are for the *client* side. This is not only about encryption: a browser grants
+  `getUserMedia` and registers a service worker only in a **secure context**, and `http://` on
+  anything but `localhost` is not one. So a phone pointed at a LAN address cannot open a
+  microphone or a camera, and the PWA sample's service worker will not install there either. Put
+  a TLS terminator in front — `samples/webrtc-chat/tls-dev-proxy.py` is a 90-line
+  standard-library one for exactly this, and it proxies raw TCP so the WebSocket upgrade and the
+  `Host` header pass through untouched.
+
+**One WebSocket defect, fixed, worth knowing about if you used an older build:**
+
+- **A disconnecting peer could stay in the table for five minutes.** A connection whose `send()`
+  failed permanently was marked closing but never reaped, because reaping required its output
+  queue to have drained — which a dead socket never does. `on("disconnect")` did not fire, and
+  the fd, its buffers and its slot against `max_connections` stayed held until the WebSocket idle
+  timeout. It needed several sockets closing in one event-loop pass *with* frames queued that the
+  client never read, which is exactly what browser tabs do when they close or reload: six
+  clients closing back-to-back leaked four. Now the undeliverable queue is discarded and the
+  connection is dropped on the same pass.
 - Push notifications are **UTC only** and assume a single record per message.

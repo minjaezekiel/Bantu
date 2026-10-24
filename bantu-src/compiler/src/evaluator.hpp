@@ -923,6 +923,42 @@ inline Value bantuJsonParseValue(const std::string& s, size_t& pos, int depth = 
 inline void bantuJsonSkipWs(const std::string& s, size_t& pos) {
     while (pos < s.size() && (s[pos]==' '||s[pos]=='\t'||s[pos]=='\n'||s[pos]=='\r')) pos++;
 }
+// One Unicode code point, appended as UTF-8. Needed by the JSON parser to
+// turn a \uXXXX escape back into the character it stands for.
+inline void bantuAppendUtf8(std::string& out, unsigned cp) {
+    if (cp <= 0x7F) {
+        out += (char)cp;
+    } else if (cp <= 0x7FF) {
+        out += (char)(0xC0 | (cp >> 6));
+        out += (char)(0x80 | (cp & 0x3F));
+    } else if (cp <= 0xFFFF) {
+        out += (char)(0xE0 | (cp >> 12));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+        out += (char)(0x80 | (cp & 0x3F));
+    } else {
+        out += (char)(0xF0 | (cp >> 18));
+        out += (char)(0x80 | ((cp >> 12) & 0x3F));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+        out += (char)(0x80 | (cp & 0x3F));
+    }
+}
+
+// Four hex digits at `at`, or false if they are not four hex digits.
+inline bool bantuJsonHex4(const std::string& s, size_t at, unsigned& outv) {
+    if (at + 4 > s.size()) return false;
+    unsigned v = 0;
+    for (size_t i = at; i < at + 4; i++) {
+        char h = s[i];
+        v <<= 4;
+        if      (h >= '0' && h <= '9') v |= (unsigned)(h - '0');
+        else if (h >= 'a' && h <= 'f') v |= (unsigned)(h - 'a' + 10);
+        else if (h >= 'A' && h <= 'F') v |= (unsigned)(h - 'A' + 10);
+        else return false;
+    }
+    outv = v;
+    return true;
+}
+
 inline std::string bantuJsonParseStringRaw(const std::string& s, size_t& pos) {
     std::string out;
     if (pos >= s.size() || s[pos] != '"') return out;
@@ -940,11 +976,55 @@ inline std::string bantuJsonParseStringRaw(const std::string& s, size_t& pos) {
                 case 'b':  out += '\b'; break;
                 case 'f':  out += '\f'; break;
                 case 'u': {
-                    if (pos + 5 < s.size()) {
-                        // Just skip unicode escapes for simplicity (drop them)
-                        pos += 5;
+                    // [found] TWO defects here, and the second was the
+                    // dangerous one.
+                    //
+                    // 1. The escape was DROPPED instead of decoded. Any client
+                    //    that encodes JSON as ASCII deletes nothing and escapes
+                    //    everything else -- Python's json.dumps does this by
+                    //    default -- so {"name": "caf\u00e9"} reached Bantu as
+                    //    "caf", silently losing characters.
+                    //
+                    // 2. It consumed SEVEN characters for a six-character
+                    //    escape: pos += 5 here, then pos += 2 after the switch.
+                    //    That ate the character AFTER the escape, which
+                    //    desynchronised the parser -- "caf\u00e9" swallowed its
+                    //    own closing quote and read on into the surrounding
+                    //    object, and "\u0041\u0042" came out as "u0042"
+                    //    because the second backslash had been eaten. A string
+                    //    could therefore corrupt the structure around it, not
+                    //    just itself.
+                    //
+                    // Decoded properly now, surrogate pairs included, so an
+                    // escaped emoji survives a round trip.
+                    unsigned cp = 0;
+                    if (bantuJsonHex4(s, pos + 2, cp)) {
+                        size_t consumed = 6;              // \uXXXX
+                        // A high surrogate carries only half a code point; the
+                        // low surrogate that follows carries the rest.
+                        if (cp >= 0xD800 && cp <= 0xDBFF &&
+                            pos + 7 < s.size() && s[pos + 6] == '\\' && s[pos + 7] == 'u') {
+                            unsigned lo = 0;
+                            if (bantuJsonHex4(s, pos + 8, lo) && lo >= 0xDC00 && lo <= 0xDFFF) {
+                                cp = 0x10000u + ((cp - 0xD800u) << 10) + (lo - 0xDC00u);
+                                consumed = 12;            // \uXXXX\uXXXX
+                            }
+                        }
+                        // A surrogate on its own is not a character. U+FFFD is
+                        // what it means, and it keeps the output valid UTF-8 --
+                        // which matters because a WebSocket text frame built
+                        // from this is validated before it is sent.
+                        if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD;
+                        bantuAppendUtf8(out, cp);
+                        pos += consumed;
+                        continue;                         // already advanced
                     }
-                    break;
+                    // Not a valid escape. Emit the 'u' and step over just the
+                    // two characters we looked at, rather than guessing a
+                    // length and losing the parser's place.
+                    out += 'u';
+                    pos += 2;
+                    continue;
                 }
                 default: out += c;
             }
@@ -1135,6 +1215,9 @@ static std::unordered_map<int, BantuUdpServer>& bantuUdpServers() {
 // ─── SHA-1 (for WebSocket handshake, RFC 6455) ────────────────────
 // We need SHA1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11") → base64
 // for the Sec-WebSocket-Accept header. ~50 lines of inline SHA1.
+//
+// That GUID is fixed by RFC 6455 §1.3 and must be copied EXACTLY -- see the
+// note on bantuWsUpgrade() for what one transposed character costs.
 struct BantuSha1 {
     uint32_t h0=0x67452301, h1=0xEFCDAB89, h2=0x98BADCFE, h3=0x10325476, h4=0xC3D2E1F0;
     uint8_t msg[64]; int msgLen=0; uint64_t totalLen=0;
@@ -1449,9 +1532,22 @@ static bool bantuValidUtf8(const std::string& s) {
 // for the next wakeup. That incremental parse is also what makes frame
 // truncation at TCP segment boundaries structurally impossible.
 static void bantuWsUpgrade(int sock, const std::string& wsKey) {
+    // The WebSocket GUID, fixed by RFC 6455 §1.3. It is NOT a random-looking
+    // string to be retyped from memory: every character matters, because
+    // Sec-WebSocket-Accept is SHA1(key + GUID) and a client that computes a
+    // different digest MUST fail the connection (§4.1).
+    //
+    // Do not "correct" this value. It has been mis-"fixed" once already, to
+    // ...-95CA-5AB0DC85B11F (the trailing F moved to the front of the last
+    // group), which is a plausible-looking transposition and completely wrong.
+    // The result was that every browser refused the handshake while the server
+    // still logged a connected client, so the breakage was invisible from the
+    // server side. Verified against the `websockets` reference implementation,
+    // whose own constant is byte-identical to this one.
+    static const char* WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     BantuSha1 sha;
     sha.update(wsKey);
-    sha.update(std::string("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
+    sha.update(std::string(WS_GUID));
     std::string acceptVal = bantuBase64Encode(sha.final_());
 
     std::string resp = "HTTP/1.1 101 Switching Protocols\r\n"
@@ -3716,10 +3812,31 @@ private:
                 }
             case BantuTokenType::EQUALTO: return Value(left.equals(right));
             case BantuTokenType::NOTEQUALTO: return Value(!left.equals(right));
-            case BantuTokenType::GREATERTHAN: return Value(left.numberVal > right.numberVal);
-            case BantuTokenType::LESSTHAN: return Value(left.numberVal < right.numberVal);
-            case BantuTokenType::GREATERTHANEQUAL: return Value(left.numberVal >= right.numberVal);
-            case BantuTokenType::LESSTHANEQUAL: return Value(left.numberVal <= right.numberVal);
+            // [found] Two strings compared as NUMBERS, and both of them read
+            // as 0: `"a" < "b"` was false, `"b" > "a"` was false, and every
+            // `<`/`>` on strings answered false while every `<=`/`>=` answered
+            // true. So nothing could be ordered alphabetically, and a range
+            // check on a character silently passed everything --
+            // `if ($ch >= " ")`, written to drop control characters, kept them
+            // all. Equality was never affected, which is why this survived:
+            // == and != go through Value::equals, which is type-aware.
+            //
+            // Two strings now compare lexicographically, by byte, which for
+            // UTF-8 is also code-point order. A mixed string/number comparison
+            // keeps the old numeric coercion rather than picking a winner
+            // between two defensible answers.
+            case BantuTokenType::GREATERTHAN:
+                if (left.isString() && right.isString()) return Value(left.stringVal > right.stringVal);
+                return Value(left.numberVal > right.numberVal);
+            case BantuTokenType::LESSTHAN:
+                if (left.isString() && right.isString()) return Value(left.stringVal < right.stringVal);
+                return Value(left.numberVal < right.numberVal);
+            case BantuTokenType::GREATERTHANEQUAL:
+                if (left.isString() && right.isString()) return Value(left.stringVal >= right.stringVal);
+                return Value(left.numberVal >= right.numberVal);
+            case BantuTokenType::LESSTHANEQUAL:
+                if (left.isString() && right.isString()) return Value(left.stringVal <= right.stringVal);
+                return Value(left.numberVal <= right.numberVal);
             // AND and OR are handled at the top of this function, where they
             // can short-circuit. Reaching here would mean the guard above
             // stopped matching, so say so rather than silently evaluating both
@@ -5047,6 +5164,28 @@ private:
                                          (int)(cc.out.size() - cc.outPos), 0);
                         if (w > 0) { cc.outPos += (size_t)w; continue; }
                         if (bantu_loop::wouldBlock()) break;
+                        // [found] A connection whose send() failed for good was
+                        // marked closing and then never reaped, because the reap
+                        // test below requires the output queue to have DRAINED --
+                        // and a socket that cannot be written will never drain
+                        // it. The connection sat in the table until the 5-minute
+                        // WS idle timeout: on("disconnect") did not fire, so a
+                        // peer that had gone stayed in every roster for five
+                        // minutes, and its fd, its buffers and its slot against
+                        // maxConnections stayed held with it.
+                        //
+                        // Reproduced with six WebSocket clients closing
+                        // back-to-back while frames they never read were still
+                        // queued -- which is what a browser tab does when it is
+                        // closed, and what every client does on a reload: four
+                        // of the six leaked. Discard what can no longer be
+                        // delivered, so the connection is reaped on this pass.
+                        //
+                        // Only a REAL send failure discards. EV_EOF also sets
+                        // ev.error, and a client that half-closes with
+                        // shutdown(WR) is still waiting to read its response --
+                        // throwing that response away would break it.
+                        cc.out.clear(); cc.outPos = 0;
                         cc.closing = true; break;
                     }
                     if (cc.outPos >= cc.out.size()) { cc.out.clear(); cc.outPos = 0; }

@@ -258,6 +258,53 @@ close($rf);
 eq($whole, "abc", "and in the documented form, $rest = read($f)");
 
 print("");
+print("-- relational operators on strings --");
+// [found] Both operands were read as numberVal, which is 0 for any string, so
+// every < and > between strings answered false and every <= and >= answered
+// true. Nothing could be ordered alphabetically, and `if ($ch >= " ")` --
+// written to drop control characters -- admitted every one of them. == and !=
+// were never affected, which is why it went unnoticed.
+ok("a" < "b",  "\"a\" < \"b\"");
+ok(!("b" < "a"), "\"b\" < \"a\" is false");
+ok("b" > "a",  "\"b\" > \"a\"");
+ok(!("a" > "b"), "\"a\" > \"b\" is false");
+ok("abc" < "abd", "a shared prefix is decided by the first difference");
+ok(!("abd" < "abc"), "and in the other direction");
+ok("apple" < "banana", "whole words order alphabetically");
+ok(!("zebra" < "apple"), "and not the wrong way round");
+ok("a" <= "a", "<= is true for equal strings");
+ok("a" >= "a", ">= is true for equal strings");
+ok(!("a" < "a"), "< is false for equal strings");
+// The case that mattered: a byte below the space must compare as less. Built
+// with chr(), because Bantu string literals have no \uXXXX escape -- writing
+// one here produced the four characters u, 0, 0, 1 and tested nothing.
+ok(!(chr(1) >= " "), "a control character is NOT >= a space");
+ok(chr(1) < " ", "and it compares as less than one");
+ok(chr(7) < chr(32), "BEL sorts below the space");
+ok("~" > "A", "ordering follows byte value, so ~ (0x7E) is above A (0x41)");
+ok(1 < 2, "numbers are unaffected");
+ok(!(2 < 1), "in both directions");
+
+print("");
+print("-- JSON \\uXXXX escapes --");
+// [found] The escape was dropped instead of decoded AND the position advanced
+// seven characters for a six-character escape, eating the next character --
+// so a string could corrupt the structure around it. Any ASCII-safe JSON
+// encoder (Python's json.dumps by default) escapes every non-ASCII character,
+// so this silently deleted them for every client that used one.
+eq(json.parse("{\"s\":\"\\u0041\\u0042\"}")["s"], "AB", "two ASCII escapes decode, and neither eats the other");
+eq(json.parse("{\"s\":\"caf\\u00e9\"}")["s"], "café", "a two-byte code point decodes to UTF-8");
+eq(json.parse("{\"s\":\"\\u4e16\\u754c\"}")["s"], "世界", "and a three-byte one");
+eq(json.parse("{\"s\":\"hi \\ud83d\\ude00\"}")["s"], "hi 😀", "a surrogate PAIR becomes one code point");
+// The structural half: the escape must not consume the closing quote.
+$jo = json.parse("{\"a\":\"caf\\u00e9\",\"b\":\"second\"}");
+eq($jo["a"], "café", "an escape does not run past its own string");
+eq($jo["b"], "second", "so the NEXT key is still parsed");
+eq(len(json.parse("{\"s\":\"x\\ud800y\"}")["s"]), 5, "a lone surrogate becomes U+FFFD (3 bytes), keeping valid UTF-8");
+eq(json.parse("{\"s\":\"a\\uZZZZb\"}")["s"], "auZZZZb", "a malformed escape does not desynchronise the parser");
+eq(json.parse("{\"s\":\"tab\\there\"}")["s"], "tab\there", "the short escapes still work");
+
+print("");
 print("========================================");
 print("  PASS: " + str($R.pass) + "   FAIL: " + str($R.fail));
 if ($R.fail == 0) { print("  RESULT: ALL GREEN"); }
