@@ -209,6 +209,14 @@ struct BantuServerLimits {
     size_t maxWsMessageBytes= 8 * 1024 * 1024;  // reassembled, across continuations
     bool   wsCheckOrigin    = true;             // reject cross-site WS upgrades
     std::vector<std::string> wsAllowedOrigins;  // empty + check on = same-origin only
+    // Host names this server answers for, lowercase, with or without a port.
+    // Empty = any, which is what a laptop dev server wants and is what every
+    // existing program already gets. Set it for anything reachable from a
+    // network you do not control: the WebSocket origin check can only compare
+    // Origin against Host, and BOTH are sent by the client, so without this a
+    // hostile page whose domain resolves to this server's address passes the
+    // same-origin test. See the note in bantuDispatchRequest.
+    std::vector<std::string> allowedHosts;
     // Concurrently SUSPENDED handlers, which is one OS thread each. Not a cap
     // on requests: a handler that never suspends never takes a slot, and the
     // slot is released the moment the handler finishes. Over the cap, a
@@ -1678,6 +1686,17 @@ static bool bantuWsProcess(BantuConn& c) {
             continue;
         }
         if (opcode == 0xA) continue;                                // pong
+
+        // [found] Reserved opcodes -- 0x3..0x7 (data) and 0xB..0xF (control)
+        // -- were silently ignored. RFC 6455 5.2 requires FAILING the
+        // connection: no extension negotiated them, so a peer sending one is
+        // broken or probing, and skipping the frame leaves the two ends
+        // disagreeing about where the next frame starts. 0x0 is consumed by
+        // the reassembly above and 0x8/0x9/0xA just returned, so anything
+        // still here that is not text or binary is reserved.
+        if (opcode != 0x1 && opcode != 0x2) {
+            bantuWsClose(sock, 1002, "reserved opcode"); return false;
+        }
 
         if (opcode == 0x2) {                                        // binary
             if (bantuWsOnMessage.isFunction() || bantuWsOnMessage.isNativeFn()) {
@@ -4421,6 +4440,47 @@ private:
             ? std::string() : bantuHeaderValueLower(request, hdrEndForConn, "connection");
         bool keepAlive = http11 ? (connHdr.find("close") == std::string::npos)
                                 : (connHdr.find("keep-alive") != std::string::npos);
+
+        // ── Host allowlist ──────────────────────────────────────────────
+        // [found] The WebSocket upgrade check accepted a request whose Origin
+        // matched its own Host header -- and the client sends both. Matching
+        // one client-supplied header against another proves nothing: a page on
+        // a domain the attacker owns, pointed by DNS at this server's address
+        // (classic DNS rebinding), sends Origin: http://evil and Host: evil,
+        // they match, and the socket is accepted. The page is then a full
+        // participant: in the chat sample it reads the roster and every
+        // message in the room, and can place calls. Verified against the
+        // running server -- accepted before this check, 400 after.
+        //
+        // Checked here rather than in the upgrade path because every request
+        // has a Host and this is the one place they all pass through, so HTTP
+        // routes and static files are covered by the same three lines.
+        //
+        // Same defence as Django's ALLOWED_HOSTS and vite's allowedHosts, and
+        // like both it is opt-in: an empty list accepts any Host, so nothing
+        // that worked before stops working.
+        if (!bantuLimits.allowedHosts.empty()) {
+            const std::string hostHdr = (hdrEndForConn == std::string::npos)
+                ? std::string()
+                : bantuHeaderValueLower(request, hdrEndForConn, "host");
+            bool hostOk = false;
+            for (const auto& h : bantuLimits.allowedHosts) {
+                // "example.com" also admits "example.com:8080". The port is
+                // ours; it is the NAME the client is making a claim about.
+                if (h == "*" || h == hostHdr || hostHdr.rfind(h + ":", 0) == 0) {
+                    hostOk = true;
+                    break;
+                }
+            }
+            if (!hostOk) {
+                std::cerr << "  [SERVER] rejected Host: " << hostHdr << "\n";
+                bantuConnWrite(sock, std::string(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n"
+                    "Connection: close\r\n\r\n"));
+                bantuConnClose(sock);
+                return;
+            }
+        }
 
         // HEAD is answered without a body -- sending one is forbidden (RFC 7231
         // §4.3.2) and, now that connections are reused, it would desynchronise
@@ -8952,6 +9012,18 @@ private:
                     for (const auto& v : ao->second.listVal)
                         bantuLimits.wsAllowedOrigins.push_back(v.toString());
                 }
+                auto ah = o.find("allowed_hosts");
+                if (ah != o.end() && ah->second.isList()) {
+                    bantuLimits.allowedHosts.clear();
+                    for (const auto& v : ah->second.listVal) {
+                        // Lowercased once here, because Host arrives lowercased
+                        // and comparing it against a mixed-case entry would
+                        // silently reject the very host it was meant to allow.
+                        std::string h = v.toString();
+                        for (auto& ch : h) ch = (char)std::tolower((unsigned char)ch);
+                        bantuLimits.allowedHosts.push_back(h);
+                    }
+                }
             }
             ObjectMap out;
             out["max_header_bytes"]     = Value((double)bantuLimits.maxHeaderBytes);
@@ -8965,6 +9037,11 @@ private:
             out["max_ws_message_bytes"] = Value((double)bantuLimits.maxWsMessageBytes);
             out["max_suspended_handlers"] = Value((double)bantuLimits.maxSuspendedHandlers);
             out["ws_check_origin"]      = Value(bantuLimits.wsCheckOrigin);
+            {
+                std::vector<Value> hosts;
+                for (const auto& h : bantuLimits.allowedHosts) hosts.push_back(Value(h));
+                out["allowed_hosts"] = Value(std::move(hosts));
+            }
             out["ws_roster"]            = Value(bantuWsRoster);
             std::vector<Value> origins;
             for (const auto& a : bantuLimits.wsAllowedOrigins) origins.push_back(Value(a));

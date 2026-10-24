@@ -13,6 +13,12 @@
 #    * unhandled SIGPIPE         -> one abrupt disconnect killed the server
 #    * wrong RFC 6455 GUID       -> Sec-WebSocket-Accept no browser accepts
 #    * undrainable output        -> a closed peer never reaped, never dropped
+#    * reserved opcodes ignored  -> RFC 6455 5.2 requires failing; skipping a
+#                                   frame leaves the ends disagreeing about
+#                                   where the next one starts
+#    * Origin matched against Host -> both are sent by the CLIENT, so a page on
+#                                   a domain pointed by DNS at this server
+#                                   passed the same-origin test (DNS rebinding)
 #
 #  The last two were missed by this file for as long as it has existed. The
 #  handshake assertions here only read the STATUS LINE, and the server does
@@ -33,6 +39,7 @@ cleanup() {
     [ -n "${SRV:-}" ]     && kill "$SRV" 2>/dev/null
     [ -n "${CAPSRV:-}" ]  && kill "$CAPSRV" 2>/dev/null
     [ -n "${LEAKSRV:-}" ] && kill "$LEAKSRV" 2>/dev/null
+    [ -n "${HOSTSRV:-}" ] && kill "$HOSTSRV" 2>/dev/null
     rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -78,11 +85,25 @@ BEOF
 CAPSRV=$!
 for _ in $(seq 1 40); do curl -s -o /dev/null "http://127.0.0.1:$CAPPORT/ping" 2>/dev/null && break; sleep 0.2; done
 
-PORT="$PORT" CAPPORT="$CAPPORT" LEAKPORT="$LEAKPORT" python3 - <<'PY'
+# A server that answers for ONE host name. The WebSocket origin check can only
+# compare Origin against Host and the client sends both, so without an
+# allowlist a hostile page whose domain resolves here passes it.
+HOSTPORT=$((PORT+7))
+cat > "$TMP/hosts.b" <<BEOF
+sua.server.limits({"allowed_hosts": ["good.example", "127.0.0.1:$HOSTPORT"]});
+sua.server.get("/ping", def(\$req, \$res) { \$res.json({"ok": true}); });
+sua.server.listen($HOSTPORT);
+BEOF
+"$BANTU" run "$TMP/hosts.b" > "$TMP/hosts.log" 2>&1 &
+HOSTSRV=$!
+for _ in $(seq 1 40); do curl -s -o /dev/null "http://127.0.0.1:$HOSTPORT/ping" 2>/dev/null && break; sleep 0.2; done
+
+PORT="$PORT" CAPPORT="$CAPPORT" LEAKPORT="$LEAKPORT" HOSTPORT="$HOSTPORT" python3 - <<'PY'
 import socket, base64, hashlib, os, struct, sys, json
 PORT=int(os.environ["PORT"])
 CAPPORT=int(os.environ["CAPPORT"])
 LEAKPORT=int(os.environ["LEAKPORT"])
+HOSTPORT=int(os.environ["HOSTPORT"])
 P=F=0
 def check(label, got, want):
     global P,F
@@ -331,6 +352,59 @@ check("all 6 are reaped after closing back-to-back", still_held, 0)
 opened, still_held = run(lambda: leak_probe(12))
 check("12 WebSockets were accepted", opened, 12)
 check("all 12 are reaped too", still_held, 0)
+
+# ── reserved opcodes ───────────────────────────────────────────────────────
+# 0x3..0x7 (data) and 0xB..0xF (control) are reserved: no extension negotiated
+# them, so RFC 6455 5.2 requires FAILING the connection. They used to be
+# ignored, which leaves the two ends disagreeing about the stream.
+def reserved(op):
+    s = ws()
+    s.sendall(frame(op, b"x"))
+    c = code(s)
+    s.close()
+    return c
+
+check("reserved data opcode 0x3 fails the connection",    run(lambda: reserved(0x3)), 1002)
+check("reserved data opcode 0x7 fails the connection",    run(lambda: reserved(0x7)), 1002)
+check("reserved control opcode 0xB fails the connection", run(lambda: reserved(0xB)), 1002)
+
+# ── Host allowlist ─────────────────────────────────────────────────────────
+# A request carries whatever Host the client chooses. Comparing Origin against
+# it proves nothing, which is why the allowlist exists.
+def host_status(host_header):
+    s = socket.create_connection(("127.0.0.1", HOSTPORT), 5); s.settimeout(6)
+    s.sendall(("GET /ping HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n"
+               % host_header).encode())
+    buf = b""
+    try:
+        while b"\r\n" not in buf:
+            d = s.recv(4096)
+            if not d: break
+            buf += d
+    except Exception:
+        pass
+    s.close()
+    parts = buf.split(b" ")
+    return int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else "no-status"
+
+check("an allowed Host is served",            run(lambda: host_status("good.example")), 200)
+check("an allowed Host with a port is served",run(lambda: host_status("127.0.0.1:%d" % HOSTPORT)), 200)
+check("an unlisted Host is refused",          run(lambda: host_status("evil.example")), 400)
+check("a spoofed Host with a port is refused",run(lambda: host_status("evil.example:%d" % HOSTPORT)), 400)
+check("an absent Host is refused",            run(lambda: host_status("")), 400)
+
+# A WebSocket upgrade goes through the same check, which is the attack that
+# motivated it: Origin and Host both say evil.example, and they match.
+def rebind_upgrade():
+    s = socket.create_connection(("127.0.0.1", HOSTPORT), 5); s.settimeout(6)
+    k = base64.b64encode(os.urandom(16)).decode()
+    s.sendall(("GET / HTTP/1.1\r\nHost: evil.example\r\nOrigin: http://evil.example\r\n"
+               "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+               "Sec-WebSocket-Version: 13\r\n\r\n" % k).encode())
+    buf = s.recv(4096); s.close()
+    return int(buf.split(b" ")[1])
+
+check("self-consistent cross-origin upgrade is refused", run(rebind_upgrade), 400)
 
 print("\n========================================")
 print("  PASS: %d   FAIL: %d" % (P,F))

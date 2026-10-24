@@ -557,6 +557,35 @@ there instead.
 Rejected connections get `503` and are counted in `stats().rejected_per_ip`. Under
 `sua.server.workers(n)` the cap is per worker, so the effective process-group limit is n × the value.
 
+Measured: with the cap at 5, exactly 5 connections from one address were admitted and the other 295
+got `503`; with it at 64, exactly 64. Note that the cap is only reached by a client that opens
+sockets *faster than `header_timeout_ms` reaps the silent ones* — a probe that opened 300 sockets one
+per second never reached a cap of 64, because the 10 s header timeout freed slots as fast as it took
+them. That is the timeout working, not the cap failing.
+
+### Host allowlist
+
+A request carries whatever `Host` header the client chooses, so matching `Origin` against `Host` —
+which is all the WebSocket origin check can do on its own — proves nothing. A page on a domain the
+attacker owns, pointed by DNS at this server's address, sends `Origin: http://evil.example` and
+`Host: evil.example`: they match, and the upgrade is accepted. That is DNS rebinding, and on a
+private network it makes the hostile page a full participant in whatever the server publishes.
+
+`allowed_hosts` is the fix, and it applies to every request, not only upgrades:
+
+```bantu
+sua.server.limits({"allowed_hosts": ["example.com", "127.0.0.1:8080"]});
+```
+
+An entry without a port also admits that name with any port, so `example.com` covers
+`example.com:8080`. A `Host` that matches nothing gets `400 Bad Request` and the connection closes.
+`*` allows anything, which is the same as leaving the list out.
+
+**It is empty by default**, so nothing that worked before stops working, and a dev server reached at
+`localhost`, at a LAN address and through a TLS front end on a third port keeps working without
+configuration. Set it the moment the server is reachable from a network you do not control. This is
+the same control as Django's `ALLOWED_HOSTS` and vite's `server.allowedHosts`.
+
 ### Cross-worker client roster
 
 `sua.ws.clients()` lists this worker's clients. To see every worker's:
