@@ -50,8 +50,15 @@ logs: ## Tail server logs
 docker: ## Start in Docker (no local libs needed)
 	PORT=$(PORT) docker compose -f docker-compose.dev.yml up --build
 
-build: ## Rebuild the bantu binary from source
-	cd bantu-src/compiler && ./build.sh
+# build.sh is the LINUX script -- it links -l:libcurl.so.4 by exact soname,
+# which does not exist on macOS, so `make build` died at the link step with
+# "ld: library ':libcurl.so.4' not found" after compiling everything. The
+# platform scripts sit side by side (build.sh / build-mac.sh / build-win.sh);
+# pick by uname rather than making every macOS contributor rediscover this.
+BUILD_SH := $(if $(filter Darwin,$(shell uname -s)),./build-mac.sh,./build.sh)
+
+build: ## Rebuild the bantu binary from source (picks build.sh / build-mac.sh)
+	cd bantu-src/compiler && $(BUILD_SH)
 	cp -f bantu-src/compiler/build/bantu ./bantu
 	chmod +x ./bantu
 	@echo "✓ New binary: $$($(BANTU) --version)"

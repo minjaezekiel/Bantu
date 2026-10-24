@@ -13,8 +13,8 @@
 //  Run:  bantu run samples/bplot/05_dataframe.b
 // ════════════════════════════════════════════════════════════════════════
 
-include "./arctic/arctic.b" as ac;
-include "./bplot/bplot.b" as plt;
+include "arctic" as ac;
+include "bplot" as plt;
 
 $df = ac.dataframe({
     "month":  ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],

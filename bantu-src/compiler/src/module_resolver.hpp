@@ -12,10 +12,13 @@
  *   3. Resolve relative to the current working directory.
  *   4. Try with `.b` extension appended if missing.
  *   5. For a BARE name (`include "numba"`, not `"./numba.b"`), look in
- *      `bantu_modules/<name>/` next to the importing file and under the cwd,
- *      honouring the package's `package.json` "main". This is where
- *      `bantu add <pkg>` installs, and without it an installed package could
- *      only be reached by spelling out its full path.
+ *      `bantu_modules/<name>/` next to the importing file AND IN EVERY
+ *      DIRECTORY ABOVE IT, then the same walk up from the cwd, honouring the
+ *      package's `package.json` "main". This is where `bantu add <pkg>`
+ *      installs, and without it an installed package could only be reached by
+ *      spelling out its full path. The walk up the tree is what makes a bare
+ *      name mean the same thing from anywhere in a project, the way
+ *      node_modules does -- see ancestorDirs().
  *   6. (v1.2.2) For each directory in $BANTU_PATH (':' on POSIX, ';' on Windows),
  *      try `<dir>/<path>` and `<dir>/<path>.b`. Lets users install shared
  *      module libraries outside their project tree.
@@ -100,6 +103,42 @@ inline std::string canonicalize(const std::string& path) {
     if (realpath(path.c_str(), full) != nullptr) return std::string(full);
     return path;
 #endif
+}
+
+// The parent of a directory, or "" when there is none left to walk to. Kept
+// separate from dirOf(): dirOf("/bplot") answers "" and dirOf("bplot") answers
+// ".", and neither is a directory to search -- the ancestor walk has to stop
+// there rather than fall through to a cwd-relative lookup.
+inline std::string parentOf(const std::string& path) {
+    size_t slash = path.find_last_of("/\\");
+    if (slash == std::string::npos) return "";
+    if (slash == 0) return path.substr(0, 1);            // "/bplot" -> "/"
+    std::string p = path.substr(0, slash);
+    if (p.size() == 2 && p[1] == ':') return "";         // "C:\bplot" -> stop
+    return p;
+}
+
+// `dir` and every directory above it, nearest first.
+//
+// [found] A bare name was looked for only beside the importing file and under
+// the working directory, so `include "bplot" as plt;` resolved from the repo
+// root and failed from samples/bplot/ -- the same file, run from its own
+// folder, and the error named the module rather than the cwd that caused it.
+// Every other module system walks up instead: node_modules at each level,
+// Python's parent packages, Cargo's workspace root. The depth cap guards
+// against a pathological path, not a real tree; 64 levels is far past any.
+inline std::vector<std::string> ancestorDirs(const std::string& dir) {
+    std::vector<std::string> out;
+    // Canonicalized first, so the walk is over absolute directories and a
+    // relative importing path does not stop after one step.
+    std::string cur = canonicalize(dir.empty() ? "." : dir);
+    for (int depth = 0; depth < 64; depth++) {
+        out.push_back(cur);
+        const std::string parent = parentOf(cur);
+        if (parent.empty() || parent == cur) break;
+        cur = parent;
+    }
+    return out;
 }
 
 inline std::string joinPath(const std::string& dir, const std::string& rel) {
@@ -260,9 +299,13 @@ inline ResolvedModule resolveAndParse(const std::string& rawPath,
     //    search dir.
     if (isBareModuleName(rawPath)) {
         if (!importingFilePath.empty()) {
-            addPackageCandidates(candidates, dirOf(importingFilePath), rawPath);
+            for (const auto& d : ancestorDirs(dirOf(importingFilePath))) {
+                addPackageCandidates(candidates, d, rawPath);
+            }
         }
-        addPackageCandidates(candidates, getCwd(), rawPath);
+        for (const auto& d : ancestorDirs(getCwd())) {
+            addPackageCandidates(candidates, d, rawPath);
+        }
     }
     // 5b. A bare name that names a DIRECTORY is a package directory: resolve
     //     inside it exactly as bantu_modules/<name>/ is resolved. This is how
@@ -282,8 +325,10 @@ inline ResolvedModule resolveAndParse(const std::string& rawPath,
             candidates.push_back(joinPath(dir, rawPath + ".b"));
             candidates.push_back(joinPath(dir, "index.b"));
         };
-        if (!importingFilePath.empty()) addDirPackage(dirOf(importingFilePath));
-        addDirPackage(getCwd());
+        if (!importingFilePath.empty()) {
+            for (const auto& d : ancestorDirs(dirOf(importingFilePath))) addDirPackage(d);
+        }
+        for (const auto& d : ancestorDirs(getCwd())) addDirPackage(d);
     }
     // 6. (v1.2.2) $BANTU_PATH lookup — for shared module libraries
     for (const auto& dir : bantuPathDirs()) {
@@ -293,6 +338,19 @@ inline ResolvedModule resolveAndParse(const std::string& rawPath,
             withExt += ".b";
             candidates.push_back(joinPath(dir, withExt));
         }
+    }
+
+    // The two ancestor walks overlap almost completely whenever the process
+    // runs inside the project it is importing from, so stat() each path once.
+    {
+        std::vector<std::string> unique;
+        unique.reserve(candidates.size());
+        for (const auto& c : candidates) {
+            bool seen = false;
+            for (const auto& u : unique) { if (u == c) { seen = true; break; } }
+            if (!seen) unique.push_back(c);
+        }
+        candidates.swap(unique);
     }
 
     std::string chosen;

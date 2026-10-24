@@ -10,7 +10,7 @@
 //  Run:  bantu run samples/bplot/03_statistics.b
 // ════════════════════════════════════════════════════════════════════════
 
-include "./bplot/bplot.b" as plt;
+include "bplot" as plt;
 
 // A reproducible sample, so this program draws the same chart every time.
 // A chart in a report that moves between runs is a chart nobody can cite.

@@ -131,6 +131,27 @@ try {
 ok($emptyRaised, "a folder with no module in it is reported missing, never bound as an empty module");
 
 print("");
+print("-- a bare name is searched UP the directory tree --");
+// [found] A bare name was looked for beside the importing file and under the
+// working directory, and nowhere else. So `include "bplot" as plt;` resolved
+// when the process happened to start in the directory holding bplot/, and
+// failed from anywhere else -- which is how every sample in samples/bplot
+// passed CI from the repo root and died with "Module not found" for anybody
+// who cd'd into samples/bplot first. Nothing is named greeter or dirpkg at or
+// above the repo root, so these can only resolve by walking up from
+// tests/fixtures/deep/nested to tests/.
+include "./fixtures/deep/nested/mod_deep.b" as deep;
+eq(deep.deep_installed(), "src/hello.b",
+   "bantu_modules/ is found three directories above the importing file");
+eq(deep.deep_dirpkg(), "dirpkg",
+   "a package directory is found three directories above the importing file");
+
+// Precedence has to survive the walk: tests/ holds BOTH bantu_modules/greeter
+// and a greeter/ folder, and the installed package still wins.
+eq(deep.deep_installed(), g.ENTRY,
+   "an installed package still beats a same-named folder found by the walk");
+
+print("");
 print("========================================");
 print("  PASS: " + str($R.pass) + "   FAIL: " + str($R.fail));
 print("========================================");
