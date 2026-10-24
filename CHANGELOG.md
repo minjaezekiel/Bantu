@@ -9,6 +9,65 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] `samples/webrtc-chat` places real calls: messaging, voice and video.** The sample
+  claimed all three and did none of them — `server.b` had four parse errors and had therefore
+  never executed once; the browser never created an `RTCPeerConnection`; and "messaging" POSTed
+  to `/send` and then printed the sender's own text into the sender's own log, so the other
+  browser received nothing. It also signalled over `POST`, which cannot push, so there was no
+  path by which one browser could learn a call was incoming. Rewritten around what WebRTC
+  actually is: the **browsers** are the peers, and the Bantu server is a signalling relay over
+  one `sua.ws` WebSocket that never touches a frame of media. `sua.webrtc.*` is deliberately
+  unused — it makes a *server-side* peer, which this has no use for. Chat rides the signalling
+  socket rather than a data channel, so a message works when no call is up. Trickle ICE that
+  arrives before the remote description is queued and flushed (the defect that only appears once
+  the two browsers are on different machines), tracks are stopped explicitly on hangup so the
+  camera light goes out, the local preview is hard-muted against feedback, every media element is
+  `playsinline` for iOS, and autoplay refusal surfaces as a tap-to-listen control instead of a
+  silent call. The interface is dark-first with a light theme, tokens defined once as custom
+  properties, a system font stack, responsive to one column under 760px with
+  `env(safe-area-inset-bottom)` and `100dvh` so a phone's URL bar and home indicator do not crop
+  the composer, and every foreground/background pair **computed** against WCAG AA rather than
+  eyeballed — which caught a "dim" text colour sitting at 4.37:1. Design in
+  `docs/webrtc-chat-design.md`; 35 assertions in `tests/webrtc_chat_test.sh` drive the protocol
+  with two real WebSocket clients.
+- **[feature] A TLS front end, so a phone can actually be tested.** `getUserMedia` is only
+  available in a secure context: `http://localhost` is one, `http://192.168.x.x` is not, so on a
+  phone `navigator.mediaDevices` is `undefined` and no microphone can be opened. sua cannot serve
+  HTTPS. `samples/webrtc-chat/tls-dev-proxy.py` terminates TLS in front of it using only the
+  Python standard library — it generates a self-signed certificate whose `subjectAltName` carries
+  the machine's LAN IP and proxies raw TCP, so the WebSocket upgrade and the `Host` header that
+  sua's same-origin check reads both pass through untouched. Verified end to end: `wss://` through
+  the proxy completes the handshake and two peers see each other. The app also detects the
+  insecure origin and names the two routes that work rather than failing as a null dereference.
+- **[feature] A UDP server is two lines, and multicast works.** `sua.udp.bind(port, def($packet) {
+  ... })` registers a handler; `$packet` carries `from`, `data` and `reply(bytes)`. `sua.udp.listen()`
+  serves them for a UDP-only program, and `sua.server.listen(port)` serves them alongside HTTP on the
+  same loop — one process for a signaling server and a TURN relay, which is what the original feature
+  request described. `join_group`/`leave_group` cover IPv4 and IPv6, and the portability traps are
+  refused with messages that name the fix: joining an unbound socket, and mismatching the group's
+  family against the socket's. Design in `docs/sua-udp-server-design.md`; 17 assertions in
+  `tests/sua_udp_server_test.sh`, including real multicast delivery.
+- **[feature] The sua server keeps connections open.** HTTP/1.1 reuses a connection unless the
+  request says `Connection: close`; HTTP/1.0 closes unless it asks to keep. Every response now states
+  which it did — the missing header was its own defect, since a client following the spec reused a
+  connection the server was about to close. Pipelined requests are answered in order, and a
+  suspended handler holds the next one back rather than letting it overtake. Idle connections that
+  have already answered get their own timeout class, `keep_alive_timeout_ms` (default 65 s), so the
+  10 s slowloris window for connections that have sent nothing is unchanged. Measured on one worker:
+  **35,000 req/s against 18–24k**, a small static file 17.9k → 31.5k, and a 2 MB file 79 → 520 req/s
+  (162 MB/s → 1.07 GB/s). Design in `docs/sua-http11-design.md`; 32 assertions in
+  `tests/sua_http11_test.sh`.
+- **[feature] Static files are cacheable and seekable.** Every file carries an `ETag` and
+  `Last-Modified` from its size and modification time, so `If-None-Match` and `If-Modified-Since` are
+  answered `304` with no body. `Range` requests are answered `206` and impossible ones `416`, which
+  is what video seeking and resumable downloads need. Files up to 1 MB are cached in memory, up to
+  16 MB in total, revalidated against size and mtime on every hit so an edited file is never stale.
+  The body no longer passes through a stringstream on its way out: four copies became one.
+- **[feature] Chunked request bodies are decoded.** `Transfer-Encoding: chunked` used to reach the
+  handler as `null`, with no error — a silent loss of any streamed upload. The chunk framing is
+  walked rather than searched for its terminator, because a chunk's own payload can contain
+  `0\r\n\r\n`, and the decoded size is checked against `max_body_bytes` as it grows.
+
 - **[feature] bplot's generators are Bantu, not Python.** `scripts/gen_circle_tables.b` and
   `scripts/gen_font_tables.b`, a TrueType reader, replace the Python scripts that wrote
   `raster_tables.hpp` and `raster_font.hpp`. Each regenerates its header byte for byte, and on all
@@ -215,6 +274,130 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Fixed
 
+- **[patch] The WebSocket handshake digest is now asserted against a third implementation.**
+  `tests/sua_ws_security_test.sh` only ever checked that the upgrade answered `101`, which cannot
+  see a wrong `Sec-WebSocket-Accept`: the server reports a connected client while every browser
+  hangs up, because RFC 6455 §4.1 requires a client with a mismatched digest to fail the
+  connection. It now recomputes `SHA1(key + GUID)` and compares, and `tests/webrtc_chat_test.sh`
+  does the same from its own client. The GUID literal in RFC 6455 §1.3 is
+  `258EAFA5-E914-47DA-95CA-C5AB0DC85B11`; `…-95CA-5AB0DC85B11F` is a plausible-looking
+  transposition of it and is wrong, so both the server and the tests carry a note saying so. Note
+  that a test which duplicates the server's constant agrees with the server even when both are
+  wrong — the check that actually bites is the one against an independent implementation.
+- **[bug fix] A disconnecting peer could stay connected for five minutes.** A connection whose
+  `send()` failed permanently was marked closing and then never reaped, because the reap test
+  required its output queue to have **drained** — which a socket that cannot be written never
+  does. So `on("disconnect")` did not fire, and the fd, its buffers and its slot against
+  `max_connections` stayed held until the 5-minute WebSocket idle timeout. It needs two things at
+  once to show: several sockets closing in the same event-loop pass, **and** frames queued that
+  the client never read, because closing with unread data makes the kernel send RST. That is
+  precisely what a browser tab does when it closes or reloads. Measured: six WebSocket clients
+  closing back-to-back leaked **four of six**; two at a time, or after draining, leaked none,
+  which is why casual testing never saw it. In a chat app the visible symptom is a roster filling
+  with ghosts of peers who have left; the real cost is a leaked descriptor per lost client, and
+  enough of them refuse new connections outright. The undeliverable queue is now discarded and
+  the connection dropped on the same pass. Only a genuine `send()` failure discards — `EV_EOF`
+  also sets the error flag, and a client that half-closes with `shutdown(WR)` is still waiting to
+  read its response. Four new assertions in `tests/sua_ws_security_test.sh` open 6 and then 12
+  sockets, leave replies unread, close them back-to-back and require the live count to return to
+  zero.
+- **[bug fix] JSON `\uXXXX` escapes were dropped, and they desynchronised the parser.** The
+  escape was skipped rather than decoded — the comment said so: *"Just skip unicode escapes for
+  simplicity"* — and the position advanced **seven** characters for a **six**-character escape, so
+  it also ate the character after it. `"\u0041\u0042"` came out as `"u0042"` because the second
+  backslash had been eaten, and `{"a":"caf\u00e9","b":"second"}` had `a` swallow its own closing
+  quote and read on into the object. A string could therefore corrupt the structure around it, not
+  just itself. This reached far past Bantu's own code: an ASCII-safe JSON encoder escapes every
+  non-ASCII character, and **Python's `json.dumps` does that by default**, so any client posting
+  `{"name": "café"}` to a Bantu server had the character silently deleted and the object
+  potentially misparsed. It affects `json.parse`, `$req.body` and a WebSocket frame's `$msg.json`
+  alike, since all three share one implementation. Escapes are now decoded to UTF-8 with
+  surrogate pairs handled, so an escaped emoji survives a round trip, and a lone surrogate becomes
+  U+FFFD so the result stays valid UTF-8 — which matters because a WebSocket text frame built from
+  it is validated before it is sent. Nine assertions in `tests/lang_test.b`.
+- **[bug fix] Two strings compared as numbers, so nothing could be ordered alphabetically.**
+  `<`, `<=`, `>` and `>=` read `numberVal` from both operands unconditionally, and `numberVal` is
+  `0` for any string. Every `<` and `>` between strings therefore answered **false** and every
+  `<=` and `>=` answered **true**: `"a" < "b"` was false, `"b" > "a"` was false,
+  `"apple" < "banana"` was false. Sorting strings was impossible, and a range check on a
+  character silently admitted everything — `if ($ch >= " ")`, the ordinary way to drop control
+  characters, kept every one of them, which is how it was found. `==` and `!=` were never
+  affected, because they go through a type-aware path, which is why this survived. Two strings now
+  compare lexicographically by byte, which for UTF-8 is also code-point order; a mixed
+  string/number comparison keeps the old numeric coercion rather than inventing a rule. 17
+  assertions in `tests/lang_test.b`.
+- **[bug fix] An `include` meant different things depending on where you ran it from.** A bare
+  `include "bplot" as plt;` was searched beside the importing file and under the working directory,
+  and nowhere else. So every example in `samples/bplot/` ran from the repo root and died for anybody
+  who did the obvious thing first:
+
+  ```
+  $ cd samples/bplot && bantu run 01_quickstart.b
+    [INCLUDE ERROR] Module not found: ./bplot/bplot.b (imported from 01_quickstart.b)
+    [FATAL] [REFERENCE ERROR] Undefined variable: plt (line 8, col 1)
+  ```
+
+  The message named the module, which was present, rather than the working directory, which was the
+  cause. A bare name is now looked for in the importing file's directory **and in every directory
+  above it**, nearest first, then the same walk up from the working directory — as `node_modules` is
+  searched up the tree, and Python's parent packages, and Cargo's workspace root. An explicit `./`
+  or `../` path is untouched and gains no walk; precedence is unchanged, so an installed
+  `bantu_modules/` package still beats a same-named folder, even a nearer one; a name that is
+  genuinely absent is still reported. The candidate list is de-duplicated before any `stat()`,
+  because the two walks overlap almost entirely inside a project. `realpath()` collapses the path
+  before the climb starts, so a symlink pointing back at its own ancestor terminates.
+  `tests/lang_module_cwd_test.sh` runs the module suite from six working directories and requires
+  the same result from each; `tests/lang_module_stress.sh` covers 30 levels of distance, the
+  64-level cap, the symlink cycle, both precedence rules and the cost of 200 deep resolutions.
+- **[bug fix] The samples gate only ever tested the one directory that could not fail.**
+  `tests/run_samples.sh` ran every sample from the repo root — the exact cwd that made the broken
+  include above resolve — so CI was green the whole time the gallery was unusable. Each sample now
+  runs twice, once from the root and once from its own directory, which is what a reader does. The
+  second pass was confirmed against the original text: green from the root, `FAIL` from
+  `samples/bplot`. Two further holes in that script are closed: it now `cd`s to the repo root and
+  fails loudly if `samples/` is missing, instead of matching an empty glob and reporting
+  "0 passed, 0 failed" with exit 0; and the second pass iterates the glob directly rather than
+  through a pipe, since a `... | while` body runs in a subshell and would have discarded every
+  failure it counted.
+- **[bug fix] `make build` could not build on macOS, and the README's macOS steps named the Linux
+  script.** Both ran `build.sh`, which links libcurl by its Linux soname, so the build compiled
+  every translation unit and then died at the link step with
+  `ld: library ':libcurl.so.4' not found`. `make build` now picks `build-mac.sh` on Darwin by
+  `uname`, the README's step 3 names `build-mac.sh`, and that linker error is listed in the macOS
+  troubleshooting table.
+- **[bug fix] SECURITY: a 20 KB request body could kill the sua server.** `json.parse` recursed once
+  per `{` or `[` with no depth limit, so a body of nothing but `[[[[...` walked off the native stack.
+  Against the shipped v1.3.0 build, a 200 KB `POST` to a route whose handler only reads `$req.body`
+  ended the process with **SIGSEGV (exit 139)** — an empty reply to that request and connection
+  refused to every request after it. No handshake, no credentials, no route logic: any client could
+  do it, and a reverse proxy would not see it coming. Nesting is now capped at 256 levels, which is
+  far past any real document, and exceeding it raises a catchable Bantu error naming the limit and
+  the fix. The sua request-body parse and the Web Push keypair read catch it internally — hostile
+  input is not a server fault, so the handler simply sees `$req.body` as null and answers for itself.
+  Verified end to end: the same bomb now returns normally and the next request is served.
+- **[bug fix] Runaway recursion raises instead of crashing.** No call-depth guard existed anywhere in
+  the evaluator, so every Bantu call being a real C++ recursion meant `def f($n) { return 1 + f($n - 1); }`
+  survived 3,000 frames and died at 3,200 with **SIGSEGV (exit 139)** — no message, and no `try` that
+  could catch it. From a sua handler it took the worker with it, and Windows was far worse: a 1 MB
+  default thread stack against 8 MB on macOS puts the cliff near 400 frames. Calls are now capped at
+  1,000 deep — a number chosen to hold on the smallest platform stack rather than one the stack
+  imposes — and the limit raises an ordinary catchable error, so a recursive descent can be wrapped
+  in `try` and recovered from. Functions, methods, constructors and mutually recursive pairs all
+  count against the same limit. 21 assertions in `tests/lang_depth_test.b`.
+- **[bug fix] `HEAD` no longer returns a body**, which RFC 7231 §4.3.2 forbids and which, on a reused
+  connection, would be read as the start of the next response. It is served by the matching `GET`
+  route unless a `HEAD` route was registered for that path, and `$req.method` still reports `HEAD`.
+- **[bug fix] A known path with an unregistered method answers `405`** with an `Allow` header, not
+  `404` — the path was right, only the verb was wrong.
+- **[bug fix] Path parameters are percent-decoded.** `/user/a%20b` handed the handler the literal
+  `a%20b`. Static file names are decoded too, and the traversal check now runs after decoding, where
+  `%2e%2e` is visible as `..`.
+- **[bug fix] Absolute-form request targets route correctly.** `GET http://host/path`, which RFC 7230
+  §5.3.2 requires every server to accept, answered `404`.
+- **[bug fix] A request with both `Content-Length` and `Transfer-Encoding` is refused with `400`.**
+  It used to hang until the connection timed out. The two headers disagree about where the body
+  ends, which is the shape of a request-smuggling attempt against a proxy in front, so the
+  connection closes rather than guessing.
 - **[bug fix] `+` on two lists concatenates them.** It read the numeric value of both lists and
   silently answered `0`. `[1, 2] + [3]` is now `[1, 2, 3]`, a new list with neither operand
   touched, as in Python. Only list `+` list changed. The branch sits in the existing non-number path,

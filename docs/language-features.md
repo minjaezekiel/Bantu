@@ -78,6 +78,87 @@ def maybe($x) {
 }
 ```
 
+### Calls are limited to 1,000 deep (fixed)
+```bantu
+def countdown($n) {
+    if ($n <= 0) { return 0; }
+    return 1 + countdown($n - 1);
+}
+
+countdown(900)          // 900 — fine
+
+try { countdown(100000); }
+catch ($e) { print($e.message); }
+// Maximum call depth of 1000 exceeded -- this is usually infinite recursion.
+// If the recursion is genuine, rewrite it as a loop with an explicit stack.
+```
+Every Bantu call is a real C++ recursion, so an unbounded one used to walk off the native
+stack: measured on macOS, 3,000 frames survived and 3,200 died with **SIGSEGV** — no message,
+and no `try` that could catch it. From a sua handler it took the worker process with it, and
+Windows was worse still, since its default thread stack is 1 MB against 8 MB here.
+
+The limit is therefore **a number we choose, not one the stack imposes** — low enough to hold
+on the smallest platform stack, high enough that no reasonable recursive algorithm reaches it.
+Functions, methods, constructors and mutually recursive pairs all count against it, and
+exceeding it raises an ordinary catchable error rather than ending the process.
+
+If you hit it with genuine recursion rather than a missing base case, rewrite the function as a
+loop with an explicit stack — a list you `push` onto and `pop` from does the same job with no
+depth limit at all.
+
+## Globals, as seen from inside a function
+
+A function **reads** a global freely. **Assigning to its name inside a function does not change
+the global** — it creates a local that is discarded when the call returns:
+
+```bantu
+$peers = {};
+
+def addBroken($id, $name) {
+    $next = {};
+    each ($k in keys($peers)) { $next[$k] = $peers[$k]; }
+    $next[$id] = $name;
+    $peers = $next;              // writes a LOCAL. The global is untouched.
+}
+```
+
+Writing a **field** of a global does propagate, because a dict is a reference type and this is an
+index-set on it rather than a rebinding:
+
+```bantu
+$peers = {};
+def add($id, $name) { $peers[$id] = $name; }     // works
+```
+
+So state a function must replace wholesale belongs in a **field of a container**:
+
+```bantu
+$S = { "peers": {} };
+
+def dropPeer($id) {
+    $next = {};
+    each ($k in keys($S["peers"])) {
+        if ($k != $id) { $next[$k] = $S["peers"][$k]; }
+    }
+    $S["peers"] = $next;         // an index-set on $S — this one propagates
+}
+```
+
+This matters most in callbacks — `sua.ws.on("disconnect", ...)`, a route handler — where the
+whole point is to mutate shared state and there is no return value to carry it out. The failure is
+silent: the write appears to succeed and the global simply never changes. In
+`samples/webrtc-chat` it meant a peer who disconnected was never removed, so "online" never went
+down and every browser kept a ghost of them.
+
+Two related points, since they come up in the same code:
+
+- **Lists are values, dicts are references.** `$b = $a;` copies a list, so passing a list to a
+  function copies it; a dict or class instance is shared. A registry that functions mutate should
+  be a dict for that reason alone.
+- **There is no key-removal builtin.** `remove(list, index)` is for lists, and `delete` is a
+  reserved word (it is `sua.server.delete`). Drop a key by rebuilding the dict without it and
+  replacing the field, as above.
+
 ## Collections
 
 ### Dict iteration (new — Python style)
@@ -359,6 +440,32 @@ A single list argument now walks the list natively, which is how you take the ra
 separate `nanmax`). A primitive should not silently discard a value it was handed; filter
 first if you want NaN skipped.
 
+### Bit operations are 32-bit
+
+Bantu has no `&`, `|`, `^`, `<<` or `>>` operators. The work is done by builtins, and they
+operate on **unsigned 32-bit integers**, like JavaScript's bitwise operators:
+
+```bantu
+band(12, 10)        // 8
+bor(12, 10)         // 14
+bxor(12, 10)        // 6
+shl(1, 31)          // 2147483648
+shr(256, 4)         // 16
+
+shl(1, 32)          // 1   — NOT 4294967296
+shl(1, 40)          // 256 — NOT 1099511627776
+```
+
+Both operands are truncated to `uint32`, and the shift count is masked to its low 5 bits, so a
+shift of 32 is a shift of 0 and a shift of 40 is a shift of 8. This is deliberate and matches
+JavaScript, but it means **64-bit bit manipulation is not expressible in Bantu** — 64-bit
+hashes, checksums, packed flags and bitboards have to be split into two 32-bit halves by hand,
+or done natively. Anything in the standard library that needs 64-bit words (SHA-512, for
+instance) computes them in C++ for exactly this reason.
+
+Note also that numbers are `float64` throughout, so integers are exact only to 2^53:
+`9007199254740993` prints as `9007199254740992`.
+
 ## Strings
 
 ### join (new)
@@ -432,6 +539,50 @@ Dicts and class instances never had this problem — they hold a `shared_ptr`, w
 why they have reference semantics and lists do not. Nothing about list semantics changed:
 `$b = $a;` is still a copy.
 
+## Comparison
+
+`==` and `!=` are type-aware. `<`, `<=`, `>` and `>=` compare two **numbers**
+numerically and two **strings** lexicographically, byte by byte — which for UTF-8 is also
+code-point order. A comparison between a string and a number still coerces to numbers.
+
+**Strings used to compare as numbers (fixed).** Both sides were read as `numberVal`, which is
+`0` for any string, so **every** `<` and `>` between strings answered `false` and every `<=`
+and `>=` answered `true`:
+
+```bantu
+print("a" < "b");        // was false — now true
+print("b" > "a");        // was false — now true
+print("apple" < "banana");  // was false — now true
+$ch = substr($s, $i, 1);
+if ($ch >= " ") { ... }  // was ALWAYS taken, so this kept control characters
+```
+
+Nothing could be sorted alphabetically, and a range check on a character silently admitted
+everything. `==` and `!=` were never affected — they go through a type-aware path — which is why
+this survived as long as it did. `tests/lang_test.b` now asserts the ordering in both directions.
+
+## JSON
+
+`json.parse` and `json.stringify`, the HTTP request-body parser and a WebSocket frame's
+`$msg.json` all share one implementation.
+
+**`\uXXXX` escapes used to be dropped, and they desynchronised the parser (fixed).** The
+escape was skipped rather than decoded, and the position advanced seven characters for a
+six-character escape — so it also ate the character *after* it:
+
+```bantu
+json.parse("{\"s\":\"caf\\u00e9\"}")["s"]       // was "caf}"  — now "café"
+json.parse("{\"s\":\"\\u0041\\u0042\"}")["s"]     // was "u0042" — now "AB"
+json.parse("{\"a\":\"caf\\u00e9\",\"b\":\"x\"}")  // 'a' swallowed its closing quote
+```
+
+That second effect is the dangerous one: a string could corrupt the structure around it, not
+only itself. It mattered well beyond Bantu's own code, because **an ASCII-safe JSON encoder
+escapes every non-ASCII character** — Python's `json.dumps` does so by default — so any client
+posting `{"name": "café"}` had the character silently deleted and the object potentially
+misparsed. Escapes are now decoded to UTF-8, surrogate pairs included, so an escaped emoji
+survives a round trip; a lone surrogate becomes U+FFFD, which keeps the result valid UTF-8.
+
 ## Modules
 
 ```bantu
@@ -450,6 +601,22 @@ resolved *inside* it, the way `bantu_modules/<name>/` is — `package.json` `"ma
 then `index.b` — which is how `include "bplot"` works from a checkout that has `bplot/bplot.b`, and is
 Node's convention for `require('./dir')`. An installed package still wins over a folder that happens
 to share its name.
+
+**A bare name is searched up the whole tree (fixed).** Both bare-name rules looked only at the
+importing file's own directory and the working directory, and nowhere else — so a bare name meant
+different things depending on where the process happened to start. `include "bplot" as plt;`
+resolved from the repo root and raised `Module not found: bplot` from `samples/bplot/`: the same
+file, run from its own folder, and the message named the module rather than the cwd that caused it.
+Every bare name is now looked for in the importing file's directory **and in every directory above
+it**, nearest first, then the same walk up from the cwd — the way `node_modules` is searched up the
+tree, and Python's parent packages, and Cargo's workspace root. An explicit `./` or `../` path is
+untouched, precedence is unchanged (an installed `bantu_modules/` package still beats a same-named
+folder), and a name that is genuinely absent is still reported. This is what makes
+`include "bplot" as plt;` work anywhere inside a project, which is what the examples and
+`docs/bplot.md` have always told you to write.
+
+`tests/lang_module_cwd_test.sh` runs the whole module suite from the repo root, from `tests/`, from
+a sample directory, from `$HOME` and from `/`, and requires the same result each time.
 
 **A module is a regular file (fixed).** The resolver's existence check used to accept a directory,
 and a directory opened as a stream reads as empty — so `include "bplot" as plt;` run from a folder

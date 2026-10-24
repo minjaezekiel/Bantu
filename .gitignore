@@ -44,7 +44,18 @@ bantu-src/compiler/build_pg/
 samples/*
 !samples/numba/
 !samples/bplot/
-samples/webrtc-chat/server.b
+# [found] This line used to read `samples/webrtc-chat/server.b` -- with no `!`,
+# so it ADDED an ignore rule for the one file it was meant to keep. The mistake
+# was invisible because server.b was already tracked and .gitignore does not
+# affect tracked files, while every NEW file in the sample -- public/app.js,
+# public/styles.css, tls-dev-proxy.py -- was ignored by `samples/*` and would
+# have been dropped from the commit that claimed to add them. The page would
+# have arrived in the repository referencing a stylesheet and a script that
+# were not there. This is the same silent loss the note above records for
+# samples/numba/, so the whole directory is re-included; the databases, logs
+# and secrets the note worries about are already covered by the global rules
+# above and below (*.db, *.log, vapid.json, subscriptions.db).
+!samples/webrtc-chat/
 
 # Web Push secrets — a VAPID private key must never be committed. Replacing it
 # silently invalidates every push subscription a browser has already created.

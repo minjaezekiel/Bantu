@@ -52,6 +52,14 @@ There are no wildcards, regex routes, route prefixes, or trailing-slash normalis
 
 **Routes beat static files.** Static files are only consulted for a GET that matched no route.
 
+`:param` values are percent-decoded, so `/user/a%20b` reaches the handler as `a b`.
+
+**`HEAD` is served by the matching `GET` route**, with the headers it would have sent and no body.
+Register `sua.server.head(...)` only when a `HEAD` needs to differ from its `GET`.
+
+**A known path with an unregistered method answers `405`** with an `Allow` header listing the
+methods it does accept, rather than `404`.
+
 ## `$req` — the request
 
 | Field | Type | Notes |
@@ -117,6 +125,15 @@ GIF, WebP, AVIF, ICO, WASM, PDF, WOFF/WOFF2/TTF/OTF, MP4/WebM, MP3/OGG/WAV, CSV,
 Anything else is `application/octet-stream`.
 
 HTML and `.webmanifest` are served `no-cache`; everything else gets `public, max-age=300`.
+
+Every file carries an `ETag` and `Last-Modified` built from its size and modification time, so
+`If-None-Match` and `If-Modified-Since` are answered `304` with no body — a browser reloading a page
+it already has transfers headers instead of megabytes. `Range` requests are answered `206`, which is
+what video seeking and resumable downloads need, and an impossible range gets `416`.
+
+Files up to 1 MB are held in memory, up to 16 MB in total, and every hit re-checks size and
+modification time, so an edited file is never served stale. File names are percent-decoded, and the
+traversal check runs after decoding, where `%2e%2e` is visible as `..`.
 
 ---
 
@@ -493,6 +510,24 @@ whether a broadcast worked; use it as a local hint, or count acknowledgements fr
 
 Multi-worker mode is POSIX-only; on Windows it logs a notice and runs single-worker.
 
+### Persistent connections
+
+Connections are reused. HTTP/1.1 keeps one open unless the request says `Connection: close`;
+HTTP/1.0 closes unless it asks to keep. Every response states which it did, and pipelined requests
+are answered in order. Nothing in a handler changes.
+
+An idle connection that has already answered is dropped after `keep_alive_timeout_ms` (default
+65 s). One that has not answered yet still gets `header_timeout_ms` (10 s), so opening a socket and
+saying nothing costs the same as before.
+
+```bantu
+sua.server.limits({"keep_alive_timeout_ms": 30000});
+```
+
+Measured on one worker, trivial JSON handler, Apple silicon: **35,000 req/s** on reused
+connections against 18–24k when every request opened its own. A small static file went from 17.9k
+to 31.5k req/s, and a 2 MB file from 79 to 520 req/s (162 MB/s to 1.07 GB/s).
+
 ### Limits and stats
 
 ```bantu
@@ -661,6 +696,10 @@ packet and not hold a connection open. Bytes are Bantu's usual representation �
 0–255, the same as the hash/crypto modules use.
 
 ```bantu
+sua.udp.bind(port, handler)           // -> handle; the server form, below
+sua.udp.listen()                      // serve every bound handler, forever
+sua.udp.join_group($sock, group, interface?)    // multicast
+sua.udp.leave_group($sock, group, interface?)
 sua.udp.socket(opts?)                 // -> handle; opts: {"family": "ipv4"|"ipv6", "nonblocking": bool}
 sua.udp.bind($sock, "host:port")      // port 0 = let the OS choose
 sua.udp.send_to($sock, "host:port", $bytes)   // -> bytes sent
@@ -669,6 +708,48 @@ sua.udp.getsockname($sock)            // -> "host:port"
 sua.udp.close($sock)                  // safe to call twice
 sua.udp.send("host:port", $bytes, opts?)      // one-shot: socket, send, await reply, close
 ```
+
+### A server, in two lines
+
+```bantu
+sua.udp.bind(3478, def($packet) {
+    print("recv " + str(len($packet.data)) + " bytes from " + $packet.from);
+    $packet.reply($packet.data);      // straight back to the sender
+});
+sua.udp.listen();
+```
+
+`$packet` carries `from` (`"host:port"`), `data` (the datagram as bytes) and `reply(bytes)`, which
+sends to the same peer on the same socket. `bind` takes a port, or an address string like
+`"127.0.0.1:3478"` to listen on one interface, and returns the socket handle so you can `close` it
+or join a multicast group.
+
+**One loop serves everything.** If the program also calls `sua.server.listen(port)`, that loop
+serves these sockets too — HTTP and UDP in one process, one thread. `sua.udp.listen()` is for a
+program that speaks only UDP, and calling it while the HTTP server runs is an error rather than a
+second loop over the same sockets.
+
+Handlers run on the loop thread, like HTTP handlers, so a slow one delays the next datagram. A
+handler that raises costs that datagram and nothing else: the error is logged and the next packet is
+served. `sua.server.workers(n)` does **not** shard UDP sockets — the kernel would hand each datagram
+to an arbitrary worker, which breaks any protocol keeping per-peer state, and STUN and TURN both do.
+
+### Multicast
+
+```bantu
+$s = sua.udp.socket({});
+sua.udp.bind($s, "0.0.0.0:5353");                      // bind the wildcard, then join
+sua.udp.join_group($s, "224.0.0.251");                 // mDNS
+```
+
+The third argument names an interface — an address for IPv4, an index for IPv6 — and defaults to
+letting the kernel choose. For a sender on the same host, naming the interface explicitly
+(`join_group($s, $group, "127.0.0.1")`) is what makes loopback delivery work on macOS.
+
+Bind the wildcard address, not the group address: binding the group works on macOS and BSD and
+fails on Linux. The socket must be bound before joining — unbound joins succeed on Linux and fail on
+macOS, so sua refuses them everywhere. An IPv6 group needs a socket created with
+`{"family": "ipv6"}`, and a mismatch says which is which rather than returning a bare error.
 
 ### A round trip
 
@@ -785,10 +866,31 @@ These are real constraints of the current implementation, not oversights to work
   response.
 - **Request headers are capped at 64 KB** (configurable via `sua.server.limits`). A larger header
   block gets `431 Request Header Fields Too Large` — it is no longer silently truncated.
-- **No chunked transfer-encoding** on requests — only `Content-Length` is honoured.
+- **A request that sends both `Content-Length` and `Transfer-Encoding` is refused with `400`**, and
+  the connection closes. The two disagree about where the body ends, which is what request smuggling
+  exploits, so neither answer is safe to guess.
 - **Unrecognised status codes render as `OK`** in the status line, though the numeric code is
   correct.
 - **No SSE.** WebSockets *are* supported (`sua.ws.*`, RFC 6455: masking enforced, continuation
   frames reassembled, UTF-8 validated, `Origin` checked on upgrade). The dead implementation in
   `server.hpp` is unrelated and still unused.
+- **No TLS on the server.** `sua.server` has no certificate option of any kind; `sua.http`'s TLS
+  settings are for the *client* side. This is not only about encryption: a browser grants
+  `getUserMedia` and registers a service worker only in a **secure context**, and `http://` on
+  anything but `localhost` is not one. So a phone pointed at a LAN address cannot open a
+  microphone or a camera, and the PWA sample's service worker will not install there either. Put
+  a TLS terminator in front — `samples/webrtc-chat/tls-dev-proxy.py` is a 90-line
+  standard-library one for exactly this, and it proxies raw TCP so the WebSocket upgrade and the
+  `Host` header pass through untouched.
+
+**One WebSocket defect, fixed, worth knowing about if you used an older build:**
+
+- **A disconnecting peer could stay in the table for five minutes.** A connection whose `send()`
+  failed permanently was marked closing but never reaped, because reaping required its output
+  queue to have drained — which a dead socket never does. `on("disconnect")` did not fire, and
+  the fd, its buffers and its slot against `max_connections` stayed held until the WebSocket idle
+  timeout. It needed several sockets closing in one event-loop pass *with* frames queued that the
+  client never read, which is exactly what browser tabs do when they close or reload: six
+  clients closing back-to-back leaked four. Now the undeliverable queue is discarded and the
+  connection is dropped on the same pass.
 - Push notifications are **UTC only** and assume a single record per message.

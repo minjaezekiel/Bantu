@@ -3,7 +3,7 @@
 //
 //  Run:  bantu run samples/bplot/01_quickstart.b
 // ────────────────────────────────────────────────────────────────────────
-include "./bplot/bplot.b" as plt;
+include "bplot" as plt;
 
 plt.plot([1, 2, 3, 4, 5], [2, 4, 9, 3, 7]);
 plt.savefig("/tmp/bplot_quickstart.svg");

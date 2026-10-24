@@ -7,7 +7,7 @@
 //
 //  Run:  bantu run samples/bplot/02_chart_types.b
 // ────────────────────────────────────────────────────────────────────────
-include "./bplot/bplot.b" as plt;
+include "bplot" as plt;
 
 $xs = [];
 $ys = [];

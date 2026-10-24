@@ -170,7 +170,9 @@ git clone https://github.com/AsseySilivestir/Bantu.git
 cd Bantu/bantu-src/compiler
 
 # 3. Build (uses clang++ shipped with Xcode)
-./build.sh
+#    build-mac.sh, NOT build.sh -- build.sh is the Linux script and links
+#    libcurl by its Linux soname, which fails at the link step on macOS.
+./build-mac.sh
 
 # 4. The freshly-built bantu binary lands at ./build/bantu
 #    Add it to your PATH:
@@ -209,6 +211,7 @@ sudo cp bantu /usr/local/bin/bantu
 | `xcode-select: error: command line tools are already installed` then build fails | Stale Xcode CLT | `sudo rm -rf /Library/Developer/CommandLineTools && xcode-select --install` |
 | `'iostream' file not found` | Xcode CLT missing or broken | `xcode-select --install` (allow the ~200 MB install to finish) |
 | `clang: error: no such file or directory: 'build.sh'` | Wrong directory | `cd Bantu/bantu-src/compiler` (build.sh lives there) |
+| `ld: library ':libcurl.so.4' not found` at the link step | Ran `./build.sh`, the Linux script, on macOS | Run `./build-mac.sh` instead (or `make build`, which now picks by `uname`) |
 | `bantu: command not found` after install | PATH not refreshed | Open a **new** Terminal tab, or `source ~/.zshrc` |
 | `bantu installer ... --platform macos` warns "Could not locate bantu binary to bundle" | Older bantu binary using PATH-lookup fallback | Rebuild from this commit or later — `_NSGetExecutablePath` is now used |
 | `permission denied: /usr/local/bin/bantu` | Owned by root | `sudo chown $(whoami) /usr/local/bin/bantu` (or reinstall with `sudo`) |

@@ -13,7 +13,7 @@
 //  Run:  bantu run samples/bplot/04_dashboard.b
 // ════════════════════════════════════════════════════════════════════════
 
-include "./bplot/bplot.b" as plt;
+include "bplot" as plt;
 
 $months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
