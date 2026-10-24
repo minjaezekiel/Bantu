@@ -7,6 +7,62 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ## [Unreleased]
 
+### Fixed
+
+- **[bug fix] A third device could not open `samples/webrtc-chat` at all: the TLS front end ran its
+  handshake on the accept thread.** `tls-dev-proxy.py` called `ctx.wrap_socket()` inside the accept
+  loop, on a socket with no timeout, so one client that opened a TCP connection and sent nothing
+  stopped the proxy accepting *any* further connection for as long as that socket stayed open.
+  Connections already running were unaffected, because each has its own pump threads — so the
+  symptom was "my phone and laptop are fine, but a third device cannot load the page", which is how
+  it was reported. Browsers open exactly such sockets: Safari and Chrome both preconnect
+  speculatively and may never send bytes on the spare. Reproduced with a single silent socket: every
+  later request timed out after **6,002 ms**, every time, and the proxy recovered the instant that
+  socket closed. The handshake now runs on the connection's own thread with a 15 s timeout, so a
+  slow or silent client delays only itself — the same request takes **3–5 ms** with six silent
+  sockets open. Each connection also costs one thread instead of two, and the total is bounded by a
+  `BoundedSemaphore`, so a flood costs a refused connection rather than the process. Regression test:
+  `tests/webrtc_tls_proxy_test.sh`, which fails against the previous version.
+
+- **[bug fix] `samples/webrtc-chat` collapsed at a few hundred peers: presence was broadcast as the
+  whole roster.** Every join and every leave sent the complete peer list to every peer — O(n²) bytes
+  per presence change, O(n³) for a room filling up. It does not degrade gracefully. Measured on one
+  laptop: 400 peers held **254 MB**, which is 635 KB of *queued roster frames per connection*; at
+  800 peers each roster frame is ~27 KB, so 800 joins queue ~21 MB per connection, far past sua's
+  4 MB per-connection backpressure cap — at which point sua closes sockets to defend itself. **519
+  of 800 peers were dropped** and p99 `hello`→`welcome` reached 1.9 s. From a browser that is "it
+  connects, then everyone keeps going offline". Presence is now a delta — `join` carries one peer,
+  `leave` one id, ~50 bytes regardless of room size — and the full roster is sent once, in the
+  `welcome`, which is the only moment a client has nothing to patch. Same laptop, after: **3,200
+  peers, 203 MB, not one dropped**, p50 ping RTT 141 ms. At 300 peers the old code held 154.7 MB and
+  dropped 29; the new code holds 10.1 MB and drops none. Stress test: `tests/webrtc_chat_stress.sh`.
+
+- **[bug fix] Reserved WebSocket opcodes were silently ignored.** Opcodes `0x3`–`0x7` (data) and
+  `0xB`–`0xF` (control) are reserved; RFC 6455 §5.2 requires *failing* the connection, because no
+  extension negotiated them and skipping the frame leaves the two ends disagreeing about where the
+  next frame starts. They now close with `1002`, like the RSV-bit and masking checks beside them.
+
+### Security
+
+- **[bug fix] The WebSocket origin check could be satisfied by the client alone, and
+  `allowed_hosts` now closes it.** The Cross-Site WebSocket Hijacking defence compared `Origin`
+  against the request's own `Host` header — and the client sends both. A page on a domain the
+  attacker owns, pointed by DNS at this server's address (DNS rebinding), sends
+  `Origin: http://evil.example` with `Host: evil.example`: they match, and the upgrade is accepted.
+  Against the chat sample the hostile page became a full participant — it could read the roster and
+  every message in the room, and place calls. Verified against a running server: accepted before,
+  `400` after. `sua.server.limits({"allowed_hosts": [...]})` states the names the server answers
+  for, is checked once for *every* request so HTTP routes and static files are covered too, and
+  accepts `example.com` as cover for `example.com:8080`. It is empty by default, so nothing that
+  worked before stops working; `docs/sua.md` says when to set it. The sample reads it from
+  `ALLOWED_HOSTS` and prints a warning when it is unset.
+
+- **[patch] `samples/webrtc-chat` now ships with the caps it was measured against.** It ran on
+  sua's defaults — 10,000 connections, no per-address cap — and one machine opened 300 sockets to it
+  in a test with nothing to stop it. It now sets `max_connections` (1,000), `max_connections_per_ip`
+  (256, loose enough that every device behind the TLS front end shares that one address) and 256 KB
+  WebSocket frame and message caps, all overridable by environment variable.
+
 ### Added
 
 - **[feature] `samples/webrtc-chat` places real calls: messaging, voice and video.** The sample

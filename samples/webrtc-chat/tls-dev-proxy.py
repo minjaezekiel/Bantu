@@ -18,6 +18,9 @@ WHAT IT DOES
     WebSocket upgrade passes through untouched -- and so does Host, which is
     what sua's same-origin WebSocket check compares against.
 
+    The handshake runs on the connection's own thread, never on the accept
+    loop: see the note in serve_one for the outage that caused.
+
     This is a development tool for one LAN. It is not a production proxy:
     no certificate verification of any kind is being claimed, and a
     self-signed certificate is exactly why the phone asks you to confirm.
@@ -122,7 +125,60 @@ def pump(src: socket.socket, dst: socket.socket):
             pass
 
 
-def serve_one(tls_sock: socket.socket, target: tuple):
+# How long a client gets to finish the TLS handshake. Long enough for a phone
+# on slow Wi-Fi, short enough that a socket which will never speak is gone
+# before anyone notices.
+HANDSHAKE_TIMEOUT = 15.0
+
+# A connection costs a thread, so the number of them is bounded. 400 silent
+# sockets produced 401 threads and real requests were still served in 3ms, so
+# this is set well above anything a LAN of phones and laptops will reach; it is
+# here so a flood costs a refused connection instead of the whole process.
+# ponytail: a counter, not a thread pool -- rewrite as a pool only if this
+# proxy ever has to serve more than a room full of devices.
+MAX_CONNECTIONS = 512
+_slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+
+
+def serve_one(raw: socket.socket, peer: tuple, ctx: ssl.SSLContext, target: tuple):
+    try:
+        _serve_one(raw, peer, ctx, target)
+    finally:
+        _slots.release()
+
+
+def _serve_one(raw: socket.socket, peer: tuple, ctx: ssl.SSLContext, target: tuple):
+    # [found] THE TLS HANDSHAKE USED TO RUN ON THE ACCEPT THREAD.
+    #
+    # ctx.wrap_socket() was called in the accept loop, on a socket with no
+    # timeout, so it blocked until the client sent a ClientHello. A client that
+    # opens a TCP connection and sends nothing therefore stopped this proxy
+    # accepting ANY further connection, for as long as it stayed open --
+    # already-running connections kept working, because each has its own pump
+    # threads, so the symptom was "my phone and laptop are fine but a third
+    # device cannot load the page at all".
+    #
+    # Browsers open exactly such sockets: Safari and Chrome both preconnect
+    # speculatively and may never send bytes on the spare. Reproduced with one
+    # silent socket -- every later request timed out, and the proxy recovered
+    # the instant that socket closed.
+    #
+    # Two changes, both needed. The handshake happens HERE, on the connection's
+    # own thread, so a slow or silent client delays only itself; and it has a
+    # timeout, so it cannot hold a thread forever either.
+    try:
+        raw.settimeout(HANDSHAKE_TIMEOUT)
+        tls_sock = ctx.wrap_socket(raw, server_side=True)
+    except (ssl.SSLError, OSError) as exc:
+        # A browser probing for plain HTTP, a port scan, or a user who refused
+        # the certificate. One connection's problem, not the proxy's.
+        print(f"  handshake with {peer[0]} failed: {exc}")
+        try:
+            raw.close()
+        except OSError:
+            pass
+        return
+
     try:
         upstream = socket.create_connection(target, timeout=10)
     except OSError as exc:
@@ -149,12 +205,14 @@ def serve_one(tls_sock: socket.socket, target: tuple):
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass
+    # Only ONE extra thread: this one carries the other direction itself.
+    # Two threads per connection instead of three -- at a few hundred devices
+    # that difference is real, and the thread that owns the sockets is the one
+    # that closes them.
     up = threading.Thread(target=pump, args=(tls_sock, upstream), daemon=True)
-    down = threading.Thread(target=pump, args=(upstream, tls_sock), daemon=True)
     up.start()
-    down.start()
+    pump(upstream, tls_sock)
     up.join()
-    down.join()
     for s in (tls_sock, upstream):
         try:
             s.close()
@@ -204,19 +262,20 @@ def main():
                 raw, peer = srv.accept()
             except OSError:
                 continue
-            try:
-                tls = ctx.wrap_socket(raw, server_side=True)
-            except (ssl.SSLError, OSError) as exc:
-                # A browser probing for HTTP, or a user who refused the
-                # certificate. One connection's problem, not the proxy's.
-                print(f"  handshake with {peer[0]} failed: {exc}")
+            if not _slots.acquire(blocking=False):
+                print(f"  refusing {peer[0]}: {MAX_CONNECTIONS} connections already open")
                 try:
                     raw.close()
                 except OSError:
                     pass
                 continue
+
+            # Nothing but accept() happens on this thread: the handshake is
+            # the connection's own problem, on the connection's own thread.
             threading.Thread(
-                target=serve_one, args=(tls, (args.host, args.target)), daemon=True
+                target=serve_one,
+                args=(raw, peer, ctx, (args.host, args.target)),
+                daemon=True,
             ).start()
     except KeyboardInterrupt:
         print("\n  stopped.")
