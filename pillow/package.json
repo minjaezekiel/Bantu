@@ -1,0 +1,8 @@
+{
+  "name": "pillow",
+  "version": "0.2.0",
+  "main": "pillow.b",
+  "description": "Imaging for Bantu, in the shape of Python's Pillow — written entirely in Bantu over numba's native arrays. This build (phase P2 of 9) is the core: the Image object with new/open/copy/crop/paste/split/merge/getpixel/putpixel/point/getdata/histogram/getbbox/getextrema/getcolors/blend/composite/alpha_composite/tobytes/save, all 20 Pillow modes, the conversion matrix, ImageColor with the 148 CSS names, the plugin registry, PPM/PGM/PBM read and write, and DEFLATE/zlib/gzip in both directions. Fidelity is differential, not aspirational: 111 of 111 verifiable conversion pairs are byte-identical to Pillow, RGB→L is verified over all 16,777,216 triples, and a live test has Pillow read what this writes. A full-frame 1080p operation is about a tenth of a second and a crop or a mirror is free, because no loop is proportional to the pixel count. Resampling, PNG, JPEG, the operators, drawing and text land in phases P3–P8; see pillow-suite/ROADMAP.md.",
+  "keywords": ["image", "imaging", "pillow", "ppm", "zlib", "deflate", "graphics"],
+  "dependencies": { "numba": "*" }
+}
