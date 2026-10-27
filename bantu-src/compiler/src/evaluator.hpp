@@ -23,6 +23,7 @@
 #include "ndarray_api.hpp"      // numba n-dimensional arrays (implementation in ndarray_native.cpp)
 #include "plot_native.hpp"      // bplot's native line/scatter kernels (docs/bplot-architecture.md §13.3)
 #include "raster_api.hpp"       // bplot's canvas + PNG encoder (implementation in raster_native.cpp)
+#include "inflate.hpp"        // DEFLATE/zlib/gzip decoding -- the inverse of bp_zlib
 #include "mime_types.hpp"       // extension -> Content-Type for the static file server
 #include "event_loop.hpp"       // kqueue/epoll/poll readiness loop for the sua server
 #include "worker_pool.hpp"      // SO_REUSEPORT workers + the cross-worker broadcast bus
@@ -30,6 +31,7 @@
 #include "pwa_native.hpp"       // manifest / service worker / offline rendering for sua.pwa
 #include "webpush.hpp"          // RFC 8188/8291/8292 Web Push (pulls in p256.hpp + aes_gcm.hpp)
 #include <iostream>
+#include <filesystem>
 #include <fstream>
 #include <sys/stat.h>   // file size + mtime, for static-file validators
 #include <sstream>
@@ -229,6 +231,30 @@ static BantuServerLimits bantuLimits;
 // Mirrors the evaluator's --quiet flag for code outside the class (setQuiet
 // keeps them in step), so diagnostics honour `bantu -q` like everything else.
 static bool bantuQuietMode = false;
+
+// ─── The SQL trace is opt-in ───────────────────────────────────────────────
+// sua.sqlite printed two lines of query trace to stdout for EVERY statement,
+// unconditionally, and sua.postgres and sua.mysql did the same. For a script
+// that is a useful log. For a server it is a defect: one Bantu web application
+// doing a handful of queries per request wrote a 45 MB log over a 600-request
+// load test, and the write amplification was large enough to dominate its
+// throughput -- the server measured 4 requests per second, and most of that
+// time was spent describing itself to a file nobody was reading.
+//
+// It also ignored `bantu -q`, which exists precisely to silence diagnostics.
+//
+// So: off by default, on with BANTU_SQL_DEBUG=1, and silenced by -q either
+// way. That mirrors BANTU_HTTP_DEBUG=1 for the HTTP client trace, which is the
+// same decision already made once in this file. ERRORS still print
+// unconditionally: an error is not chatter, and hiding a failed write is how
+// it comes to look like a successful one.
+static bool bantuSqlTraceEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("BANTU_SQL_DEBUG");
+        return v && *v && std::string(v) != "0";
+    }();
+    return on && !bantuQuietMode;
+}
 
 // ─── Suspending a handler ──────────────────────────────────────────────────
 // Handing the baton between the loop and a suspended handler means the
@@ -2127,16 +2153,39 @@ static void bantuSqliteBindParams(sqlite3_stmt* stmt, const std::vector<Value>& 
     }
 }
 
-// Convert a text column value to a number when it is fully numeric, mirroring
-// bantuSqliteCallback so parameterized queries return the same shapes.
-static Value bantuSqliteCellToValue(const char* txt) {
-    std::string val = txt ? txt : "NULL";
-    try {
-        size_t pos;
-        double nv = std::stod(val, &pos);
-        if (pos == val.size()) return Value(nv);
-    } catch (...) {}
-    return Value(val);
+// Convert one column of the current row, using the type SQLite reports rather
+// than guessing from the text.
+//
+// Two defects this replaces, both silent:
+//
+//   A NULL column arrived as the four-character STRING "NULL". So
+//   `if ($row["phone"] == null)` was false for every NULL column in the
+//   database, every nullable field serialised into JSON as the word NULL, and
+//   a column that legitimately held the text "NULL" was indistinguishable
+//   from one that held nothing.
+//
+//   A TEXT column was converted to a number whenever its contents happened to
+//   parse as one. A chat message of "42" came back as the number 42, a phone
+//   number "0712345678" lost its leading zero, and `len()` of either answered
+//   0 because they were no longer strings.
+//
+// sqlite3_column_type knows the answer, so neither guess is necessary. The
+// declared-type columns the ORM relies on are unaffected: an INTEGER column
+// still reads as a number, because SQLite's INTEGER affinity converts numeric
+// text on the way in.
+static Value bantuSqliteCellToValue(sqlite3_stmt* stmt, int col) {
+    switch (sqlite3_column_type(stmt, col)) {
+        case SQLITE_NULL:
+            return Value();
+        case SQLITE_INTEGER:
+            return Value((double)sqlite3_column_int64(stmt, col));
+        case SQLITE_FLOAT:
+            return Value(sqlite3_column_double(stmt, col));
+        default: {
+            const char* txt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, col));
+            return Value(std::string(txt ? txt : ""));
+        }
+    }
 }
 
 // ─── HTTP Status Text Helper ───
@@ -7033,6 +7082,8 @@ private:
                     "ndarray", // numba n-dimensional arrays + kernels
                     "bplot",   // bplot's line/scatter/escape kernels (plot_native.hpp)
                     "raster",  // bplot's canvas and PNG encoder (raster_native.cpp)
+                    "inflate", // DEFLATE/zlib/gzip decoding (inflate.hpp)
+                    "ndbytes", // nd_frombytes / nd_tobytes (ndarray_native.cpp)
                     "pwa"      // sua.pwa: manifest / service worker / offline
 #ifdef BANTU_ARROW
                     ,"arrow"  // Parquet + Feather/Arrow-IPC I/O (opt-in build)
@@ -8201,6 +8252,240 @@ private:
             return Value(true);
         }));
 
+        // ─── Directories and paths ──────────────────────────────────────
+        //
+        // Bantu could open, read, write and append a file and could not create
+        // the directory to put it in, ask whether a path existed, or list one.
+        // Any program that organises the files it writes -- uploads sharded by
+        // hash, a cache, logs by date, model checkpoints -- hits this on its
+        // first run, and the only symptom is that writefile() raises "cannot
+        // write" for a path whose parent is missing. That is how it was found:
+        // an image upload failed with nothing to say why.
+        //
+        // std::filesystem's error_code overloads are used throughout, so a
+        // permission problem or a race returns false instead of throwing out
+        // of a native frame.
+        env_->define("mkdir", makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(false);
+            std::error_code ec;
+            std::filesystem::create_directory(args[0].toString(), ec);
+            // Already existing is success: "make sure this directory exists"
+            // is what every caller actually wants, and checking first is a
+            // race.
+            if (ec) return Value(std::filesystem::is_directory(args[0].toString(), ec));
+            return Value(true);
+        }));
+
+        // The one an uploads directory needs: parents too.
+        env_->define("mkdirs", makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(false);
+            std::error_code ec;
+            std::filesystem::create_directories(args[0].toString(), ec);
+            if (ec) return Value(std::filesystem::is_directory(args[0].toString(), ec));
+            return Value(true);
+        }));
+
+        env_->define("exists", makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(false);
+            std::error_code ec;
+            return Value(std::filesystem::exists(args[0].toString(), ec) && !ec);
+        }));
+
+        env_->define("isdir", makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(false);
+            std::error_code ec;
+            return Value(std::filesystem::is_directory(args[0].toString(), ec) && !ec);
+        }));
+
+        env_->define("isfile", makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(false);
+            std::error_code ec;
+            return Value(std::filesystem::is_regular_file(args[0].toString(), ec) && !ec);
+        }));
+
+        env_->define("filesize", makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(-1.0);
+            std::error_code ec;
+            auto n = std::filesystem::file_size(args[0].toString(), ec);
+            if (ec) return Value(-1.0);
+            return Value((double)n);
+        }));
+
+        // Names only, not full paths, like Python's os.listdir -- a caller that
+        // wants paths joins them itself and one that wants names does not have
+        // to strip a prefix off every entry.
+        env_->define("listdir", makeNative([](std::vector<Value> args) -> Value {
+            std::vector<Value> out;
+            if (args.empty()) return Value(std::move(out));
+            std::error_code ec;
+            std::filesystem::directory_iterator it(args[0].toString(), ec);
+            if (ec) return Value(std::move(out));
+            for (const auto& entry : it) {
+                out.push_back(Value(entry.path().filename().string()));
+            }
+            std::sort(out.begin(), out.end(), [](const Value& a, const Value& b) {
+                return a.stringVal < b.stringVal;
+            });
+            return Value(std::move(out));
+        }));
+
+        // "unlink", not "delete": `delete` is a reserved word (it is
+        // sua.server.delete), so `def delete(...)` does not even parse.
+        env_->define("unlink", makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(false);
+            std::error_code ec;
+            return Value(std::filesystem::remove(args[0].toString(), ec) && !ec);
+        }));
+
+        // ─── base64, natively ───────────────────────────────────────────
+        //
+        // crypto.b has a pure-Bantu codec, and it is correct, and it returns a
+        // LIST of bytes -- which is the right shape for a 32-byte key and a
+        // catastrophe for an image. Measured: 1,299 ms to decode 100 KB, and
+        // super-linear, so a 4 MB photo is minutes of a single-threaded
+        // server's life and a four-million-element list at ~190 bytes per
+        // element. Uploading a picture was not slow, it was impossible.
+        //
+        // These work string-to-string: the decoded result is a Bantu string
+        // holding raw bytes, which writefile(path, s, "wb") stores verbatim
+        // and bytes(s) still explodes into a list if a caller wants one.
+        env_->define("b64encode", makeNative([](std::vector<Value> args) -> Value {
+            static const char* A =
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            if (args.empty()) return Value(std::string());
+            const std::string in = args[0].toString();
+            const bool urlSafe = args.size() > 1 && args[1].isBool() && args[1].boolVal;
+            std::string out;
+            out.reserve(((in.size() + 2) / 3) * 4);
+            size_t i = 0;
+            while (i + 2 < in.size()) {
+                uint32_t n = ((uint8_t)in[i] << 16) | ((uint8_t)in[i+1] << 8) | (uint8_t)in[i+2];
+                out += A[(n >> 18) & 63]; out += A[(n >> 12) & 63];
+                out += A[(n >> 6) & 63];  out += A[n & 63];
+                i += 3;
+            }
+            if (i + 1 == in.size()) {
+                uint32_t n = ((uint8_t)in[i] << 16);
+                out += A[(n >> 18) & 63]; out += A[(n >> 12) & 63]; out += "==";
+            } else if (i + 2 == in.size()) {
+                uint32_t n = ((uint8_t)in[i] << 16) | ((uint8_t)in[i+1] << 8);
+                out += A[(n >> 18) & 63]; out += A[(n >> 12) & 63];
+                out += A[(n >> 6) & 63];  out += '=';
+            }
+            if (urlSafe) {
+                for (char& c : out) { if (c == '+') c = '-'; else if (c == '/') c = '_'; }
+                while (!out.empty() && out.back() == '=') out.pop_back();
+            }
+            return Value(out);
+        }));
+
+        // Accepts both alphabets and tolerates missing padding and embedded
+        // whitespace, because a base64 payload that has been through a JSON
+        // body, a textarea or an email is routinely wrapped. Returns null on a
+        // character that is not base64 at all -- a rejection a caller can
+        // test, rather than a truncated image.
+        env_->define("b64decode", makeNative([](std::vector<Value> args) -> Value {
+            if (args.empty()) return Value(std::string());
+            const std::string in = args[0].toString();
+            static int8_t T[256];
+            static bool built = false;
+            if (!built) {
+                for (int i = 0; i < 256; i++) T[i] = -1;
+                const char* A =
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                for (int i = 0; i < 64; i++) T[(uint8_t)A[i]] = (int8_t)i;
+                T[(uint8_t)'-'] = 62;   // url-safe
+                T[(uint8_t)'_'] = 63;
+                built = true;
+            }
+            std::string out;
+            out.reserve((in.size() / 4) * 3 + 3);
+            uint32_t acc = 0;
+            int bits = 0;
+            for (char ch : in) {
+                const uint8_t c = (uint8_t)ch;
+                if (c == '=' ) break;
+                if (c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+                const int8_t v = T[c];
+                if (v < 0) return Value();          // not base64: reject
+                acc = (acc << 6) | (uint32_t)v;
+                bits += 6;
+                if (bits >= 8) {
+                    bits -= 8;
+                    out += (char)((acc >> bits) & 0xFF);
+                }
+            }
+            return Value(out);
+        }));
+
+        // ─── Decompression: the inverse of bp_zlib ───
+        // raster_core.hpp has shipped a zlib COMPRESSOR since bplot's PNG
+        // writer landed, and nothing in the interpreter could decompress -- so
+        // Bantu could write a PNG, a gzip body or a ZIP member and could not
+        // read one back. Every compressed format was write-only. These are the
+        // other half, and they are as general as the compressor: nothing here
+        // knows about images.
+        //
+        //   inflate(src, maxOut?)  container sniffed: gzip, zlib or raw DEFLATE
+        //   gunzip(src, maxOut?)   gzip specifically
+        //
+        // `src` is a byte string or a byte-list; the result is a byte STRING,
+        // because that is the representation that costs one byte per byte
+        // (a Bantu list costs ~100). bytes() turns it into a list when a
+        // caller wants to index it as numbers.
+        //
+        // maxOut is the defence against an inflate bomb: a 1 KB stream can
+        // legally expand to gigabytes, so a caller that knows the expected
+        // size passes it and a stream claiming more is refused BEFORE the
+        // memory is committed. Omitted, a 256 MiB absolute ceiling applies.
+        {
+            auto inflateBuiltin = [](const char* who,
+                                     std::vector<Value> a,
+                                     bool gzipOnly) -> Value {
+                if (a.empty()) {
+                    throw std::runtime_error(std::string(who) + "(src, maxOut?): src is required");
+                }
+                const std::vector<unsigned char> in = bantuToBytes(a[0]);
+                size_t maxOut = 0;
+                if (a.size() > 1 && !a[1].isNull()) {
+                    if (!a[1].isNumber()) {
+                        throw std::runtime_error(std::string(who) +
+                            ": maxOut must be a number or null (got " + a[1].toString() + ")");
+                    }
+                    const double d = a[1].numberVal;
+                    if (!(d >= 0.0) || d > 9.0e15) {
+                        throw std::runtime_error(std::string(who) +
+                            ": maxOut must be a non-negative whole number");
+                    }
+                    maxOut = (size_t)d;
+                    // 0 means "no caller limit" to inflateRaw, so a genuine
+                    // request for zero bytes is expressed as a 1-byte cap that
+                    // any output trips.
+                    if (maxOut == 0) {
+                        if (!in.empty()) {
+                            std::vector<uint8_t> probe =
+                                gzipOnly ? bantu_inflate::inflateGzip(in.data(), in.size(), 1)
+                                         : bantu_inflate::inflateAuto(in.data(), in.size(), 1);
+                            if (!probe.empty()) {
+                                throw std::runtime_error("inflate: output would exceed maxOut (0 bytes)");
+                            }
+                        }
+                        return Value(std::string());
+                    }
+                }
+                const std::vector<uint8_t> out =
+                    gzipOnly ? bantu_inflate::inflateGzip(in.data(), in.size(), maxOut)
+                             : bantu_inflate::inflateAuto(in.data(), in.size(), maxOut);
+                return Value(std::string((const char*)out.data(), out.size()));
+            };
+            env_->define("inflate", makeNative([inflateBuiltin](std::vector<Value> a) -> Value {
+                return inflateBuiltin("inflate", std::move(a), false);
+            }));
+            env_->define("gunzip", makeNative([inflateBuiltin](std::vector<Value> a) -> Value {
+                return inflateBuiltin("gunzip", std::move(a), true);
+            }));
+        }
+
         // ─── FFI (v1.3.0): call C functions in shared libraries via libffi ───
         env_->define("loadlib", makeNative(&bantuFfiLoadLib));
         env_->define("func", makeNative(&bantuFfiFunc));
@@ -8558,9 +8843,24 @@ private:
             return Value(args[0].stringVal.find(args[1].stringVal) != std::string::npos);
         }));
 
-        // indexOf(s, needle) → number (or -1)
+        // indexOf(haystack, needle) → number (or -1)
+        //
+        // Accepts a LIST as well as a string, using the same element equality
+        // contains() uses. It used to take strings only and answer -1 for any
+        // list, so contains($L, $x) said true while indexOf($L, $x) said -1
+        // for the same pair -- a silently wrong answer rather than an error,
+        // and the opposite of what the name promises. indexOf is the
+        // position-returning twin of contains and now behaves like it.
         env_->define("indexOf", makeNative([](std::vector<Value> args) -> Value {
-            if (args.size() < 2 || !args[0].isString() || !args[1].isString()) return Value(-1.0);
+            if (args.size() < 2) return Value(-1.0);
+            if (args[0].isList()) {
+                const std::vector<Value>& L = args[0].listVal;
+                for (size_t i = 0; i < L.size(); i++) {
+                    if (L[i].equals(args[1])) return Value((double)i);
+                }
+                return Value(-1.0);
+            }
+            if (!args[0].isString() || !args[1].isString()) return Value(-1.0);
             auto p = args[0].stringVal.find(args[1].stringVal);
             return Value(p == std::string::npos ? -1.0 : (double)p);
         }));
@@ -9837,7 +10137,7 @@ private:
             }
 
             bantuSqlitePath = path;
-            std::cout << "  [SQLITE] Opened: " << path << "\n";
+            if (bantuSqlTraceEnabled()) std::cout << "  [SQLITE] Opened: " << path << "\n";
             ObjectMap openInfo;
             openInfo["path"] = Value(path);
             openInfo["connected"] = Value(true);
@@ -9853,7 +10153,7 @@ private:
                 // Auto-open in-memory database
                 sqlite3_open(":memory:", &bantuSqliteDb);
                 bantuSqlitePath = ":memory:";
-                std::cout << "  [SQLITE] Auto-opened: :memory:\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [SQLITE] Auto-opened: :memory:\n";
             }
 
             // Parameterized path: exec(sql, [params]) binds `?` placeholders
@@ -9895,8 +10195,8 @@ private:
 
             int changes = sqlite3_changes(bantuSqliteDb);
             sqlite3_int64 lastId = sqlite3_last_insert_rowid(bantuSqliteDb);
-            std::cout << "  [SQLITE] Exec: " << sql.substr(0, 80) << (sql.length() > 80 ? "..." : "") << "\n";
-            std::cout << "  [SQLITE]   Changes: " << changes << ", Last ID: " << lastId << "\n";
+            if (bantuSqlTraceEnabled()) std::cout << "  [SQLITE] Exec: " << sql.substr(0, 80) << (sql.length() > 80 ? "..." : "") << "\n";
+            if (bantuSqlTraceEnabled()) std::cout << "  [SQLITE]   Changes: " << changes << ", Last ID: " << lastId << "\n";
 
             ObjectMap execInfo;
             execInfo["changes"] = Value((double)changes);
@@ -9912,7 +10212,7 @@ private:
             if (!bantuSqliteDb) {
                 sqlite3_open(":memory:", &bantuSqliteDb);
                 bantuSqlitePath = ":memory:";
-                std::cout << "  [SQLITE] Auto-opened: :memory:\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [SQLITE] Auto-opened: :memory:\n";
             }
 
             // Parameterized path: query(sql, [params]) binds `?` placeholders
@@ -9930,7 +10230,7 @@ private:
                     ObjectMap row;
                     for (int c = 0; c < cols; c++) {
                         row[sqlite3_column_name(stmt, c)] =
-                            bantuSqliteCellToValue(reinterpret_cast<const char*>(sqlite3_column_text(stmt, c)));
+                            bantuSqliteCellToValue(stmt, c);
                     }
                     prows.push_back(Value(std::move(row)));
                 }
@@ -9938,22 +10238,44 @@ private:
                 return Value(std::move(prows));
             }
 
+            // No parameters, but still a prepared statement rather than
+            // sqlite3_exec: exec's callback receives every value as text and
+            // cannot distinguish a NULL from the string "NULL" even in
+            // principle. Both paths now return identical shapes, which is what
+            // the comment on bantuSqliteCellToValue always claimed.
             std::vector<Value> rows;
-            char* errMsg = nullptr;
-            int rc = sqlite3_exec(bantuSqliteDb, sql.c_str(), bantuSqliteCallback, &rows, &errMsg);
-
-            if (rc != SQLITE_OK) {
-                std::string err = errMsg ? errMsg : "Unknown error";
-                if (errMsg) sqlite3_free(errMsg);
-                std::cout << "  [SQLITE] Error: " << err << "\n";
-                ObjectMap errInfo;
-                errInfo["error"] = Value(err);
-                errInfo["success"] = Value(false);
-                return Value(std::move(errInfo));
+            {
+                sqlite3_stmt* stmt = nullptr;
+                if (sqlite3_prepare_v2(bantuSqliteDb, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+                    std::string err = sqlite3_errmsg(bantuSqliteDb);
+                    std::cout << "  [SQLITE] Error: " << err << "\n";
+                    ObjectMap errInfo;
+                    errInfo["error"] = Value(err);
+                    errInfo["success"] = Value(false);
+                    return Value(std::move(errInfo));
+                }
+                const int cols = sqlite3_column_count(stmt);
+                int rc = SQLITE_OK;
+                while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+                    ObjectMap row;
+                    for (int c = 0; c < cols; c++) {
+                        row[sqlite3_column_name(stmt, c)] = bantuSqliteCellToValue(stmt, c);
+                    }
+                    rows.push_back(Value(std::move(row)));
+                }
+                sqlite3_finalize(stmt);
+                if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
+                    std::string err = sqlite3_errmsg(bantuSqliteDb);
+                    std::cout << "  [SQLITE] Error: " << err << "\n";
+                    ObjectMap errInfo;
+                    errInfo["error"] = Value(err);
+                    errInfo["success"] = Value(false);
+                    return Value(std::move(errInfo));
+                }
             }
 
-            std::cout << "  [SQLITE] Query: " << sql.substr(0, 80) << (sql.length() > 80 ? "..." : "") << "\n";
-            std::cout << "  [SQLITE]   Rows: " << rows.size() << "\n";
+            if (bantuSqlTraceEnabled()) std::cout << "  [SQLITE] Query: " << sql.substr(0, 80) << (sql.length() > 80 ? "..." : "") << "\n";
+            if (bantuSqlTraceEnabled()) std::cout << "  [SQLITE]   Rows: " << rows.size() << "\n";
             return Value(std::move(rows));
         });
 
@@ -9962,7 +10284,7 @@ private:
             if (bantuSqliteDb) {
                 sqlite3_close(bantuSqliteDb);
                 bantuSqliteDb = nullptr;
-                std::cout << "  [SQLITE] Closed: " << bantuSqlitePath << "\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [SQLITE] Closed: " << bantuSqlitePath << "\n";
                 bantuSqlitePath = "";
                 return Value(true);
             }
@@ -9995,7 +10317,7 @@ private:
                 }
             }
 
-            std::cout << "  [SQLITE] Tables: " << tableNames.size() << "\n";
+            if (bantuSqlTraceEnabled()) std::cout << "  [SQLITE] Tables: " << tableNames.size() << "\n";
             return Value(std::move(tableNames));
         });
 
@@ -10042,7 +10364,7 @@ private:
 
             bantuPgConnStr = connStr;
 
-            std::cout << "  [POSTGRES] Connecting to " << bantuPgHost << ":" << port << "/" << bantuPgDb << "\n";
+            if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES] Connecting to " << bantuPgHost << ":" << port << "/" << bantuPgDb << "\n";
 
 #ifdef HAS_LIBPQ
             // Real PostgreSQL connection via libpq
@@ -10062,7 +10384,7 @@ private:
                 return Value(std::move(errInfo));
             }
             bantuPgConnected = true;
-            std::cout << "  [POSTGRES] Connected as " << bantuPgUser
+            if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES] Connected as " << bantuPgUser
                       << " (server: " << PQserverVersion(bantuPgConn) << ")\n";
             ObjectMap connInfo;
             connInfo["connected"] = Value(true);
@@ -10077,7 +10399,7 @@ private:
 #else
             // Stub mode (no libpq linked)
             bantuPgConnected = true;
-            std::cout << "  [POSTGRES] Connected as " << bantuPgUser
+            if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES] Connected as " << bantuPgUser
                       << " (stub mode — rebuild with -DBANTU_POSTGRES=ON for real queries)\n";
             ObjectMap connInfo;
             connInfo["connected"] = Value(true);
@@ -10114,7 +10436,7 @@ private:
                 errInfo["success"] = Value(false);
                 return Value(std::move(errInfo));
             }
-            std::cout << "  [POSTGRES] Query: " << sql.substr(0, 80)
+            if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES] Query: " << sql.substr(0, 80)
                       << (sql.length() > 80 ? "..." : "") << "\n";
             // Parameterized path: query(sql, [params]) binds $1..$n via
             // PQexecParams (injection-safe); otherwise a plain PQexec.
@@ -10174,7 +10496,7 @@ private:
                     }
                     rows.push_back(Value(std::move(row)));
                 }
-                    std::cout << "  [POSTGRES]   Rows: " << rows.size() << "\n";
+                    if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES]   Rows: " << rows.size() << "\n";
                 PQclear(res);
                 return Value(std::move(rows));
             }
@@ -10188,11 +10510,11 @@ private:
             if (!oidStr.empty() && oidStr != "0") {
                 execInfo["insertId"] = Value((double)atoll(oidStr.c_str()));
             }
-                std::cout << "  [POSTGRES]   Affected " << affected << " row(s)\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES]   Affected " << affected << " row(s)\n";
             return Value(std::move(execInfo));
 #else
             // Stub mode — simulate based on SQL keyword
-            std::cout << "  [POSTGRES] Query: " << sql.substr(0, 80) << (sql.length() > 80 ? "..." : "") << "\n";
+            if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES] Query: " << sql.substr(0, 80) << (sql.length() > 80 ? "..." : "") << "\n";
             std::string sqlUpper = sql;
             std::transform(sqlUpper.begin(), sqlUpper.end(), sqlUpper.begin(), ::toupper);
 
@@ -10204,39 +10526,39 @@ private:
                 row2["id"] = Value(2.0); row2["name"] = Value(std::string("Bob")); row2["email"] = Value(std::string("bob@" + bantuPgDb + ".com"));
                 rows.push_back(Value(std::move(row1)));
                 rows.push_back(Value(std::move(row2)));
-                std::cout << "  [POSTGRES]   Rows: " << rows.size() << " (simulated)\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES]   Rows: " << rows.size() << " (simulated)\n";
                 return Value(std::move(rows));
             } else if (sqlUpper.find("INSERT") != std::string::npos) {
                 ObjectMap execInfo;
                 execInfo["affectedRows"] = Value(1.0);
                 execInfo["insertId"] = Value(1.0);
                 execInfo["success"] = Value(true);
-                std::cout << "  [POSTGRES]   Inserted 1 row (simulated)\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES]   Inserted 1 row (simulated)\n";
                 return Value(std::move(execInfo));
             } else if (sqlUpper.find("UPDATE") != std::string::npos) {
                 ObjectMap execInfo;
                 execInfo["affectedRows"] = Value(1.0);
                 execInfo["success"] = Value(true);
-                std::cout << "  [POSTGRES]   Updated 1 row (simulated)\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES]   Updated 1 row (simulated)\n";
                 return Value(std::move(execInfo));
             } else if (sqlUpper.find("DELETE") != std::string::npos) {
                 ObjectMap execInfo;
                 execInfo["affectedRows"] = Value(1.0);
                 execInfo["success"] = Value(true);
-                std::cout << "  [POSTGRES]   Deleted 1 row (simulated)\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES]   Deleted 1 row (simulated)\n";
                 return Value(std::move(execInfo));
             } else if (sqlUpper.find("CREATE") != std::string::npos) {
                 ObjectMap execInfo;
                 execInfo["success"] = Value(true);
-                std::cout << "  [POSTGRES]   Table created (simulated)\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES]   Table created (simulated)\n";
                 return Value(std::move(execInfo));
             } else if (sqlUpper.find("DROP") != std::string::npos) {
                 ObjectMap execInfo;
                 execInfo["success"] = Value(true);
-                std::cout << "  [POSTGRES]   Table dropped (simulated)\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES]   Table dropped (simulated)\n";
                 return Value(std::move(execInfo));
             }
-            std::cout << "  [POSTGRES]   OK (simulated)\n";
+            if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES]   OK (simulated)\n";
             ObjectMap execInfo;
             execInfo["success"] = Value(true);
             return Value(std::move(execInfo));
@@ -10259,7 +10581,7 @@ private:
                 errInfo["success"] = Value(false);
                 return Value(std::move(errInfo));
             }
-                std::cout << "  [POSTGRES] Exec: " << sql.substr(0, 80)
+                if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES] Exec: " << sql.substr(0, 80)
                           << (sql.length() > 80 ? "..." : "") << "\n";
             // Parameterized path: exec(sql, [params]) binds $1..$n via
             // PQexecParams (injection-safe); otherwise a plain PQexec.
@@ -10298,7 +10620,7 @@ private:
             if (!oidStr.empty() && oidStr != "0") {
                 execInfo["insertId"] = Value((double)atoll(oidStr.c_str()));
             }
-                std::cout << "  [POSTGRES]   Affected " << affected << " row(s)\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES]   Affected " << affected << " row(s)\n";
             return Value(std::move(execInfo));
 #else
             // Stub: dispatch through the same simulation as query()
@@ -10309,11 +10631,11 @@ private:
                 errInfo["success"] = Value(false);
                 return Value(std::move(errInfo));
             }
-            std::cout << "  [POSTGRES] Exec: " << sql.substr(0, 80) << (sql.length() > 80 ? "..." : "") << "\n";
+            if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES] Exec: " << sql.substr(0, 80) << (sql.length() > 80 ? "..." : "") << "\n";
             ObjectMap execInfo;
             execInfo["success"] = Value(true);
             execInfo["affectedRows"] = Value(1.0);
-            std::cout << "  [POSTGRES]   OK (simulated)\n";
+            if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES]   OK (simulated)\n";
             return Value(std::move(execInfo));
 #endif
         });
@@ -10326,7 +10648,7 @@ private:
 #endif
                 bantuPgConnected = false;
                 bantuPgConnStr = "";
-                std::cout << "  [POSTGRES] Connection closed\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [POSTGRES] Connection closed\n";
                 return Value(true);
             }
             std::cout << "  [POSTGRES] No connection open\n";
@@ -10357,8 +10679,8 @@ private:
             bantuMysqlPort = port;
             bantuMysqlConnected = true;
 
-            std::cout << "  [MYSQL] Connecting to " << host << ":" << port << "/" << database << "\n";
-            std::cout << "  [MYSQL] Connected as " << user << "\n";
+            if (bantuSqlTraceEnabled()) std::cout << "  [MYSQL] Connecting to " << host << ":" << port << "/" << database << "\n";
+            if (bantuSqlTraceEnabled()) std::cout << "  [MYSQL] Connected as " << user << "\n";
             ObjectMap connInfo;
             connInfo["connected"] = Value(true);
             connInfo["host"] = Value(host);
@@ -10383,7 +10705,7 @@ private:
                 return Value(std::move(errInfo));
             }
 
-            std::cout << "  [MYSQL] Query: " << sql.substr(0, 80) << (sql.length() > 80 ? "..." : "") << "\n";
+            if (bantuSqlTraceEnabled()) std::cout << "  [MYSQL] Query: " << sql.substr(0, 80) << (sql.length() > 80 ? "..." : "") << "\n";
 
             // Determine query type for simulation
             std::string sqlUpper = sql;
@@ -10397,41 +10719,41 @@ private:
                 row2["id"] = Value(2.0); row2["name"] = Value(std::string("Bob")); row2["email"] = Value(std::string("bob@" + bantuMysqlDb + ".com"));
                 rows.push_back(Value(std::move(row1)));
                 rows.push_back(Value(std::move(row2)));
-                std::cout << "  [MYSQL]   Rows: " << rows.size() << "\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [MYSQL]   Rows: " << rows.size() << "\n";
                 return Value(std::move(rows));
             } else if (sqlUpper.find("INSERT") != std::string::npos) {
                 ObjectMap execInfo;
                 execInfo["affectedRows"] = Value(1.0);
                 execInfo["insertId"] = Value(1.0);
                 execInfo["success"] = Value(true);
-                std::cout << "  [MYSQL]   Inserted 1 row\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [MYSQL]   Inserted 1 row\n";
                 return Value(std::move(execInfo));
             } else if (sqlUpper.find("UPDATE") != std::string::npos) {
                 ObjectMap execInfo;
                 execInfo["affectedRows"] = Value(1.0);
                 execInfo["success"] = Value(true);
-                std::cout << "  [MYSQL]   Updated 1 row\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [MYSQL]   Updated 1 row\n";
                 return Value(std::move(execInfo));
             } else if (sqlUpper.find("DELETE") != std::string::npos) {
                 ObjectMap execInfo;
                 execInfo["affectedRows"] = Value(1.0);
                 execInfo["success"] = Value(true);
-                std::cout << "  [MYSQL]   Deleted 1 row\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [MYSQL]   Deleted 1 row\n";
                 return Value(std::move(execInfo));
             } else if (sqlUpper.find("CREATE") != std::string::npos) {
                 ObjectMap execInfo;
                 execInfo["success"] = Value(true);
-                std::cout << "  [MYSQL]   Table created\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [MYSQL]   Table created\n";
                 return Value(std::move(execInfo));
             } else if (sqlUpper.find("DROP") != std::string::npos) {
                 ObjectMap execInfo;
                 execInfo["success"] = Value(true);
-                std::cout << "  [MYSQL]   Table dropped\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [MYSQL]   Table dropped\n";
                 return Value(std::move(execInfo));
             }
 
             // Generic
-            std::cout << "  [MYSQL]   OK\n";
+            if (bantuSqlTraceEnabled()) std::cout << "  [MYSQL]   OK\n";
             ObjectMap execInfo;
             execInfo["success"] = Value(true);
             return Value(std::move(execInfo));
@@ -10441,7 +10763,7 @@ private:
         mysqlObj["close"] = makeNative([](std::vector<Value> args) -> Value {
             if (bantuMysqlConnected) {
                 bantuMysqlConnected = false;
-                std::cout << "  [MYSQL] Connection closed\n";
+                if (bantuSqlTraceEnabled()) std::cout << "  [MYSQL] Connection closed\n";
                 return Value(true);
             }
             std::cout << "  [MYSQL] No connection open\n";

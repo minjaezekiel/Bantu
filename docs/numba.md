@@ -169,6 +169,45 @@ download.
 
 ---
 
+## Raw binary file I/O
+
+```bantu
+np.tofile($a, "weights.bin", null);                      // -> bytes written
+$a = np.fromfile("weights.bin", "f64", [3, 4], null);    // shape optional
+$rest = np.fromfile("weights.bin", "f64", null, null);   // whole file, one axis
+$t = np.fromfile("model.btw", "f64", [8000, 128], 164);  // a tensor after a header
+```
+
+| | |
+|---|---|
+| `fromfile(path, dtype?, shape?, byteOffset?)` | read a flat buffer straight into an array |
+| `tofile(array, path, append?)` | write it back; returns the byte count |
+
+No shape means *the rest of the file as one axis*, and the remaining byte count must be a whole
+number of elements. `byteOffset` is how you read a tensor that sits after a header — which is what
+`lugha`'s `.btw` model loader does.
+
+**Why these are native.** Decoding one IEEE-754 double from eight bytes in the interpreter is a
+dozen float operations, and a Bantu list of a million numbers is a million ~190-byte `Value`s —
+roughly 190 MB to hold what the array stores in 8 MB. Loading a model's weights through
+`readfile` + hand-rolled float decoding was not slow, it was impossible. Measured here: **1.5M f64
+written in 33 ms and read back in 10 ms**, bit-identical.
+
+Three things worth knowing:
+
+- **A strided or flipped array is written in logical order, not buffer order**, so what
+  `fromfile` gives back is what you wrote. `np.tofile(np.transpose($a, null), …)` round-trips.
+- **Byte order is the machine's**, which is little-endian on every platform Bantu builds for. This
+  is a checkpoint or a cache, not an interchange format — say so if you ship one.
+- **A `bool` array is normalised to 0/1 on read.** A stray `2` in a hand-made file would compare
+  unequal to `true` while still testing as truthy, which is the kind of bug that never gets found.
+
+Errors are catchable and name the file: a missing path, a short read, a `byteOffset` past the end, or
+a shape that needs more bytes than the file has. The usual live-memory ceiling applies, so
+`fromfile` cannot be used to allocate past `np.max_bytes`.
+
+---
+
 ## Working with large arrays
 
 A chained expression holds several full-size temporaries at once: `$a.add($b).multiply(2).sqrt()` on

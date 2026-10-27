@@ -275,6 +275,34 @@ eq(len($both), 100000, "two 50,000-element lists join");
 eq($both[99999], 49999, "with the right last element");
 ok(clock() - $ct < 1000, "in well under a second");
 
+// ── indexOf over a list: the position-returning twin of contains ─────────────
+// indexOf used to take strings only and answer -1 for any list, so
+// contains($L, $x) said true while indexOf($L, $x) said -1 for the same pair.
+$names = ["alpha", "beta", "gamma"];
+eq(indexOf($names, "alpha"), 0, "indexOf finds the first element");
+eq(indexOf($names, "gamma"), 2, "indexOf finds the last element");
+eq(indexOf($names, "beta"), 1, "indexOf finds a middle element");
+eq(indexOf($names, "delta"), -1, "indexOf returns -1 when absent");
+eq(indexOf([10, 20, 30], 20), 1, "indexOf over numbers");
+eq(indexOf([10, 20, 30], 99), -1, "indexOf over numbers, absent");
+eq(indexOf([true, false], false), 1, "indexOf over booleans");
+eq(indexOf([1, 2, 2, 3], 2), 1, "indexOf returns the FIRST match");
+eq(indexOf([], "x"), -1, "indexOf over an empty list");
+eq(indexOf([null, 5], 5), 1, "indexOf skips a null element");
+eq(indexOf([[1, 2], [3]], [3]), 1, "indexOf over nested lists");
+// it agrees with contains on every input, which is the property that was broken
+$probe = ["a", 1, true, null, [2]];
+$agree = 0;
+$pi = 0;
+while ($pi < len($probe)) {
+    if (contains($names, $probe[$pi]) == (indexOf($names, $probe[$pi]) >= 0)) { $agree = $agree + 1; }
+    $pi = $pi + 1;
+}
+eq($agree, len($probe), "indexOf and contains agree on every probe value");
+// strings still behave exactly as before
+eq(indexOf("hello", "ll"), 2, "indexOf over a string is unchanged");
+eq(indexOf("hello", "z"), -1, "indexOf over a string, absent");
+
 print("");
 print("========================================");
 print("  PASS: " + str($R.pass) + "   FAIL: " + str($R.fail));

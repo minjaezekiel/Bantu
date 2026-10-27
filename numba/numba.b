@@ -108,6 +108,17 @@ def copy($a)              { return nd_copy($a); }
 def astype($a, $dtype)    { return nd_astype($a, $dtype); }
 def ascontiguous($a)      { return nd_ascontiguous($a); }
 def to_list($a)           { return nd_to_list($a); }
+
+// ── raw binary file I/O ──────────────────────────────────────────────────
+// fromfile(path, dtype?, shape?, byteOffset?) — read a flat buffer of
+// machine-order values straight into an array. No shape means "the rest of
+// the file as one axis". byteOffset is how you read a tensor that sits after
+// a header, which is what lugha's .btw loader does.
+// tofile(array, path, append?) — write it back; returns the byte count.
+def fromfile($path, $dtype, $shape, $byteOffset) {
+    return nd_fromfile($path, $dtype, $shape, $byteOffset);
+}
+def tofile($a, $path, $append)  { return nd_tofile($a, $path, $append); }
 def get($a, $idx)         { return nd_get($a, $idx); }
 def set($a, $idx, $v)     { return nd_set($a, $idx, $v); }
 

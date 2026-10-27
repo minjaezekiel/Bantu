@@ -868,6 +868,45 @@ sua.sqlite.close()
 `sua.postgres.*` needs a build with `-DBANTU_POSTGRES=ON`. For a higher-level interface see
 [orm.md](orm.md); for analytics see [arctic.md](arctic.md).
 
+### The query trace is opt-in (fixed)
+
+`sua.sqlite` printed two lines to stdout for **every statement** — the SQL and
+the row or change count — unconditionally, and `sua.postgres` and `sua.mysql`
+did the same. It also ignored `bantu -q`, which exists precisely to silence
+diagnostics.
+
+For a script that is a useful log. For a server it is a defect, and a
+measurable one: a Bantu web application doing a handful of queries per request
+wrote a **45 MB log over a 600-request load test**, and the write amplification
+dominated its throughput. The server measured **4 requests per second**, most of
+it spent describing itself to a file nobody was reading.
+
+```sh
+bantu run server.b                     # quiet, as a server should be
+BANTU_SQL_DEBUG=1 bantu run script.b   # the full trace, for debugging
+bantu -q run script.b                  # silent, whatever the env var says
+```
+
+Off by default, on with `BANTU_SQL_DEBUG=1`, silenced by `-q` either way —
+mirroring `BANTU_HTTP_DEBUG=1` for the HTTP client trace. **Errors still print
+unconditionally**: an error is not chatter, and hiding a failed write is how it
+comes to look like a successful one.
+
+Two pragmas `sua.sqlite.open` does *not* set for you, and both matter for a
+server:
+
+```bantu
+sua.sqlite.exec("PRAGMA journal_mode=WAL");    // readers do not block on a writer
+sua.sqlite.exec("PRAGMA busy_timeout=5000");   // required for sua.server.workers(n)
+```
+
+Without WAL a writer blocks every reader, and on a single-threaded event loop
+that is the whole server. Without `busy_timeout`, a second worker process
+writing concurrently gets `SQLITE_BUSY` immediately instead of waiting the few
+milliseconds the first one needs — so `sua.server.workers(n)` for `n > 1`
+produces intermittent write failures under load, which is worse than being
+slow: a lost post rather than a late one.
+
 > `sua.mysql.*` is a **simulation** — it returns canned rows regardless of build flags. Do not use it.
 
 ---

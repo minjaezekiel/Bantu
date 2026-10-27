@@ -10,6 +10,8 @@
  */
 
 #include "ndarray_native.hpp"
+#include <fstream>
+#include <cstring>      // memcpy, for the nd_frombytes/nd_tobytes float paths
 #include "ndarray_api.hpp"
 #include "ndarray_ufunc_reg.hpp"
 #include "ndarray_reduce_reg.hpp"
@@ -646,6 +648,321 @@ void registerBuiltins(const DefineFn& rawDefine) {
         if (x->isCContig()) return a[0];
         return wrap(contiguousCopy(x, x->dtype));
     });
+
+    // ── raw binary file I/O ──────────────────────────────────────────────────
+    //
+    // nd_fromfile(path, dtype?, shape?, byteOffset?) -> array
+    // nd_tofile(array, path, append?)               -> bytes written
+    //
+    // The reason these are native rather than Bantu: decoding one IEEE-754
+    // double from eight bytes in the interpreter is a dozen float operations,
+    // and a Bantu list of a million numbers is a million ~190-byte Values --
+    // about 190 MB to hold what the array itself stores in 8 MB. So "load a
+    // model's weights" was not slow in pure Bantu, it was impossible. NumPy
+    // has fromfile/tofile for the same reason, and `lugha` is the first caller.
+    //
+    // Byte order is the machine's, which is little-endian on every platform
+    // Bantu builds for. A file written here reads back identically here; it is
+    // a cache or a model checkpoint, not an interchange format.
+    define("nd_fromfile", [](std::vector<Value> a) -> Value {
+        needArgs(a, 1, "nd_fromfile(path, dtype?, shape?, byteOffset?)");
+        if (!a[0].isString()) {
+            throw std::runtime_error("nd_fromfile: path must be a string (got " +
+                                     a[0].toString() + ")");
+        }
+        const std::string path = a[0].stringVal;
+        const DType dt = dtypeArg(a, 1, DType::F64);
+        const size_t item = itemsize(dt);
+
+        const double offD = numArg(a, 3, 0.0, "nd_fromfile");
+        if (offD < 0 || offD != std::floor(offD)) {
+            throw std::runtime_error("nd_fromfile: byteOffset must be a non-negative whole number");
+        }
+        const size_t byteOffset = (size_t)offD;
+
+        std::ifstream f(path, std::ios::binary | std::ios::ate);
+        if (!f) throw std::runtime_error("nd_fromfile: cannot open '" + path + "'");
+        const std::streamoff total = f.tellg();
+        if (total < 0) throw std::runtime_error("nd_fromfile: cannot size '" + path + "'");
+        if (byteOffset > (size_t)total) {
+            throw std::runtime_error("nd_fromfile: byteOffset " + std::to_string(byteOffset) +
+                                     " is past the end of '" + path + "' (" +
+                                     std::to_string((size_t)total) + " bytes)");
+        }
+        const size_t avail = (size_t)total - byteOffset;
+
+        // No shape: the rest of the file, as one axis.
+        std::vector<size_t> shape;
+        if (a.size() > 2 && !a[2].isNull()) {
+            shape = shapeFrom(a[2], "nd_fromfile");
+        } else {
+            if (avail % item != 0) {
+                throw std::runtime_error("nd_fromfile: '" + path + "' has " +
+                    std::to_string(avail) + " bytes to read, which is not a whole number of " +
+                    std::to_string(item) + "-byte elements");
+            }
+            shape.push_back(avail / item);
+        }
+
+        auto out = makeArray(shape, dt, "nd_fromfile", false);
+        const size_t want = checkedMul(out->size(), item, "nd_fromfile");
+        if (want > avail) {
+            throw std::runtime_error("nd_fromfile: that shape needs " + std::to_string(want) +
+                " bytes but only " + std::to_string(avail) + " are available in '" + path + "'");
+        }
+        if (want) {
+            f.seekg((std::streamoff)byteOffset, std::ios::beg);
+            if (!f) throw std::runtime_error("nd_fromfile: cannot seek in '" + path + "'");
+            f.read(static_cast<char*>(out->buf->data), (std::streamsize)want);
+            if ((size_t)f.gcount() != want) {
+                throw std::runtime_error("nd_fromfile: short read on '" + path + "' (" +
+                    std::to_string((size_t)f.gcount()) + " of " + std::to_string(want) + " bytes)");
+            }
+        }
+        // A bool array must hold only 0 or 1: every kernel and every read-back
+        // assumes it, and a stray 2 from a hand-made file would compare unequal
+        // to true while still testing as truthy.
+        if (dt == DType::BOOL) {
+            uint8_t* p = static_cast<uint8_t*>(out->buf->data);
+            for (size_t i = 0; i < out->size(); i++) p[i] = p[i] ? 1 : 0;
+        }
+        return wrap(out);
+    });
+
+    define("nd_tofile", [](std::vector<Value> a) -> Value {
+        needArgs(a, 2, "nd_tofile(array, path, append?)");
+        auto x = asArray(a[0]);
+        if (!a[1].isString()) {
+            throw std::runtime_error("nd_tofile: path must be a string (got " +
+                                     a[1].toString() + ")");
+        }
+        const bool append = a.size() > 2 && !a[2].isNull() && a[2].isBool() && a[2].boolVal;
+        // Strided or flipped data is written in logical order, not buffer
+        // order, so what comes back out of nd_fromfile is what you wrote.
+        ArrayPtr src = x->isCContig() ? x : contiguousCopy(x, x->dtype);
+        const size_t bytes = checkedMul(src->size(), itemsize(src->dtype), "nd_tofile");
+
+        std::ios::openmode mode = std::ios::binary |
+                                  (append ? std::ios::app : std::ios::trunc);
+        std::ofstream f(a[1].stringVal, mode);
+        if (!f) throw std::runtime_error("nd_tofile: cannot open '" + a[1].stringVal + "' for writing");
+        if (bytes) {
+            const char* base = static_cast<const char*>(src->buf->data) +
+                               src->offset * itemsize(src->dtype);
+            f.write(base, (std::streamsize)bytes);
+        }
+        f.flush();
+        if (!f) throw std::runtime_error("nd_tofile: write to '" + a[1].stringVal + "' failed");
+        return Value((double)bytes);
+    });
+
+    // ── bytes <-> array ──────────────────────────────────────────────────────
+    //
+    // nd_frombytes(src, elem?, shape?) -> array
+    // nd_tobytes(array, elem?)         -> byte string
+    //
+    // nd_fromfile above can only read 8-byte elements, because DType is
+    // f64/i64/bool -- so a BYTE buffer had no way into an array at all. The
+    // only route was readfile -> bytes() -> nd(list), measured at 479 ms and a
+    // ~100 MB transient per megabyte: an 8 MB image would spend four seconds
+    // and most of a gigabyte turning its own pixels into an array. These are
+    // the natural completion of nd_fromfile, and NumPy's frombuffer/tobytes
+    // exist for the same reason.
+    //
+    // `elem` names the WIRE element type -- how wide each value is in the byte
+    // string and in what order -- which is independent of the array's dtype:
+    //
+    //   "u8"    1 byte, unsigned            -> i64   (the default)
+    //   "i8"    1 byte, signed              -> i64
+    //   "u16le" "u16be"  2 bytes, unsigned  -> i64
+    //   "i16le" "i16be"  2 bytes, signed    -> i64
+    //   "u32le" "u32be"  4 bytes, unsigned  -> i64
+    //   "i32le" "i32be"  4 bytes, signed    -> i64
+    //   "f32le" "f32be"  4 bytes, IEEE-754  -> f64
+    //   "f64le" "f64be"  8 bytes, IEEE-754  -> f64
+    //
+    // Explicit byte order is the point: every image, audio and network format
+    // specifies one, and the machine's is not it. "u16" and friends without a
+    // suffix mean little-endian, which is what every platform Bantu builds for
+    // uses natively.
+    {
+        struct Elem { int width; bool isSigned; bool isFloat; bool bigEndian; DType dt; };
+        auto parseElem = [](const std::string& s, const char* who) -> Elem {
+            // The u8 default is supplied by the CALL SITE when the argument is
+            // absent or null. An explicitly-passed empty string is therefore a
+            // caller that built the name and got it wrong, which is worth an
+            // error rather than a silent u8.
+            if (s.empty()) {
+                throw std::runtime_error(std::string(who) + ": element type is empty. "
+                    "Use u8 i8 u16 i16 u32 i32 f32 f64, optionally suffixed le or be, "
+                    "or omit it for u8");
+            }
+            std::string n = s;
+            bool big = false;
+            if (n.size() > 2) {
+                const std::string tail = n.substr(n.size() - 2);
+                if (tail == "be") { big = true;  n = n.substr(0, n.size() - 2); }
+                else if (tail == "le") {         n = n.substr(0, n.size() - 2); }
+            }
+            if (n == "u8"  || n == "byte")  return { 1, false, false, false, DType::I64 };
+            if (n == "i8")                  return { 1, true,  false, false, DType::I64 };
+            if (n == "u16")                 return { 2, false, false, big,   DType::I64 };
+            if (n == "i16")                 return { 2, true,  false, big,   DType::I64 };
+            if (n == "u32")                 return { 4, false, false, big,   DType::I64 };
+            if (n == "i32")                 return { 4, true,  false, big,   DType::I64 };
+            if (n == "f32" || n == "float") return { 4, false, true,  big,   DType::F64 };
+            if (n == "f64" || n == "double")return { 8, false, true,  big,   DType::F64 };
+            throw std::runtime_error(std::string(who) + ": unknown element type '" + s +
+                "'. Use u8 i8 u16 i16 u32 i32 f32 f64, optionally suffixed le or be");
+        };
+
+        define("nd_frombytes", [parseElem](std::vector<Value> a) -> Value {
+            needArgs(a, 1, "nd_frombytes(src, elem?, shape?)");
+            // A byte string costs one byte per byte; a byte-list is accepted
+            // too, for callers that already hold one.
+            std::string buf;
+            if (a[0].isString()) {
+                buf = a[0].stringVal;
+            } else if (a[0].isList()) {
+                buf.reserve(a[0].listVal.size());
+                for (const auto& e : a[0].listVal) {
+                    if (!e.isNumber()) {
+                        throw std::runtime_error("nd_frombytes: a byte-list must hold numbers (got " +
+                                                 e.toString() + ")");
+                    }
+                    buf.push_back((char)(unsigned char)((long long)std::llround(e.numberVal) & 0xFF));
+                }
+            } else {
+                throw std::runtime_error("nd_frombytes: src must be a byte string or a byte-list (got " +
+                                         a[0].toString() + ")");
+            }
+
+            const Elem el = parseElem(
+                (a.size() > 1 && !a[1].isNull()) ? a[1].toString() : std::string("u8"),
+                "nd_frombytes");
+
+            const size_t nbytes = buf.size();
+            if (nbytes % (size_t)el.width != 0) {
+                throw std::runtime_error("nd_frombytes: " + std::to_string(nbytes) +
+                    " bytes is not a whole number of " + std::to_string(el.width) +
+                    "-byte elements");
+            }
+            const size_t count = nbytes / (size_t)el.width;
+
+            std::vector<size_t> shape;
+            if (a.size() > 2 && !a[2].isNull()) {
+                shape = shapeFrom(a[2], "nd_frombytes");
+                size_t want = 1;
+                for (size_t d : shape) want = checkedMul(want, d, "nd_frombytes");
+                if (want != count) {
+                    throw std::runtime_error("nd_frombytes: that shape needs " +
+                        std::to_string(want) + " elements but the buffer holds " +
+                        std::to_string(count));
+                }
+            } else {
+                shape.push_back(count);
+            }
+
+            auto out = makeArray(shape, el.dt, "nd_frombytes", false);
+            const uint8_t* p = (const uint8_t*)buf.data();
+
+            if (el.dt == DType::I64) {
+                int64_t* d = static_cast<int64_t*>(out->buf->data);
+                for (size_t i = 0; i < count; i++) {
+                    const uint8_t* q = p + i * (size_t)el.width;
+                    uint64_t raw = 0;
+                    if (el.bigEndian) {
+                        for (int k = 0; k < el.width; k++) raw = (raw << 8) | (uint64_t)q[k];
+                    } else {
+                        for (int k = el.width - 1; k >= 0; k--) raw = (raw << 8) | (uint64_t)q[k];
+                    }
+                    if (el.isSigned) {
+                        // Sign-extend from `width` bytes without relying on
+                        // implementation-defined narrowing.
+                        const int bits = el.width * 8;
+                        const uint64_t signBit = (uint64_t)1 << (bits - 1);
+                        if (bits < 64 && (raw & signBit)) {
+                            raw |= ~(((uint64_t)1 << bits) - 1);
+                        }
+                        d[i] = (int64_t)raw;
+                    } else {
+                        d[i] = (int64_t)raw;
+                    }
+                }
+            } else {
+                double* d = static_cast<double*>(out->buf->data);
+                for (size_t i = 0; i < count; i++) {
+                    const uint8_t* q = p + i * (size_t)el.width;
+                    uint8_t tmp[8];
+                    for (int k = 0; k < el.width; k++) {
+                        tmp[k] = el.bigEndian ? q[el.width - 1 - k] : q[k];
+                    }
+                    if (el.width == 4) {
+                        float f;
+                        std::memcpy(&f, tmp, 4);
+                        d[i] = (double)f;
+                    } else {
+                        double v;
+                        std::memcpy(&v, tmp, 8);
+                        d[i] = v;
+                    }
+                }
+            }
+            return wrap(out);
+        });
+
+        define("nd_tobytes", [parseElem](std::vector<Value> a) -> Value {
+            needArgs(a, 1, "nd_tobytes(array, elem?)");
+            auto x = asArray(a[0]);
+            const Elem el = parseElem(
+                (a.size() > 1 && !a[1].isNull()) ? a[1].toString() : std::string("u8"),
+                "nd_tobytes");
+
+            // Strided, flipped or transposed data is written in LOGICAL order,
+            // so a view round-trips to what it looks like, not to its buffer.
+            ArrayPtr src = x->isCContig() ? x : contiguousCopy(x, x->dtype);
+            const size_t count = src->size();
+            const size_t nbytes = checkedMul(count, (size_t)el.width, "nd_tobytes");
+
+            std::string out;
+            out.resize(nbytes);
+            uint8_t* o = (uint8_t*)&out[0];
+
+            for (size_t i = 0; i < count; i++) {
+                uint8_t* q = o + i * (size_t)el.width;
+                if (el.isFloat) {
+                    const double v = getAsDouble(*src, src->offset + i);
+                    uint8_t tmp[8];
+                    if (el.width == 4) {
+                        const float f = (float)v;
+                        std::memcpy(tmp, &f, 4);
+                    } else {
+                        std::memcpy(tmp, &v, 8);
+                    }
+                    for (int k = 0; k < el.width; k++) {
+                        q[k] = el.bigEndian ? tmp[el.width - 1 - k] : tmp[k];
+                    }
+                } else {
+                    // Integer narrowing WRAPS, as a cast does in C and as
+                    // NumPy's astype does -- it does not clamp. A caller that
+                    // wants clamping calls nd_clip first, which is explicit and
+                    // free; silent clamping here would hide a mode bug.
+                    const double v = getAsDouble(*src, src->offset + i);
+                    int64_t iv;
+                    if (std::isnan(v)) iv = 0;
+                    else if (v >= 9.2e18) iv = INT64_MAX;
+                    else if (v <= -9.2e18) iv = INT64_MIN;
+                    else iv = (int64_t)std::llround(v);
+                    uint64_t raw = (uint64_t)iv;
+                    for (int k = 0; k < el.width; k++) {
+                        const int shift = el.bigEndian ? (el.width - 1 - k) * 8 : k * 8;
+                        q[k] = (uint8_t)((raw >> shift) & 0xFFu);
+                    }
+                }
+            }
+            return Value(out);
+        });
+    }
 
     // ── shape operations ─────────────────────────────────────────────────────
 
