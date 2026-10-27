@@ -7,7 +7,89 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ## [Unreleased]
 
+### Added
+
+- **[feature] `pillow` — imaging for Bantu, in the shape of Python's Pillow.** `Image.open`,
+  `new`, `convert`, `resize`, `copy`, `crop`, `paste`, `split`, `merge`, `point`, `histogram`,
+  `getbbox`, `getextrema`, `getcolors`, `blend`, `composite`, `alpha_composite`, `tobytes`, `save`;
+  all 20 Pillow modes; `ImageColor` with the 148 CSS names; `ImagePalette` and the web colour cube;
+  the six resampling filters; the plugin registry; PPM/PGM/PBM read and write. Written entirely in
+  Bantu over numba's arrays, so no loop is proportional to the pixel count: a full-frame 1080p
+  `convert("L")` is 108 ms and a crop or a mirror is free, where an interpreted per-pixel pass over
+  the same image is 4.1 s.
+  Fidelity is **differential, not aspirational** — checked against Pillow 13 rather than against its
+  documentation: **177 of 191 conversion pairs** and **all 378 `resize` reference images** are
+  byte-identical, `RGB → L` over **all 16,777,216** RGB triples, Floyd–Steinberg over **9,154 of
+  9,154** pixels. The remaining gaps are stated, not hidden: `RGBA → P` needs `quantize()`, and
+  `LAB` goes through littleCMS in Pillow and so cannot be matched without shipping an ICC engine.
+  See [docs/pillow.md](docs/pillow.md) and
+  [docs/pillow-architecture.md](docs/pillow-architecture.md).
+
+- **[feature] `inflate(src, maxOut?)` and `gunzip(src, maxOut?)` — the decompressor the interpreter
+  never had.** `bp_zlib` has shipped a zlib *compressor* since bplot's PNG writer landed, and
+  nothing could decompress: Bantu could write a PNG, a gzip body or a ZIP member and could not read
+  one back, which made every compressed format write-only. DEFLATE (RFC 1951), zlib (RFC 1950) and
+  gzip (RFC 1952), with the container sniffed. `maxOut` is checked **before each append**, so an
+  inflate bomb is refused rather than allocated — a 975:1 stream is rejected at the first byte over
+  the limit. Verified against 40 vectors from Python's `zlib`/`gzip` at levels 0, 1, 6 and 9, and
+  cross-checked against an independent pure-Bantu decoder on 3,596 hostile inputs with zero
+  disagreements.
+
+- **[feature] `nd_frombytes(src, elem?, shape?)` and `nd_tobytes(array, elem?)` — the bridge between
+  a byte buffer and an array.** `nd_fromfile` could only read 8-byte elements, so a *byte* buffer had
+  no way into an array at all: the only route was `readfile → bytes() → nd(list)`, measured at
+  **479 ms and a ~100 MB transient per megabyte**, which made an 8 MB image impossible rather than
+  slow. Now **6 ms per megabyte**. Element types `u8 i8 u16 i16 u32 i32 f32 f64`, each with an
+  explicit `le`/`be` suffix, because every format that matters specifies a byte order and the
+  machine's is not it. A view is written in *logical* order, so a flipped or transposed array
+  round-trips to what it looks like.
+
+- **[feature] Filesystem and base64 builtins**: `exists`, `isfile`, `isdir`, `listdir`, `mkdir`,
+  `mkdirs`, `unlink`, `filesize`, `b64encode`, `b64decode`.
+
+- **[feature] `numba` can read and write raw binary arrays: `np.fromfile` and `np.tofile`.**
+  There was no way to get a large array of numbers into Bantu. Decoding one IEEE-754 double from
+  eight bytes in the interpreter is a dozen float operations, and a Bantu list of a million numbers
+  is a million ~190-byte `Value`s — roughly 190 MB to hold what an array stores in 8 MB. Loading a
+  model's weights was not slow, it was impossible. Measured: **1.5M f64 written in 33 ms and read
+  back in 10 ms**, bit-identical. A strided or flipped array writes in logical order, so
+  `np.tofile(np.transpose($a, null), …)` round-trips; a `bool` array is normalised to 0/1 on read;
+  byte order is the machine's, which is little-endian everywhere Bantu builds. The usual live-memory
+  ceiling applies, so `fromfile` cannot allocate past `np.max_bytes`. See
+  [docs/numba.md](docs/numba.md#raw-binary-file-io).
+
+- **[feature] `lugha` — NLP for Bantu**: text normalisation, a WordPiece tokenizer, and a
+  transformer encoder with a multi-label classification head, written in Bantu over numba's kernels.
+  Normalises the whole family of evasions (Unicode confusables, zero-width insertions, leetspeak,
+  masked and stretched letters, separator-spelled words) to one canonical form, then scores seven
+  harm labels in about 10 ms. Multi-head attention without `concatenate`, by summing per-head
+  projections. Every gradient in the hand-written backward pass is checked against central finite
+  differences. See [docs/lugha.md](docs/lugha.md) and
+  [docs/lugha-architecture.md](docs/lugha-architecture.md).
+
+- **[feature] `samples/one-taylor`** — an age-safe social feed and dating app, backend in Bantu
+  (sua + orm + lugha), frontend in Next.js/TypeScript. Its defining property is that accounts under
+  18 and accounts over 18 cannot observe or reach each other at all; the rule lives in one module
+  and `tests/one_taylor_safety_test.b` checks it against every ordered pair of ages from 13 to 80.
+  See [docs/one-taylor-architecture.md](docs/one-taylor-architecture.md).
+
 ### Fixed
+
+- **[bug fix] `indexOf` silently returned `-1` for any list.** `contains($L, $x)` answered `true`
+  while `indexOf($L, $x)` answered `-1` for the same pair — a wrong answer rather than an error, and
+  the opposite of what the name promises, since `indexOf` is the position-returning twin of
+  `contains`. It now accepts a list and uses the same element equality `contains` does; strings
+  behave exactly as before.
+
+- **[bug fix] The SQL query trace is opt-in, and now honours `bantu -q`.** `sua.sqlite` printed two
+  lines to stdout for every statement, unconditionally, and `sua.postgres` and `sua.mysql` did the
+  same. For a script that is a useful log; for a server it is a defect. A Bantu web application
+  doing a handful of queries per request wrote a **45 MB log over a 600-request load test**, and the
+  write amplification dominated its throughput — 4 requests per second, most of it spent describing
+  itself to a file nobody was reading. It also ignored `-q`, the flag that exists to silence
+  diagnostics. Now off by default, on with `BANTU_SQL_DEBUG=1`, and silenced by `-q` either way,
+  mirroring `BANTU_HTTP_DEBUG=1` for the HTTP client trace. **Errors still print unconditionally**:
+  hiding a failed write is how it comes to look like a successful one.
 
 - **[bug fix] A third device could not open `samples/webrtc-chat` at all: the TLS front end ran its
   handshake on the accept thread.** `tls-dev-proxy.py` called `ctx.wrap_socket()` inside the accept
