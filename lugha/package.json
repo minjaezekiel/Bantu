@@ -1,0 +1,8 @@
+{
+  "name": "lugha",
+  "version": "1.0.0",
+  "description": "NLP for Bantu: text normalisation, WordPiece tokenizer and a transformer encoder with a multi-label classification head, in pure Bantu over numba's kernels.",
+  "main": "lugha.b",
+  "keywords": ["nlp", "transformer", "tokenizer", "moderation", "classifier"],
+  "dependencies": { "numba": "*" }
+}
