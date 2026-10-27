@@ -1,0 +1,13 @@
+{
+  "name": "one-taylor-backend",
+  "version": "1.0.0",
+  "description": "One Taylor — age-safe social + dating backend: sua HTTP, ORM over SQLite, and a pure-Bantu transformer for moderation.",
+  "entry": "server.b",
+  "dependencies": {
+    "orm": "*",
+    "crypto": "*",
+    "hash": "*",
+    "lugha": "*",
+    "numba": "*"
+  }
+}

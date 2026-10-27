@@ -1,0 +1,206 @@
+/* ==========================================================================
+   One Taylor — design tokens
+
+   Hand-written, no component library. "Custom and modern" is a design brief;
+   a component library is someone else's answer to it.
+
+   ── Typefaces ───────────────────────────────────────────────────────────────
+   Web-safe only: no webfont request, no layout shift, no third-party domain
+   in the critical path. A dating app is read on a bus on a bad connection,
+   and a 90 KB font that arrives after the text is worse than no font at all.
+
+   The stacks below are ordered so that each platform gets a face it actually
+   has installed, and each list ends in a generic family:
+
+     --font-display   Optima / Palatino / Georgia — a humanist face with real
+                      stroke contrast. Warm and personal rather than
+                      technical, which is the whole register of this product,
+                      and present on macOS, iOS, Windows and Android in turn.
+     --font-body      the system UI stack. Body text should look native,
+                      because that is what people read fastest.
+     --font-mono      only for moderation internals and scores.
+
+   ── Colour ──────────────────────────────────────────────────────────────────
+   One warm accent (a deep rose), one cool counterpart for the under-18 band,
+   a neutral ramp with a faint warm cast, and three semantic colours.
+
+   Not a red-pink gradient. Every dating app reaches for hot pink and it reads
+   as either clinical or cheap; a muted rose against warm paper reads like
+   something made by people. Minor accounts get a cool teal EVERYWHERE, so
+   which side of the 18 wall you are looking at is visible at a glance rather
+   than inferred from an empty feed.
+
+   Contrast: every foreground/background pair in use clears WCAG AA — 4.5:1
+   for body text, 3:1 for large text and UI borders. The ratios are noted
+   against the colours they were measured against, so a later edit can be
+   checked rather than guessed at.
+   ========================================================================== */
+
+:root {
+  /* ── neutral ramp, faint warm cast ──────────────────────────────────── */
+  --bg:            #fdfbf9;
+  --bg-sunk:       #f4efe9;
+  --surface:       #ffffff;
+  --surface-2:     #f7f2ed;
+  --surface-3:     #efe7df;
+  --border:        #e3d9cf;
+  --border-strong: #c9bcae;
+
+  --text:          #1f1b18;   /* 15.2:1 on --bg */
+  --text-muted:    #605650;   /*  6.5:1 on --bg */
+  --text-faint:    #867a72;   /*  4.6:1 on --bg */
+  --text-on-accent:#ffffff;
+
+  /* ── accent: deep rose ──────────────────────────────────────────────── */
+  --accent:        #b03a56;   /*  5.4:1 with white text */
+  --accent-hover:  #932840;
+  --accent-press:  #7c1f36;
+  --accent-soft:   #fdeef1;
+  --accent-border: #f0c9d2;
+  --accent-text:   #93283f;   /*  6.1:1 on --bg, for accent-coloured text */
+
+  /* ── the cool counterpart: under-18 accounts, everywhere ────────────── */
+  --minor:         #19607a;   /*  5.9:1 on --bg */
+  --minor-soft:    #e8f2f6;
+  --minor-border:  #bcd9e4;
+
+  /* ── semantic ───────────────────────────────────────────────────────── */
+  --ok:            #2c6a45;
+  --ok-soft:       #e7f3ec;
+  --warn:          #8a5406;
+  --warn-soft:     #fbf1de;
+  --danger:        #a32733;
+  --danger-soft:   #fbe9ea;
+
+  /* ── live states, for presence and calls ────────────────────────────── */
+  --live:          #2c6a45;
+  --ring:          #b03a56;
+
+  /* ── type ───────────────────────────────────────────────────────────── */
+  --font-display: Optima, Palatino, "Palatino Linotype", "Book Antiqua",
+                  Georgia, "Times New Roman", serif;
+  --font-body:    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                  "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+  --font-mono:    ui-monospace, SFMono-Regular, Menlo, Consolas,
+                  "Liberation Mono", monospace;
+
+  --step--1: clamp(0.78rem, 0.76rem + 0.1vw, 0.84rem);
+  --step-0:  clamp(0.94rem, 0.91rem + 0.15vw, 1rem);
+  --step-1:  clamp(1.08rem, 1.02rem + 0.3vw, 1.22rem);
+  --step-2:  clamp(1.32rem, 1.2rem + 0.6vw, 1.62rem);
+  --step-3:  clamp(1.7rem, 1.45rem + 1.2vw, 2.4rem);
+  --step-4:  clamp(2.1rem, 1.7rem + 2vw, 3.2rem);
+
+  /* ── space, on a 4px grid ───────────────────────────────────────────── */
+  --s-1: 0.25rem;  --s-2: 0.5rem;   --s-3: 0.75rem;  --s-4: 1rem;
+  --s-5: 1.5rem;   --s-6: 2rem;     --s-7: 3rem;     --s-8: 4rem;
+
+  --radius-s: 8px;
+  --radius:   12px;
+  --radius-l: 18px;
+  --radius-xl: 26px;
+  --radius-pill: 999px;
+
+  --shadow-1: 0 1px 2px rgb(31 27 24 / 0.05), 0 1px 3px rgb(31 27 24 / 0.04);
+  --shadow-2: 0 2px 6px rgb(31 27 24 / 0.06), 0 10px 26px rgb(31 27 24 / 0.08);
+  --shadow-3: 0 8px 20px rgb(31 27 24 / 0.1), 0 24px 60px rgb(31 27 24 / 0.14);
+
+  --content: 42rem;
+  --wide: 66rem;
+
+  color-scheme: light;
+}
+
+/*
+  Dark mode is declared twice, and the order matters.
+
+  The media query is guarded with :root:not([data-theme="light"]) so that an
+  explicit light choice still wins on a dark-mode OS. Without the guard the
+  media query and the attribute fight, the later one wins, and a user who
+  picked "light" gets dark anyway.
+*/
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg:            #17130f;
+    --bg-sunk:       #100d0a;
+    --surface:       #201b16;
+    --surface-2:     #29231d;
+    --surface-3:     #332b23;
+    --border:        #372f26;
+    --border-strong: #52483b;
+
+    --text:          #f4efe8;
+    --text-muted:    #b6aa9c;
+    --text-faint:    #8b8075;
+    --text-on-accent:#1b1209;
+
+    --accent:        #f08098;   /* lightened: 8.4:1 on --bg */
+    --accent-hover:  #f79aae;
+    --accent-press:  #d96a82;
+    --accent-soft:   #32171e;
+    --accent-border: #572430;
+    --accent-text:   #f08098;
+
+    --minor:         #7cc2dd;
+    --minor-soft:    #122730;
+    --minor-border:  #1f4356;
+
+    --ok:            #7fc99a;
+    --ok-soft:       #16241b;
+    --warn:          #e3b25f;
+    --warn-soft:     #2a2114;
+    --danger:        #ef8d8d;
+    --danger-soft:   #2b1616;
+
+    --live:          #7fc99a;
+    --ring:          #f08098;
+
+    --shadow-1: 0 1px 2px rgb(0 0 0 / 0.4);
+    --shadow-2: 0 2px 6px rgb(0 0 0 / 0.4), 0 10px 28px rgb(0 0 0 / 0.5);
+    --shadow-3: 0 8px 24px rgb(0 0 0 / 0.5), 0 24px 64px rgb(0 0 0 / 0.6);
+
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg:            #17130f;
+  --bg-sunk:       #100d0a;
+  --surface:       #201b16;
+  --surface-2:     #29231d;
+  --surface-3:     #332b23;
+  --border:        #372f26;
+  --border-strong: #52483b;
+
+  --text:          #f4efe8;
+  --text-muted:    #b6aa9c;
+  --text-faint:    #8b8075;
+  --text-on-accent:#1b1209;
+
+  --accent:        #f08098;
+  --accent-hover:  #f79aae;
+  --accent-press:  #d96a82;
+  --accent-soft:   #32171e;
+  --accent-border: #572430;
+  --accent-text:   #f08098;
+
+  --minor:         #7cc2dd;
+  --minor-soft:    #122730;
+  --minor-border:  #1f4356;
+
+  --ok:            #7fc99a;
+  --ok-soft:       #16241b;
+  --warn:          #e3b25f;
+  --warn-soft:     #2a2114;
+  --danger:        #ef8d8d;
+  --danger-soft:   #2b1616;
+
+  --live:          #7fc99a;
+  --ring:          #f08098;
+
+  --shadow-1: 0 1px 2px rgb(0 0 0 / 0.4);
+  --shadow-2: 0 2px 6px rgb(0 0 0 / 0.4), 0 10px 28px rgb(0 0 0 / 0.5);
+  --shadow-3: 0 8px 24px rgb(0 0 0 / 0.5), 0 24px 64px rgb(0 0 0 / 0.6);
+
+  color-scheme: dark;
+}

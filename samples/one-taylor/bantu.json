@@ -1,0 +1,13 @@
+{
+  "name": "one-taylor",
+  "version": "1.0.0",
+  "description": "Age-safe social feed and dating app: Bantu backend, Next.js frontend, pure-Bantu transformer moderation.",
+  "entry": "backend/server.b",
+  "dependencies": {
+    "orm": "*",
+    "crypto": "*",
+    "hash": "*",
+    "lugha": "*",
+    "numba": "*"
+  }
+}

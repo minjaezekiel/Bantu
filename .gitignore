@@ -56,6 +56,26 @@ samples/*
 # and secrets the note worries about are already covered by the global rules
 # above and below (*.db, *.log, vapid.json, subscriptions.db).
 !samples/webrtc-chat/
+# samples/one-taylor needs the same re-include, for the same reason the notes
+# above record twice: `samples/*` stops git descending into the directory, so
+# every file in a new sample is silently dropped from the commit that claims to
+# add it. The uploads directory, the SQLite file and the node/next build output
+# are excluded below; the trained model and its vocabulary are kept, because
+# without them the sample cannot run without a twelve-minute training session.
+!samples/one-taylor/
+samples/one-taylor/backend/uploads/*
+!samples/one-taylor/backend/uploads/.gitkeep
+# The derived-key root. Never committed: every key in the app descends from it.
+samples/one-taylor/.secrets.env
+samples/one-taylor/web/node_modules/
+samples/one-taylor/web/.next/
+samples/one-taylor/web/next-env.d.ts
+samples/one-taylor/web/*.tsbuildinfo
+# An operator's own lexicon terms are theirs, and must not end up in a public
+# diff. The README in that directory explains why the shipped files are nearly
+# empty.
+samples/one-taylor/backend/safety/lexicons/*.txt
+!samples/one-taylor/backend/safety/lexicons/slur.txt
 
 # Web Push secrets — a VAPID private key must never be committed. Replacing it
 # silently invalidates every push subscription a browser has already created.

@@ -1,0 +1,1 @@
+# Operator terms, one per line. See README.md.
