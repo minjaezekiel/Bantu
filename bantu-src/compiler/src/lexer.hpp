@@ -188,7 +188,46 @@ private:
                         case '\'': value += '\''; break;
                         case '"': value += '"'; break;
                         case '0': value += '\0'; break;
-                        default: value += source_[pos_]; break;
+                        // \xNN -- an arbitrary byte, which a byte-oriented
+                        // language with binary-safe strings had no way to
+                        // write. Every binary format needs it: a PNG starts
+                        // \x89PNG, a gzip member \x1f\x8b, a JPEG \xff\xd8.
+                        // Before this, chr(137) + "PNG" was the only way to
+                        // spell a signature.
+                        case 'x': {
+                            auto hex = [](char c) -> int {
+                                if (c >= '0' && c <= '9') return c - '0';
+                                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                                return -1;
+                            };
+                            if (pos_ + 2 < source_.size()) {
+                                const int hi = hex(source_[pos_ + 1]);
+                                const int lo = hex(source_[pos_ + 2]);
+                                if (hi >= 0 && lo >= 0) {
+                                    value += (char)(unsigned char)((hi << 4) | lo);
+                                    advance();   // consume the first hex digit
+                                    advance();   // consume the second
+                                    break;
+                                }
+                            }
+                            // Not two hex digits: fall through to the
+                            // unknown-escape rule below rather than inventing
+                            // a byte.
+                            value += '\\';
+                            value += source_[pos_];
+                            break;
+                        }
+                        // An UNKNOWN escape keeps its backslash. It used to be
+                        // dropped silently, so "C:\path" became "C:path" and a
+                        // string holding a regex lost every escape in it --
+                        // data loss with no diagnostic. Preserving both
+                        // characters is what makes an unrecognised escape
+                        // visible instead of lossy.
+                        default:
+                            value += '\\';
+                            value += source_[pos_];
+                            break;
                     }
                 }
             } else {
