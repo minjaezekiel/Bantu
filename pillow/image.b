@@ -25,6 +25,7 @@ include "./pxbuf.b" as pxbuf;
 include "./color.b" as color;
 include "./convert.b" as convert;
 include "./resample.b" as resample;
+include "./transform.b" as xform;
 include "./codecs/registry.b" as registry;
 
 // Pillow's guard against a decompression bomb, with Pillow's default.
@@ -571,6 +572,217 @@ class PillowImage {
                      _copyInfo(this.info), null);
     }
 
+    // ─── geometry: transpose, rotate, reduce, thumbnail, transform ──────
+
+    // transpose($op) -> one of the eight flips and right-angle rotations.
+    // Every one is an axis permutation or a flip, so all eight are exact and
+    // effectively free -- no resampling is involved at any point.
+    def transpose($op) {
+        $out = xform.transpose(this.px, $op);
+        return _wrap(this.mode, $out, _copyPalette(this.palette),
+                     _copyInfo(this.info), null);
+    }
+
+    // reduce($factor, $box) -> integer box averaging.
+    //
+    // $factor is a number or [xfactor, yfactor]. The output size rounds UP,
+    // and a partial block at the right or bottom edge is averaged over its
+    // own smaller area rather than over zeros.
+    //
+    // LA and RGBA are premultiplied first, for the same reason resize does
+    // it: averaging a transparent pixel's colour into its visible neighbours
+    // leaves a fringe.
+    def reduce($factor, $box) {
+        if (type($factor) == "list") {
+            if (len($factor) != 2) { throw "Image.reduce: factor must be a number or [x, y]"; }
+            $fx = floor($factor[0]);
+            $fy = floor($factor[1]);
+        } else {
+            $fx = floor($factor);
+            $fy = $fx;
+        }
+        if ($fx < 1 || $fy < 1) {
+            throw "Image.reduce: the factor must be at least 1 (got " +
+                  str($fx) + "x" + str($fy) + ")";
+        }
+        if ($fx == 1 && $fy == 1) {
+            if ($box == null) { return this.copy(); }
+            return this.crop($box);
+        }
+        // ImagingReduce refuses these outright: a palette index and a
+        // bilevel value cannot be averaged, and the I;16 path is absent
+        // upstream. Raising is better than returning a blend of indices.
+        if (this.mode == "P" || this.mode == "1" ||
+            this.mode == "I;16" || this.mode == "I;16L" ||
+            this.mode == "I;16B" || this.mode == "I;16N") {
+            throw "Image.reduce: mode " + this.mode + " cannot be reduced " +
+                  "(averaging an index or a bilevel value is meaningless). " +
+                  "Convert to L or RGB first.";
+        }
+        if (this.mode == "LA" || this.mode == "RGBA") {
+            $premul = "La";
+            if (this.mode == "RGBA") { $premul = "RGBa"; }
+            $tmp = this.convert($premul, null, null);
+            return $tmp.reduce($factor, $box).convert(this.mode, null, null);
+        }
+        $kind = "u8";
+        if (this.mode == "I") { $kind = "i32"; }
+        if (mode.is_float(this.mode)) { $kind = "f32"; }
+        $out = xform.reduce(this.px, $fx, $fy, $box, $kind);
+        return _wrap(this.mode, $out, _copyPalette(this.palette),
+                     _copyInfo(this.info), null);
+    }
+
+    // transform($size, $method, $data, $filter, $fill) -> a general remap.
+    //
+    // $method is AFFINE, EXTENT, PERSPECTIVE, QUAD or MESH, and $data is
+    // that method's coefficients. A source coordinate outside the image
+    // takes $fill (a colour or null for zero) rather than a clamped edge
+    // pixel, which is what stops a rotated image growing a smeared border.
+    def transform($size, $method, $data, $filter, $fill) {
+        if (type($size) != "list" || len($size) != 2) {
+            throw "Image.transform: size must be [width, height]";
+        }
+        $w = floor($size[0]);
+        $h = floor($size[1]);
+        if ($w < 1 || $h < 1) {
+            throw "Image.transform: width and height must be at least 1";
+        }
+        _checkPixels($w, $h, "Image.transform");
+        $f = $filter;
+        if ($f == null) { $f = resample.NEAREST; }
+        if ($f != resample.NEAREST && $f != resample.BILINEAR && $f != resample.BICUBIC) {
+            throw "Image.transform: " + str(resample.filter_name($f)) +
+                  " cannot be used. Use NEAREST, BILINEAR or BICUBIC.";
+        }
+        // LA and RGBA are PREMULTIPLIED for any interpolating filter, the
+        // same dance resize does and for the same reason: averaging a
+        // transparent pixel's colour into its visible neighbours leaves a
+        // fringe. Pillow's Python layer does this before reaching the C.
+        if ((this.mode == "LA" || this.mode == "RGBA") && $f != resample.NEAREST) {
+            $premul = "La";
+            if (this.mode == "RGBA") { $premul = "RGBa"; }
+            $tmp = this.convert($premul, null, null);
+            $r = $tmp.transform($size, $method, $data, $f, $fill);
+            return $r.convert(this.mode, null, null);
+        }
+        // A palette index or a bilevel value cannot be interpolated, so the
+        // filter degrades to NEAREST exactly as resize does.
+        if (this.mode == "1" || this.mode == "P") { $f = resample.NEAREST; }
+        $fillList = null;
+        if ($fill != null) { $fillList = _colourList($fill, this.mode); }
+        $out = xform.apply(this.px, $w, $h, $method, $data, $f, $fillList);
+        return _wrap(this.mode, $out, _copyPalette(this.palette),
+                     _copyInfo(this.info), null);
+    }
+
+    // rotate($angle, $filter, $expand, $center, $translate, $fill)
+    //
+    // Counter-clockwise, in degrees. 0, 90, 180 and 270 take the exact
+    // transpose path whenever there is no custom centre or translation --
+    // and for 90/270 only when the result fits, i.e. expand is asked for or
+    // the image is square. Everything else is an affine transform.
+    def rotate($angle, $filter, $expand, $center, $translate, $fill) {
+        $a = $angle % 360.0;
+        if ($a < 0) { $a = $a + 360.0; }
+        $exp = false;
+        if ($expand != null) { $exp = $expand; }
+
+        if ($center == null && $translate == null) {
+            if ($a == 0) { return this.copy(); }
+            if ($a == 180) { return this.transpose(xform.ROTATE_180); }
+            if (($a == 90 || $a == 270) && ($exp || this.width == this.height)) {
+                if ($a == 90) { return this.transpose(xform.ROTATE_90); }
+                return this.transpose(xform.ROTATE_270);
+            }
+        }
+
+        $w = this.width;
+        $h = this.height;
+        $tx = 0;
+        $ty = 0;
+        if ($translate != null) { $tx = $translate[0]; $ty = $translate[1]; }
+        $cx = $w / 2.0;
+        $cy = $h / 2.0;
+        if ($center != null) { $cx = $center[0]; $cy = $center[1]; }
+
+        // The matrix is the REVERSE transform -- destination to source --
+        // because each discrete output pixel is interpolated from the area
+        // around its (floating) source position. Pillow rounds the four
+        // trigonometric entries to 15 decimal places so that a right angle
+        // comes out exactly 0 and 1 rather than 6e-17.
+        $rad = 0.0 - ($a * PI / 180.0);
+        $ca = _round15(cos($rad));
+        $sa = _round15(sin($rad));
+        $m = [$ca, $sa, 0.0, 0.0 - $sa, $ca, 0.0];
+
+        $p = _affinePoint(0.0 - $cx - $tx, 0.0 - $cy - $ty, $m);
+        $m[2] = $p[0] + $cx;
+        $m[5] = $p[1] + $cy;
+
+        if ($exp) {
+            $corners = [[0, 0], [$w, 0], [$w, $h], [0, $h]];
+            $xs = [];
+            $ys = [];
+            $i = 0;
+            while ($i < 4) {
+                $q = _affinePoint($corners[$i][0], $corners[$i][1], $m);
+                push($xs, $q[0]);
+                push($ys, $q[1]);
+                $i = $i + 1;
+            }
+            $nw = ceil(max($xs)) - floor(min($xs));
+            $nh = ceil(max($ys)) - floor(min($ys));
+            $p2 = _affinePoint(0.0 - ($nw - $w) / 2.0, 0.0 - ($nh - $h) / 2.0, $m);
+            $m[2] = $p2[0];
+            $m[5] = $p2[1];
+            $w = $nw;
+            $h = $nh;
+        }
+
+        $f = $filter;
+        if ($f == null) { $f = resample.NEAREST; }
+        return this.transform([$w, $h], xform.AFFINE, $m, $f, $fill);
+    }
+
+    // thumbnail($size, $filter, $reducing_gap) -> shrink in place, keeping
+    // the aspect ratio. Returns null, as Pillow's does.
+    //
+    // It only ever shrinks: if the image already fits inside $size, nothing
+    // happens. The preserved size is computed with Pillow's round_aspect,
+    // which picks whichever of floor and ceil lands closer to the true
+    // aspect -- not a plain round, which can be a pixel out.
+    def thumbnail($size, $filter, $reducing_gap) {
+        if (type($size) != "list" || len($size) != 2) {
+            throw "Image.thumbnail: size must be [width, height]";
+        }
+        $x = floor($size[0]);
+        $y = floor($size[1]);
+        if ($x < 1 || $y < 1) { throw "Image.thumbnail: size must be at least 1x1"; }
+        if ($x >= this.width && $y >= this.height) { return null; }
+
+        $aspect = this.width / this.height;
+        if ($x / $y >= $aspect) {
+            $x = _roundAspectW($y * $aspect, $y, $aspect);
+        } else {
+            $y = _roundAspectH($x / $aspect, $x, $aspect);
+        }
+        if ($x < 1) { $x = 1; }
+        if ($y < 1) { $y = 1; }
+
+        $f = $filter;
+        if ($f == null) { $f = resample.BICUBIC; }
+        if (this.width == $x && this.height == $y) { return null; }
+
+        $r = this.resize([$x, $y], $f, null, null);
+        this.px = $r.px;
+        this.size = [$x, $y];
+        this.width = $x;
+        this.height = $y;
+        this.mode = $r.mode;
+        return null;
+    }
+
     // ─── bytes ──────────────────────────────────────────────────────────
     //
     // Mode "1" is PACKED: one bit per pixel, most significant bit first, with
@@ -950,6 +1162,50 @@ def eval_image($im, $fn) {
 $new = def($m, $size, $colour) { return new_image($m, $size, $colour); };
 $open = def($path) { return open_image($path); };
 $eval = def($im, $fn) { return eval_image($im, $fn); };
+
+// _round15($v) -> rounded to 15 decimal places, as Pillow's rotate does to
+// its trigonometric entries, so cos(90 degrees) is exactly 0 rather than
+// 6.1e-17 and a right angle lands on whole pixels.
+def _round15($v) {
+    $s = 1000000000000000.0;
+    if ($v < 0) { return 0.0 - floor(0.5 - $v * $s) / $s; }
+    return floor(0.5 + $v * $s) / $s;
+}
+
+// _affinePoint($x, $y, $m) -> the 6-element affine applied to one point.
+def _affinePoint($x, $y, $m) {
+    return [$m[0] * $x + $m[1] * $y + $m[2], $m[3] * $x + $m[4] * $y + $m[5]];
+}
+
+// Pillow's round_aspect: of floor(n) and ceil(n), take whichever leaves the
+// aspect ratio closer to the original, never below 1. A plain round can be a
+// pixel out, and for a thumbnail that is a visible stretch.
+def _roundAspectW($n, $y, $aspect) {
+    $lo = floor($n);
+    $hi = ceil($n);
+    if ($lo < 1) { $lo = 1; }
+    if ($hi < 1) { $hi = 1; }
+    $dlo = $aspect - $lo / $y;
+    if ($dlo < 0) { $dlo = 0.0 - $dlo; }
+    $dhi = $aspect - $hi / $y;
+    if ($dhi < 0) { $dhi = 0.0 - $dhi; }
+    if ($dlo <= $dhi) { return $lo; }
+    return $hi;
+}
+
+def _roundAspectH($n, $x, $aspect) {
+    $lo = floor($n);
+    $hi = ceil($n);
+    if ($lo < 1) { $lo = 1; }
+    if ($hi < 1) { $hi = 1; }
+    // Pillow's key is 0 when n == 0, which cannot arise once clamped to 1.
+    $dlo = $aspect - $x / $lo;
+    if ($dlo < 0) { $dlo = 0.0 - $dlo; }
+    $dhi = $aspect - $x / $hi;
+    if ($dhi < 0) { $dhi = 0.0 - $dhi; }
+    if ($dlo <= $dhi) { return $lo; }
+    return $hi;
+}
 
 def _sameShape($a, $b, $who) {
     if ($a.width != $b.width || $a.height != $b.height) {

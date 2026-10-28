@@ -89,7 +89,31 @@ while (\$i < len(\$d)) {
     \$i = \$i + 1;
 }
 writefile(\$D + "rgb.expect", join(\$parts, "\n"));
-print("pillow wrote 5 files");
+
+// Phase P4: the real formats. Each is written here and read by Pillow on the
+// other side, which is the only test that proves the BYTES are right rather
+// than merely self-consistent.
+\$rgb.save(\$D + "out_rgb.png", null);
+\$rgb.convert("RGBA", null, null).save(\$D + "out_rgba.png", null);
+\$rgb.convert("L", null, null).save(\$D + "out_l.png", null);
+\$rgb.convert("LA", null, null).save(\$D + "out_la.png", null);
+\$rgb.convert("1", "NONE", null).save(\$D + "out_bw.png", null);
+\$rgb.convert("P", "NONE", null).save(\$D + "out_p.png", null);
+\$rgb.save(\$D + "out_rgb.bmp", null);
+\$rgb.convert("L", null, null).save(\$D + "out_l.bmp", null);
+\$rgb.convert("1", "NONE", null).save(\$D + "out_bw.bmp", null);
+\$rgb.save(\$D + "out_rgb.tga", null);
+\$rgb.convert("RGBA", null, null).save(\$D + "out_rgba.tga", null);
+\$rgb.convert("L", null, null).save(\$D + "out_l.tga", null);
+// every PNG filter, so each unfilter path is proved against a real decoder
+\$f = 0;
+while (\$f <= 4) {
+    writefile(\$D + "out_f" + str(\$f) + ".png",
+              pillow.encode_png({"mode": \$rgb.mode, "size": \$rgb.size, "px": \$rgb.px,
+                                 "palette": null, "info": {}, "png_filter": \$f}));
+    \$f = \$f + 1;
+}
+print("pillow wrote 5 + 17 files");
 BANTU_EOF
 
 "$BANTU" --quiet run "$TMP/emit.b" || { echo "[FAIL] the emitter did not run"; exit 1; }
@@ -140,6 +164,60 @@ g16 = Image.open(os.path.join(D, 'g16.pgm'))
 exp16 = [(x * 9000 + y * 300) % 65536 for y in range(3) for x in range(7)]
 check("all 21 16-bit values identical (big-endian wire)", px(g16) == exp16,
       f"got {px(g16)[:4]} want {exp16[:4]}")
+
+# ── Phase P4: Pillow reads the PNG, BMP and TGA files pillow wrote ──
+print()
+ref = px(im)                      # the RGB source, as Pillow sees it
+refL = px(im.convert('L'))
+refBW = px(im.convert('1', dither=Image.Dither.NONE))
+
+cases = [
+    ('out_rgb.png',  'RGB',  ref),
+    ('out_rgba.png', 'RGBA', [(r, g, b, 255) for (r, g, b) in ref]),
+    ('out_l.png',    'L',    refL),
+    ('out_la.png',   'LA',   [(v, 255) for v in refL]),
+    ('out_bw.png',   '1',    refBW),
+    ('out_rgb.bmp',  'RGB',  ref),
+    ('out_l.bmp',    'L',    refL),
+    ('out_bw.bmp',   '1',    refBW),
+    ('out_rgb.tga',  'RGB',  ref),
+    ('out_rgba.tga', 'RGBA', [(r, g, b, 255) for (r, g, b) in ref]),
+    ('out_l.tga',    'L',    refL),
+]
+for name, mode, want in cases:
+    path = os.path.join(D, name)
+    try:
+        g = Image.open(path)
+        g.load()
+    except Exception as e:
+        check(f"Pillow opens {name}", False, f"{type(e).__name__}: {e}")
+        continue
+    okmode = g.mode == mode
+    okpx = px(g) == want
+    check(f"Pillow reads {name} as {mode}, {len(want)} pixels identical",
+          okmode and okpx,
+          f"mode={g.mode} pixels differ={sum(1 for a, b in zip(px(g), want) if a != b)}")
+
+# a P-mode PNG: compare through RGB, since the index depends on the palette
+try:
+    gp = Image.open(os.path.join(D, 'out_p.png'))
+    gp.load()
+    check("Pillow reads out_p.png as P and its colours match",
+          gp.mode == 'P' and px(gp.convert('RGB')) == px(im.convert('P', dither=Image.Dither.NONE).convert('RGB')),
+          f"mode={gp.mode}")
+except Exception as e:
+    check("Pillow opens out_p.png", False, f"{type(e).__name__}: {e}")
+
+# every PNG scanline filter must decode to the same pixels in Pillow
+for f in range(5):
+    name = f'out_f{f}.png'
+    try:
+        g = Image.open(os.path.join(D, name))
+        g.load()
+        check(f"Pillow reads PNG filter {f} correctly", px(g) == ref,
+              f"{sum(1 for a, b in zip(px(g), ref) if a != b)} pixels differ")
+    except Exception as e:
+        check(f"Pillow opens PNG filter {f}", False, f"{type(e).__name__}: {e}")
 
 print()
 sys.exit(1 if bad else 0)

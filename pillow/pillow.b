@@ -13,9 +13,11 @@
 //  and nesting them would mean a caller writing pillow.Image.new, which is
 //  one more indirection for nothing. The names themselves are Pillow's.
 //
-//  WHAT IS IN THIS BUILD: phase P2. The object model, the full 20-mode
-//  table, the conversion matrix, ImageColor, and PPM/PGM/PBM read and write.
-//  Phases P3-P9 add resampling, PNG, JPEG, the operators, drawing, text and
+//  WHAT IS IN THIS BUILD: phase P4. The object model, the full 20-mode
+//  table, the conversion matrix, ImageColor, ImagePalette, the six
+//  resampling filters with resize/rotate/transpose/thumbnail/reduce/
+//  transform, ImageTransform, ImagePath, and PNG, BMP, TGA and PPM read and
+//  write. Phases P5-P9 add JPEG, the operation surface, drawing, text and
 //  the remaining formats; pillow-suite/ROADMAP.md tracks them item by item.
 // ════════════════════════════════════════════════════════════════════════
 
@@ -24,19 +26,44 @@ include "./pxbuf.b" as pxbuf;
 include "./color.b" as color;
 include "./convert.b" as convert;
 include "./resample.b" as resample;
+include "./transform.b" as xform;
+include "./path.b" as path;
 include "./image.b" as image;
 include "./codecs/registry.b" as registry;
 include "./codecs/ppm.b" as ppm;
+include "./codecs/png.b" as png;
+include "./codecs/bmp.b" as bmp;
+include "./codecs/tga.b" as tga;
 include "./inflate.b" as inflate;
 include "./deflate.b" as deflate;
 include "./bitio.b" as bitio;
 
-$VERSION = "0.2.0";
+$VERSION = "0.4.0";
 
 // ─── Register the codecs this build ships ───────────────────────────────
 //
 // Each registers a sniffer, an opener and a saver over BUFFERS, never over
 // Image objects -- see codecs/registry.b for why that layering matters.
+registry.register("PNG", ["png"], "image/png",
+                  def($head) { return png.sniff($head); },
+                  def($data) { return png.decode($data); },
+                  def($spec) { return png.encode($spec); });
+
+registry.register("BMP", ["bmp", "dib"], "image/bmp",
+                  def($head) { return bmp.sniff($head); },
+                  def($data) { return bmp.decode($data); },
+                  def($spec) { return bmp.encode($spec); });
+
+// TGA LAST, and with its sniffer registered: a TGA has NO magic number, so
+// its sniffer validates the whole 18-byte header for self-consistency rather
+// than comparing a signature. That is weaker than a real signature, so it is
+// tried after every format that has one, and the extension remains the
+// reliable route.
+registry.register("TGA", ["tga", "icb", "vda", "vst"], "image/x-tga",
+                  def($head) { return tga.sniff($head); },
+                  def($data) { return tga.decode($data); },
+                  def($spec) { return tga.encode($spec); });
+
 registry.register("PPM", ["ppm", "pgm", "pbm", "pnm"], "image/x-portable-anymap",
                   def($head) { return ppm.sniff($head); },
                   def($data) { return ppm.decode($data); },
@@ -105,6 +132,28 @@ $HAMMING  = 5;
 def filter_name($f) { return resample.filter_name($f); }
 def filter_id($n)   { return resample.filter_id($n); }
 
+// ─── ImageTransform: the four transform classes ─────────────────────────
+$AFFINE      = 0;
+$EXTENT      = 1;
+$PERSPECTIVE = 2;
+$QUAD        = 3;
+$MESH        = 4;
+
+def AffineTransform($m)      { return xform.AffineTransform($m); }
+def ExtentTransform($box)    { return xform.ExtentTransform($box); }
+def PerspectiveTransform($m) { return xform.PerspectiveTransform($m); }
+def QuadTransform($q)        { return xform.QuadTransform($q); }
+def MeshTransform($e)        { return xform.MeshTransform($e); }
+def transform_method_name($m) { return xform.method_name($m); }
+
+// ─── ImagePath ──────────────────────────────────────────────────────────
+def Path($points)            { return path.Path($points); }
+def path_getbbox($p)         { return path.getbbox($p); }
+def path_tolist($p, $flat)   { return path.tolist($p, $flat); }
+def path_transform($p, $m)   { return path.transform($p, $m); }
+def path_compact($p, $d)     { return path.compact($p, $d); }
+def path_len($p)             { return path.len_points($p); }
+
 $FLIP_LEFT_RIGHT = 0;
 $FLIP_TOP_BOTTOM = 1;
 $ROTATE_90  = 2;
@@ -127,6 +176,14 @@ def zlib_compress($data, $level)    { return deflate.zlib($data, $level); }
 def gzip_decompress($data, $maxOut) { return inflate.gunzip($data, $maxOut); }
 def gzip_compress($data, $level)    { return deflate.gzip($data, $level); }
 def crc32($data)                    { return deflate.crc32($data); }
+
+// The raw codec entry points, for a caller that needs an option the Image
+// layer does not surface -- a specific PNG scanline filter, say, or a TGA
+// written run-length encoded.
+def encode_png($spec) { return png.encode($spec); }
+def encode_bmp($spec) { return bmp.encode($spec); }
+def encode_tga($spec) { return tga.encode($spec); }
+def png_allow_truncated($yes) { return png.allow_truncated($yes); }
 def adler32($data)                  { return deflate.adler32($data); }
 
 // ─── help() ─────────────────────────────────────────────────────────────
@@ -148,7 +205,10 @@ def help() {
     print("             getbbox getextrema getcolors tobytes save show");
     print("  ImageColor getrgb getcolor colormap");
     print("");
-    print("  This build is phase P2. Resampling, PNG, JPEG, the operators,");
-    print("  drawing and text arrive in P3-P8 -- see pillow-suite/ROADMAP.md.");
+    print("  geometry   resize rotate transpose thumbnail reduce transform");
+    print("  ImagePath  Path path_getbbox path_tolist path_transform path_compact");
+    print("");
+    print("  This build is phase P4. JPEG, the operation surface, drawing and");
+    print("  text arrive in P5-P8 -- see pillow-suite/ROADMAP.md.");
     return null;
 }

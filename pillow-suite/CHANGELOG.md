@@ -5,6 +5,88 @@ here only once all five tiers of its gate are green.
 
 ---
 
+## Phase P4 — PNG, BMP, TGA ✅ (2026-10-28)
+
+**131 checks green.** PngSuite — the canonical 176-file PNG conformance corpus — decodes **162 of
+162** readable files pixel-identically to Pillow, with all 14 intentionally-corrupt files refused;
+**238 images written by Pillow itself** at every option combination read back byte-identically (PNG
+147, BMP 28, TGA 63); and Pillow reads 11 files this codec wrote, all pixels identical.
+
+- `[feature]` **`pillow/codecs/png.b`** — colour types 0/2/3/4/6, bit depths 1/2/4/8/16, Adam7
+  interlace, all five scanline filters, `PLTE tRNS gAMA pHYs sRGB bKGD tEXt zTXt iTXt`, and **every
+  chunk CRC verified**. Writes 1, L, LA, P, RGB, RGBA and I;16 with a chosen filter and compression
+  level. The two Pillow quirks are matched: a 16-bit truecolour PNG comes back as **8-bit RGB** (the
+  low byte of every sample is dropped), and 16-bit grey+alpha comes back as **RGBA**, not LA.
+- `[feature]` **`pillow/codecs/bmp.b`** — 1/4/8/16/24/32-bit, `BITMAPCOREHEADER`,
+  `BITMAPINFOHEADER` and the V2–V5 extensions, uncompressed, RLE4, RLE8 and BITFIELDS, bottom-up and
+  top-down. Reports a grey-ramp-palette BMP as mode **L** and a black-and-white 1-bit one as **1**,
+  as Pillow does, rather than leaving a palette the image does not need.
+- `[feature]` **`pillow/codecs/tga.b`** — types 1/2/3 and their RLE forms, 1/8/15/16/24/32-bit, both
+  origins, colour maps. A TGA has **no magic number**, so its sniffer validates the whole 18-byte
+  header for self-consistency and is tried after every format that has one. Depth 1 is not in the TGA
+  specification but Pillow writes mode `1` that way, so it is read and written.
+- `[feature]` **`tests/fixtures/pillow/pngsuite/`** — PngSuite checked in (176 files, with Pillow's
+  decoded pixels beside each and a README explaining what each prefix exercises). The `x*` files are
+  the valuable ones: a decoder that reads them is not lenient, it is wrong.
+- `[bug fix]` **Bantu had no way to write a non-printable byte in a string literal, and silently
+  dropped the backslash on any unrecognised escape.** `"\x89PNG"` became `x89PNG`; `"C:\path"`
+  became `C:path`. A byte-oriented language with binary-safe strings could not spell a single file
+  signature — a PNG's `\x89PNG`, a gzip member's `\x1f\x8b`, a JPEG's `\xff\xd8`. `\xNN` now
+  works, and an unknown escape keeps its backslash instead of losing data with no diagnostic.
+- `[patch]` **Every PNG chunk CRC is verified, including IDAT's.** Pillow checks metadata chunks and
+  not IDAT, so it accepts PngSuite's `xcsn0g01.png`. A checksum mismatch means the data cannot be
+  trusted; `png.allow_truncated(true)` is the opt-out and recovers Pillow's exact pixels.
+
+---
+
+## Phase P3 — Geometry: resampling, transpose, rotate, reduce, thumbnail ✅ (2026-10-28)
+
+**140 checks green.** All **378** `resize` reference images byte-identical to Pillow (9 modes × 7
+shape pairs × 6 filters), plus 49/49 transpose, 45/45 transform, 32/32 rotate, 30/30 thumbnail and
+84/84 `reduce` for every integer mode.
+
+- `[feature]` **`pillow/resample.b`** — the six filters, two separable passes, Pillow's
+  `precompute_coeffs` with its `filterscale` clamp and 22-bit fixed-point weights. Vectorised as
+  **one array operation per tap**: 5 for bicubic at scale 1, 17 for a 4× box reduction, regardless of
+  the pixel count.
+- `[feature]` **`pillow/transform.b`** — `transpose` (all eight, each an axis permutation so all are
+  free and exact by construction), `reduce` with its three numeric paths, and `transform` by AFFINE,
+  EXTENT, PERSPECTIVE, QUAD and MESH. The per-pixel samplers vectorise through a **flat gather**:
+  NEAREST is 1 gather, BILINEAR 4, BICUBIC 16.
+- `[feature]` **`pillow/path.b`** — `ImagePath.Path` with `getbbox`, `tolist`, `transform`, `map` and
+  `compact` (city-block distance, as Pillow uses).
+- `[feature]` `resize`, `rotate`, `transpose`, `reduce`, `thumbnail` and `transform` on the image,
+  with the behaviours Pillow's Python layer adds on top of its C: modes `1` and `P` force NEAREST,
+  `LA`/`RGBA` are premultiplied before any interpolating operation, and `thumbnail` uses Pillow's
+  `round_aspect` rather than a plain round.
+- `[bug fix]` **The resize PASS ORDER is part of the answer, not just of the speed.** Pillow 13
+  chooses horizontal-vs-vertical first by cost, and because each pass rounds to the mode's precision
+  the order changes the result. Every single pass matched Pillow exactly; only the combination did
+  not, which is how this was found.
+- `[bug fix]` **NEAREST accumulates its source coordinate** (`xo += scale`) rather than computing it.
+  Repeated addition drifts: where the closed form lands on 5.999999999999999 the accumulation lands
+  on 6.0000000000001 — one whole source row different.
+- `[bug fix]` **An interpolated sample is stored with a C cast, which truncates.** Rounding instead
+  differs on about half of all interpolated pixels.
+- `[bug fix]` **`Geometry.c`'s `FLOOR` macro is plain `floor()` in both branches**, so the 16.16
+  fixed-point `FIX(v)` rounds down, not toward zero. Truncating moved one pixel of a rotated image to
+  the wrong source column.
+- `[bug fix]` **`EXTENT` is rewritten to an AFFINE before dispatch**, as Pillow's Python layer does,
+  so it inherits the integer NEAREST path. Treating it as its own double map differed on 6 of 60
+  pixels.
+- `[patch]` **`reduce`'s 32-bit path sums each 2×2 group in float32, not in double.** The C writes
+  `double ss = 0; ss += a + b + c + d`, and for a `FLOAT32` image every operand of that inner sum is
+  a float, so the four values are added in float32 and only the group total is widened. Reproducing
+  the grouping took mode F from 85 to 95 of 105 exact; the residual 10 are Pillow's eleven
+  hand-unrolled per-factor kernels, each differing by a single ULP, and that is documented and
+  bounded rather than chased.
+- `[patch]` **An out-of-range transform coordinate takes the fill colour, not a clamped edge pixel**,
+  which is what stops a rotated image growing a smeared border. And a negative bicubic undershoot
+  CLAMPS at zero rather than wrapping as the C cast's undefined behaviour does on x86 — turning −5
+  into 251, a bright speck in a dark area.
+
+---
+
 ## Phase P2 — The core: modes, the image object, conversion, colour `[~]` (2026-10-27)
 
 **249 feature checks green**, 111 of 111 verifiable conversion pairs byte-identical to Pillow, and a

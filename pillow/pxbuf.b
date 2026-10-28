@@ -124,6 +124,22 @@ def scalar($a) {
     return nd_to_list($a);
 }
 
+// materialise2d($a) -> a contiguous, writable copy of a 2-D array.
+//
+// The codecs work on (rows, bytes) arrays before the band axis exists, and
+// nd_ascontiguous hands back the SAME array when it is already contiguous --
+// which for a strided slice it is not, and for a plain view it is, so a
+// caller cannot tell whether it owns the result. This always owns it.
+def materialise2d($a) {
+    $s = nd_shape($a);
+    if (len($s) != 2) {
+        throw "pxbuf.materialise2d: expected a 2-dimensional array, got " + str($s);
+    }
+    $out = nd_zeros([$s[0], $s[1]], nd_dtype($a));
+    nd_add($a, 0, $out);
+    return $out;
+}
+
 // ─── Range ──────────────────────────────────────────────────────────────
 
 // clamp($px, $m) -> values forced into mode m's range, in a new buffer.

@@ -425,6 +425,39 @@ The mechanics, per pass, with **no loop over pixels**:
 `thumbnail()`, `ImageOps.fit`, `ImageOps.contain`, `ImageOps.cover` and `ImageOps.scale` are all
 `resize` plus box arithmetic, as in Pillow — including `thumbnail`'s `reducing_gap` pre-reduction.
 
+#### 5.2.1 The pass order is part of the answer
+
+Separating the kernel means two passes, and **each pass rounds its result to the mode's precision**.
+So the order they run in changes the output, not merely the cost. Pillow chooses it by cost:
+
+```
+horizontal_first = !((inH - outH) > 0 && (inH - outH) > (inW - outW) * 2)
+```
+
+— vertical first when the height shrinks more than twice as much as the width, so the horizontal
+pass has fewer rows to walk. For 7×5 → 13×3 that is false (the height loses 2 rows while the width
+*gains* 6 columns), and running horizontal first there disagrees with Pillow on about a quarter of
+the pixels.
+
+This was the hardest finding in the phase precisely because **every individual pass was already
+bit-exact**: a pure horizontal resize matched, a pure vertical resize matched, and only the
+combination did not. The lesson, recorded because it generalises: when each part is right and the
+whole is wrong, the composition is the thing to look at.
+
+#### 5.2.2 `NEAREST` accumulates, and that is observable
+
+`ImagingScaleAffine` does not compute the source coordinate from the output index. It accumulates:
+
+```c
+xo = a[2] + a[0] * 0.5;
+for each x:  xin = floor(xo);  xo += a[0];
+```
+
+Repeated addition drifts in the last bits, and the drift crosses integer boundaries: where the closed
+form lands on 5.999999999999999 the accumulation lands on 6.0000000000001 — a whole source row
+different. Resampling 12 rows to 11 hits it. The accumulation is therefore reproduced rather than
+simplified, in both `resample.b` and `transform.b`.
+
 ## 6. Codecs
 
 A codec's inner loop is **inherently sequential** — a bitstream has to be read in order. This is the
@@ -442,9 +475,16 @@ accumulator in a Bantu number, refilled a byte at a time, and exposes `bits(n)`,
 
 ### 6.2 Format by format
 
+Status after P4: **PNG, BMP, TGA and PPM are done and differentially verified.** PngSuite — the
+canonical 176-file PNG conformance corpus, checked in at `tests/fixtures/pillow/pngsuite/` — decodes
+**162 of 162** readable files pixel-identically to Pillow, and all **14** intentionally-corrupt files
+are refused. A further **238 images written by Pillow itself** at every option combination read back
+byte-identically (PNG 147, BMP 28, TGA 63), and `tests/pillow_differential.sh` has Pillow read eleven
+files these codecs wrote.
+
 | format | read | write | how |
 |---|---|---|---|
-| **PNG** | ✅ all 5 colour types, 1/2/4/8/16 bits, interlaced (Adam7), `tRNS` `gAMA` `pHYs` `iCCP` `tEXt` `zTXt` `iTXt` | ✅ | §4.1's inflate, then the 5 filters un-applied per scanline (`None Sub Up Average Paeth` — each is one array add after the previous row is known, so the loop is over *rows*); APNG frames read |
+| **PNG** | ✅ all 5 colour types, 1/2/4/8/16 bits, interlaced (Adam7), `tRNS` `gAMA` `pHYs` `sRGB` `bKGD` `tEXt` `zTXt` `iTXt`, **every chunk CRC verified** | ✅ | §4.1's inflate, then the 5 filters un-applied per scanline (`None Sub Up Average Paeth` — each is one array add after the previous row is known, so the loop is over *rows*); APNG frames read |
 | **JPEG** | ✅ baseline + progressive, all subsamplings, restart markers, EXIF, JFIF, Adobe APP14 | ✅ baseline, quality 1–100, `optimize`, `progressive` | Huffman scan is sequential (§6.3); dequantise, IDCT, upsample and YCbCr→RGB are array operations |
 | **GIF** | ✅ including all frames, local palettes, transparency, interlace, disposal | ✅ including animation | LZW, sequential, over the compressed stream |
 | **BMP** | ✅ 1/4/8/16/24/32-bit, RLE4/RLE8, `BITFIELDS`, top-down and bottom-up | ✅ 1/8/24-bit | raw rows → `nd_frombytes` → one reshape |
@@ -461,6 +501,24 @@ accumulator in a Bantu number, refilled a byte at a time, and exposes `bits(n)`,
 **Plugin registration matches Pillow's.** `codecs/registry.b` holds `register_open`,
 `register_save`, `register_mime` and `register_extension`; `Image.open` sniffs by magic bytes, falls
 back to the extension, and raises `UnidentifiedImageError` — the same name Pillow raises.
+
+### 6.2.1 Two things P4 had to fix before a codec could exist
+
+**Bantu could not spell a file signature.** A string literal had no `\xNN` escape, and the lexer
+*silently dropped the backslash* on any unrecognised escape — so `"\x89PNG"` became `x89PNG` and
+`"C:\path"` became `C:path`. A byte-oriented language with binary-safe strings, native `bytes()` and
+a working inflate still could not write the eight bytes that begin a PNG without `chr(137) + "PNG"`.
+`\xNN` now works and an unknown escape keeps its backslash, so an unrecognised escape is visible
+rather than lossy.
+
+**Unfiltering is the slow part of PNG, and only partly avoidable.** Of the five scanline filters,
+three are whole-row array operations — `None` is nothing, `Up` is one add, and `Sub` is a strided
+prefix sum — but `Average` and `Paeth` need the byte to the *left*, which needs the one to *its*
+left. They are sequential by construction, the documented exception to rule PW2 alongside the
+dither. Two things keep the cost down: a whole-image fast path when every row is filter 0 (which is
+what this codec writes by default, so its own output re-reads at array speed), and the native
+`inflate` doing the decompression. Measured: a 60,000-pixel RGB PNG writes in 13 ms and reads in
+8 ms.
 
 ### 6.3 The one place the envelope is genuinely tight
 
@@ -569,11 +627,11 @@ columns, in [`pillow-suite/ROADMAP.md`](../pillow-suite/ROADMAP.md).
 
 | phase | content | why here |
 |---|---|---|
-| **P0** | this document, `ROADMAP.md`, `DECISIONS.md`, `CHANGELOG.md` | design before code |
-| **P1** | the two atoms of §4, with `inflate.b`'s pure-Bantu twin and the differential test between them | nothing else can be built on a one-way compressor |
-| **P2** | `mode.b`, `image.b`, `convert.b`, `color.b`, `palette.b` — the object model, the full mode matrix, `new`/`frombytes`/`fromarray`/`tobytes`, `copy`/`crop`/`paste`/`split`/`merge`/`getpixel`/`putpixel`/`point`/`getbbox`/`getextrema`/`histogram`, PPM read+write | the core, and PPM makes it testable end to end on the first day |
-| **P3** | `resample.b` — the six filters, `resize`/`rotate`/`transpose`/`thumbnail`/`reduce`/`transform`; `transform.b` | every later phase wants to resize |
-| **P4** | `codecs/png.b`, `codecs/bmp.b`, `codecs/tga.b` | PNG is the format that matters most and the one P1 unblocked |
+| **P0** ✅ | this document, `ROADMAP.md`, `DECISIONS.md`, `CHANGELOG.md` | design before code |
+| **P1** ✅ | the two atoms of §4, with `inflate.b`'s pure-Bantu twin and the differential test between them | nothing else can be built on a one-way compressor |
+| **P2** ✅ | `mode.b`, `image.b`, `convert.b`, `color.b`, `palette.b` — the object model, the full mode matrix, `new`/`frombytes`/`fromarray`/`tobytes`, `copy`/`crop`/`paste`/`split`/`merge`/`getpixel`/`putpixel`/`point`/`getbbox`/`getextrema`/`histogram`, PPM read+write | the core, and PPM makes it testable end to end on the first day |
+| **P3** ✅ | `resample.b` — the six filters, `resize`/`rotate`/`transpose`/`thumbnail`/`reduce`/`transform`; `transform.b`, `path.b` | every later phase wants to resize |
+| **P4** ✅ | `codecs/png.b`, `codecs/bmp.b`, `codecs/tga.b` | PNG is the format that matters most and the one P1 unblocked |
 | **P5** | `codecs/jpeg.b` — baseline, progressive, `draft`, encode; `exif.b` | the second format that matters most |
 | **P6** | `filter.b`, `chops.b`, `enhance.b`, `ops.b`, `stat.b`, `math.b`, `morph.b` | the operation surface, once there is something to operate on |
 | **P7** | `draw.b`, `font.b`, `path.b` | drawing and text |

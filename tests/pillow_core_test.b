@@ -414,7 +414,9 @@ eq(pillow.eval(pillow.new("L", [1, 1], 10), def($v) { return $v * 2; }).getpixel
 // ════════════════════════════════════════════════════════════════════════
 print("── PPM / PGM / PBM ──");
 
-eq(pillow.formats(), ["PPM"], "PPM is registered");
+// Presence, not the exact list: more codecs register as the phases land,
+// and tests/pillow_codec_test.b owns the full roster.
+ok(contains(pillow.formats(), "PPM"), "PPM is registered");
 eq(pillow.registered_extensions()[".ppm"], "PPM", "the .ppm extension maps to PPM");
 eq(pillow.registered_extensions()[".pgm"], "PPM", "and .pgm");
 eq(pillow.registered_extensions()[".pbm"], "PPM", "and .pbm");

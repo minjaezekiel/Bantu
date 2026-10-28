@@ -9,20 +9,29 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
-- **[feature] `pillow` — imaging for Bantu, in the shape of Python's Pillow.** `Image.open`,
-  `new`, `convert`, `resize`, `copy`, `crop`, `paste`, `split`, `merge`, `point`, `histogram`,
-  `getbbox`, `getextrema`, `getcolors`, `blend`, `composite`, `alpha_composite`, `tobytes`, `save`;
-  all 20 Pillow modes; `ImageColor` with the 148 CSS names; `ImagePalette` and the web colour cube;
-  the six resampling filters; the plugin registry; PPM/PGM/PBM read and write. Written entirely in
-  Bantu over numba's arrays, so no loop is proportional to the pixel count: a full-frame 1080p
-  `convert("L")` is 108 ms and a crop or a mirror is free, where an interpreted per-pixel pass over
-  the same image is 4.1 s.
+- **[feature] `pillow` — imaging for Bantu, in the shape of Python's Pillow.** Phases P0–P4 of
+  nine. The Image object (`open new convert copy crop paste split merge point histogram getbbox
+  getextrema getcolors blend composite alpha_composite tobytes save`), all 20 Pillow modes, the
+  conversion matrix, `ImageColor` with the 148 CSS names, `ImagePalette` and the web colour cube,
+  the six resampling filters with `resize rotate transpose thumbnail reduce transform`,
+  `ImageTransform`, `ImagePath`, the plugin registry, and **PNG, BMP, TGA and PPM** read and write.
+  Written entirely in Bantu over numba's arrays, so no loop is proportional to the pixel count: a
+  full-frame 1080p `convert("L")` is 108 ms and a crop or a transpose is free, where an interpreted
+  per-pixel pass over the same image is 4.1 s. A 60,000-pixel PNG writes in 13 ms and reads in 8 ms.
+
   Fidelity is **differential, not aspirational** — checked against Pillow 13 rather than against its
-  documentation: **177 of 191 conversion pairs** and **all 378 `resize` reference images** are
-  byte-identical, `RGB → L` over **all 16,777,216** RGB triples, Floyd–Steinberg over **9,154 of
-  9,154** pixels. The remaining gaps are stated, not hidden: `RGBA → P` needs `quantize()`, and
-  `LAB` goes through littleCMS in Pillow and so cannot be matched without shipping an ICC engine.
-  See [docs/pillow.md](docs/pillow.md) and
+  documentation. **177 of 191** conversion pairs and **all 378** `resize` reference images are
+  byte-identical; `RGB → L` is verified over **all 16,777,216** RGB triples; Floyd–Steinberg over
+  **9,154 of 9,154** pixels; and **PngSuite**, the canonical 176-file PNG conformance corpus,
+  decodes **162 of 162** readable files pixel-identically with all 14 corrupt files refused. The
+  remaining gaps are stated, not hidden: `RGBA → P` needs `quantize()` (P6), `LAB` goes through
+  littleCMS in Pillow and cannot be matched without shipping an ICC engine, and `reduce` in mode F
+  differs by one float32 ULP on about one pixel in forty.
+
+  Four upstream defects are **fixed rather than reproduced**, each with a test bounding the
+  difference: the dithered palette writer discarding two of its three error accumulators, two
+  `(UINT8)` casts that wrap an out-of-range value instead of saturating, and PNG IDAT checksums
+  going unverified. See [docs/pillow.md](docs/pillow.md) and
   [docs/pillow-architecture.md](docs/pillow-architecture.md).
 
 - **[feature] `inflate(src, maxOut?)` and `gunzip(src, maxOut?)` — the decompressor the interpreter
@@ -46,6 +55,11 @@ All notable changes to the Bantu programming language are documented in this fil
 
 - **[feature] Filesystem and base64 builtins**: `exists`, `isfile`, `isdir`, `listdir`, `mkdir`,
   `mkdirs`, `unlink`, `filesize`, `b64encode`, `b64decode`.
+
+- **[feature] `\xNN` escapes in string literals.** Bantu had **no way to write a non-printable byte
+  in a literal**, so a byte-oriented language with binary-safe strings, `bytes()`, `frombytes()` and
+  a working inflate still could not spell the eight bytes that begin a PNG — `chr(137) + "PNG"` was
+  the only route, and the same went for a gzip member's `\x1f\x8b` and a JPEG's `\xff\xd8`.
 
 - **[feature] `numba` can read and write raw binary arrays: `np.fromfile` and `np.tofile`.**
   There was no way to get a large array of numbers into Bantu. Decoding one IEEE-754 double from
@@ -74,6 +88,13 @@ All notable changes to the Bantu programming language are documented in this fil
   See [docs/one-taylor-architecture.md](docs/one-taylor-architecture.md).
 
 ### Fixed
+
+- **[bug fix] An unrecognised string escape silently lost its backslash.** `"C:\path"` became
+  `C:path` and a string holding a regex lost every escape in it — data loss with no diagnostic,
+  because the lexer's `default` case appended the escaped character and dropped the backslash. An
+  unknown escape now keeps both characters, so it is visible instead of lossy. Verified against the
+  whole tree first: every existing use was either an escaped `\\` or text inside a comment, so
+  nothing relied on the old behaviour.
 
 - **[bug fix] `indexOf` silently returned `-1` for any list.** `contains($L, $x)` answered `true`
   while `indexOf($L, $x)` answered `-1` for the same pair — a wrong answer rather than an error, and

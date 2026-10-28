@@ -208,35 +208,94 @@ for JPEG's entropy scan, and not added speculatively.
 
 ---
 
-## Phase P3 — Geometry: the six resampling filters
+## Phase P3 — Geometry: resampling, transpose, rotate, reduce, thumbnail ✅
 
-- [ ] `pillow/resample.b` — `NEAREST BOX BILINEAR HAMMING BICUBIC LANCZOS`, two separable passes,
-      Pillow's `precompute_coeffs` including `filterscale` and 1/2048 fixed-point weights
-- [ ] `resize rotate transpose thumbnail reduce transform` on `PillowImage`
-- [ ] `pillow/transform.b` — `AffineTransform ExtentTransform QuadTransform MeshTransform`
-- [ ] `pillow/path.b` — `ImagePath.Path`
+- [x] `pillow/resample.b` — `NEAREST BOX BILINEAR HAMMING BICUBIC LANCZOS`, two separable passes,
+      Pillow's `precompute_coeffs` including `filterscale`, the 1/2048 fixed-point weights and the
+      PASS ORDER (see below)
+- [x] `resize` with a box and the `LA`/`RGBA` premultiply dance; `transpose` (all 8);
+      `rotate` (right-angle fast paths, arbitrary angles, `expand`, `center`, `translate`, `fillcolor`);
+      `reduce`; `thumbnail` with Pillow's `round_aspect`; `transform`
+- [x] `pillow/transform.b` — `AffineTransform ExtentTransform PerspectiveTransform QuadTransform
+      MeshTransform`, the three transform filters, and `reduce`'s three numeric paths
+- [x] `pillow/path.b` — `ImagePath.Path`: `getbbox tolist transform map compact`
 
-| gate | form |
+| gate | result |
 |---|---|
-| differential | every filter × every mode × upscale/downscale/identity, byte-identical to Pillow |
-| differential | the 8 `transpose` operations and `rotate` at 90/180/270 exact; `expand=True` boxes match |
-| stress | 1 px → 10,000 px in one call and back; a 1×10,000 strip; `reducing_gap`; **a bicubic 1080p resize is ≤ 20 array operations**, asserted by instrumenting the call count |
+| feature | ✅ `tests/pillow_resample_test.b` **69**, `tests/pillow_geometry_test.b` **71** |
+| differential | ✅ **378 of 378** `resize` images byte-identical: 9 modes × 7 shape pairs × 6 filters |
+| differential | ✅ **49 of 49** transpose, **45 of 45** transform, **32 of 32** rotate, **30 of 30** thumbnail |
+| differential | ✅ `reduce`: **84 of 84** for every integer mode (L, RGB, RGBA, I); mode F has a bounded residual, below |
+| stress | ✅ 1 px → 10,000 px and back; 1×200 and 200×1 strips; a 640,000-pixel upscale in 1.4 s; `MAX_IMAGE_PIXELS` enforced |
+| stress | ✅ **rule PW2 asserted**: 4× the pixels costs 3× the time; NEAREST (1 gather) ≤ BILINEAR (4) ≤ BICUBIC (16); a 240,000-pixel `ROTATE_90` is 19 ms and `reduce /4` is 20 ms |
+
+**Four facts that only the C source gave up.** Each was fitted as a black box first and reached
+within ±1 on a slice of the inputs; none would have closed by more fitting.
+
+| | the structure, not the constants |
+|---|---|
+| **the pass order** | Pillow 13 chooses horizontal-vs-vertical first BY COST — `!((inH-outH) > 0 && (inH-outH) > (inW-outW)*2)` — and since each pass rounds to the mode's precision, **the order is part of the answer**. Every single pass matched exactly; only the combination did not |
+| **NEAREST** | `ImagingScaleAffine` *accumulates* the source coordinate (`xo += scale`) rather than computing it. The drift is real: where the closed form says 5.999999999999999 the accumulation says 6.0000000000001 — one whole source row |
+| **the transform cast** | Pillow stores an interpolated sample with `(UINT8)v`, which **truncates**. Rounding instead differs on ~half of all interpolated pixels |
+| **`FIX`** | `Geometry.c`'s `FLOOR` macro is plain `floor()` in *both* branches, so the 16.16 fixed-point `FIX(v)` rounds DOWN, not toward zero |
+
+**Also matched:** modes `1` and `P` force NEAREST (an index cannot be interpolated); `LA` and `RGBA`
+are premultiplied before any interpolating `resize`, `reduce` or `transform`; `EXTENT` is rewritten to
+an AFFINE *before* dispatch, so it inherits the integer NEAREST path; `reduce` refuses `P`, `1` and
+`I;16` as `ImagingReduce` does; mode `I` rounds with `ROUND_UP` where the 8-bit path shifts a
+fixed-point accumulator.
+
+### The one bounded residual: `reduce` in mode F
+
+`Reduce.c` does not use its general kernel for the common factors — it dispatches to **eleven
+hand-unrolled kernels** (1x2, 2x1, 2x2, 1x3, 3x1, 3x3, 4x4, 5x5, 1xN, Nx1) whose float addition order
+differs from the general one. For `u8` and `I` that is invisible, because integer addition is
+associative. For **F** it moves the last float32 step on 10 of 105 corpus images, each by one or two
+values of a single ULP (asserted: the largest relative difference is under 5e-7).
+
+Reproducing eleven unrolled summation orders to chase one ULP in a mode that is rarely reduced is a
+poor trade — eleven more paths to keep correct for a difference no viewer can see. The general kernel
+is used for every factor, the gap is **bounded and asserted per mode** rather than hidden, and the
+integer modes stay exact. The per-channel float32 grouping *is* reproduced (`double ss = 0; ss +=
+a + b + c + d` adds the four floats in float32 and only then widens), which took mode F from 85 to 95
+exact on its own.
 
 ---
 
-## Phase P4 — PNG, BMP, TGA
+## Phase P4 — PNG, BMP, TGA ✅
 
-- [ ] `pillow/codecs/png.b` — colour types 0/2/3/4/6, bit depths 1/2/4/8/16, Adam7 interlace, the 5
-      scanline filters (loop over **rows**), `tRNS gAMA pHYs iCCP tEXt zTXt iTXt sRGB bKGD`, APNG
-      frames, CRC-32 checked, write with filter selection and `compress_level`
-- [ ] `pillow/codecs/bmp.b` — 1/4/8/16/24/32-bit, RLE4/RLE8, `BITFIELDS`, both row orders
-- [ ] `pillow/codecs/tga.b` — 8/16/24/32-bit, RLE, all four origins
+- [x] `pillow/codecs/png.b` — colour types 0/2/3/4/6, bit depths 1/2/4/8/16, **Adam7 interlace**, all
+      five scanline filters, `PLTE tRNS gAMA pHYs sRGB bKGD tEXt zTXt iTXt`, **every chunk CRC
+      verified**, `LOAD_TRUNCATED_IMAGES` as the opt-out; writes 1, L, LA, P, RGB, RGBA, I;16 with a
+      chosen filter and compression level
+- [x] `pillow/codecs/bmp.b` — 1/4/8/16/24/32-bit, `BITMAPCOREHEADER` and `BITMAPINFOHEADER` and the
+      V2–V5 extensions, uncompressed, **RLE4, RLE8 and BITFIELDS**, bottom-up and top-down; writes
+      1, L, P, RGB
+- [x] `pillow/codecs/tga.b` — types 1/2/3 and their RLE forms 9/10/11, 1/8/15/16/24/32-bit, both
+      origins, colour maps; writes 1, L, P, RGB, RGBA, optionally RLE
 
-| gate | form |
+| gate | result |
 |---|---|
-| differential | **PngSuite** (Willem van Schaik's 175-file conformance corpus) decoded and compared pixel for pixel; every file Pillow accepts, accepted identically; every file Pillow rejects, rejected |
-| differential | written PNGs re-read by Pillow and by `png.b` to the same pixels |
-| stress | the fuzz tier of architecture §8 over all three formats; a 60,000×60,000 header refused before allocation; an inflate bomb refused |
+| feature | ✅ `tests/pillow_codec_test.b` **131** checks |
+| differential | ✅ **PngSuite**, the canonical 176-file conformance corpus: **162 of 162** readable files pixel-identical to Pillow, same mode and size; **all 14** intentionally-corrupt `x*` files refused |
+| differential | ✅ **238 images written by Pillow itself** at every option: PNG **147/147**, BMP **28/28**, TGA **63/63** — all byte-identical |
+| differential | ✅ **live, against Pillow** (`tests/pillow_differential.sh`): Pillow reads 11 PNG/BMP/TGA files this codec wrote, all 391 pixels identical each, plus all five PNG scanline filters |
+| stress | ✅ every writable mode round-trips at six sizes including 1×1, 1×9 and 9×1 (the row-padding cases); all five PNG filters; palettes through PNG, BMP and TGA; a TGA RLE run crossing a row boundary |
+| stress | ✅ hostile: truncation at many lengths, 64 header-byte corruptions, a 65535×65535 TGA refused from its header, nonsense DIB headers — no crash, no hang, every failure catchable |
+| cost | 60,000-pixel RGB PNG: **write 13 ms, read 8 ms**; the same as BMP, 17 ms |
+
+**A language defect this phase had to fix first.** Bantu had **no way to write a non-printable byte
+in a string literal** — and silently *dropped the backslash* on any unrecognised escape, so
+`"\x89PNG"` became `x89PNG` and `"C:\path"` became `C:path`. A byte-oriented language with
+binary-safe strings could not spell a single file signature. `\xNN` now works, and an unknown escape
+keeps its backslash instead of losing data without a diagnostic.
+
+**One deliberate deviation (PW11).** Pillow verifies the CRC of metadata chunks but **not of IDAT**,
+so it accepts PngSuite's `xcsn0g01.png` (a deliberately corrupted IDAT checksum). This codec verifies
+every chunk's CRC and refuses it: a checksum mismatch means the data cannot be trusted, and accepting
+it turns a corrupt file into a plausible image. `png.allow_truncated(true)` is the documented way
+through, and it recovers Pillow's exact pixels — asserted, so the escape hatch is proved rather than
+promised.
 
 ---
 

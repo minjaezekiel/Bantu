@@ -35,21 +35,24 @@ tests/pillow_differential.sh            # live, against Python's Pillow
 
 ## ⚠ What is in this build, and what is not
 
-`pillow` is being built in nine phases. **This is phase P2 of 9.** The table below is the honest
+`pillow` is being built in nine phases. **This is phase P4 of 9.** The table below is the honest
 state; nothing is stubbed to look present.
 
 | | status |
 |---|---|
 | **The Image object** — `new open copy crop paste split merge getchannel putalpha getpixel putpixel getdata putdata point histogram getbbox getextrema getcolors blend composite alpha_composite eval tobytes frombytes fromarray save show` | ✅ |
 | **All 20 modes** — `1 L LA La P PA RGB RGBA RGBa RGBX CMYK YCbCr LAB HSV I I;16 I;16L I;16B I;16N F` | ✅ |
-| **The conversion matrix** | ✅ **111 pairs byte-identical to Pillow**; 60 close but not yet exact (below); 20 need quantisation |
+| **The conversion matrix** | ✅ **177 of 191 pairs byte-identical to Pillow** (below) |
 | **`ImageColor`** — `getrgb getcolor colormap`, 148 CSS names | ✅ |
+| **`ImagePalette`** — the web cube, the grey ramp, nearest-colour mapping | ✅ |
+| **Geometry** — `resize rotate transpose thumbnail reduce transform`, the six resampling filters, `ImageTransform`, `ImagePath` | ✅ |
+| **PNG** — all colour types and depths, interlaced, all five filters, CRC-verified | ✅ |
+| **BMP** — 1/4/8/16/24/32-bit, RLE4, RLE8, BITFIELDS, both row orders | ✅ |
+| **TGA** — types 1/2/3 and their RLE forms, both origins | ✅ |
 | **PPM / PGM / PBM** (P1–P6), 8- and 16-bit, read + write | ✅ |
 | **DEFLATE / zlib / gzip**, both directions | ✅ |
 | **The plugin registry** — `register_codec`, sniffing, `registered_extensions` | ✅ |
-| `ImagePalette`, `quantize`, `* → P` conversions | ⏳ P2 remainder |
-| `resize rotate transpose thumbnail reduce transform`, `ImageTransform`, `ImagePath` | ⏳ P3 |
-| **PNG**, BMP, TGA | ⏳ P4 |
+| `quantize` (and `RGBA → P`, which needs it) | ⏳ P6 |
 | **JPEG**, `ExifTags` | ⏳ P5 |
 | `ImageFilter ImageChops ImageEnhance ImageOps ImageStat ImageMath ImageMorph` | ⏳ P6 |
 | `ImageDraw`, `ImageFont` | ⏳ P7 |
@@ -159,6 +162,29 @@ $bw   = $im.convert("1", "NONE", null);               // threshold instead
 `$im.convert($mode, $dither, $matrix)`. `$dither` is `"FLOYDSTEINBERG"` (the default, matching
 Pillow) or `"NONE"`. `$matrix` is not implemented yet (P6).
 
+### Geometry
+
+| call | notes |
+|---|---|
+| `$im.resize($size, $filter, $box, $reducing_gap)` | `$filter` is `NEAREST LANCZOS BILINEAR BICUBIC BOX HAMMING`, default `BICUBIC`. Modes `1` and `P` force `NEAREST`; `LA` and `RGBA` are premultiplied first so transparent pixels do not bleed colour |
+| `$im.transpose($op)` | `FLIP_LEFT_RIGHT FLIP_TOP_BOTTOM ROTATE_90 ROTATE_180 ROTATE_270 TRANSPOSE TRANSVERSE`. Each is an axis permutation, so all are exact and effectively free. `ROTATE_90` is **anticlockwise** |
+| `$im.rotate($angle, $filter, $expand, $center, $translate, $fill)` | counter-clockwise degrees. 0/90/180/270 take the exact transpose path when there is no custom centre or translation |
+| `$im.reduce($factor, $box)` | integer box averaging; the output size rounds **up**, and a partial edge block averages over its own smaller area. Refuses `P`, `1` and `I;16`, as Pillow does |
+| `$im.thumbnail($size, $filter, $reducing_gap)` | shrinks **in place** and returns `null`. Never enlarges; preserves the aspect ratio with Pillow's `round_aspect` |
+| `$im.transform($size, $method, $data, $filter, $fill)` | `AFFINE EXTENT PERSPECTIVE QUAD MESH`, with `NEAREST`, `BILINEAR` or `BICUBIC`. A source coordinate outside the image takes `$fill` rather than a clamped edge pixel |
+
+```bantu
+$thumb = $im.resize([320, 240], pillow.LANCZOS, null, null);
+$flipped = $im.transpose(pillow.FLIP_LEFT_RIGHT);
+$turned = $im.rotate(30, pillow.BICUBIC, true, null, null, "white");
+$half = $im.reduce(2, null);
+$t = $im.transform([200, 150], pillow.AFFINE, [1, 0, 10, 0, 1, 20], pillow.BILINEAR, null);
+```
+
+`pillow.AffineTransform($m)`, `ExtentTransform`, `PerspectiveTransform`, `QuadTransform` and
+`MeshTransform` name the method instead of its id. `pillow.Path($points)` is `ImagePath.Path`, with
+`path_getbbox`, `path_tolist`, `path_transform` and `path_compact`.
+
 ### Output
 
 | call | notes |
@@ -201,24 +227,51 @@ pillow.getmodebandnames("La")   // ["L", "a"]
 pillow.MODES                    // all 20, in Pillow's order
 ```
 
-### How exact is `convert()`?
+### How exact is it?
 
-Measured against Pillow 13.0.0 over a 191-pair reference matrix, and reported rather than assumed:
+Measured against Pillow 13.0.0 and reported rather than assumed:
 
-| | pairs |
+| | result |
 |---|---|
-| **byte-identical to Pillow** | **111** |
-| need quantisation (`* → P`, `* → PA`) | 20 — raise an error naming `palette.b` |
-| **close but not yet identical**: the `YCbCr`, `HSV` and `LAB` families | 60 |
+| conversion pairs byte-identical | **177 of 191** |
+| `RGB → L`, over **all 16,777,216** RGB triples | 0 mismatches |
+| `RGB → YCbCr` and `HSV`, both directions, 3,014 pixels | 0 mismatches |
+| Floyd–Steinberg to mode `1`, 24 images from 1×1 to 64×40 | **9,154 of 9,154** pixels |
+| `RGB → P` undithered, 5 images | **815 of 815** pixels |
+| `resize`, 9 modes × 7 shape pairs × 6 filters | **378 of 378** images |
+| `transpose`, `transform`, `rotate`, `thumbnail` | **49/49, 45/45, 32/32, 30/30** |
+| `reduce`, every integer mode | **84 of 84** |
+| **PngSuite**, the canonical PNG conformance corpus | **162 of 162** readable files; all 14 corrupt files refused |
+| images written by Pillow at every option (PNG/BMP/TGA) | **238 of 238** |
 
-`RGB → L` is additionally verified over **all 16,777,216 RGB triples**. It is Pillow's `L24` macro —
-`(R×19595 + G×38470 + B×7471 + 32768) >> 16` — and **not** the truncated `(R×299 + G×587 + B×114)/1000`
-that BT.601 references print; the two disagree on about half of all inputs.
+`RGB → L` is Pillow's `L24` macro — `(R×19595 + G×38470 + B×7471 + 32768) >> 16` — and **not** the
+truncated `(R×299 + G×587 + B×114)/1000` that BT.601 references print; the two disagree on about half
+of all inputs. `convert("1")` uses the truncated form, because `tobilevel` does. Both are matched.
 
-**For `YCbCr`, `HSV` and `LAB`**, `pillow` uses the standard formulations, which land within ±1 of
-Pillow on 8–25% of inputs. They work and they are documented as not yet bit-exact; ask
-`convert.unverified($from, $to)` if your code depends on matching Pillow exactly. Finishing them is
-the first item of the next phase, and the fitting evidence so far is in the roadmap.
+**The three remaining gaps, stated rather than rounded off:**
+
+- **`RGBA → P`** (4 pairs) routes through `quantize()` in Pillow — an *adaptive* median-cut palette,
+  a feature of its own. `convert()` raises an error naming it rather than returning fixed-cube
+  indices that would look almost right. Lands in P6.
+- **`LAB`** (10 pairs) cannot be matched at all: Pillow has no LAB row in `Convert.c` and routes it
+  through **ImageCms, i.e. littleCMS**. `pillow` ships a correct standard D65 sRGB ↔ L\*a\*b\*
+  conversion; `convert.why_unverified()` explains why it is not bit-identical. Closing it would mean
+  shipping an ICC engine.
+- **`reduce` in mode F** differs by a single float32 ULP on about one output pixel in forty, because
+  `Reduce.c` dispatches the common factors to eleven hand-unrolled kernels whose float addition order
+  differs. Every integer mode is exact. Bounded and asserted, not chased.
+
+### Where this deliberately differs from Pillow
+
+Matching Pillow's arithmetic does not extend to reproducing its defects. Three fixes, each with a
+test asserting the *containment* of the difference:
+
+| upstream | fix |
+|---|---|
+| the dithered `topalette` writes blue's error accumulators into all three channel slots at each row's end, discarding red's and green's | each channel carries its own. Row 0 is identical to Pillow; the difference stays within 4 columns of the right edge |
+| `ImagingConvertRGB2YCbCr` casts with `(UINT8)`, so an out-of-range input *wraps* — 256 becomes 0 | clamp. Identical on all valid input |
+| a negative bicubic undershoot is cast to `UINT8`, which is undefined behaviour and on x86 wraps −5 to 251 — a bright speck in a dark area | clamp at zero |
+| Pillow verifies metadata chunk CRCs but **not IDAT's**, so it accepts a PNG with a corrupted image checksum | verify every CRC. `png.allow_truncated(true)` is the opt-out, and it recovers Pillow's exact pixels |
 
 ---
 
@@ -255,6 +308,24 @@ pillow.formats()                 // ["PPM"]
 pillow.registered_extensions()   // {".ppm": "PPM", ".pgm": "PPM", …}
 pillow.identify($data, $path)    // the format id, or null
 ```
+
+**PNG** — colour types 0, 2, 3, 4 and 6; bit depths 1, 2, 4, 8 and 16; Adam7 interlace; all five
+scanline filters; `PLTE tRNS gAMA pHYs sRGB bKGD tEXt zTXt iTXt`. **Every chunk CRC is verified** —
+`png.allow_truncated(true)` is the opt-out. Writes 1, L, LA, P, RGB, RGBA and I;16; pass
+`png_filter` (0–4) and `png_level` (0–9) through `pillow.encode_png` for control over the output.
+
+Two Pillow behaviours worth knowing: a **16-bit truecolour PNG comes back as 8-bit RGB** (the low
+byte of each sample is dropped) and **16-bit grey+alpha comes back as RGBA**, not LA. Both are
+matched.
+
+**BMP** — 1, 4, 8, 16, 24 and 32 bits; `BITMAPCOREHEADER`, `BITMAPINFOHEADER` and the V2–V5
+extensions; uncompressed, RLE4, RLE8 and BITFIELDS; bottom-up and top-down. Writes 1, L, P and RGB.
+**The writer drops alpha**, as Pillow's does — save an RGBA image and it reads back as RGB.
+
+**TGA** — types 1 (colour-mapped), 2 (truecolour) and 3 (greyscale) and their RLE forms; 1, 8, 15,
+16, 24 and 32 bits; both vertical origins. Writes 1, L, P, RGB and RGBA; pass `tga_rle` or
+`tga_topdown` through `pillow.encode_tga`. A TGA has **no magic number**, so it is identified by a
+self-consistency check on its 18-byte header and by its extension.
 
 **PPM / PGM / PBM** — all seven Netpbm formats: `P1` `P2` `P3` (plain) and `P4` `P5` `P6` (raw), 8-
 and 16-bit, header comments and arbitrary whitespace, read and write. Writable from modes `1`, `L`,
@@ -306,11 +377,15 @@ Measured on a 1080p RGB image (6,220,800 channel values), Darwin/Apple silicon:
 
 | operation | cost |
 |---|---|
-| `crop()` | **0 ms** — a view |
+| `crop()`, `transpose()` | **0 ms** — a view or an axis permutation |
 | `point()` with a 256-entry table | 92 ms |
 | `convert("L")` | 108 ms |
 | `histogram()` | 74 ms |
+| `resize()` bicubic, to half size | ~530 ms |
+| `reduce(4)` | ~20 ms |
 | `getpixel()` | ~2.5 µs **each** |
+
+A 60,000-pixel RGB **PNG writes in 13 ms and reads in 8 ms**.
 
 **The rule the whole design exists to satisfy:** no operation is proportional to the pixel count in
 *interpreted* work. An interpreted per-pixel pass over a 1080p image costs 4.1 s; the same operation

@@ -339,7 +339,201 @@ def gen_resample():
     return header("resample corpus index (images in reference/resample/)") + man
 
 
+def gen_geometry():
+    """transpose, rotate, reduce, thumbnail and transform reference images.
+
+    Whole images as raw bytes, for the same reason the resample corpus is:
+    these are per-pixel maps, and a probe pixel says nothing about its
+    neighbours. Covers the cases where the answer is decided by something
+    other than the obvious formula:
+
+      * the eight transpose operations, including which of ROTATE_90 and
+        ROTATE_270 is anticlockwise
+      * rotate at the right angles (which take the transpose fast path only
+        when the result fits) and at angles that do not
+      * rotate with expand, a custom centre, a translation and a fill colour
+      * reduce at factors that do NOT divide the size, so the partial blocks
+        at the right and bottom edges are exercised
+      * thumbnail's aspect preservation, including sizes where floor and ceil
+        disagree about which is closer to the true ratio
+      * transform by AFFINE, EXTENT, PERSPECTIVE and QUAD, under all three
+        filters the C supports
+    """
+    import random
+    random.seed(60606)
+    out = os.path.join(OUT, "geometry")
+    os.makedirs(out, exist_ok=True)
+    man = []
+
+    def src(m, w, h):
+        base = Image.new("RGB", (w, h))
+        base.putdata([(random.randrange(256), random.randrange(256),
+                       random.randrange(256)) for _ in range(w * h)])
+        return base.convert(m)
+
+    modes = ["L", "RGB", "RGBA", "1", "P", "I", "F"]
+    transposes = {"FLIP_LEFT_RIGHT": Image.Transpose.FLIP_LEFT_RIGHT,
+                  "FLIP_TOP_BOTTOM": Image.Transpose.FLIP_TOP_BOTTOM,
+                  "ROTATE_90": Image.Transpose.ROTATE_90,
+                  "ROTATE_180": Image.Transpose.ROTATE_180,
+                  "ROTATE_270": Image.Transpose.ROTATE_270,
+                  "TRANSPOSE": Image.Transpose.TRANSPOSE,
+                  "TRANSVERSE": Image.Transpose.TRANSVERSE}
+    for m in modes:
+        im = src(m, 7, 5)
+        tag = f"T_{m}_7x5"
+        open(os.path.join(out, tag + ".src"), "wb").write(im.tobytes())
+        for name, op in transposes.items():
+            g = im.transpose(op)
+            open(os.path.join(out, f"{tag}_{name}.dst"), "wb").write(g.tobytes())
+            man.append(f"transpose {m} 7 5 {name} {g.size[0]} {g.size[1]}")
+
+    # reduce, including factors that do not divide the size
+    for m in ["L", "RGB", "RGBA", "I", "F"]:
+        for (w, h) in [(12, 8), (13, 7), (9, 9)]:
+            im = src(m, w, h)
+            tag = f"R_{m}_{w}x{h}"
+            open(os.path.join(out, tag + ".src"), "wb").write(im.tobytes())
+            for (fx, fy) in [(2, 2), (3, 2), (2, 3), (4, 4), (5, 1), (1, 5), (3, 3)]:
+                g = im.reduce((fx, fy))
+                open(os.path.join(out, f"{tag}_{fx}x{fy}.dst"), "wb").write(g.tobytes())
+                man.append(f"reduce {m} {w} {h} {fx} {fy} {g.size[0]} {g.size[1]}")
+
+    # NOTE: reduce refuses P, 1 and I;16 upstream, so they are not in the
+    # mode list above -- ImagingReduce raises a ModeError for them.
+
+    # thumbnail: aspect preservation
+    for (w, h) in [(40, 30), (31, 17), (100, 7), (7, 100), (9, 9)]:
+        im = src("RGB", w, h)
+        tag = f"TH_RGB_{w}x{h}"
+        open(os.path.join(out, tag + ".src"), "wb").write(im.tobytes())
+        for (tw, th) in [(10, 10), (20, 5), (5, 20), (1, 1), (200, 200), (13, 11)]:
+            g = im.copy()
+            g.thumbnail((tw, th), Image.Resampling.BICUBIC, None)
+            open(os.path.join(out, f"{tag}_{tw}x{th}.dst"), "wb").write(g.tobytes())
+            man.append(f"thumbnail RGB {w} {h} {tw} {th} {g.size[0]} {g.size[1]}")
+
+    # transform: AFFINE, EXTENT, PERSPECTIVE, QUAD under three filters
+    filters = {"NEAREST": Image.Resampling.NEAREST,
+               "BILINEAR": Image.Resampling.BILINEAR,
+               "BICUBIC": Image.Resampling.BICUBIC}
+    cases = [
+        ("AFFINE", Image.Transform.AFFINE, (1, 0, 0, 0, 1, 0)),
+        ("AFFINE2", Image.Transform.AFFINE, (0.7, 0.2, 1.5, -0.3, 1.1, -0.5)),
+        ("EXTENT", Image.Transform.EXTENT, (1, 1, 9, 6)),
+        ("PERSPECTIVE", Image.Transform.PERSPECTIVE,
+         (1.0, 0.1, 0.0, 0.05, 1.0, 0.0, 0.002, 0.001)),
+        ("QUAD", Image.Transform.QUAD, (0, 0, 0, 7, 11, 6, 10, 1)),
+    ]
+    for m in ["L", "RGB", "RGBA"]:
+        im = src(m, 12, 8)
+        tag = f"X_{m}_12x8"
+        open(os.path.join(out, tag + ".src"), "wb").write(im.tobytes())
+        for (cname, meth, data) in cases:
+            for fname, f in filters.items():
+                g = im.transform((10, 6), meth, data, f)
+                open(os.path.join(out, f"{tag}_{cname}_{fname}.dst"), "wb").write(g.tobytes())
+                man.append(f"transform {m} 12 8 {cname} {fname} 10 6")
+
+    # rotate
+    for m in ["L", "RGB"]:
+        im = src(m, 11, 7)
+        tag = f"RO_{m}_11x7"
+        open(os.path.join(out, tag + ".src"), "wb").write(im.tobytes())
+        for ang in [0, 90, 180, 270, 45, 30, -30, 17]:
+            for exp in (0, 1):
+                g = im.rotate(ang, Image.Resampling.NEAREST, bool(exp))
+                open(os.path.join(out, f"{tag}_{ang}_{exp}.dst"), "wb").write(g.tobytes())
+                man.append(f"rotate {m} 11 7 {ang} {exp} {g.size[0]} {g.size[1]}")
+
+    open(os.path.join(out, "MANIFEST"), "w").write("\n".join(man) + "\n")
+    return header("geometry corpus index (images in reference/geometry/)") + man
+
+
+def gen_codecs():
+    """PNG, BMP and TGA reference images, beyond what PngSuite covers.
+
+    PngSuite (tests/fixtures/pillow/pngsuite/) is the conformance corpus and
+    covers PNG exhaustively. This adds what it cannot: the same image written
+    by PILLOW at every option combination, so the comparison is against
+    Pillow's own encoder choices, plus BMP and TGA, which have no suite.
+
+    Covers the cases a codec gets wrong:
+      * PNG at every bit depth, interlaced and not, with and without tRNS
+      * BMP at 1, 4, 8, 24 and 32 bits, bottom-up and top-down, RLE8 and RLE4
+      * TGA uncompressed and RLE, both origins, 8/16/24/32 bits
+      * widths where the row padding bites (BMP pads to 4 bytes, TGA does not)
+    """
+    import random
+    random.seed(4242)
+    out = os.path.join(OUT, "codecs")
+    os.makedirs(out, exist_ok=True)
+    man = []
+
+    def src(m, w, h):
+        base = Image.new("RGB", (w, h))
+        base.putdata([(random.randrange(256), random.randrange(256),
+                       random.randrange(256)) for _ in range(w * h)])
+        return base.convert(m)
+
+    # Widths chosen so BMP's 4-byte row padding is exercised at every residue.
+    sizes = [(11, 7), (8, 8), (1, 1), (1, 17), (17, 1), (13, 4), (16, 3)]
+
+    png_modes = ["1", "L", "LA", "P", "RGB", "RGBA", "I;16"]
+    for m in png_modes:
+        for (w, h) in sizes:
+            im = src(m, w, h)
+            tag = f"PNG_{m.replace(';','_')}_{w}x{h}"
+            for (label, kw) in (("plain", {}), ("inter", {"interlace": True}),
+                                ("opt", {"optimize": True})):
+                path = os.path.join(out, f"{tag}_{label}.png")
+                try:
+                    im.save(path, **kw)
+                except Exception:
+                    continue
+                r = Image.open(path)
+                r.load()
+                open(path + ".exp", "wb").write(r.tobytes())
+                man.append(f"PNG {tag}_{label}.png {r.mode} {r.size[0]} {r.size[1]}")
+
+    bmp_modes = ["1", "L", "P", "RGB"]
+    for m in bmp_modes:
+        for (w, h) in sizes:
+            im = src(m, w, h)
+            tag = f"BMP_{m}_{w}x{h}"
+            path = os.path.join(out, tag + ".bmp")
+            try:
+                im.save(path)
+            except Exception:
+                continue
+            r = Image.open(path)
+            r.load()
+            open(path + ".exp", "wb").write(r.tobytes())
+            man.append(f"BMP {tag}.bmp {r.mode} {r.size[0]} {r.size[1]}")
+
+    tga_modes = ["1", "L", "P", "RGB", "RGBA"]
+    for m in tga_modes:
+        for (w, h) in sizes:
+            im = src(m, w, h)
+            for (label, kw) in (("plain", {}), ("rle", {"rle": True})):
+                tag = f"TGA_{m}_{w}x{h}_{label}"
+                path = os.path.join(out, tag + ".tga")
+                try:
+                    im.save(path, **kw)
+                except Exception:
+                    continue
+                r = Image.open(path)
+                r.load()
+                open(path + ".exp", "wb").write(r.tobytes())
+                man.append(f"TGA {tag}.tga {r.mode} {r.size[0]} {r.size[1]}")
+
+    open(os.path.join(out, "MANIFEST"), "w").write("\n".join(man) + "\n")
+    return header("codec corpus index (images in reference/codecs/)") + man
+
+
 GENERATORS = {
+    "codec_index.txt": gen_codecs,
+    "geometry_index.txt": gen_geometry,
     "resample_index.txt": gen_resample,
     "palette_index.txt": gen_palette,
     "dither_index.txt": gen_dither,
