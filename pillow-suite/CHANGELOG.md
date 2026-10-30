@@ -5,6 +5,64 @@ here only once all five tiers of its gate are green.
 
 ---
 
+## Phase P5 — JPEG and EXIF ✅ (2026-10-30)
+
+**87 checks green.** The corpus in `tests/fixtures/pillow/reference/jpeg/` — 54 files spanning every
+subsampling Pillow writes and five that it cannot, baseline and progressive, restart markers by block
+and by row, greyscale, CMYK, YCCK, quality 1 to 100, `optimize`, and draft mode at 1/2, 1/4 and 1/8 —
+decodes **byte-identically to Pillow**, which is to say to libjpeg-turbo. The encoder is
+**byte-identical to libjpeg** on all 17 baseline cases and pixel-identical on the two progressive
+ones. EXIF written here is read back tag for tag by Python Pillow's `Image.getexif()`.
+
+- `[feature]` **`pillow/codecs/jpeg.b`** — baseline (SOF0/SOF1) and progressive (SOF2) decode: all
+  four of progressive's successive-approximation paths, every subsampling including the ones only
+  `cjpeg` writes (4:1:1, 2x1, 1x2, 4x2, 3x1, mixed), restart markers, JFIF, Adobe APP14, EXIF, ICC
+  profiles reassembled from numbered APP2 segments, CMYK and YCCK with Adobe's inversion, and
+  `draft()`'s scaled decoding. The entropy scan is one function with the bit accumulator in locals
+  and an 8-bit Huffman lookahead — libjpeg's own `HUFF_LOOKAHEAD` trick — because a Bantu call is
+  ~0.3 µs and a per-symbol helper would pay it on every symbol.
+- `[feature]` **JPEG encode** — quality 1–100 with Annex K's tables scaled libjpeg's way, `optimize`
+  (per-image Huffman tables built by T.81 Annex K.2's algorithm, including the 16-bit length limit
+  and the reserved all-ones codeword), `progressive`, the three subsamplings, caller-supplied
+  `qtables`, Pillow's named presets, `quality="keep"`, restart intervals by block or by row, and
+  `dpi`/`exif`/`icc_profile`/`comment` written as JFIF density, APP1, APP2 and COM.
+- `[feature]` **`pillow/jpegdct.b`'s encoder half** — `jpeg_fdct_islow`, `jccolor`'s RGB→YCbCr
+  tables, `jcsample`'s downsamplers *with their alternating rounding bias* (0,1,0,1 for h2v1 and
+  1,2,1,2 for h2v2 — drop it and the image loses half a level of brightness), and `jcdctmgr`'s
+  round-to-nearest-by-magnitude quantisation. All of it vectorised the way the inverse DCT is: ~70
+  array operations per component, whatever the image size.
+- `[feature]` **`pillow/exif.b` and `pillow/exif_tags.b`** — both byte orders, all twelve TIFF field
+  types plus BigTIFF's three, the Exif / GPSInfo / Interop sub-IFDs, MakerNote as raw bytes, the
+  thumbnail IFD, read **and write**; `ExifTags.TAGS / GPSTAGS / IFD / Base / GPS / Interop`
+  generated from Pillow's own dictionaries by `tools/gen_exif_tags.py` rather than retyped. Plus
+  `exif_transpose`, over all eight orientations, which drops the tag from the result as Pillow does.
+- `[feature]` **`Image.draft($mode, $size)`** and **`Image.save($path, $format, $options)`** — save
+  keywords arrive as one dict, because Bantu has no keyword arguments.
+- `[bug fix]` **The scaled inverse DCTs had the 8×8 kernel's constants.** `jpegdct.b`'s `idct4` and
+  `idct2` were carrying `FIX_0_298631336` and friends from `jpeg_idct_islow`, the wrong left shift on
+  the DC term (`CONST_BITS` instead of `CONST_BITS+1`/`+2`) and the wrong descale amounts. The
+  scaled kernels in `jidctred.c` are separate derivations with their own constants; borrowing the
+  8×8 ones produces an image that is recognisable and wrong. Seven of the nine draft fixtures
+  differed from Pillow; all nine are now byte-identical.
+- `[bug fix]` **A module-level variable assigned from inside a function silently stayed null.**
+  `jpegdct.b`'s `_tables()` set `$_CRR` and three siblings, which bound function-locals and left the
+  module variables null, so every colour transform called `nd_take(null, …)`. The cure is the one
+  `codecs/registry.b` already documents — module state lives in a dict — and it is now applied here
+  (decision PW12's neighbourhood).
+- `[found]` **A trailing comma in a Bantu list or dict literal is a syntax error, and inside an
+  `include` it fails silently.** `jpeg_tables.b`'s `$PRESETS` was generated with trailing commas;
+  the include reported success and `$PRESETS` was an empty dict, so every named quality preset was
+  missing with no diagnostic anywhere. The generator no longer emits them. The interpreter swallowing
+  a parse error in an included file is a defect in its own right and is recorded here because the
+  failure mode — a value that is quietly empty — is the worst available one.
+- `[patch]` **`docs/pillow-architecture.md` §6.3 and decision PW9 claimed `draft()` skips the
+  entropy scan.** It does not: scaling happens in the IDCT and the scan is parsed in full at every
+  scale. Measured, 1/8 draft saves 6–9 %, not 90 %. Both are corrected in place rather than quietly
+  dropped, because the reason the claim was wrong is instructive — it assumed a format property
+  (that a resolution pyramid is skippable) that JPEG does not have.
+
+---
+
 ## Phase P4 — PNG, BMP, TGA ✅ (2026-10-28)
 
 **131 checks green.** PngSuite — the canonical 176-file PNG conformance corpus — decodes **162 of

@@ -27,6 +27,7 @@ include "./convert.b" as convert;
 include "./resample.b" as resample;
 include "./transform.b" as xform;
 include "./codecs/registry.b" as registry;
+include "./codecs/jpeg.b" as jpeg;
 
 // Pillow's guard against a decompression bomb, with Pillow's default.
 $CFG = {"MAX_IMAGE_PIXELS": 89478485};
@@ -789,13 +790,63 @@ class PillowImage {
     // each row padded to a whole byte. A 13-wide bilevel image is two bytes
     // per row, not thirteen. Every other mode is its wire element, one value
     // per band per pixel.
+    // draft($mode, $size) -> [mode, box], or null if this image cannot be
+    // drafted. Pillow's own signature, and Pillow's own arithmetic.
+    //
+    // In Pillow this configures a LAZY decode: the file is not read yet, so
+    // draft() only tells libjpeg which scale to use when load() finally
+    // runs. An Image here is never lazy, so draft() re-decodes from the
+    // file bytes the JPEG decoder kept in info["jpeg_src"] -- the result is
+    // identical, the saving is not, and the way to get the saving is to ask
+    // for the scale at open time with pillow.decode_jpeg(data, denom, mode).
+    //
+    // Scaling happens in the IDCT, so the entropy scan is read in full at
+    // every scale; see codecs/jpeg.b on why that is JPEG's fault and not
+    // this implementation's.
+    def draft($mode, $size) {
+        if (this.format != "JPEG" || this.info.jpeg_src == null) { return null; }
+        $ow = this.width;
+        $oh = this.height;
+        $scale = 1;
+        if ($size != null) {
+            if (type($size) != "list" || len($size) != 2) {
+                throw "Image.draft: size must be [width, height]";
+            }
+            if (floor($size[0]) < 1 || floor($size[1]) < 1) {
+                throw "Image.draft: a draft size of " + str($size);
+            }
+            $want = min(floor($ow / floor($size[0])), floor($oh / floor($size[1])));
+            if ($want >= 8) { $scale = 8; }
+            else if ($want >= 4) { $scale = 4; }
+            else if ($want >= 2) { $scale = 2; }
+        }
+        $as = null;
+        if (this.mode == "RGB" && ($mode == "L" || $mode == "YCbCr")) { $as = $mode; }
+        if ($scale > 1 || $as != null) {
+            $spec = jpeg.decode_scaled(this.info.jpeg_src, $scale, $as);
+            this.mode = $spec.mode;
+            this.px = $spec.px;
+            this.size = $spec.size;
+            this.width = $spec.size[0];
+            this.height = $spec.size[1];
+        }
+        return [this.mode, [0, 0, $ow / $scale, $oh / $scale]];
+    }
+
     def tobytes() {
         if (this.mode == "1") { return _packBilevel(this.px); }
         return nd_tobytes(this.px, mode.wire_elem(this.mode));
     }
 
     // ─── output ─────────────────────────────────────────────────────────
-    def save($path, $format) {
+    // save($path, $format, $options) -> the file written. Returns null, as
+    // Pillow's save does.
+    //
+    // $options is Pillow's save keywords as a dict -- {"quality": 95,
+    // "progressive": true}, {"png_filter": 2} -- and is merged onto the
+    // buffer spec the codec receives. Pillow spells these as **kwargs;
+    // Bantu has no keyword arguments, so they arrive as one dict.
+    def save($path, $format, $options) {
         $id = $format;
         if ($id == null) { $id = registry.format_for_path($path); }
         if ($id == null) {
@@ -804,6 +855,23 @@ class PillowImage {
         }
         $spec = {"mode": this.mode, "size": this.size, "px": this.px,
                  "palette": this.palette, "info": this.info};
+        if ($options != null) {
+            if (type($options) != "dict") {
+                throw "Image.save: options must be a dict of Pillow's save keywords";
+            }
+            for $k, $v in $options.items() {
+                if ($k == "dpi" || $k == "exif" || $k == "icc_profile" || $k == "comment") {
+                    // These are info keys in Pillow, and a codec reads them
+                    // from info rather than from the spec's top level.
+                    $inf = {};
+                    for $ik, $iv in $spec.info.items() { $inf[$ik] = $iv; }
+                    $inf[$k] = $v;
+                    $spec.info = $inf;
+                } else {
+                    $spec[$k] = $v;
+                }
+            }
+        }
         $bytes = registry.encode($spec, $id);
         writefile($path, $bytes);
         return null;
@@ -814,7 +882,7 @@ class PillowImage {
     // bplot.show() makes the same accommodation for the same reason.
     def show($title) {
         $p = "/tmp/pillow-show.ppm";
-        this.save($p, "PPM");
+        this.save($p, "PPM", null);
         print("pillow: wrote " + $p + " (" + str(this.width) + "x" +
               str(this.height) + " " + this.mode + ")");
         return $p;

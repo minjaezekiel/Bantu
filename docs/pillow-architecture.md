@@ -72,7 +72,7 @@ The rule that follows, and that every phase is held to:
 
 > **No loop in `pillow` may be proportional to the pixel count.** Loops over bands (≤4), over
 > kernel taps (≤25), over palette entries (≤256), over scanlines of a *codec* (§6) — all fine. A
-> loop over pixels is a defect, and the stress tier (§9) is built to catch one by its timing curve.
+> loop over pixels is a defect, and the stress tier (§10) is built to catch one by its timing curve.
 
 ## 2. The pixel store
 
@@ -165,8 +165,8 @@ pillow/
   stat.b          ImageStat — extrema, count, sum, sum2, mean, median, rms, var, stddev
   math.b          ImageMath — eval over band expressions
   morph.b         ImageMorph — LutBuilder, MorphOp
-  draw.b          ImageDraw — the vector rasteriser (§7)
-  font.b          ImageFont — TrueType and BDF/PCF readers, glyph rasterisation (§7.2)
+  draw.b          ImageDraw — the vector rasteriser (§8)
+  font.b          ImageFont — TrueType and BDF/PCF readers, glyph rasterisation (§8.2)
   path.b          ImagePath
   transform.b     ImageTransform — Affine, Extent, Quad, Mesh
   sequence.b      ImageSequence — Iterator, all_frames
@@ -473,9 +473,32 @@ One reader, one writer, both over a byte string, both parameterised by bit order
 accumulator in a Bantu number, refilled a byte at a time, and exposes `bits(n)`, `peek(n)`,
 `align()`, `skip(n)`, `pos()`. Every codec that reads bits uses it; none reimplements it.
 
+### 6.1.1 Two interpreter facts that decide every codec's shape
+
+Measured on this build, and they matter more to the entropy coders than the formats do:
+
+| | cost |
+|---|---|
+| `$local[$i]` — a list read | ~0.5 µs |
+| `$state.table[$i]` — a list read **through a dict field** | ~25 µs at 1,000 entries, ~500 µs at 20,000 |
+| `f($bigList, …)` — a user function taking a list | the same, per call |
+| `push($state.list, $v)` and `$state.list[$i] = $v` | ~0.5 µs — the *write* paths are in-place |
+| `ord($s[$i])` — a string index | ~1 µs, O(1) in the string's length |
+
+**A Bantu list is copied when it crosses a user function's boundary or comes out of a dict field.**
+The write paths are not, which is what makes the asymmetry easy to miss. So every entropy coder in
+this package is one long function whose tables are *flat locals* with per-component base offsets, the
+byte source arrives as one local copy per scan, and no helper is called per byte, per coefficient or
+per block. The readable arrangement — a `$state` dict of tables and small helpers over it — measured
+100× slower. Decision PW14, written down because nothing about the code says so.
+
 ### 6.2 Format by format
 
-Status after P4: **PNG, BMP, TGA and PPM are done and differentially verified.** PngSuite — the
+Status after P5: **PNG, BMP, TGA, PPM and JPEG are done and differentially verified**, as is EXIF.
+The JPEG corpus — 54 files covering every subsampling Pillow writes and five it cannot, baseline and
+progressive, restart markers, greyscale, CMYK, YCCK, quality 1 to 100, `optimize` and draft at 1/2,
+1/4 and 1/8 — decodes **byte-identically to libjpeg-turbo through Pillow**, and the encoder is
+byte-identical to libjpeg on every baseline case (PW15). PngSuite — the
 canonical 176-file PNG conformance corpus, checked in at `tests/fixtures/pillow/pngsuite/` — decodes
 **162 of 162** readable files pixel-identically to Pillow, and all **14** intentionally-corrupt files
 are refused. A further **238 images written by Pillow itself** at every option combination read back
@@ -494,7 +517,7 @@ files these codecs wrote.
 | **ICO/CUR** | ✅ all sizes, PNG- and BMP-payload | ✅ multi-size | |
 | **PCX/DCX** | ✅ | ✅ | |
 | **XBM/XPM** | ✅ | ✅ XBM | |
-| **WebP** | ✅ lossless (VP8L) and still lossy (VP8) | ✅ lossless | the largest single codec; phased last (§10, P8) |
+| **WebP** | ✅ lossless (VP8L) and still lossy (VP8) | ✅ lossless | the largest single codec; phased last (§11, P8) |
 | **PDF** | — | ✅ | an image wrapped in a one-page document, as Pillow's `PdfImagePlugin` does |
 | **EPS, PSD, DDS, SGI, SUN, IM, MSP, FITS, BLP, PALM** | ✅ read | — | the long tail; read-only, as in Pillow |
 
@@ -522,29 +545,403 @@ what this codec writes by default, so its own output re-reads at array speed), a
 
 ### 6.3 The one place the envelope is genuinely tight
 
-JPEG's entropy-coded scan is a bit-by-bit Huffman walk over every non-zero coefficient. Measured
-cost per coefficient is ~8 interpreted operations, so:
+JPEG's entropy-coded scan is a bit-by-bit Huffman walk over every non-zero coefficient. **Measured
+in P5** on photographic 4:2:0 files, with the decoder shaped as §6.4 and PW14 describe:
 
-| JPEG | coefficients | decode |
-|---|---|---|
-| 640×480 | ~0.3 M | ~1.2 s |
-| 1600×1200 | ~1.9 M | ~7.6 s |
-| 4000×3000 | ~12 M | ~48 s |
+| JPEG | decode | `draft` 1/8 | encode | per pixel |
+|---|---|---|---|---|
+| 320×240 | 0.80 s | 0.73 s | 0.72 s | 10.4 µs |
+| 640×480 | 3.06 s | 2.89 s | 3.12 s | 10.0 µs |
+| 1024×768 | 7.77 s | 7.21 s | 7.59 s | 9.9 µs |
+| 4000×3000 (extrapolated, linear) | ~2 min | ~1.9 min | ~2 min | — |
+
+The estimate this table replaces said 1.2 s for 640×480, from "~8 interpreted operations per
+coefficient". The real figure is ~2.5× that: a coefficient costs a Huffman lookahead, a canonical
+walk when the code is over 8 bits, a receive-and-extend, two pushes and the loop itself, and every
+one of those is a statement at 0.2–0.6 µs (PW14's table). The curve is linear in pixels, which is
+what matters for the rule in §1; the constant is what it is.
 
 Everything *after* the scan is array work and costs a fraction of this. The scan is written in Bantu,
 it is correct, and its cost is published in [`docs/pillow.md`](pillow.md) next to the API rather than
 left for a user to discover. `draft()` — Pillow's own answer, DCT-domain downscaling that decodes a
-1/2, 1/4 or 1/8 image — is implemented, and it makes a thumbnail of a 12 MP JPEG a **0.8 s**
-operation by never decoding the full scan. That is the right fix and it is Pillow's fix.
+1/2, 1/4 or 1/8 image — is implemented, and it shrinks everything after the scan. It does **not**
+shrink the scan itself, which is what this section originally claimed; see §6.4.6 for why that was
+wrong and what draft mode actually costs.
 
 If measurement after P4 shows the full-size scan is the thing users actually hit, the answer is one
 more generic atom — a canonical-prefix-code scanner, which is what `band`/`rotr` are to `hash` — and
 [decision PW9](../pillow-suite/DECISIONS.md) records the trigger for it. It is not added
 speculatively.
 
-## 7. `ImageDraw` and `ImageFont`
+### 6.4 JPEG — the one codec whose reference is not Pillow
 
-### 7.1 The rasteriser
+Every other format in §6.2 has Pillow's own C as its reference. JPEG does not: Pillow hands the file
+to **libjpeg-turbo** and asks for scanlines back. So the thing `jpeg.b` has to match is
+`libjpeg-turbo`'s arithmetic, and `JpegDecode.c` matters only for *which* libjpeg knobs Pillow turns.
+There are four, and reading them first saved implementing three code paths that can never run:
+
+| knob | what Pillow sets | consequence |
+|---|---|---|
+| `out_color_space` | from the rawmode: `JCS_GRAYSCALE`, `JCS_EXT_RGBX`, `JCS_CMYK`, `JCS_YCbCr`, `JCS_YCCK` | **libjpeg does the colour transform**, not Pillow. So `jpeg.b` must reproduce libjpeg's YCbCr→RGB, which is *not* the YCbCr of `convert()` (§5.1) — different constants, different rounding, a different table layout |
+| `scale_num` / `scale_denom` | `1` / `draft`'s 1, 2, 4 or 8 | selects `_min_DCT_scaled_size` 8, 4, 2 or 1 — a *scaled IDCT*, not a resize |
+| `draft` | **always 0** | `decoderconfig` is `(scale, 0)`, so the flag that would turn off fancy upsampling and switch to the fast IDCT is never set. `do_fancy_upsampling` stays `TRUE` and `dct_method` stays `JDCT_ISLOW` even in draft mode |
+| `jpeg_color_space` | only when the rawmode says so | otherwise libjpeg guesses from JFIF / Adobe APP14 / component IDs, and `jpeg.b` has to guess identically |
+
+That third row is the one worth stating plainly, because the obvious reading of `draft()` is wrong:
+**draft mode in Pillow does not mean "fast and approximate".** It means a smaller output from a
+*scaled* IDCT, computed with the same slow-and-exact kernel. The consequence is that `draft()` is
+bit-exact too, and that `use_merged_upsample()` — which requires `do_fancy_upsampling == FALSE` —
+can never fire. One upsampling family, one IDCT family, both exact.
+
+#### 6.4.1 What must be bit-exact, and why each one can be
+
+`libjpeg`'s decode path is five stages. Four are fixed-point integer arithmetic with no freedom in
+them at all, which is why aiming at bit-exactness here is reasonable rather than optimistic:
+
+1. **Entropy decode** — spec-determined. The coefficient values are whatever ITU T.81 says they are;
+   there is nothing to match, only to get right.
+2. **Dequantise** — one multiply per coefficient.
+3. **IDCT** — `jpeg_idct_islow`: the Loeffler–Ligtenberg–Moschytz 12-multiply kernel in 13-bit fixed
+   point, two passes, with `DESCALE` (round-half-up by an arithmetic shift) at three named points.
+   Deterministic to the last bit. libjpeg-turbo's SIMD variants of *islow* are bit-exact with the C
+   kernel by design, which is why this remains a single target on every machine.
+4. **Upsample** — `h2v1_fancy_upsample` / `h1v2_fancy_upsample` / `h2v2_fancy_upsample`: integer
+   triangle filters with an alternating ±1 bias, plus `int_upsample`'s box filter for odd ratios.
+5. **Colour transform** — `ycc_rgb_convert`, three 256-entry integer tables at 16 fractional bits.
+
+#### 6.4.2 The IDCT without a pixel loop
+
+`jpeg_idct_islow` is written as a loop over 8 columns then 8 rows of one block. Transcribed
+literally that is a loop over coefficients, which rule PW2 forbids and which would cost minutes.
+
+The transcription that works keeps the *arithmetic* identical and changes only what each operation is
+applied to. Hold the whole component's coefficients as one `(N, 8, 8)` array — `N` blocks, 8 rows, 8
+columns, in natural (de-zigzagged) order, exactly libjpeg's `JBLOCK` layout. Then:
+
+* **pass 1** reads row `r` of every block as `nd_slice(a, [null, [r, r+1], null])` — an `(N, 1, 8)`
+  view, free — and so computes all 8 columns of all `N` blocks at once. The kernel's 12 multiplies
+  and 32 adds become 12 `nd_multiply`s and 32 `nd_add`s.
+* **pass 2** does the same with column slices.
+
+`DESCALE(x, n)` is `nd_floor_divide(nd_add(x, 1 << (n-1)), 1 << n)` — an arithmetic right shift *is*
+a floor division, and `nd_floor_divide` floors, which is what the C does for negative values too.
+
+The whole IDCT of a component is **~70 array operations, whatever the image size**. One array
+operation per arithmetic step of the kernel, not one per pixel.
+
+Two consequences fall out of the same arrangement:
+
+* The two "all AC terms are zero" short-circuits in the C are *not* reproduced, and do not need to
+  be: they are exact algebraic identities, verified by hand (a DC-only column gives
+  `DESCALE(dc << 13, 11) == dc << 2`, which is the shortcut's `dcval`), and a vectorised kernel
+  cannot branch per column anyway.
+* The C accumulates pass 1 into `int workspace[64]` and would **overflow and wrap** on a
+  deliberately-crafted coefficient block. Our store is `i64`, so it saturates nothing and wraps
+  nothing. On every valid input the two agree; on a hostile one, ours stays arithmetic. This is
+  decision PW11's second case again, recorded in `jpeg.b`'s header.
+
+The scaled IDCTs for `draft()` — `jpeg_idct_4x4`, `jpeg_idct_2x2`, `jpeg_idct_1x1` — are separate
+kernels in the C with their own constants, and are transcribed the same way.
+
+#### 6.4.3 The range-limit table is not a clamp
+
+`libjpeg` ends the IDCT with `range_limit[x & 1023]`, where `range_limit` is the middle of a
+five-segment 1,280-entry table. It is tempting to read that as `clamp(x + 128, 0, 255)` and it very
+nearly is — but only for `x` in `[-512, 511]`. Outside that window the mask **wraps**, and the table
+is built so that the wrap lands on deliberate values rather than on whatever was next in memory.
+
+So `jpeg.b` builds the same 1,024-entry table, generated from the same construction by
+`tools/gen_jpeg_tables.py`, and applies it as `nd_take(table, nd_mod(v, 1024))` — `nd_mod` with a
+positive divisor is exactly a bitwise AND with 1,023, including for negative `v`. One gather for the
+whole component. The colour converter's `range_limit` is a *different* slice of the same table and is
+a genuine clamp over its reachable domain; both are generated, neither is fitted.
+
+#### 6.4.4 Chroma is upsampled by the IDCT, not by the upsampler
+
+This is the detail that decides the whole draft-mode shape, and it is six lines in
+`jpeg_calc_output_dimensions`: libjpeg scales a subsampled component up by choosing a **larger IDCT**
+for it, so the upsampler gets to run 1:1 where it can.
+
+For a 4:2:0 image at `scale_denom = 2`, luma gets the 4×4 IDCT and chroma gets the **full 8×8** one —
+and then nothing is upsampled at all, because both components land at the same size. At
+`scale_denom = 1` both get 8×8 and chroma is upsampled 2×. At `scale_denom = 8` the minimum DCT size
+is 1, and `do_fancy_upsampling && _min_DCT_scaled_size > 1` is false, so the *box* upsamplers run
+instead of the fancy ones. Three different paths through the same file, all reachable from
+`draft()`, all of which have to be selected the way libjpeg selects them.
+
+The edge behaviour is the other half of it. The fancy upsamplers read one sample of context on each
+side, and `jdmainct.c` manufactures that context by **duplicating the first or last real sample
+row**; `h2v1_fancy_upsample`'s first and last column cases are the same duplication done inline. So
+every fancy upsample in `jpeg.b` is written against an edge-clamped neighbour array, which is one
+`nd_slice` of the plane plus one of its own edge row — and the `(cs * 4 + 8) >> 4` first-column case
+is then just the general case with `lastcolsum == thiscolsum`, which is how it is tested.
+
+#### 6.4.5 Where the coefficients live, and the one place memory bites
+
+A baseline scan is decoded once, in order, and never read back — so the entropy decoder emits two
+flat lists, the indices and the values of the **non-zero** coefficients, and one `nd_put` scatters
+them into a zeroed array. Memory is proportional to the non-zero count, which for a photograph is
+~5–15% of the coefficients.
+
+A **progressive** scan cannot do that. Successive-approximation refinement reads each coefficient to
+decide whether to consume a correction bit, so the store has to be randomly readable *during*
+decoding, and `nd_get` at ~2.5 µs would cost more than the scan. So progressive decoding holds the
+coefficients in a flat Bantu list, which costs a `Value` per coefficient — roughly 100 bytes.
+
+| progressive image | coefficients | coefficient store |
+|---|---|---|
+| 640×480 RGB 4:2:0 | 0.46 M | ~46 MB |
+| 1600×1200 RGB 4:2:0 | 2.9 M | ~290 MB |
+| 4000×3000 RGB 4:2:0 | 18 M | ~1.8 GB — refused |
+
+`jpeg.b` therefore enforces a coefficient budget before the first scan is read, the same way
+`MAX_IMAGE_PIXELS` is enforced from the header (PW6), and the error names the limit and the
+alternative rather than letting the machine swap. Baseline files of any size are unaffected. This is
+decision PW13, and the `u8`/`i16` dtype of PW7 does not fix it — a Bantu *list* is the cost, not the
+array.
+
+#### 6.4.6 What `draft()` actually buys, which is not what §6.3 claimed
+
+§6.3 said `draft()` "makes a thumbnail of a 12 MP JPEG a 0.8 s operation by never decoding the full
+scan". **That is wrong, and reading `jdhuff.c` is what showed it.** Scaling happens in the IDCT;
+the entropy-coded scan is parsed in full at every scale, because the amplitude bits of every
+coefficient are interleaved into the bitstream and there is no way to know where the next block
+starts without decoding the current one. libjpeg does exactly the same amount of Huffman work for a
+1/8-scale decode as for a full one.
+
+So what `draft()` saves is stages 3, 4 and 5 — the IDCT drops from 64 to 1 output per block, the
+upsampler and the colour transform shrink with the output, and the output buffer shrinks 64×. In
+Bantu those are the *cheap* stages, so the saving is real but bounded. **Measured in P5: 6–9 %**
+(§6.3's table). The published cost of reading a JPEG is the scan, at every scale.
+
+§6.3's claim is corrected rather than quietly dropped, because the reason it was wrong is
+instructive: it assumed a format property — that a resolution pyramid is skippable — that JPEG does
+not have. What `draft()` *is* still worth having for is correctness: it is the only way to get
+libjpeg's own scaled pixels, which are a scaled IDCT and not a resize of the full-size result, and
+all nine draft fixtures are byte-identical because of it.
+
+**And it needed three kernels, not one.** `jidctred.c`'s 4×4, 2×2 and 1×1 IDCTs are separate
+derivations with their own `FIX` constants, their own left shift on the DC term (`CONST_BITS+1` and
+`CONST_BITS+2`, not `CONST_BITS`) and their own descale amounts (12 and 19; 13 and 20). The draft
+kernels in this package were first written with the 8×8 kernel's constants — the plausible mistake —
+and seven of the nine draft fixtures differed from Pillow. The difference is not subtle in kind but
+it is subtle in appearance: the image is recognisable and wrong, which is exactly the failure a
+differential corpus exists to catch.
+
+### 6.5 EXIF
+
+EXIF is a TIFF file stored inside a JPEG APP1 segment, so `exif.b` is the TIFF tag reader with a
+different entry point — which is why it is written now, in P5, and why `codecs/tiff.b` in P8 will
+*include* it rather than reimplementing it. Both byte orders, all 12 TIFF field types, the four
+sub-IFDs Pillow exposes (`Exif`, `GPSInfo`, `Interop`, `MakerNote` as raw bytes), and
+`ExifTags.TAGS` / `GPSTAGS` / `IFD` / `Base` / `GPS` / `Interop` generated from Pillow's own
+dictionaries rather than retyped.
+
+Two properties are load-bearing and tested as such:
+
+* **An IFD offset chain can point at itself.** A `next IFD` pointer that loops, or a sub-IFD that
+  points back at its parent, is a hang in a naive reader. Every offset is checked against the
+  segment length and against a visited set before it is followed.
+* **A tag's count times its type size can overflow the segment.** Checked before the read, not
+  after — a `LONG` tag claiming 2^31 entries is a header, not an allocation.
+
+Writing is the same structure in reverse, and round-trips through Pillow: `exif.b` writes the
+segment, Pillow's `Image.getexif()` reads back every tag it was given.
+
+## 7. The operation surface
+
+`ImageFilter`, `ImageChops`, `ImageEnhance`, `ImageOps`, `ImageStat`, `ImageMath` and `ImageMorph`
+are, between them, about ninety calls. Almost all of them are three lines once the layer underneath
+is right, and the interesting content is in the handful of places where the obvious implementation is
+subtly not Pillow's.
+
+### 7.1 `ImageFilter` — four unrelated algorithms wearing one name
+
+`image.filter(f)` dispatches to four implementations that share nothing but a signature:
+
+| family | Pillow's implementation | our shape |
+|---|---|---|
+| the ten built-ins, and `Kernel` | `Filter.c`'s `ImagingFilter3x3` / `ImagingFilter5x5` | 9 or 25 shifted multiply-adds, in float32 |
+| `BoxBlur`, `GaussianBlur` | `BoxBlur.c`'s sliding accumulator | one `nd_cumsum` per axis per pass |
+| `RankFilter`, `MedianFilter`, `MinFilter`, `MaxFilter` | `RankFilter.c`'s per-window sort | `nd_sort` along a stacked tap axis |
+| `ModeFilter` | `ModeFilter.c`'s per-window histogram | `nd_bincount` per window offset |
+
+Five things about the convolution are contracts rather than details, and four of the five are
+surprises:
+
+1. **Only 3×3 and 5×5 exist.** `ImagingFilter` rejects every other size with `bad kernel size`, and
+   mode `F` with a mode error. A 7×7 `Kernel` is not slow in Pillow, it is an exception — so it is an
+   exception here, with the same message.
+2. **The kernel is applied vertically flipped.** `kernel[0..2]` multiplies row `y+1`, not `y-1`.
+   Pillow's docstring says so; every built-in kernel is vertically symmetric, so it is invisible until
+   someone writes an asymmetric one. Tested with a deliberately asymmetric kernel, because a
+   symmetric corpus cannot catch a flip.
+3. **The border is copied, not filtered.** The outer one row/column (two, for 5×5) of the output is
+   the *input's* pixels, unweighted. Not zero-padded, not edge-extended — copied. An image smaller
+   than the kernel is returned unchanged.
+4. **The accumulation is `float`, not `double`.** `ss` is a C `float`, so every multiply and every
+   add rounds to 24 bits of mantissa. In f64 the result differs by one on a few pixels in a thousand,
+   which is exactly the kind of difference that looks like a bug in someone's test suite. So each
+   step goes through `pxbuf.to_f32`, in Pillow's order: the three taps of a row are summed into one
+   float32 value, and *that* is added to the accumulator.
+5. **The rounding is folded into the offset.** Pillow does `offset += 0.5` once and then truncates,
+   so the operation is round-half-up for a positive sum and *toward zero* for a negative one. And the
+   kernel itself is pre-divided by `scale` in float32 — `kerneldata[i] /= divisor` — so the divided
+   weights, not the integer ones, are what multiply the pixels.
+
+#### 7.1.1 The box blur is a prefix sum, and that is the whole trick
+
+`ImagingLineBoxBlur32` is a classic sliding accumulator: one add and one subtract per output pixel,
+left to right, so it costs the same for radius 1 and radius 100. Written out it is a loop over
+pixels with a carried dependency — the shape rule PW2 exists to forbid.
+
+But a sliding window sum *is* a difference of prefix sums, and `nd_cumsum` computes all the prefix
+sums in one call. Reading the C closely, each output is
+
+```
+bulk(x) = ww · Σ C(i) for i in [x−r, x+r]  +  fw · (C(x−r−1) + C(x+r+1))
+out(x)  = (bulk(x) + 2²³) >> 24
+```
+
+where `C(i)` is the row clamped at both edges, `r = (int)radius`, `ww = (1<<24)/(radius·2+1)`
+computed in **float32 and truncated**, and `fw = ((1<<24) − (r·2+1)·ww)/2` in integers. `fw` is the
+weight of the two fractional-radius pixels at the window's edges, which is how a float radius works
+at all.
+
+So the whole thing becomes: one `nd_cumsum` along the axis, two gathers for the window ends, two more
+for the fractional pixels, and the integer combination — **six array operations per pass per axis**,
+independent of radius. The edge clamping that the C does with its `edgeA`/`edgeB` case analysis
+becomes clamped index arrays, which is also why the degenerate `radius ≥ width` case needs no special
+code: the indices simply all clamp.
+
+`GaussianBlur` is this box blur run **three times per axis** with the radius transformed by
+Gwosdek et al.'s formula — `_gaussian_blur_radius`, which solves for the box length whose triple
+convolution has the requested variance. It is not a Gaussian kernel and `pillow` does not substitute
+one (PW4): Pillow's approximation is the contract.
+
+`UnsharpMask` is `GaussianBlur(radius, 3)` plus a thresholded difference, where
+`diff * percent / 100` is **C integer division, truncating toward zero**, which for a negative `diff`
+is not the floor. `transform.b`'s `_truncToward0` is reused for it rather than rediscovered.
+
+#### 7.1.2 Rank filters sort a stack, not a window
+
+`RankFilter(size, rank)` takes the `rank`-th smallest of the `size²` pixels in a window. Pillow
+expands the image by `size // 2` with edge replication (`ImagingExpand`), then runs
+`RankFilter.c`'s per-window insertion sort.
+
+A sort per pixel is a pixel loop. The arrangement that is not: expand once, build the `size²` shifted
+views as a new axis — `nd_slice` each, which is free — stack them into one `(h, w, bands, k²)` array,
+and `nd_sort` along the last axis. One sort call for the whole image; the loop is over **taps**,
+which PW2 permits. `MedianFilter`, `MinFilter` and `MaxFilter` are this with rank `k²/2`, `0` and
+`k²−1`, exactly as Pillow derives them.
+
+`ModeFilter` is the odd one out: it needs the most frequent value in each window, with Pillow's
+tie-break (values occurring once or twice are ignored, and the *current* pixel wins if nothing else
+does). `nd_bincount` over the stacked taps gives the counts; the tie-break is then a comparison
+chain over the 256 bins, which is a loop over **bins**.
+
+### 7.2 `ImageChops` — twenty-four operations and two rounding regimes
+
+The twenty-four channel operations are one-liners over whole arrays. What matters is that `Chops.c`
+has **two** macros and they do not round the same way:
+
+* `CHOP` computes in `int` and clamps to `[0, 255]`.
+* `CHOP2` computes in `int` and **assigns to a `UINT8`** — so it wraps modulo 256.
+
+`add_modulo` and `subtract_modulo` use the second deliberately; that is their entire purpose.
+`difference`, `soft_light`, `hard_light` and `overlay` also use it, and for those the wrap is
+*unreachable* — each expression is provably within `[0, 255]` for 8-bit inputs, which is checked by
+evaluating the extremes rather than assumed. They are implemented with the wrap, and the test states
+the bound that makes the wrap unobservable.
+
+Three further contracts: the output size is the **minimum** of the two inputs in each axis (not an
+error, not a union); `logical_and`/`or`/`xor` require *both* images to be mode `1`; and
+`add`/`subtract` divide by a **float** `scale` and then truncate toward zero before clamping.
+
+### 7.3 `ImageOps` — look-up tables, and the three that are not
+
+Most of `ImageOps` is a 256-entry look-up table applied with `point()`, which is one `nd_take`
+(§2). `autocontrast`, `equalize`, `posterize`, `solarize`, `invert` and `colorize` build a table and
+hand it over; the interesting part of each is the table's integer arithmetic, which is reproduced
+statement for statement because each one has a quirk:
+
+* `autocontrast`'s cutoff removes pixels from the histogram ends with `int(n * cutoff // 100)`, and
+  its mapping is `int(ix * scale + offset)` — a truncation of a float32-free double, clamped after.
+  If `hi <= lo` it returns the identity table rather than dividing by zero.
+* `equalize`'s step is `(sum(histo) − histo[−1]) // 255` where `histo` is the histogram **with zero
+  bins removed** — so the last *non-zero* bin is subtracted, not bin 255. Then `n` starts at
+  `step // 2` and the table entry is `n // step`. Getting this wrong gives a plausible, wrong,
+  slightly-too-bright image.
+* `colorize` interpolates with `i * (hi − lo) // len(range_map)` — floor division per channel, and
+  the three segments are built with separate ranges whose lengths differ.
+* `_lut` refuses mode `P` unless the table is to be applied to the **palette** rather than the
+  indexes, which is why `invert`, `posterize` and `solarize` pass `palette=True` and `autocontrast`
+  and `equalize` do not. A `P` image through `autocontrast` raises `NotImplementedError` in Pillow;
+  it raises here too, with Pillow's message.
+
+The three that are not look-up tables — `contain`, `cover`, `fit`, `pad`, `scale`, `deform` — are
+geometry, and they are composition over P3's `resize` and `transform`. Their content is the rounding
+of the target size (`round`, which is banker's rounding in Python, not `floor(x + 0.5)`) and the
+`centering` arithmetic, both of which are reproduced exactly because an off-by-one in a thumbnail
+size is a visible difference.
+
+`exif_transpose` belongs here and needs P5: it reads the orientation tag, applies one of seven
+transpositions, and **removes the tag from the copy it returns**, including from `info["exif"]` so
+that a subsequent save does not rotate the image twice.
+
+### 7.4 `ImageStat` is the histogram, and nothing but
+
+Every `Stat` property is derived from `histogram()` — including `extrema`, which therefore reports
+`(0, 255)` bins for `I` and `F` images rather than true extrema. That is a documented Pillow wart
+(its own docstring says to use `getextrema()` instead), so it is reproduced: `count` is the bin sum,
+`sum` is `Σ j·h[j]`, `median` is the first bin where the running sum **exceeds** half the count, and
+`var` is `(sum2 − sum²/count)/count` — the computational form, with its cancellation, not the
+two-pass form.
+
+### 7.5 `ImageMath` — an expression evaluator, and six operators Bantu's arrays did not have
+
+`ImageMath` evaluates arithmetic over whole images in mode `I` (int32) or `F` (float32), converting
+`1`/`L` up to `I` and mixing modes by promoting both to `F`. The operator semantics come from
+`_imagingmath.c` and three of them are not what the host language would do:
+
+* **division by zero yields zero**, for both int and float. It is not an error and not an infinity.
+* integer division and `%` are **C's**: truncating, with `%` taking the sign of the dividend.
+* `pow` is `(int)(pow(x, y) + 0.5)` clamped to int32 for mode `I` — rounded, not truncated, and
+  saturating rather than wrapping.
+
+Pillow's entry points are `lambda_eval(f, **kw)`, which calls a *callable* with a dict of operands,
+and `unsafe_eval(expr, **kw)`, which compiles a Python expression. The first maps onto Bantu directly
+— pass a Bantu function, receive a dict. The second cannot: there is no Python to compile. So
+`math.b` ships **a small expression evaluator for exactly the grammar Pillow's examples use** —
+`+ - * / % ** & | ^ << >> ~` with Python's precedence, the comparisons, parentheses, numbers, names,
+and the named functions `abs min max convert float int equal notequal`. An expression outside that
+grammar is a parse error naming the offending token, not a silent misread. That is the honest
+mapping, and `docs/pillow.md` states the grammar rather than implying that arbitrary Bantu is
+evaluated.
+
+**The six operators `numba` was missing.** `&`, `|`, `^`, `~`, `<<` and `>>` have no `nd_*` form:
+NumPy has all six, `numba` had none, so there was no way to do bitwise arithmetic on an array at all
+— not in `pillow`, not in a hash, not in a bitset. Doing it in Bantu means 32 array passes per
+operation, one per bit. This is the same kind of gap as P1's two atoms: general, not
+`pillow`-specific, and a defect in `numba` rather than a missing feature of this package. So
+`nd_bitwise_and`, `nd_bitwise_or`, `nd_bitwise_xor`, `nd_bitwise_not`, `nd_left_shift` and
+`nd_right_shift` were added to `numba`, integer-only (a float operand is an error, as in NumPy),
+with `>>` arithmetic on negatives — and `jpeg.b`'s `& 1023` and `DESCALE` use them too.
+
+### 7.6 `ImageMorph` — a 512-entry look-up table over the 3×3 neighbourhood
+
+Binary morphology on mode `1` images, where the operation is defined entirely by a table indexed by
+the nine neighbours as nine bits. `LutBuilder` compiles a pattern language (`4:(... .1. 111)->1`,
+with rotation, mirror and negate operators) into that table; `MorphOp.apply` applies it.
+
+Applying it is nine shifted comparisons, a weighted sum, and one `nd_take` of the 512-entry table —
+no pixel loop, and the same arrangement for every pattern anyone writes. `match` and `get_on_pixels`
+return coordinate lists, which `nd_nonzero` answers directly. The border is left at zero, as
+`_imagingmorph.c` leaves it.
+
+## 8. `ImageDraw` and `ImageFont`
+
+### 8.1 The rasteriser
 
 `ImageDraw` is vector drawing onto a raster, which is per-pixel by nature — so it is written the way
 §1.1 demands:
@@ -563,14 +960,14 @@ speculatively.
 - **`width=`** on lines and outlines, `joint="curve"`, and the `ImagePath`/`ImageDraw.Outline`
   surfaces all behave as Pillow's do.
 
-### 7.2 Fonts
+### 8.2 Fonts
 
 `ImageFont.load_default()` returns an embedded bitmap font, so text works with no file and no
 dependency.
 
 `ImageFont.truetype(path, size)` is a **TrueType reader written in Bantu**: `cmap` (formats 0, 4, 6,
 12), `glyf`/`loca` outlines, `hmtx` advances, `kern`/`GPOS` pair kerning, and composite glyphs
-decomposed. Quadratic curves are flattened by integer Bernstein weights and filled through §7.1's
+decomposed. Quadratic curves are flattened by integer Bernstein weights and filled through §8.1's
 scanline filler. Per-glyph cost is proportional to glyph *area*, and a glyph is small — a 24 px
 label is a few thousand pixels in total, and the glyph is **cached by (font, size, codepoint)** so a
 repeated character is a slice copy. `getbbox`, `getlength`, `getmask`, `font_variant`, the
@@ -581,7 +978,7 @@ There is prior art in this repository: bplot's raster backend already renders De
 integer outline tables generated by `scripts/gen_font_tables.b`, *a TrueType reader written in
 Bantu*. `font.b` is that reader, promoted to run at load time over an arbitrary font file.
 
-## 8. Security
+## 9. Security
 
 An imaging library is a parser of hostile input. This is the attack surface of the whole package, and
 it is designed, not patched.
@@ -602,7 +999,7 @@ truncated at every length; with every length field replaced by 0, 1, `2^31−1` 
 is that **no input crashes the interpreter and no input hangs it** — every failure is a catchable
 error.
 
-## 9. The test gate
+## 10. The test gate
 
 Five tiers, all green before a phase advances — the gate `numba` and `bplot` use:
 
@@ -610,7 +1007,7 @@ Five tiers, all green before a phase advances — the gate `numba` and `bplot` u
 |---|---|---|
 | 1. **feature** | every call does what it claims, including its failure modes | `tests/pillow_*_test.b`, ending `RESULT: ALL GREEN` |
 | 2. **differential** | the output is *right*, not merely stable — **byte-identical to Python Pillow** | `tests/pillow_differential.sh` writes the same operation from both and compares. Where Pillow is unavailable, checked-in golden files generated from it |
-| 3. **stress** | it survives size, repetition and abuse | scale (and the **timing curve is asserted linear**, which is how a pixel loop gets caught) · degenerate (0×0, 1×1, 1×65535) · hostile (§8's fuzz corpus) · memory |
+| 3. **stress** | it survives size, repetition and abuse | scale (and the **timing curve is asserted linear**, which is how a pixel loop gets caught) · degenerate (0×0, 1×1, 1×65535) · hostile (§9's fuzz corpus) · memory |
 | 4. **regression** | nothing else broke | the whole existing suite on the same build |
 | 5. **sanitizers** | no latent memory defect | ASan + UBSan over the two native atoms of §4 |
 
@@ -620,7 +1017,7 @@ produces the same bytes. Where it cannot — JPEG encoding, which depends on the
 quantisation choices — the test asserts a PSNR floor against Pillow's output and the difference is
 documented.
 
-## 10. Phases
+## 11. Phases
 
 Each is a working, tested increment; nothing is merged half-built. Detail, with per-item test
 columns, in [`pillow-suite/ROADMAP.md`](../pillow-suite/ROADMAP.md).
@@ -632,7 +1029,7 @@ columns, in [`pillow-suite/ROADMAP.md`](../pillow-suite/ROADMAP.md).
 | **P2** ✅ | `mode.b`, `image.b`, `convert.b`, `color.b`, `palette.b` — the object model, the full mode matrix, `new`/`frombytes`/`fromarray`/`tobytes`, `copy`/`crop`/`paste`/`split`/`merge`/`getpixel`/`putpixel`/`point`/`getbbox`/`getextrema`/`histogram`, PPM read+write | the core, and PPM makes it testable end to end on the first day |
 | **P3** ✅ | `resample.b` — the six filters, `resize`/`rotate`/`transpose`/`thumbnail`/`reduce`/`transform`; `transform.b`, `path.b` | every later phase wants to resize |
 | **P4** ✅ | `codecs/png.b`, `codecs/bmp.b`, `codecs/tga.b` | PNG is the format that matters most and the one P1 unblocked |
-| **P5** | `codecs/jpeg.b` — baseline, progressive, `draft`, encode; `exif.b` | the second format that matters most |
+| **P5** ✅ | `codecs/jpeg.b` — baseline, progressive, `draft`, encode; `exif.b`, `exif_tags.b` | the second format that matters most |
 | **P6** | `filter.b`, `chops.b`, `enhance.b`, `ops.b`, `stat.b`, `math.b`, `morph.b` | the operation surface, once there is something to operate on |
 | **P7** | `draw.b`, `font.b`, `path.b` | drawing and text |
 | **P8** | `codecs/gif.b` (+ `sequence.b`), `tiff.b`, `ico.b`, `pcx.b`, `xbm.b`, `webp.b`, the read-only long tail, PDF write | the rest of the formats, in descending order of use |

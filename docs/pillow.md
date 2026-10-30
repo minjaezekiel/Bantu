@@ -35,7 +35,7 @@ tests/pillow_differential.sh            # live, against Python's Pillow
 
 ## ⚠ What is in this build, and what is not
 
-`pillow` is being built in nine phases. **This is phase P4 of 9.** The table below is the honest
+`pillow` is being built in nine phases. **This is phase P5 of 9.** The table below is the honest
 state; nothing is stubbed to look present.
 
 | | status |
@@ -52,8 +52,9 @@ state; nothing is stubbed to look present.
 | **PPM / PGM / PBM** (P1–P6), 8- and 16-bit, read + write | ✅ |
 | **DEFLATE / zlib / gzip**, both directions | ✅ |
 | **The plugin registry** — `register_codec`, sniffing, `registered_extensions` | ✅ |
+| **JPEG** — baseline and progressive, every subsampling, restart markers, CMYK/YCCK, `draft`, read + write | ✅ **54 of 54 corpus files byte-identical to Pillow**, and the encoder byte-identical to libjpeg |
+| **`ExifTags`** — `TAGS GPSTAGS IFD Base GPS Interop`, EXIF read + write, `exif_transpose` | ✅ |
 | `quantize` (and `RGBA → P`, which needs it) | ⏳ P6 |
-| **JPEG**, `ExifTags` | ⏳ P5 |
 | `ImageFilter ImageChops ImageEnhance ImageOps ImageStat ImageMath ImageMorph` | ⏳ P6 |
 | `ImageDraw`, `ImageFont` | ⏳ P7 |
 | GIF, TIFF, ICO, WebP, PCX, XBM, the read-only long tail, PDF write | ⏳ P8 |
@@ -318,6 +319,30 @@ Two Pillow behaviours worth knowing: a **16-bit truecolour PNG comes back as 8-b
 byte of each sample is dropped) and **16-bit grey+alpha comes back as RGBA**, not LA. Both are
 matched.
 
+**JPEG** — baseline (SOF0/SOF1) and **progressive** (SOF2); every subsampling, including the ones
+Pillow cannot write (4:1:1, 2x1, 1x2, 4x2, 3x1 and mixed factors); restart markers; JFIF, Adobe
+APP14, EXIF and ICC profiles split across APP2 segments; greyscale, RGB, CMYK and YCCK with Adobe's
+inversion. Writes 1, L, RGB, RGBX, CMYK and YCbCr.
+
+```bantu
+$im = pillow.open("photo.jpg");
+$im.save("out.jpg", null, {"quality": 90, "subsampling": 2, "progressive": true});
+$im.save("out.jpg", null, {"quality": "web_high"});        // Pillow's presets
+$im.save("out.jpg", null, {"quality": "keep"});            // the file's own tables
+$im.info.jpeg_qtables                                      // and they come back
+$im.info.jpeg_subsampling                                  // 0, 1, 2 or -1
+```
+
+Save options: `quality` (1–100, `"keep"`, or a preset name), `optimize`, `progressive`,
+`subsampling` (0 = 4:4:4, 1 = 4:2:2, 2 = 4:2:0, or `"keep"`), `qtables` (a list of 64-entry tables
+in natural order), `restart_marker_blocks`, `restart_marker_rows`, and `dpi`, `exif`, `icc_profile`
+and `comment` as info keys. The defaults are libjpeg's: quality 75, 4:2:0.
+
+**`draft($mode, $size)`** decodes through libjpeg's *scaled* IDCT at 1/2, 1/4 or 1/8 — a smaller
+image with the slow exact kernel, not a resize, and bit-exact with Pillow's. It can also ask a
+3-component file for `L` or `YCbCr`, which is libjpeg's `out_color_space` and not a conversion of the
+RGB result. **It does not make reading faster** (below).
+
 **BMP** — 1, 4, 8, 16, 24 and 32 bits; `BITMAPCOREHEADER`, `BITMAPINFOHEADER` and the V2–V5
 extensions; uncompressed, RLE4, RLE8 and BITFIELDS; bottom-up and top-down. Writes 1, L, P and RGB.
 **The writer drops alpha**, as Pillow's does — save an RGBA image and it reads back as RGB.
@@ -345,6 +370,39 @@ pillow.register_codec("MYFMT", ["mft"], "image/x-myfmt",
 A codec deals in **pixel buffers**, never in `Image` objects — that is what keeps the array layer
 independent of the object layer. Pass `null` for the sniffer (found by extension instead) or for the
 saver (read-only).
+
+---
+
+## EXIF
+
+EXIF is a TIFF block inside a JPEG's APP1 segment, so one tag reader serves both (and `codecs/tiff.b`
+will use it in P8 rather than repeat it).
+
+```bantu
+$ex = pillow.getexif($im);                       // Image.getexif()
+pillow.exif_get($ex, "ifd0", 274);               // Orientation
+pillow.exif_get($ex, "exif", 33434);             // ExposureTime, as [n, d]
+pillow.exif_get($ex, "gps", 2);                  // GPSLatitude
+pillow.exif_tag_name(271);                       // "Make"
+pillow.TAGS() pillow.GPSTAGS() pillow.IFD() pillow.ExifBase() pillow.GPS() pillow.Interop()
+
+$ex = pillow.exif_empty();
+pillow.exif_put($ex, "ifd0", 274, 6);
+$im.save("out.jpg", null, {"exif": pillow.exif_tobytes($ex)});
+
+$upright = pillow.exif_transpose($im);           // ImageOps.exif_transpose
+```
+
+Values follow Pillow's rules: count 1 is a scalar, ASCII is a string with one trailing NUL stripped,
+`UNDEFINED` and multi-byte `BYTE` are byte strings, a rational is `[numerator, denominator]`, and
+anything else with a count above one is a list. The IFDs are `ifd0`, `exif`, `gps`, `interop` and
+`ifd1` (the thumbnail directory); `makernote` is kept as raw bytes and `thumbnail` as the embedded
+JPEG, if there is one.
+
+Both hostile shapes are handled rather than hit: an **IFD chain that points at itself** raises
+instead of hanging (every offset is checked against the block length and a visited set), and a tag
+whose **count × type size overshoots the block** is skipped before the read, not after — a `LONG` tag
+claiming 2³¹ entries is a header, not an allocation.
 
 ---
 
@@ -386,6 +444,34 @@ Measured on a 1080p RGB image (6,220,800 channel values), Darwin/Apple silicon:
 | `getpixel()` | ~2.5 µs **each** |
 
 A 60,000-pixel RGB **PNG writes in 13 ms and reads in 8 ms**.
+
+### JPEG is the slow one, and here is the number
+
+A JPEG's entropy-coded scan is a bit-by-bit Huffman walk over every non-zero coefficient, and it is
+sequential by construction: the amplitude bits of one coefficient sit between its neighbours' Huffman
+codes, so nothing says where the next block starts until the current one is decoded. That is the one
+place in this package where the no-pixel-loop rule cannot hold, and the cost is published here rather
+than left to be discovered. Measured on photographic 4:2:0 files:
+
+| JPEG | decode | `draft` 1/8 | encode |
+|---|---|---|---|
+| 320×240 | 0.80 s | 0.73 s | 0.72 s |
+| 640×480 | 3.06 s | 2.89 s | 3.12 s |
+| 1024×768 | 7.77 s | 7.21 s | 7.59 s |
+
+About **10 µs per pixel**, linear, at every scale. Two consequences worth planning around:
+
+* **`draft()` does not make reading faster.** It saves 6–9 %, because scaling happens in the IDCT and
+  the scan is read in full whatever the scale — libjpeg does the same amount of Huffman work for a
+  1/8 decode as for a full one. Use it for libjpeg's exact scaled pixels and for the smaller output
+  buffer, not for speed.
+* **A progressive JPEG has a coefficient budget.** Successive approximation has to read coefficients
+  back while decoding, so they are held in a Bantu list at ~100 bytes each. Over 6 M coefficients
+  (about 2 MP at 4:2:0) the decoder refuses by name and says how to proceed —
+  `pillow.jpeg_set_max_progressive_coeffs($n)` if the memory is there, or re-save as baseline.
+  Baseline files of any size are unaffected.
+* **An open JPEG keeps its file bytes** in `info["jpeg_src"]`, which is what `draft()` re-decodes
+  from, since an `Image` here is never lazy. That is the file's own size, per open image.
 
 **The rule the whole design exists to satisfy:** no operation is proportional to the pixel count in
 *interpreted* work. An interpreted per-pixel pass over a 1080p image costs 4.1 s; the same operation

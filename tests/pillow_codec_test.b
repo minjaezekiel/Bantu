@@ -357,7 +357,8 @@ eq(pillow.open_bytes($td, null).getdata(), $cross.getdata(), "a top-down TGA rou
 // ─── format identification ──────────────────────────────────────────────
 print("── identification ──");
 
-eq(pillow.formats(), ["PNG", "BMP", "TGA", "PPM"], "four formats are registered");
+eq(pillow.formats(), ["PNG", "BMP", "JPEG", "TGA", "PPM"],
+   "five formats are registered, TGA last because it has no magic number");
 eq(pillow.registered_extensions()[".png"], "PNG", "the .png extension");
 eq(pillow.registered_extensions()[".bmp"], "BMP", "the .bmp extension");
 eq(pillow.registered_extensions()[".tga"], "TGA", "the .tga extension");

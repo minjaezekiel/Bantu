@@ -12,8 +12,11 @@ machine with no Python and no Pillow.
 Fixtures land in tests/fixtures/pillow/reference/ as flat, line-oriented text, because a
 Bantu test has to parse them with split() and nothing else.
 
-Requires Pillow. If the installed version differs from the one that produced the checked-in
-files, the header line records both so a mismatch is explicable rather than mysterious.
+Requires Pillow. Each file's header records the Pillow that produced it, and a run whose Pillow
+differs from the checked-in files' REFUSES to write rather than quietly replacing one version's
+answers with another's -- pass --force if that is what you mean, or --only <index> to touch just the
+files this Pillow produced. The JPEG corpus (jpeg_index.txt, reference/jpeg/) was produced by
+Pillow 12.3.0; everything else by 13.0.0.
 """
 
 import argparse
@@ -531,7 +534,234 @@ def gen_codecs():
     return header("codec corpus index (images in reference/codecs/)") + man
 
 
+
+def gen_jpeg():
+    """JPEG reference images: the corpus phase P5's codec is held to.
+
+    Pillow hands a JPEG to libjpeg-turbo, so this fixture is really a
+    recording of libjpeg's arithmetic -- the entropy decoder, jidctint.c's
+    IDCT, jdsample.c's fancy upsamplers and jdcolor.c's colour transform.
+    `pillow` has to reproduce all four exactly, and these files are how that
+    is checked without Pillow present.
+
+    Covers, in order of what a JPEG decoder gets wrong:
+      * every subsampling Pillow can write (4:4:4, 4:2:2, 4:2:0) at sizes
+        that are and are not multiples of the MCU, down to 1x1
+      * the samplings Pillow CANNOT write, produced with cjpeg: 4:1:1, 2x1,
+        1x2, 4x2 and the 3x-wide odd ratios that take the box upsampler
+      * progressive, with and without subsampling, and progressive with
+        restart markers -- the successive-approximation paths
+      * restart markers in a baseline scan
+      * greyscale, CMYK (Adobe, transform 0) and YCCK (transform 2)
+      * quality 1, 10, 100 and `optimize`, which change the tables rather
+        than the structure
+      * draft mode at 1/2, 1/4 and 1/8, which is a SCALED IDCT and so has
+        its own three kernels and its own upsampling ratios
+    """
+    import random
+    import subprocess
+
+    random.seed(5151)
+    out = os.path.join(OUT, "jpeg")
+    os.makedirs(out, exist_ok=True)
+    man = []
+
+    def pattern(w, h, mode="RGB"):
+        """A pattern with real high-frequency content: a flat ramp quantises to
+        nothing and would pass with the IDCT wired wrong."""
+        im = Image.new(mode, (w, h))
+        px = im.load()
+        for y in range(h):
+            for x in range(w):
+                n = random.randrange(48)
+                if mode == "RGB":
+                    px[x, y] = ((x * 37 + y * 11 + n) % 256,
+                                (x * 7 + y * 53 + n) % 256,
+                                (x * 101 + y * 3 + n) % 256)
+                elif mode == "L":
+                    px[x, y] = (x * 13 + y * 29 + n) % 256
+                elif mode == "CMYK":
+                    px[x, y] = ((x * 37 + n) % 256, (y * 53 + n) % 256,
+                                ((x + y) * 17) % 256, (x * y + n) % 256)
+        return im
+
+    def record(tag, path, denom=1):
+        r = Image.open(path)
+        if denom != 1:
+            r.draft(None, (max(1, r.size[0] // denom), max(1, r.size[1] // denom)))
+        r.load()
+        open(path + ".exp", "wb").write(r.tobytes())
+        man.append(f"{tag} {os.path.basename(path)} {r.mode} "
+                   f"{r.size[0]} {r.size[1]} {denom}")
+
+    # ── what Pillow itself writes ──
+    for (w, h) in [(16, 16), (17, 13), (1, 1), (2, 3), (64, 48), (31, 32)]:
+        for ss in (0, 1, 2):
+            tag = f"rgb_{w}x{h}_ss{ss}"
+            path = os.path.join(out, tag + ".jpg")
+            pattern(w, h).save(path, "JPEG", quality=90, subsampling=ss)
+            record(tag, path)
+
+    for (w, h) in [(17, 13), (1, 1), (64, 48)]:
+        tag = f"gray_{w}x{h}"
+        path = os.path.join(out, tag + ".jpg")
+        pattern(w, h, "L").save(path, "JPEG", quality=85)
+        record(tag, path)
+
+    for q in (1, 10, 50, 100):
+        tag = f"rgb_q{q}_32x32"
+        path = os.path.join(out, tag + ".jpg")
+        pattern(32, 32).save(path, "JPEG", quality=q)
+        record(tag, path)
+
+    tag = "rgb_opt_32x32"
+    path = os.path.join(out, tag + ".jpg")
+    pattern(32, 32).save(path, "JPEG", quality=70, optimize=True)
+    record(tag, path)
+
+    for (tag, kw) in (("rgb_prog_ss0_33x25", dict(progressive=True, subsampling=0)),
+                      ("rgb_prog_ss2_33x25", dict(progressive=True, subsampling=2)),
+                      ("rgb_prog_rst_33x25", dict(progressive=True, subsampling=2,
+                                                  restart_marker_blocks=3)),
+                      ("rgb_rst_33x25", dict(restart_marker_blocks=2)),
+                      ("rgb_rst_rows_33x25", dict(restart_marker_rows=1))):
+        path = os.path.join(out, tag + ".jpg")
+        pattern(33, 25).save(path, "JPEG", quality=80, **kw)
+        record(tag, path)
+
+    tag = "gray_prog_33x25"
+    path = os.path.join(out, tag + ".jpg")
+    pattern(33, 25, "L").save(path, "JPEG", quality=80, progressive=True)
+    record(tag, path)
+
+    # ── CMYK: Adobe transform 0, and the same file read as YCCK ──
+    tag = "cmyk_17x13"
+    path = os.path.join(out, tag + ".jpg")
+    pattern(17, 13, "CMYK").save(path, "JPEG", quality=90)
+    record(tag, path)
+
+    # Flipping APP14's transform byte to 2 makes libjpeg read the SAME
+    # coefficients through its YCCK path, which is the only way to get a YCCK
+    # reference without an encoder that writes one.
+    raw = bytearray(open(path, "rb").read())
+    i = raw.find(b"Adobe")
+    assert i > 0 and raw[i - 3] == 0xEE, "no APP14 Adobe segment to patch"
+    raw[i + 11] = 2            # the transform byte: 0 CMYK, 2 YCCK
+    ycck = os.path.join(out, "ycck_17x13.jpg")
+    open(ycck, "wb").write(bytes(raw))
+    record("ycck_17x13", ycck)
+
+    # ── draft mode: a scaled IDCT at every denominator ──
+    for (base, ss) in (("64x48", 2), ("64x48", 0), ("17x13", 0)):
+        w, h = (int(v) for v in base.split("x"))
+        for denom in (2, 4, 8):
+            tag = f"draft_{base}_ss{ss}_d{denom}"
+            path = os.path.join(out, tag + ".jpg")
+            pattern(w, h).save(path, "JPEG", quality=85, subsampling=ss)
+            record(tag, path, denom)
+
+    # ── the samplings Pillow cannot write: cjpeg, if it is here ──
+    have_cjpeg = subprocess.run(["cjpeg", "-version"], capture_output=True).returncode in (0, 1)
+    if have_cjpeg:
+        ppm = os.path.join(out, "_src.ppm")
+        pattern(35, 27).save(ppm)
+        for sample in ("4x1", "2x1", "1x2", "4x2", "3x1", "1x1,2x2,2x2"):
+            tag = "samp_" + sample.replace(",", "_").replace("x", "X")
+            path = os.path.join(out, tag + ".jpg")
+            r = subprocess.run(["cjpeg", "-quality", "85", "-sample", sample,
+                                "-outfile", path, ppm], capture_output=True)
+            if r.returncode != 0 or not os.path.exists(path):
+                continue
+            record(tag, path)
+        for extra in (["-progressive"], ["-restart", "1"],
+                      ["-progressive", "-restart", "1"], ["-grayscale"],
+                      ["-optimize", "-sample", "4x1"]):
+            tag = "cj_" + "_".join(e.strip("-") for e in extra)
+            path = os.path.join(out, tag + ".jpg")
+            r = subprocess.run(["cjpeg", "-quality", "80"] + extra +
+                               ["-outfile", path, ppm], capture_output=True)
+            if r.returncode != 0 or not os.path.exists(path):
+                continue
+            record(tag, path)
+        os.remove(ppm)
+
+    # ── the encoder's side: Pillow's own bytes, for the same source and
+    # options, so the comparison is byte-for-byte where it can be ──
+    #
+    # The source is stored as RAW BYTES per mode rather than as an image, so
+    # the Bantu test reconstructs it with frombytes and no codec is in the
+    # way of the comparison.
+    esrc = pattern(64, 48)
+    emans = []
+    for mode in ("RGB", "L", "CMYK", "YCbCr"):
+        im = esrc if mode == "RGB" else esrc.convert(mode)
+        open(os.path.join(out, f"enc_src_{mode}.raw"), "wb").write(im.tobytes())
+    # Sizes that are NOT a multiple of the MCU, which is where libjpeg's
+    # dummy blocks (zero AC, DC copied from the previous block) decide the
+    # bytes -- 23x17 and 31x33 are odd against every subsampling's MCU.
+    for (w, h) in [(23, 17), (31, 33)]:
+        # ONE source per size: pattern() draws from the RNG, so calling it
+        # again inside the subsampling loop would write a different source
+        # under the same name and three of the six cases would compare
+        # against pixels they were not encoded from.
+        esrc2 = pattern(w, h)
+        open(os.path.join(out, f"enc_src_RGB_{w}x{h}.raw"), "wb").write(esrc2.tobytes())
+        for ss in (0, 1, 2):
+            tag = f"edge_{w}x{h}_ss{ss}"
+            path = os.path.join(out, f"enc_{tag}.jpg")
+            esrc2.save(path, "JPEG", quality=80, subsampling=ss)
+            emans.append(f"{tag} enc_{tag}.jpg RGB {w} {h} 1 quality=80,subsampling={ss}")
+
+    enc_cases = [
+        ("ss0", "RGB", dict(quality=90, subsampling=0)),
+        ("ss1", "RGB", dict(quality=90, subsampling=1)),
+        ("ss2", "RGB", dict(quality=90, subsampling=2)),
+        ("q1", "RGB", dict(quality=1, subsampling=2)),
+        ("q25", "RGB", dict(quality=25, subsampling=2)),
+        ("q75", "RGB", dict(quality=75, subsampling=2)),
+        ("q100", "RGB", dict(quality=100, subsampling=0)),
+        ("opt", "RGB", dict(quality=75, subsampling=2, optimize=True)),
+        ("opt444", "RGB", dict(quality=60, subsampling=0, optimize=True)),
+        ("rst2", "RGB", dict(quality=75, subsampling=2, restart_marker_blocks=2)),
+        ("rstrow", "RGB", dict(quality=75, subsampling=1, restart_marker_rows=1)),
+        ("dpi300", "RGB", dict(quality=75, subsampling=2, dpi=(300, 300))),
+        ("gray", "L", dict(quality=80)),
+        ("grayopt", "L", dict(quality=80, optimize=True)),
+        ("cmyk", "CMYK", dict(quality=80)),
+        ("ycbcr", "YCbCr", dict(quality=80, subsampling=0)),
+        ("preset_web_high", "RGB", dict(quality="web_high")),
+        ("prog", "RGB", dict(quality=75, subsampling=2, progressive=True)),
+        ("progopt", "RGB", dict(quality=75, subsampling=2, progressive=True, optimize=True)),
+    ]
+    for tag, mode, kw in enc_cases:
+        im = esrc if mode == "RGB" else esrc.convert(mode)
+        path = os.path.join(out, f"enc_{tag}.jpg")
+        im.save(path, "JPEG", **kw)
+        opts = []
+        for k, v in kw.items():
+            if isinstance(v, bool):
+                opts.append(f"{k}={1 if v else 0}")
+            elif isinstance(v, tuple):
+                opts.append(f"{k}={v[0]}")
+            else:
+                opts.append(f"{k}={v}")
+        # Whether our encoder is expected to match BYTE FOR BYTE. It does
+        # for every baseline file; progressive deliberately writes a
+        # spectral-selection script instead of libjpeg's successive
+        # approximation, so there the gate is identical PIXELS.
+        exact = 0 if kw.get("progressive") else 1
+        emans.append(f"{tag} enc_{tag}.jpg {mode} 64 48 {exact} " + ",".join(opts))
+    open(os.path.join(out, "MANIFEST.enc"), "w").write("\n".join(emans) + "\n")
+
+    open(os.path.join(out, "MANIFEST"), "w").write("\n".join(man) + "\n")
+    return header("JPEG corpus index (images in reference/jpeg/); "
+                  "fields: tag file mode width height draft_denominator") + man + \
+        ["# encoder cases (reference/jpeg/MANIFEST.enc); "
+         "fields: tag file mode width height byte_exact options"] + emans
+
+
 GENERATORS = {
+    "jpeg_index.txt": gen_jpeg,
     "codec_index.txt": gen_codecs,
     "geometry_index.txt": gen_geometry,
     "resample_index.txt": gen_resample,
@@ -547,15 +777,56 @@ GENERATORS = {
 }
 
 
+def recorded_version(path):
+    """The Pillow version that produced a checked-in fixture, or None."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                if not line.startswith("#"):
+                    break
+                if "from Pillow " in line:
+                    return line.split("from Pillow ", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true",
                     help="compare against the checked-in files instead of writing them")
+    ap.add_argument("--force", action="store_true",
+                    help="write even when the installed Pillow differs from the one "
+                         "that produced the checked-in fixtures")
+    ap.add_argument("--only", metavar="NAME", action="append",
+                    help="regenerate only these index files (repeatable)")
     args = ap.parse_args()
 
     os.makedirs(OUT, exist_ok=True)
+
+    # These fixtures ARE Pillow's answers, so regenerating them with a
+    # different Pillow rewrites the expectations of every suite that reads
+    # them -- which looks like the package breaking, in files nobody touched.
+    # It has happened: a run under Pillow 12.3.0 downgraded fixtures recorded
+    # from 13.0.0 and four green suites went red at once.
+    if not args.check and not args.force:
+        selected = [n for n in GENERATORS if not args.only or n in args.only]
+        stale = sorted({v for name in selected
+                        for v in [recorded_version(os.path.join(OUT, name))]
+                        if v is not None and v != PIL.__version__})
+        if stale:
+            print(f"refusing to write: the checked-in fixtures were produced by "
+                  f"Pillow {', '.join(stale)} and this is Pillow {PIL.__version__}.")
+            print("  Regenerating here would rewrite every suite's expectations with a")
+            print("  different Pillow's answers. Either install that version, or pass")
+            print("  --force (and expect test changes), or --only <index> to regenerate")
+            print("  just the files this Pillow produced.")
+            return 2
+
     rc = 0
     for name, fn in sorted(GENERATORS.items()):
+        if args.only and name not in args.only:
+            continue
         body = "\n".join(fn()) + "\n"
         path = os.path.join(OUT, name)
         if args.check:

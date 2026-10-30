@@ -13,12 +13,15 @@
 //  and nesting them would mean a caller writing pillow.Image.new, which is
 //  one more indirection for nothing. The names themselves are Pillow's.
 //
-//  WHAT IS IN THIS BUILD: phase P4. The object model, the full 20-mode
+//  WHAT IS IN THIS BUILD: phase P5. The object model, the full 20-mode
 //  table, the conversion matrix, ImageColor, ImagePalette, the six
 //  resampling filters with resize/rotate/transpose/thumbnail/reduce/
-//  transform, ImageTransform, ImagePath, and PNG, BMP, TGA and PPM read and
-//  write. Phases P5-P9 add JPEG, the operation surface, drawing, text and
-//  the remaining formats; pillow-suite/ROADMAP.md tracks them item by item.
+//  transform, ImageTransform, ImagePath, PNG, BMP, TGA and PPM read and
+//  write, and -- new in P5 -- JPEG read and write (baseline, progressive,
+//  every subsampling, restart markers, draft-mode scaled decoding) with
+//  EXIF and ExifTags. Phases P6-P9 add the operation surface, drawing,
+//  text and the remaining formats; pillow-suite/ROADMAP.md tracks them
+//  item by item.
 // ════════════════════════════════════════════════════════════════════════
 
 include "./mode.b" as mode;
@@ -33,12 +36,14 @@ include "./codecs/registry.b" as registry;
 include "./codecs/ppm.b" as ppm;
 include "./codecs/png.b" as png;
 include "./codecs/bmp.b" as bmp;
+include "./codecs/jpeg.b" as jpeg;
+include "./exif.b" as exif;
 include "./codecs/tga.b" as tga;
 include "./inflate.b" as inflate;
 include "./deflate.b" as deflate;
 include "./bitio.b" as bitio;
 
-$VERSION = "0.4.0";
+$VERSION = "0.5.0";
 
 // ─── Register the codecs this build ships ───────────────────────────────
 //
@@ -53,6 +58,11 @@ registry.register("BMP", ["bmp", "dib"], "image/bmp",
                   def($head) { return bmp.sniff($head); },
                   def($data) { return bmp.decode($data); },
                   def($spec) { return bmp.encode($spec); });
+
+registry.register("JPEG", ["jpg", "jpeg", "jpe", "jfif"], "image/jpeg",
+                  def($head) { return jpeg.sniff($head); },
+                  def($data) { return jpeg.decode($data); },
+                  def($spec) { return jpeg.encode($spec); });
 
 // TGA LAST, and with its sniffer registered: a TGA has NO magic number, so
 // its sniffer validates the whole 18-byte header for self-consistency rather
@@ -183,8 +193,34 @@ def crc32($data)                    { return deflate.crc32($data); }
 def encode_png($spec) { return png.encode($spec); }
 def encode_bmp($spec) { return bmp.encode($spec); }
 def encode_tga($spec) { return tga.encode($spec); }
+def encode_jpeg($spec) { return jpeg.encode($spec); }
+def decode_jpeg($data, $denom, $want) { return jpeg.decode_scaled($data, $denom, $want); }
+def jpeg_max_progressive_coeffs()       { return jpeg.max_progressive_coeffs(); }
+def jpeg_set_max_progressive_coeffs($n) { return jpeg.set_max_progressive_coeffs($n); }
 def png_allow_truncated($yes) { return png.allow_truncated($yes); }
 def adler32($data)                  { return deflate.adler32($data); }
+
+// ─── EXIF and ExifTags ──────────────────────────────────────────────────
+//
+// EXIF is a TIFF block inside a JPEG APP1 segment, so exif.b is the TIFF
+// tag reader; codecs/tiff.b will include it rather than repeat it.
+def getexif($im)              { if ($im.info.exif == null) { return exif.empty(); }
+                                return exif.load($im.info.exif); }
+def exif_load($data)          { return exif.load($data); }
+def exif_empty()              { return exif.empty(); }
+def exif_tobytes($ex)         { return exif.tobytes($ex); }
+def exif_get($ex, $ifd, $tag) { return exif.get($ex, $ifd, $tag); }
+def exif_put($ex, $ifd, $tag, $v) { return exif.put($ex, $ifd, $tag, $v); }
+def exif_remove($ex, $ifd, $tag)  { return exif.remove($ex, $ifd, $tag); }
+def exif_transpose($im)       { return exif.exif_transpose($im); }
+def exif_tag_name($t)         { return exif.tag_name($t); }
+def exif_gps_tag_name($t)     { return exif.gps_tag_name($t); }
+def TAGS()                    { return exif.TAGS(); }
+def GPSTAGS()                 { return exif.GPSTAGS(); }
+def IFD()                     { return exif.IFD(); }
+def ExifBase()                { return exif.BASE(); }
+def GPS()                     { return exif.GPS(); }
+def Interop()                 { return exif.INTEROP(); }
 
 // ─── help() ─────────────────────────────────────────────────────────────
 def help() {
@@ -205,10 +241,12 @@ def help() {
     print("             getbbox getextrema getcolors tobytes save show");
     print("  ImageColor getrgb getcolor colormap");
     print("");
-    print("  geometry   resize rotate transpose thumbnail reduce transform");
+    print("  geometry   resize rotate transpose thumbnail reduce transform draft");
+    print("  ExifTags   getexif exif_load exif_put exif_tobytes exif_transpose");
+    print("             TAGS GPSTAGS IFD ExifBase GPS Interop");
     print("  ImagePath  Path path_getbbox path_tolist path_transform path_compact");
     print("");
-    print("  This build is phase P4. JPEG, the operation surface, drawing and");
-    print("  text arrive in P5-P8 -- see pillow-suite/ROADMAP.md.");
+    print("  This build is phase P5. The operation surface, drawing, text and");
+    print("  the remaining formats arrive in P6-P8 -- see pillow-suite/ROADMAP.md.");
     return null;
 }

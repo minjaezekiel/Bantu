@@ -104,14 +104,32 @@ nobody asked for.
 The Huffman walk is ~8 interpreted operations per coefficient, so a 12 MP JPEG's full scan is ~48 s.
 Everything after it is array work and costs a fraction of that.
 
-`draft()` is the answer, and it is Pillow's answer: DCT-domain downscaling decodes a 1/2, 1/4 or 1/8
-image without the full scan, which makes a thumbnail of a 12 MP JPEG a ~0.8 s operation.
-`thumbnail()` calls it automatically, exactly as Pillow does.
+**What this paragraph used to say was wrong, and P5 is what showed it.** It said `draft()` "decodes a
+1/2, 1/4 or 1/8 image without the full scan, which makes a thumbnail of a 12 MP JPEG a ~0.8 s
+operation". Reading `jdhuff.c` and then measuring both say otherwise: scaling happens in the **IDCT**,
+and the entropy-coded scan is parsed in full at every scale, because the amplitude bits of every
+coefficient are interleaved into the bitstream and nothing says where the next block starts until the
+current one is decoded. libjpeg does exactly the same amount of Huffman work for a 1/8 decode as for
+a full one.
 
-**Trigger for a third atom**, recorded so the decision is not re-argued from scratch: if, after P5
-ships, full-size decoding of JPEGs above ~4 MP is a thing users actually do (rather than thumbnailing
-them), the fix is one *generic* atom — a canonical-prefix-code scanner, which is to `jpeg.b` what
-`band` is to `hash.b` — and not a native JPEG decoder. It is not added speculatively.
+Measured in P5, Darwin/Apple silicon, a photographic 4:2:0 file:
+
+| image | full decode | `draft` 1/8 | saving |
+|---|---|---|---|
+| 320×240 | 0.80 s | 0.73 s | 9 % |
+| 640×480 | 3.06 s | 2.89 s | 6 % |
+| 1024×768 | 7.77 s | 7.21 s | 7 % |
+
+So `draft()` shrinks the IDCT, the upsampling, the colour transform and the output buffer — the cheap
+stages — and the cost of reading a JPEG is the scan at every scale. It is still worth having (it is
+also the only way to get libjpeg's *exact* scaled pixels), and `thumbnail()` still calls it the way
+Pillow does; it is just not the answer to the scan's cost.
+
+**Trigger for a third atom**, recorded so the decision is not re-argued from scratch: ~10 µs per
+pixel means a 12 MP JPEG is about two minutes, so if full-size decoding of large JPEGs is a thing
+users actually do, the fix is one *generic* atom — a canonical-prefix-code scanner, which is to
+`jpeg.b` what `band` is to `hash.b` — and not a native JPEG decoder. It is not added speculatively,
+and P5 ships without it.
 
 ### PW10 — `ImageTk`, `ImageQt`, `ImageWin`, `ImageShow`, `ImageGrab` and `ImageCms` are declined, loudly
 
@@ -173,3 +191,85 @@ Two rules follow, applied throughout the package:
 
 The interpreter's error message already names the cause, which is why both were quick to find — but
 the cure is naming, not vigilance.
+
+### PW13 — A progressive JPEG's coefficients live in a Bantu list, and so there is a budget
+
+**Alternative:** hold them in a numba array for every file, as the baseline decoder does.
+
+A baseline scan is decoded once, in order, and never read back, so the decoder emits the indices and
+values of the non-zero coefficients and `nd_put` scatters them into a zeroed array in 64 K chunks —
+memory proportional to the chunk, not to the image.
+
+A progressive scan cannot. Successive-approximation refinement *reads each coefficient back* to
+decide whether to consume a correction bit, and `nd_get` at ~2.5 µs would cost more than the whole
+scan. So progressive decoding holds the coefficients in a flat Bantu list, which costs a `Value`
+each — about 100 bytes:
+
+| progressive image | coefficients | list |
+|---|---|---|
+| 640×480 RGB 4:2:0 | 0.46 M | ~46 MB |
+| 1600×1200 RGB 4:2:0 | 2.9 M | ~290 MB |
+| 4000×3000 RGB 4:2:0 | 18 M | ~1.8 GB |
+
+`jpeg.b` therefore checks a **coefficient budget from the frame header**, before a byte of scan is
+read — the same shape as PW6's pixel budget — and refuses the third row by name, with the limit, the
+arithmetic and the two ways out (re-save as baseline, or raise the budget) in the message. Baseline
+files of any size are unaffected, and PW7's `u8` dtype does not fix this: a Bantu *list* is the cost,
+not the array.
+
+### PW14 — A Bantu list is copied when it crosses a function boundary or comes out of a dict
+
+This is a language property with the same teeth as PW12, and it decides the shape of every hot loop
+in `jpeg.b`. Measured on this build:
+
+| | cost |
+|---|---|
+| `$local[$i]` — a list read | ~0.5 µs |
+| `$state.table[$i]` — a list read **through a dict field** | ~25 µs on a 1,000-entry list, ~500 µs on a 20,000-entry one |
+| `f($bigList, $i)` — a user function taking a list | the same, per call |
+| `push($state.list, $v)`, `$state.list[$i] = $v` | ~0.5 µs — the *write* paths are in-place |
+| `ord($s[$i])` — a string index | ~1 µs, and O(1) in the string's length |
+
+A dict-field list read and a user-function argument both **copy the whole list**. So the entropy
+coder is one long function with every table it touches flattened into a *local* list with
+per-component base offsets, the byte source arrives as one local copy per scan, and no helper is
+called per byte, per coefficient or per block. The alternative measured 100× slower, which is the
+difference between a JPEG decoder and a demonstration of one.
+
+Written down because the natural, readable arrangement — a `$state` dict of tables, small helpers
+taking it — is the slow one, and nothing about the code says so.
+
+### PW15 — The encoder writes libjpeg's bytes where libjpeg's choices are published, and says where it does not
+
+The decoder can be bit-exact because every stage of a decode is spec- or table-determined. An encoder
+has freedom: which quantisation tables, which Huffman tables, which scan script. So `jpeg.b` copies
+libjpeg's *published* choices — Annex K's tables scaled by `jpeg_quality_scaling`, the `islow`
+forward DCT, `jcsample`'s downsamplers with their alternating rounding bias, `jccolor`'s RGB→YCbCr
+tables, `jcmarker`'s segment order — and the result is **byte-identical to Pillow** for every
+baseline case in the test corpus: all three subsamplings, quality 1/25/75/90/100, `optimize`,
+restart markers by block and by row, `dpi`, greyscale, CMYK, YCbCr and the named presets. That is a
+stronger result than the P5 gate asked for (a PSNR floor), so the test asserts the stronger one.
+
+Two places deliberately differ, both visible only in file size, both stated in the module header:
+
+1. **`progressive` writes a spectral-selection script** — one DC scan, then one AC scan per component
+   — rather than libjpeg's successive-approximation script. The file is a valid progressive JPEG and
+   decodes to identical pixels (asserted); it is a few per cent larger. Successive approximation on
+   the *encode* side is the upgrade path, and the decoder already implements all four of its
+   refinement cases because Pillow's own files need them.
+2. **End-of-band runs are emitted one at a time.** The standard Annex K AC tables contain `EOB` but
+   no `EOBn` symbol, so a run longer than one cannot be spelled with them at all; accumulating runs
+   is only reachable with `optimize`, for a few per cent.
+
+### PW16 — `draft()` re-decodes, because an `Image` here is never lazy
+
+In Pillow, `Image.open` reads only the header, so `draft()` merely tells libjpeg which scale to use
+when `load()` finally runs. `pillow`'s `Image` is eager by PW1's design — `load()` is a no-op — so
+`draft()` has nothing left to configure.
+
+Rather than make the object model lazy for one format, the JPEG decoder keeps the file bytes in
+`info["jpeg_src"]` and `draft()` decodes them again at the smaller scale. The *result* is identical to
+Pillow's, including the mode change to `L` or `YCbCr`; the *saving* is not, because the first decode
+already happened. A caller who wants the saving asks for the scale at open time:
+`pillow.decode_jpeg($data, 8, null)`. The cost is the file's own size held per open JPEG, which is
+stated in the docs rather than hidden.

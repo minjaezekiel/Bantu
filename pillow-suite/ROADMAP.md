@@ -299,21 +299,33 @@ promised.
 
 ---
 
-## Phase P5 — JPEG and EXIF
+## Phase P5 — JPEG and EXIF ✅
 
-- [ ] `pillow/codecs/jpeg.b` — baseline **and progressive**; all subsamplings (4:4:4, 4:2:2, 4:2:0,
-      4:1:1); restart markers; the array-side pipeline (dequantise → IDCT by two `nd_matmul` over all
-      blocks at once → upsample → YCbCr→RGB); CMYK and Adobe APP14 inversion; `draft()`
-- [ ] JPEG encode — quality 1–100 with Pillow's quantisation tables, `optimize`, `progressive`,
-      `subsampling`, `qtables`, `restart_marker_blocks`
-- [ ] `pillow/exif.b` — `ExifTags.TAGS/GPSTAGS/IFD/Base/GPS/Interop`, read and write, and
-      `ImageOps.exif_transpose`
+- [x] `pillow/codecs/jpeg.b` — baseline **and progressive** (all four successive-approximation
+      paths); every subsampling, including the five only `cjpeg` writes (4:1:1, 2x1, 1x2, 4x2, 3x1
+      and a mixed 1x1,2x2,2x2); restart markers; the array-side pipeline (dequantise → IDCT →
+      upsample → YCbCr→RGB, ~70 array operations per component whatever the size); CMYK, YCCK and
+      Adobe APP14 inversion; ICC profiles reassembled from numbered APP2 segments; `draft()`
+- [x] JPEG encode — quality 1–100 with Annex K's tables scaled by `jpeg_quality_scaling`,
+      `optimize`, `progressive`, `subsampling`, `qtables`, Pillow's named presets, `quality="keep"`,
+      `restart_marker_blocks` and `restart_marker_rows`, and `dpi`/`exif`/`icc_profile`/`comment`
+- [x] `pillow/exif.b` — `ExifTags.TAGS/GPSTAGS/IFD/Base/GPS/Interop` generated from Pillow's own
+      dictionaries, both byte orders, all twelve TIFF types plus BigTIFF's three, the four sub-IFDs,
+      the thumbnail IFD, read **and** write, and `exif_transpose` over all eight orientations
 
-| gate | form |
-|---|---|
-| differential | a corpus spanning every subsampling and both scan types, decoded pixel-identical to Pillow (libjpeg-turbo's IDCT is the reference; a ±1 tolerance is documented where the IDCT is not bit-specified) |
-| differential | encode compared to Pillow at a **PSNR floor**, since quantisation choices are the encoder's |
-| stress | truncated scans; a restart marker in every position; 2^16-wide; `draft` at 1/2, 1/4, 1/8 asserted ≤ 1 s on 12 MP |
+| gate | form | result |
+|---|---|---|
+| differential | a corpus spanning every subsampling and both scan types | **54 of 54 byte-identical** to Pillow — no tolerance needed anywhere, including the three scaled IDCTs behind `draft` |
+| differential | encode compared to Pillow at a **PSNR floor**, since quantisation choices are the encoder's | **stronger than asked: 17 of 17 baseline cases byte-identical to libjpeg**, and the 2 progressive ones pixel-identical (PW15 says where the bytes differ and why) |
+| differential | EXIF written here, read by Python Pillow | every tag in all four IFDs comes back, `tests/pillow_differential.sh` |
+| stress | truncated scans; poisoned length fields; a flipped bit in every header byte; the frame-header guards | 1,076 truncations (621 refused, 455 decoded from a partial scan), 4 poison values × every segment length, 200 bit flips — no crash, no hang |
+| stress | `draft` at 1/2, 1/4, 1/8 | works and is bit-exact, but it does **not** skip the scan — measured 6–9 % saving, not 90 %. §6.4.6 and PW9 corrected |
+
+**The one claim this phase falsified.** `draft()` was supposed to make a 12 MP thumbnail a ~0.8 s
+operation by never decoding the full scan. Scaling happens in the IDCT; the scan is parsed in full at
+every scale. The measured cost of reading a JPEG is ~10 µs per pixel at *any* scale, published in
+[`docs/pillow.md`](../docs/pillow.md) beside `open` rather than left to be discovered, and PW9 now
+records the trigger for the one atom that would change it.
 
 ---
 

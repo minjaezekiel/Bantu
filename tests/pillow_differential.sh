@@ -31,18 +31,28 @@ BANTU="${BANTU:-./bantu}"
 [ -x "$BANTU" ] || { echo "[FAIL] no bantu binary at $BANTU"; exit 1; }
 
 PY="${PYREF:-python3}"
-# The probe MUST use the same -I (isolated) flag the real call does: without
-# it, python3 can find Pillow in user site-packages, -I cannot, and the script
-# would announce a reference it then fails to import.
-if ! "$PY" -I -c "import PIL" >/dev/null 2>&1; then
-    echo "[SKIP] $PY has no Pillow -- tier 2's live comparison needs it."
-    echo "       The checked-in fixtures still cover this in the .b suites:"
-    echo "         bantu run tests/pillow_core_test.b"
-    echo "         bantu run tests/pillow_convert_test.b"
-    echo "       To enable this script:  python3 -m pip install Pillow"
-    exit 0
+# The probe MUST use the same flags the real call does, and the flags are
+# chosen here rather than fixed: -I (isolated) is what we want, because it
+# ignores PYTHONPATH and the current directory, but -I also ignores USER
+# site-packages, which is where `pip install --user Pillow` puts it. So try
+# isolated first and fall back to plain, loudly, rather than announcing a
+# reference the script then fails to import.
+PYFLAGS="-I"
+if ! "$PY" $PYFLAGS -c "import PIL" >/dev/null 2>&1; then
+    if "$PY" -c "import PIL" >/dev/null 2>&1; then
+        PYFLAGS=""
+        echo "note: Pillow is in user site-packages, so python runs without -I"
+    else
+        echo "[SKIP] $PY has no Pillow -- tier 2's live comparison needs it."
+        echo "       The checked-in fixtures still cover this in the .b suites:"
+        echo "         bantu run tests/pillow_core_test.b"
+        echo "         bantu run tests/pillow_convert_test.b"
+        echo "         bantu run tests/pillow_jpeg_test.b"
+        echo "       To enable this script:  python3 -m pip install Pillow"
+        exit 0
+    fi
 fi
-echo "reference: $("$PY" -I -c 'import PIL; print("Pillow", PIL.__version__)')"
+echo "reference: $("$PY" $PYFLAGS -c 'import PIL; print("Pillow", PIL.__version__)')"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -113,12 +123,50 @@ while (\$f <= 4) {
                                  "palette": null, "info": {}, "png_filter": \$f}));
     \$f = \$f + 1;
 }
-print("pillow wrote 5 + 17 files");
+// Phase P5: JPEG and EXIF. A JPEG written here is read by libjpeg on the
+// other side, which is the only check that proves the entropy coder's bytes
+// rather than this package's agreement with itself.
+\$rgb.save(\$D + "out_q90.jpg", null, {"quality": 90, "subsampling": 0});
+\$rgb.save(\$D + "out_q50_420.jpg", null, {"quality": 50, "subsampling": 2});
+\$rgb.save(\$D + "out_opt.jpg", null, {"quality": 75, "optimize": true});
+\$rgb.save(\$D + "out_prog.jpg", null, {"quality": 75, "progressive": true});
+\$rgb.save(\$D + "out_rst.jpg", null, {"quality": 75, "restart_marker_blocks": 1});
+\$rgb.convert("L", null, null).save(\$D + "out_gray.jpg", null, {"quality": 80});
+\$rgb.convert("CMYK", null, null).save(\$D + "out_cmyk.jpg", null, {"quality": 80});
+
+// The same pixels through our own decoder, for Pillow to compare against.
+\$parts = [];
+\$rd = pillow.open(\$D + "out_q90.jpg").getdata();
+\$i = 0;
+while (\$i < len(\$rd)) {
+    push(\$parts, str(\$rd[\$i][0]) + "," + str(\$rd[\$i][1]) + "," + str(\$rd[\$i][2]));
+    \$i = \$i + 1;
+}
+writefile(\$D + "jpeg_q90.expect", join(\$parts, "\n"));
+
+// EXIF written here, for Pillow's Image.getexif() to read back.
+\$ex = pillow.exif_empty();
+pillow.exif_put(\$ex, "ifd0", 271, "Bantu");
+pillow.exif_put(\$ex, "ifd0", 272, "pillow");
+pillow.exif_put(\$ex, "ifd0", 274, 6);
+pillow.exif_put(\$ex, "ifd0", 282, [72, 1]);
+pillow.exif_put(\$ex, "ifd0", 296, 2);
+pillow.exif_put(\$ex, "exif", 33434, [1, 125]);
+pillow.exif_put(\$ex, "exif", 33437, [56, 10]);
+pillow.exif_put(\$ex, "exif", 34855, 400);
+pillow.exif_put(\$ex, "exif", 36867, "2026:10:30 12:00:00");
+pillow.exif_put(\$ex, "gps", 1, "N");
+pillow.exif_put(\$ex, "gps", 2, [[51, 1], [30, 1], [0, 1]]);
+pillow.exif_put(\$ex, "interop", 1, "R98");
+\$rgb.save(\$D + "out_exif.jpg", null, {"quality": 80, "exif": pillow.exif_tobytes(\$ex)});
+writefile(\$D + "exif.bin", pillow.exif_tobytes(\$ex));
+
+print("pillow wrote 5 + 17 + 10 files");
 BANTU_EOF
 
 "$BANTU" --quiet run "$TMP/emit.b" || { echo "[FAIL] the emitter did not run"; exit 1; }
 
-"$PY" -I - "$TMP" <<'PY'
+"$PY" $PYFLAGS - "$TMP" <<'PY'
 import sys, os
 from PIL import Image
 
@@ -218,6 +266,110 @@ for f in range(5):
               f"{sum(1 for a, b in zip(px(g), ref) if a != b)} pixels differ")
     except Exception as e:
         check(f"Pillow opens PNG filter {f}", False, f"{type(e).__name__}: {e}")
+
+# ── Phase P5: JPEG, read by libjpeg itself ────────────────────────────────
+import io
+import math
+
+def psnr(a, b):
+    se = sum((x - y) ** 2 for x, y in zip(a, b))
+    return float('inf') if se == 0 else 10 * math.log10(255 * 255 * len(a) / se)
+
+# Each case is compared against PILLOW'S OWN ENCODE of the same source with
+# the same options -- an absolute PSNR floor would only measure how badly
+# JPEG does on this deliberately high-frequency 23x17 pattern (at 4:2:0 its
+# chroma is destroyed, by Pillow too). `exact` says the bytes must match
+# libjpeg's; progressive is the one case where they deliberately do not.
+jpeg_cases = [
+    ('out_q90.jpg', 'RGB', dict(quality=90, subsampling=0), True),
+    ('out_q50_420.jpg', 'RGB', dict(quality=50, subsampling=2), True),
+    ('out_opt.jpg', 'RGB', dict(quality=75, optimize=True), True),
+    ('out_prog.jpg', 'RGB', dict(quality=75, progressive=True), False),
+    ('out_rst.jpg', 'RGB', dict(quality=75, restart_marker_blocks=1), True),
+    ('out_gray.jpg', 'L', dict(quality=80), True),
+    ('out_cmyk.jpg', 'CMYK', dict(quality=80), True),
+]
+for name, mode, kw, exact in jpeg_cases:
+    try:
+        want = im if mode == 'RGB' else im.convert(mode)
+        buf = io.BytesIO()
+        want.save(buf, 'JPEG', **kw)
+        theirs_bytes = buf.getvalue()
+        ours_bytes = open(os.path.join(D, name), 'rb').read()
+        g = Image.open(os.path.join(D, name))
+        g.load()
+        t = Image.open(io.BytesIO(theirs_bytes))
+        t.load()
+        if exact:
+            check(f"{name} is byte-identical to what libjpeg writes",
+                  ours_bytes == theirs_bytes,
+                  f"{len(ours_bytes)} bytes vs {len(theirs_bytes)}")
+        else:
+            check(f"{name} decodes to the same pixels as libjpeg's own file",
+                  g.mode == t.mode and g.tobytes() == t.tobytes(),
+                  f"mode={g.mode}/{t.mode}")
+        po = psnr(list(g.tobytes()), list(want.tobytes()))
+        pt = psnr(list(t.tobytes()), list(want.tobytes()))
+        check(f"{name} is no worse than libjpeg against the source",
+              g.mode == mode and g.size == im.size and po >= pt - 0.01,
+              f"ours {po:.2f} dB, libjpeg {pt:.2f} dB")
+    except Exception as e:
+        check(f"Pillow opens {name}", False, f"{type(e).__name__}: {e}")
+
+# progressive must actually be progressive, and optimize must be smaller
+try:
+    gp = Image.open(os.path.join(D, 'out_prog.jpg'))
+    check("out_prog.jpg really is progressive", gp.info.get('progressive') == 1,
+          str(gp.info.get('progressive')))
+except Exception as e:
+    check("out_prog.jpg opens", False, str(e))
+check("optimize produced a smaller file than the default tables",
+      os.path.getsize(os.path.join(D, 'out_opt.jpg')) <
+      os.path.getsize(os.path.join(D, 'out_q90.jpg')))
+
+# our own decoder against libjpeg's, on the same file, pixel for pixel
+try:
+    g = Image.open(os.path.join(D, 'out_q90.jpg'))
+    g.load()
+    theirs = [f"{r},{gg},{b}" for (r, gg, b) in px(g)]
+    ours = open(os.path.join(D, 'jpeg_q90.expect')).read().split("\n")
+    bad_px = sum(1 for a, b in zip(ours, theirs) if a != b)
+    check("our JPEG decoder and libjpeg agree on every pixel of the same file",
+          ours == theirs, f"{bad_px} of {len(theirs)} pixels differ")
+except Exception as e:
+    check("the JPEG decoder comparison runs", False, f"{type(e).__name__}: {e}")
+
+# EXIF written here, read by Pillow's own reader
+try:
+    g = Image.open(os.path.join(D, 'out_exif.jpg'))
+    g.load()
+    ex = g.getexif()
+    sub = ex.get_ifd(0x8769)
+    gps = ex.get_ifd(0x8825)
+    itop = ex.get_ifd(0xA005)
+    want_ifd0 = {271: 'Bantu', 272: 'pillow', 274: 6, 296: 2}
+    ok_ifd0 = all(ex.get(k) == v for k, v in want_ifd0.items())
+    check("Pillow reads back every IFD0 tag pillow wrote", ok_ifd0,
+          str({k: ex.get(k) for k in want_ifd0}))
+    check("Pillow reads XResolution as 72", float(ex.get(282)) == 72.0, str(ex.get(282)))
+    check("Pillow reads back the Exif sub-IFD",
+          float(sub.get(33434)) == 1 / 125 and sub.get(34855) == 400 and
+          sub.get(36867) == '2026:10:30 12:00:00', str(dict(sub)))
+    check("Pillow reads back the GPS IFD",
+          gps.get(1) == 'N' and tuple(float(v) for v in gps.get(2)) == (51.0, 30.0, 0.0),
+          str(dict(gps)))
+    check("Pillow reads back the Interop IFD", itop.get(1) == 'R98', str(dict(itop)))
+except Exception as e:
+    check("the EXIF comparison runs", False, f"{type(e).__name__}: {e}")
+
+# and the standalone block, loaded by Pillow's Exif directly
+try:
+    ex2 = Image.Exif()
+    ex2.load(open(os.path.join(D, 'exif.bin'), 'rb').read())
+    check("Pillow's Exif.load accepts the block pillow wrote",
+          ex2.get(271) == 'Bantu' and ex2.get(274) == 6, str(dict(ex2)))
+except Exception as e:
+    check("Exif.load runs", False, f"{type(e).__name__}: {e}")
 
 print()
 sys.exit(1 if bad else 0)
