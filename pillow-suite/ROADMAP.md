@@ -368,6 +368,14 @@ reason.
 
 ## Phase P7 — Drawing and text
 
+**Not started. The research that precedes it is written down in
+[`P7-NOTES.md`](P7-NOTES.md)**: the prior art in this repository (`scripts/gen_font_tables.b` is
+already a TrueType reader in Bantu), every rasterisation rule `draw.b` has to match from `Draw.c`
+(the endpoint a line never draws, the rectangle that does not normalise x, the polygon's float32
+crossings and corner joins, the ellipse quarter-tracer and its unrefreshed third candidate), and why
+**text cannot be pixel-exact** — Pillow hands outlines to FreeType — so its gate is a measured one in
+PW17's shape rather than byte equality.
+
 - [ ] `pillow/draw.b` — `Draw getdraw floodfill`; `arc bitmap chord ellipse line pieslice point
       polygon rectangle regular_polygon rounded_rectangle shape text multiline_text textbbox
       multiline_textbbox textlength`; `width=`, `joint="curve"`, `ImageDraw.Outline`
