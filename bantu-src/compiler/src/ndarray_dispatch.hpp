@@ -297,6 +297,8 @@ inline void noteMethod(const char* builtinName, const NativeFn& fn) {
         "isnan", "isinf", "isfinite", "clip",
         "equal", "not_equal", "less", "less_equal", "greater", "greater_equal",
         "logical_and", "logical_or", "logical_xor", "logical_not",
+        "bitwise_and", "bitwise_or", "bitwise_xor", "bitwise_not",
+        "left_shift", "right_shift",
         "cumsum", "cumprod", "cummax", "cummin", "diff",
         "sort", "argsort", "searchsorted", "unique", "bincount", "histogram",
         "take", "put", "compress", "nonzero",

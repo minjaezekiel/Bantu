@@ -15,7 +15,8 @@ enum class Kind : uint8_t {
     REAL,       // / pow and every transcendental -- always f64
     COMPARE,    // == != < <= > >=  -- promote to compare, emit bool
     LOGIC,      // and/or/xor/not -- truthiness in, bool out
-    PREDICATE   // isnan/isinf/isfinite -- ALWAYS f64 in, bool out
+    PREDICATE,  // isnan/isinf/isfinite -- ALWAYS f64 in, bool out
+    BITWISE     // & | ^ ~ << >>  -- integers only, a float operand is an error
 };
 
 inline DType computeDType(Kind k, DType a, DType b) {
@@ -33,6 +34,13 @@ inline DType computeDType(Kind k, DType a, DType b) {
         case Kind::COMPARE: {
             const DType p = promote(a, b);
             return p == DType::BOOL ? DType::I64 : p;   // compare bools as 0/1
+        }
+        // Bitwise asks about the bits of an integer. An f64 operand has no
+        // answer -- rounding it to i64 to produce one would make a bug look
+        // like a feature -- so applyBinary/applyUnary reject it by name.
+        case Kind::BITWISE: {
+            const DType p = promote(a, b);
+            return p == DType::BOOL ? DType::I64 : p;
         }
         case Kind::ARITH: {
             const DType p = promote(a, b);
@@ -124,13 +132,45 @@ inline void copyInto(const NdArray& src, NdArray& dst, const char* what) {
 
 // ── binary application ───────────────────────────────────────────────────────
 // FD/FI are the f64 and i64 kernels; only one runs, chosen by the compute dtype.
+// ── bitwise operands (docs/numba-architecture.md §4.6.1) ─────────────────────
+// A Bantu number is a double, so `nd_bitwise_and($a, 3)` hands a BITWISE op an
+// f64 operand for an integer the caller wrote as an integer -- and so does any
+// array that came out of nd_divide. Converting a value that already IS an
+// integer is the only reading of such a call. Converting 1.5 would be a guess,
+// so that is an error naming the value rather than a silent rounding.
+inline ArrayPtr asIntegerOperand(const ArrayPtr& a, const char* what) {
+    if (a->dtype != DType::F64) return a;
+    ArrayPtr c = contiguousCopy(a, DType::F64);
+    const double* p = c->ptr<double>();
+    const size_t n = c->size();
+    for (size_t i = 0; i < n; i++) {
+        const double v = p[i];
+        if (!(v >= -9223372036854775808.0) || !(v <= 9223372036854775807.0) ||
+            v != std::floor(v)) {
+            throw std::runtime_error(std::string(what) +
+                ": bitwise operations need integers, and " + std::to_string(v) +
+                " is not one");
+        }
+    }
+    return contiguousCopy(c, DType::I64);
+}
+
 template <class FD, class FI>
+
 inline Value applyBinary(const char* what, Kind kind,
                          const Value& av, const Value& bv, const Value* outArg,
                          FD fd, FI fi) {
     ArrayPtr a = asArray(av), b = asArray(bv);
+    if (kind == Kind::BITWISE) {
+        a = asIntegerOperand(a, what);
+        b = asIntegerOperand(b, what);
+    }
     const std::vector<size_t> shape = broadcastShapes(a->shape, b->shape, what);
     const DType cdt = computeDType(kind, a->dtype, b->dtype);
+    if (kind == Kind::BITWISE && cdt != DType::I64) {
+        throw std::runtime_error(std::string(what) +
+            ": bitwise operations need integers, got " + dtypeName(cdt));
+    }
     const DType rdt = resultDType(kind, cdt);
 
     OutPlan plan = planOut(outArg, shape, rdt, {a.get(), b.get()}, what);
@@ -203,8 +243,13 @@ template <class FD, class FI>
 inline Value applyUnary(const char* what, Kind kind,
                         const Value& av, const Value* outArg, FD fd, FI fi) {
     ArrayPtr a = asArray(av);
+    if (kind == Kind::BITWISE) a = asIntegerOperand(a, what);
     const std::vector<size_t> shape = a->shape;
     const DType cdt = computeDType(kind, a->dtype, a->dtype);
+    if (kind == Kind::BITWISE && cdt != DType::I64) {
+        throw std::runtime_error(std::string(what) +
+            ": bitwise operations need integers, got " + dtypeName(cdt));
+    }
     const DType rdt = resultDType(kind, cdt);
 
     OutPlan plan = planOut(outArg, shape, rdt, {a.get()}, what);

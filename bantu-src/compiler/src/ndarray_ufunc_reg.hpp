@@ -71,6 +71,33 @@ inline void registerUfuncs(const DefineFn& define) {
         [](double x, double y) { return (std::isnan(x) || std::isnan(y)) ? NAN : (x > y ? x : y); },
         [](int64_t x, int64_t y) { return x > y ? x : y; });
 
+    // ── binary: bitwise (docs/numba-architecture.md §4.6.1) ──────────────────
+    // Integer-only, and that is checked by name in applyBinary. The f64 lambda
+    // is never reached; it exists because `bin` takes both.
+    auto nofloat = [](double, double) -> double { return 0.0; };
+    bin("nd_bitwise_and", Kind::BITWISE, nofloat,
+                                   [](int64_t x, int64_t y) { return x & y; });
+    bin("nd_bitwise_or",  Kind::BITWISE, nofloat,
+                                   [](int64_t x, int64_t y) { return x | y; });
+    bin("nd_bitwise_xor", Kind::BITWISE, nofloat,
+                                   [](int64_t x, int64_t y) { return x ^ y; });
+    // A shift count outside [0, 63] is undefined in C, so it is an error here
+    // rather than a silent zero -- and the count is element-wise, which is what
+    // makes `a << b` over two images expressible.
+    bin("nd_left_shift",  Kind::BITWISE, nofloat,
+        [](int64_t x, int64_t y) -> int64_t {
+            if (y < 0 || y > 63) throw std::runtime_error(
+                "nd_left_shift: shift count " + std::to_string(y) + " is outside 0..63");
+            return (int64_t)((uint64_t)x << (uint64_t)y);
+        });
+    // Arithmetic: the sign bit replicates, so -8 >> 1 is -4 (C, NumPy, Python).
+    bin("nd_right_shift", Kind::BITWISE, nofloat,
+        [](int64_t x, int64_t y) -> int64_t {
+            if (y < 0 || y > 63) throw std::runtime_error(
+                "nd_right_shift: shift count " + std::to_string(y) + " is outside 0..63");
+            return x >> y;
+        });
+
     // ── binary: comparisons and logic, all producing bool ────────────────────
     bin("nd_equal",         Kind::COMPARE, [](double x, double y) { return (double)(x == y); },
                                            [](int64_t x, int64_t y) { return (int64_t)(x == y); });
@@ -110,6 +137,9 @@ inline void registerUfuncs(const DefineFn& define) {
        [](int64_t x) { return (int64_t)((x > 0) - (x < 0)); });
     un("nd_square",     Kind::ARITH, [](double x) { return x * x; },
                                      [](int64_t x) { return (int64_t)((uint64_t)x * (uint64_t)x); });
+    // One's complement, NOT a logical not: ~0 is -1. nd_logical_not is that.
+    un("nd_bitwise_not", Kind::BITWISE, [](double) { return 0.0; },
+                                        [](int64_t x) { return ~x; });
 
     auto real1 = [&un](const char* name, auto fd) {
         un(name, Kind::REAL, fd, [](int64_t) -> int64_t { return 0; });

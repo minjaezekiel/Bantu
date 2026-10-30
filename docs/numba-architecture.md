@@ -378,6 +378,35 @@ Integer division and modulo by zero **raise**, rather than trapping (`SIGFPE` on
 case, which is a process kill, not an error). Float division by zero follows IEEE and yields ±inf,
 which is the correct answer and must not be turned into an error.
 
+### 4.6.1 The bitwise ops, and why they are integer-only
+
+`& | ^ ~ << >>` were absent until `pillow`'s P6 needed them, and their absence was a hole rather
+than a gap in coverage: there was **no way to do bitwise arithmetic on an array at all**. Not one
+slower way — none. A caller's only recourse was 32 whole-array passes, one per bit, built out of
+`floor_divide` and `mod`. Every bit-manipulating workload has this shape: a hash over a column, a
+bitset, a packed flag field, an image mask, JPEG's `& 1023`.
+
+So `nd_bitwise_and`, `nd_bitwise_or`, `nd_bitwise_xor`, `nd_bitwise_not`, `nd_left_shift` and
+`nd_right_shift` exist, with `Kind::BITWISE`:
+
+| | |
+|---|---|
+| compute dtype | `promote(a, b)`; an `f64` operand is accepted only if every value **is** an integer, and is an error otherwise, naming the value |
+| result dtype | the same integer type |
+| `~` | the one's complement of the `i64`, so `~0 == -1` — not a logical not (`nd_logical_not` is that) |
+| `>>` | **arithmetic**: the sign bit is replicated, so `-8 >> 1 == -4`, matching C, NumPy and Python |
+| `<<` | undefined in C for counts ≥ 64 or negative; here a count outside `[0, 63]` is an **error**, not a silent zero or a wrap |
+
+Not *rounding* a float operand is the deliberate part. A Bantu number is a double, so
+`nd_bitwise_and($a, 3)` arrives with an `f64` three — and `3.0` has exactly one sensible reading, so
+it is converted. `1.5` has none, and rounding it to produce one would make a bug look like a feature,
+so it raises and the message contains the offending value. (NumPy rejects the whole dtype; that would
+reject the literal `3` as well, which in a language without an integer type is not a defensible
+boundary.)
+
+Shifts take their count element-wise, so `nd_left_shift(a, b)` with two arrays shifts each element by
+its own count — which is what makes `ImageMath`'s `a << b` expressible at all.
+
 ### 4.7 `out=`, aliasing, and why the safe case is worth detecting
 
 Every binary ufunc takes an optional trailing `out`. It exists for one reason: `$a.add($b).mul(2)`
