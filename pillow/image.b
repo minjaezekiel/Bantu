@@ -28,6 +28,9 @@ include "./resample.b" as resample;
 include "./transform.b" as xform;
 include "./codecs/registry.b" as registry;
 include "./codecs/jpeg.b" as jpeg;
+include "./filter.b" as flt;
+include "./palette.b" as pal;
+include "./quantize.b" as quant;
 
 // Pillow's guard against a decompression bomb, with Pillow's default.
 $CFG = {"MAX_IMAGE_PIXELS": 89478485};
@@ -401,14 +404,28 @@ class PillowImage {
         if (mode.is_float(this.mode)) {
             throw "Image.histogram: mode F has no histogram; use ImageStat instead";
         }
+        // A mask counts only the pixels where it is NON-ZERO, which is what
+        // ImagingGetHistogram does for a mask of mode 1 or L alike.
+        $keep = null;
         if ($mask != null) {
-            throw "Image.histogram: a mask is not implemented yet (phase P6)";
+            if ($mask.mode != "1" && $mask.mode != "L") { throw "bad transparency mask"; }
+            if ($mask.width != this.width || $mask.height != this.height) {
+                throw "Image.histogram: the mask is " + str($mask.size) +
+                      " and the image " + str(this.size);
+            }
+            $keep = nd_not_equal(pxbuf.band($mask.px, 0), 0);
         }
         $n = mode.bands(this.mode);
         $out = [];
         $i = 0;
         while ($i < $n) {
             $b = nd_clip(pxbuf.band(this.px, $i), 0, 255);
+            if ($keep != null) {
+                // Masked-out pixels are moved to bin 256, which is then
+                // dropped: one compress would do it too, but this keeps the
+                // whole thing to two array operations.
+                $b = nd_where($keep, $b, 256);
+            }
             $h = nd_bincount(nd_ravel($b));
             $hl = nd_to_list($h);
             $k = 0;
@@ -500,9 +517,42 @@ class PillowImage {
     def convert($m, $dither, $matrix) {
         if ($m == null) { return this.copy(); }
         if ($matrix != null) {
-            throw "Image.convert: the matrix argument is not implemented yet (phase P6)";
+            // ImagingConvertMatrix: a 4-tuple to L or a 12-tuple to a
+            // 3-band mode, in float32, with +0.5 folded in and clip8's
+            // truncation after -- so it rounds half up and clamps.
+            if ($m != "L" && mode.bands($m) != 3) { throw "illegal conversion"; }
+            if (mode.bands(this.mode) != 3) { throw "illegal conversion"; }
+            $need = 4;
+            if ($m != "L") { $need = 12; }
+            if (type($matrix) != "list" || len($matrix) != $need) {
+                throw "Image.convert: the matrix for " + $m + " is " + str($need) +
+                      " numbers, got " + str(len($matrix));
+            }
+            $r0 = pxbuf.band(this.px, 0);
+            $g0 = pxbuf.band(this.px, 1);
+            $b0 = pxbuf.band(this.px, 2);
+            $parts = [];
+            $k = 0;
+            while ($k < floor($need / 4)) {
+                $v = flt._f32a(nd_add(nd_add(nd_add(
+                        flt._f32a(nd_multiply($r0, flt._f32($matrix[$k * 4]))),
+                        flt._f32a(nd_multiply($g0, flt._f32($matrix[$k * 4 + 1])))),
+                        flt._f32a(nd_multiply($b0, flt._f32($matrix[$k * 4 + 2])))),
+                        flt._f32($matrix[$k * 4 + 3]) + 0.5));
+                push($parts, nd_clip(nd_trunc($v), 0, 255));
+                $k = $k + 1;
+            }
+            return _wrap($m, pxbuf.stack($parts, mode.dtype($m)), null,
+                         _copyInfo(this.info), null);
         }
         if ($m == this.mode) { return this.copy(); }
+        // Pillow sends a source WITH ALPHA to quantize() for mode P -- an
+        // adaptive palette, through the fast octree, because that is the
+        // only method that survives alpha. The fixed colour cube would look
+        // almost right and be wrong.
+        if ($m == "P" && mode.has_alpha(this.mode)) {
+            return this.quantize(256, null, 0, null, $dither);
+        }
         $r = convert.px(this.px, this.mode, $m, this.palette, $dither);
         $px = $r.px;
         if (nd_is_view($px)) { $px = pxbuf.materialise($px, mode.dtype($m)); }
@@ -833,6 +883,259 @@ class PillowImage {
         return [this.mode, [0, 0, $ow / $scale, $oh / $scale]];
     }
 
+    // filter($f) -> the image through an ImageFilter. The four filter
+    // families and their contracts live in filter.b.
+    def filter($f) {
+        if (this.mode == "P" || this.mode == "PA") {
+            throw "cannot filter palette images";
+        }
+        return _wrap(this.mode, flt.apply(this.px, this.mode, $f),
+                     _copyPalette(this.palette), _copyInfo(this.info), null);
+    }
+
+    // quantize($colors, $method, $kmeans, $palette, $dither) -> a P image
+    // with an ADAPTIVE palette. Pillow's defaults: 256 colours, median cut,
+    // or fast octree for an RGBA source because that is the only method
+    // that can carry alpha.
+    def quantize($colors, $method, $kmeans, $palette, $dither) {
+        if ($palette != null) {
+            // Quantize to another image's palette, which is a nearest-colour
+            // conversion and not a new palette at all.
+            if ($palette.mode != "P") { throw "bad mode for palette image"; }
+            if (this.mode != "RGB" && this.mode != "L") {
+                throw "only RGB or L mode images can be quantized to a palette";
+            }
+            $d = $dither;
+            if ($d == null) { $d = "FLOYDSTEINBERG"; }
+            $rgb = this.px;
+            if (this.mode != "RGB") { $rgb = this.convert("RGB", null, null).px; }
+            $r = pal.rgb_to_index($rgb, $palette.palette, $d);
+            return _wrap("P", pxbuf.materialise($r.idx, "i64"),
+                         _copyPalette($palette.palette), _copyInfo(this.info), null);
+        }
+        $r = quant.quantize(this.px, this.mode, $colors, $method, $kmeans);
+        return _wrap("P", $r.px, $r.palette, _copyInfo(this.info), null);
+    }
+
+    // entropy($mask, $extrema) -> the histogram's entropy in bits, which is
+    // -sum(p * log2(p)) over every bin of every band.
+    def entropy($mask, $extrema) {
+        $h = this.histogram($mask);
+        $total = 0;
+        $i = 0;
+        while ($i < len($h)) { $total = $total + $h[$i]; $i = $i + 1; }
+        if ($total == 0) { return 0; }
+        $e = 0;
+        $i = 0;
+        while ($i < len($h)) {
+            if ($h[$i] != 0) {
+                $v = $h[$i] / $total;
+                $e = $e + $v * log($v) / log(2);
+            }
+            $i = $i + 1;
+        }
+        return 0 - $e;
+    }
+
+    // getpalette($rawmode) -> the palette as a flat list of bytes, or null
+    // for an image that has none.
+    def getpalette($rawmode) {
+        if (this.palette == null) { return null; }
+        return nd_to_list(nd_ravel(this.palette));
+    }
+
+    // putpalette($data, $rawmode) -> the palette replaced. $data is a flat
+    // list of RGB (or RGBA) bytes, an ImagePalette from palette.b, or a
+    // 256x3 array. The mode becomes P, as Pillow's does.
+    def putpalette($data, $rawmode) {
+        if (this.mode != "L" && this.mode != "LA" && this.mode != "P" &&
+            this.mode != "PA") {
+            throw "Image.putpalette: illegal image mode " + this.mode;
+        }
+        $bands = 3;
+        if ($rawmode == "RGBA") { $bands = 4; }
+        if (type($data) == "list") {
+            if (len($data) % $bands != 0) {
+                throw "Image.putpalette: " + str(len($data)) + " values is not a " +
+                      "whole number of " + str($bands) + "-byte entries";
+            }
+            $n = floor(len($data) / $bands);
+            $p = nd_zeros([$n, 3], "i64");
+            $i = 0;
+            $flat = [];
+            while ($i < $n) {
+                push($flat, $data[$i * $bands]);
+                push($flat, $data[$i * $bands + 1]);
+                push($flat, $data[$i * $bands + 2]);
+                $i = $i + 1;
+            }
+            this.palette = nd_reshape(nd($flat, "i64"), [$n, 3]);
+        } else {
+            this.palette = $data;
+        }
+        if (this.mode == "L") { this.mode = "P"; }
+        if (this.mode == "LA") { this.mode = "PA"; }
+        return null;
+    }
+
+    // remap_palette($dest_map, $source_palette) -> the palette reordered
+    // and the indexes remapped to match, which is Pillow's own two-step:
+    // the new palette is the source palette picked in dest_map's order, and
+    // every index is replaced by its new position.
+    def remap_palette($dest_map, $source_palette) {
+        if (this.mode != "L" && this.mode != "P") {
+            throw "Image.remap_palette: illegal image mode " + this.mode;
+        }
+        $src = $source_palette;
+        if ($src == null) {
+            if (this.mode == "P" && this.palette != null) { $src = this.palette; }
+            else {
+                // An L image's implied palette is the grey ramp.
+                $flat = [];
+                $i = 0;
+                while ($i < 256) {
+                    push($flat, $i); push($flat, $i); push($flat, $i);
+                    $i = $i + 1;
+                }
+                $src = nd_reshape(nd($flat, "i64"), [256, 3]);
+            }
+        }
+        $srcList = nd_to_list(nd_ravel($src));
+        $entries = floor(len($srcList) / 3);
+        $newPos = nd_to_list(nd_zeros([256], "i64"));
+        $palFlat = [];
+        $i = 0;
+        while ($i < len($dest_map)) {
+            $old = floor($dest_map[$i]);
+            if ($old < 0 || $old >= $entries) {
+                throw "Image.remap_palette: dest_map names entry " + str($old) +
+                      " of a " + str($entries) + "-entry palette";
+            }
+            push($palFlat, $srcList[$old * 3]);
+            push($palFlat, $srcList[$old * 3 + 1]);
+            push($palFlat, $srcList[$old * 3 + 2]);
+            $newPos[$old] = $i;
+            $i = $i + 1;
+        }
+        $idx = pxbuf.lut(nd_clip(this.px, 0, 255), $newPos);
+        return _wrap("P", pxbuf.materialise($idx, "i64"),
+                     nd_reshape(nd($palFlat, "i64"), [floor(len($palFlat) / 3), 3]),
+                     _copyInfo(this.info), null);
+    }
+
+    // apply_transparency() -> info["transparency"] folded into the palette
+    // as an alpha band, for a P image. Pillow's own method, and like
+    // Pillow's it is a no-op unless the image is P with a transparency key.
+    def apply_transparency() {
+        if (this.mode != "P" || this.info.transparency == null ||
+            this.palette == null) { return null; }
+        $t = this.info.transparency;
+        if (type($t) != "number") { return null; }
+        $n = nd_shape(this.palette)[0];
+        $flat = nd_to_list(nd_ravel(this.palette));
+        $out = [];
+        $i = 0;
+        while ($i < $n) {
+            push($out, $flat[$i * 3]);
+            push($out, $flat[$i * 3 + 1]);
+            push($out, $flat[$i * 3 + 2]);
+            if ($i == floor($t)) { push($out, 0); } else { push($out, 255); }
+            $i = $i + 1;
+        }
+        this.palette = nd_reshape(nd($out, "i64"), [$n, 4]);
+        $inf = {};
+        for $k, $v in this.info.items() { if ($k != "transparency") { $inf[$k] = $v; } }
+        this.info = $inf;
+        return null;
+    }
+
+    // getim() -> the underlying buffer. Pillow returns its C handle; here
+    // it is the numba array, which is the same idea and rather more useful.
+    def getim() { return this.px; }
+
+    // tobitmap($name) -> the image as an XBM C fragment, which is what
+    // Pillow's tobitmap writes: the three #defines, then the bytes as
+    // 0xNN separated by commas, FIFTEEN TO A LINE, with no comma after the
+    // last one. Mode 1 only, as in Pillow.
+    //
+    // XBM packs a row LSB-FIRST and a set bit is a WHITE pixel here, which
+    // is the opposite of mode 1's own MSB-first packing, so the bits are
+    // gathered rather than reusing _packBilevel.
+    def tobitmap($name) {
+        if (this.mode != "1") { throw "not a bitmap"; }
+        $nm = $name;
+        if ($nm == null) { $nm = "image"; }
+        $rowBytes = floor((this.width + 7) / 8);
+        $vals = [];
+        $hexd = "0123456789abcdef";
+        $y = 0;
+        while ($y < this.height) {
+            $b = 0;
+            while ($b < $rowBytes) {
+                $v = 0;
+                $k = 0;
+                while ($k < 8) {
+                    $x = $b * 8 + $k;
+                    if ($x < this.width) {
+                        if (nd_get(this.px, [$y, $x, 0]) != 0) { $v = $v + pow(2, $k); }
+                    }
+                    $k = $k + 1;
+                }
+                // Spelled out rather than through tohex(frombytes(...)):
+                // image.b defines a `frombytes` of its own and Bantu keeps
+                // functions and variables in one namespace (PW12), so the
+                // builtin is not reachable from in here.
+                push($vals, "0x" + $hexd[floor($v / 16)] + $hexd[$v % 16]);
+                $b = $b + 1;
+            }
+            $y = $y + 1;
+        }
+        $body = [];
+        $i = 0;
+        while ($i < len($vals)) {
+            $piece = $vals[$i];
+            if ($i != len($vals) - 1) { $piece = $piece + ","; }
+            if (($i + 1) % 15 == 0) { $piece = $piece + "\n"; }
+            push($body, $piece);
+            $i = $i + 1;
+        }
+        return "#define " + $nm + "_width " + str(this.width) + "\n" +
+               "#define " + $nm + "_height " + str(this.height) + "\n" +
+               "static char " + $nm + "_bits[] = {\n" +
+               join($body, "") + "\n};";
+    }
+
+    // effect_spread($distance) -> every pixel displaced by a random offset
+    // within +/- distance. Pillow's own effect_spread, and like Pillow's it
+    // is random: the result cannot be compared pixel for pixel, so the test
+    // asserts the distribution instead (every output pixel is a value that
+    // was within `distance` of it in the input).
+    def effect_spread($distance) {
+        $d = floor($distance);
+        if ($d < 0) { throw "Image.effect_spread: distance must not be negative"; }
+        if ($d == 0) { return this.copy(); }
+        $h = this.height;
+        $w = this.width;
+        $dx = nd_random_int([$h, $w], 0, 2 * $d + 1);
+        $dy = nd_random_int([$h, $w], 0, 2 * $d + 1);
+        $xs = nd_clip(nd_add(nd_subtract($dx, $d),
+                             nd_reshape(nd_arange(0, $w, 1), [1, $w])), 0, $w - 1);
+        $ys = nd_clip(nd_add(nd_subtract($dy, $d),
+                             nd_reshape(nd_arange(0, $h, 1), [$h, 1])), 0, $h - 1);
+        $flat = nd_add(nd_multiply($ys, $w), $xs);
+        $bands = mode.bands(this.mode);
+        $parts = [];
+        $i = 0;
+        while ($i < $bands) {
+            $band = nd_reshape(pxbuf.materialise(pxbuf.band(this.px, $i),
+                                                 mode.dtype(this.mode)), [$h * $w]);
+            push($parts, nd_reshape(nd_take($band, nd_ravel($flat)), [$h, $w, 1]));
+            $i = $i + 1;
+        }
+        return _wrap(this.mode, pxbuf.stack($parts, mode.dtype(this.mode)),
+                     _copyPalette(this.palette), _copyInfo(this.info), null);
+    }
+
     def tobytes() {
         if (this.mode == "1") { return _packBilevel(this.px); }
         return nd_tobytes(this.px, mode.wire_elem(this.mode));
@@ -893,6 +1196,14 @@ class PillowImage {
 // ════════════════════════════════════════════════════════════════════════
 //  Factories and helpers
 // ════════════════════════════════════════════════════════════════════════
+
+// wrap($m, $px, $palette, $info, $format) -> an Image over a buffer that
+// the caller has already built. The modules of the operation surface
+// (chops.b, ops.b, enhance.b, morph.b) work in buffers and need this to
+// hand one back as an Image; nothing is copied.
+def wrap($m, $px, $palette, $info, $format) {
+    return _wrap($m, $px, $palette, $info, $format);
+}
 
 def _wrap($m, $px, $palette, $info, $format) {
     $d = pxbuf.dims($px);
@@ -1038,8 +1349,12 @@ def _packBilevel($px) {
     if ($h == 0 || $w == 0) { return ""; }
     $rowBytes = floor(($w + 7) / 8);
     $padded = nd_zeros([$h, $rowBytes * 8, 1], "i64");
-    // a stored 255 becomes a set bit
-    $bits = nd_floor_divide(nd_clip($px, 0, 255), 255);
+    // ANY non-zero value becomes a set bit, which is what Pack.c's pack1
+    // does -- `if (in[i] != 0)`. Testing for 255 instead is wrong for a
+    // mode-1 buffer that has been through a filter, whose interior holds
+    // the convolution's 0..255 output; it cost four of the 320 images in
+    // P6's corpus before the corpus said so.
+    $bits = nd_where(nd_not_equal($px, 0), 1, 0);
     nd_add($bits, 0, nd_slice($padded, [null, [0, $w], null]));
     $acc = nd_zeros([$h, $rowBytes], "i64");
     $bit = 0;
@@ -1165,15 +1480,26 @@ def blend($im1, $im2, $alpha) {
     if ($im1.mode != $im2.mode) {
         throw "Image.blend: modes differ (" + $im1.mode + " and " + $im2.mode + ")";
     }
-    $a = $alpha;
-    $f1 = nd_astype($im1.px, "f64");
-    $f2 = nd_astype($im2.px, "f64");
-    $out = nd_add(nd_multiply($f1, 1.0 - $a), nd_multiply($f2, $a));
-    if (mode.is_float($im1.mode)) {
-        return _wrap($im1.mode, pxbuf.to_f32($out), null, {}, null);
+    // ImagingBlend is a byte operation: it rejects every mode that is not
+    // 8 bits per band, including I and F, with "image has wrong mode".
+    if (mode.bits_per_band($im1.mode) != 8 || mode.dtype($im1.mode) != "i64") {
+        throw "Image.blend: image has wrong mode (" + $im1.mode +
+              "); blend is an 8-bit operation in Pillow too";
     }
-    $r = nd_astype(nd_floor(nd_add($out, 0.5)), "i64");
-    return _wrap($im1.mode, pxbuf.clamp($r, $im1.mode), null, {}, null);
+    $a = $alpha;
+    if ($a == 0) { return $im1.copy(); }
+    if ($a == 1) { return $im2.copy(); }
+    // out = (UINT8)(in1 + alpha * (in2 - in1)): the cast TRUNCATES toward
+    // zero, it does not round. `floor(x + 0.5)` here is off by one on half
+    // the inputs, which is what the 65,536-pair chops corpus caught.
+    $d = nd_subtract(nd_astype($im2.px, "f64"), nd_astype($im1.px, "f64"));
+    $out = nd_add(nd_astype($im1.px, "f64"), nd_multiply($d, $a));
+    $r = nd_astype(nd_multiply(nd_sign($out), nd_floor(nd_abs($out))), "i64");
+    if ($a < 0 || $a > 1) {
+        // Extrapolation: the C clips, because the result can leave 0..255.
+        $r = nd_clip($r, 0, 255);
+    }
+    return _wrap($im1.mode, $r, null, {}, null);
 }
 
 // composite($im1, $im2, $mask) -> im2 where mask is 0, im1 where mask is 255

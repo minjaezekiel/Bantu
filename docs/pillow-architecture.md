@@ -750,6 +750,16 @@ segment, Pillow's `Image.getexif()` reads back every tag it was given.
 
 ## 7. The operation surface
 
+**Status after P6: done, and four defects deeper than this section expected.** 294 whole images are
+byte-identical to Pillow, all 24 channel operations are exact over every one of the 65,536 input
+pairs, and the numbers — ImageStat's nine properties, `entropy`, 30 `ImageMath` expressions, nine
+`ImageMorph` operators — all match. What the corpus found on the way is recorded in decision PW18:
+`Image.blend` rounded where `ImagingBlend` truncates (off by one on half of all inputs, and
+`ImageEnhance` is built on `blend`), mode 1 packed a bit only for 255 where `Pack.c` packs any
+non-zero value, `ModeFilter` had been given `RankFilter`'s border, and `ImageMorph`'s change count
+included the border the C never writes. Each was a defensible reading of the documentation and wrong
+against the code.
+
 `ImageFilter`, `ImageChops`, `ImageEnhance`, `ImageOps`, `ImageStat`, `ImageMath` and `ImageMorph`
 are, between them, about ninety calls. Almost all of them are three lines once the layer underneath
 is right, and the interesting content is in the handful of places where the obvious implementation is
@@ -835,10 +845,17 @@ and `nd_sort` along the last axis. One sort call for the whole image; the loop i
 which PW2 permits. `MedianFilter`, `MinFilter` and `MaxFilter` are this with rank `k²/2`, `0` and
 `k²−1`, exactly as Pillow derives them.
 
-`ModeFilter` is the odd one out: it needs the most frequent value in each window, with Pillow's
-tie-break (values occurring once or twice are ignored, and the *current* pixel wins if nothing else
-does). `nd_bincount` over the stacked taps gives the counts; the tie-break is then a comparison
+`ModeFilter` is the odd one out twice over. It needs the most frequent value in each window, with
+Pillow's tie-break — values occurring once or twice are ignored, the lowest value wins a tie, and
+the *current* pixel stands if nothing occurs more than twice — and the counts come from a comparison
 chain over the 256 bins, which is a loop over **bins**.
+
+And its border is not RankFilter's. **RankFilter expands the image with edge replication**, in
+Pillow's *Python*, before the C sees it; **ModeFilter filters every pixel with the window clipped to
+the image**, in C, with out-of-image taps simply not counted. Two neighbouring filters in one module,
+two different edge rules, and nothing in either name says so — P6 shipped RankFilter's rule in
+ModeFilter first and the corpus caught it. The clipping falls out of padding with **256**: a value no
+histogram bin can match, so an out-of-image tap counts for nothing without a mask of its own.
 
 ### 7.2 `ImageChops` — twenty-four operations and two rounding regimes
 
@@ -897,6 +914,23 @@ Every `Stat` property is derived from `histogram()` — including `extrema`, whi
 `sum` is `Σ j·h[j]`, `median` is the first bin where the running sum **exceeds** half the count, and
 `var` is `(sum2 − sum²/count)/count` — the computational form, with its cancellation, not the
 two-pass form.
+
+### 7.4.1 `quantize` is the one call with an error bound rather than byte equality
+
+Decision PW17 has the numbers and the reasoning; the short version is that median cut as an
+*algorithm* is reproducible and is reproduced, while `Quant.c`'s colour **hash** — which merges
+colours whose hashes collide and coarsens the whole colour space when its table overflows — is an
+implementation detail, not an algorithm. So `quantize.b` works from the exact distinct colours and
+the gate is measured error against the source rather than equality with Pillow's palette. Median cut
+comes out a wash and the octree 5× better at 16 colours.
+
+The shape is worth stating because it is PW2 again, one level down: a box is three index **arrays**,
+and a split is `nd_cumsum` for the count median, `nd_compress` for the partition and `nd_min`/`nd_max`
+for the new bounds — about fifteen array calls per split, whatever the box holds. The first
+transcription used Bantu lists and per-colour loops, the way `Quant.c`'s linked lists read, and took
+**48 seconds** on a 160×120 image; localising the dict-field reads took it to 8.7 s and vectorising
+the splits to 0.3 s. Rule PW2 says no loop proportional to the pixel count; 19,000 distinct colours
+is the same kind of data.
 
 ### 7.5 `ImageMath` — an expression evaluator, and six operators Bantu's arrays did not have
 
@@ -1030,7 +1064,7 @@ columns, in [`pillow-suite/ROADMAP.md`](../pillow-suite/ROADMAP.md).
 | **P3** ✅ | `resample.b` — the six filters, `resize`/`rotate`/`transpose`/`thumbnail`/`reduce`/`transform`; `transform.b`, `path.b` | every later phase wants to resize |
 | **P4** ✅ | `codecs/png.b`, `codecs/bmp.b`, `codecs/tga.b` | PNG is the format that matters most and the one P1 unblocked |
 | **P5** ✅ | `codecs/jpeg.b` — baseline, progressive, `draft`, encode; `exif.b`, `exif_tags.b` | the second format that matters most |
-| **P6** | `filter.b`, `chops.b`, `enhance.b`, `ops.b`, `stat.b`, `math.b`, `morph.b` | the operation surface, once there is something to operate on |
+| **P6** ✅ | `filter.b`, `chops.b`, `enhance.b`, `ops.b`, `stat.b`, `math.b`, `morph.b`, `quantize.b` | the operation surface, once there is something to operate on |
 | **P7** | `draw.b`, `font.b`, `path.b` | drawing and text |
 | **P8** | `codecs/gif.b` (+ `sequence.b`), `tiff.b`, `ico.b`, `pcx.b`, `xbm.b`, `webp.b`, the read-only long tail, PDF write | the rest of the formats, in descending order of use |
 | **P9** | `docs/pillow.md` complete, `samples/pillow/`, registry publication, and the `u8`-dtype measurement of PW7 | ship |

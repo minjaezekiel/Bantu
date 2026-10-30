@@ -35,7 +35,7 @@ tests/pillow_differential.sh            # live, against Python's Pillow
 
 ## ⚠ What is in this build, and what is not
 
-`pillow` is being built in nine phases. **This is phase P5 of 9.** The table below is the honest
+`pillow` is being built in nine phases. **This is phase P6 of 9.** The table below is the honest
 state; nothing is stubbed to look present.
 
 | | status |
@@ -54,8 +54,12 @@ state; nothing is stubbed to look present.
 | **The plugin registry** — `register_codec`, sniffing, `registered_extensions` | ✅ |
 | **JPEG** — baseline and progressive, every subsampling, restart markers, CMYK/YCCK, `draft`, read + write | ✅ **54 of 54 corpus files byte-identical to Pillow**, and the encoder byte-identical to libjpeg |
 | **`ExifTags`** — `TAGS GPSTAGS IFD Base GPS Interop`, EXIF read + write, `exif_transpose` | ✅ |
-| `quantize` (and `RGBA → P`, which needs it) | ⏳ P6 |
-| `ImageFilter ImageChops ImageEnhance ImageOps ImageStat ImageMath ImageMorph` | ⏳ P6 |
+| **`ImageFilter`** — the ten built-ins, `Kernel`, `BoxBlur`, `GaussianBlur`, `UnsharpMask`, `RankFilter`, `MedianFilter`, `MinFilter`, `MaxFilter`, `ModeFilter`, `Color3DLUT` | ✅ **190 results byte-identical** over seven modes |
+| **`ImageChops`** — all 24 operations | ✅ **exact over all 65,536 input pairs each** |
+| **`ImageEnhance`** — `Color Contrast Brightness Sharpness` | ✅ 60 results byte-identical |
+| **`ImageOps`** — `autocontrast colorize contain cover crop deform equalize expand fit flip grayscale invert mirror pad posterize scale solarize exif_transpose` | ✅ 38 results byte-identical |
+| **`ImageStat`**, **`ImageMath`**, **`ImageMorph`** | ✅ nine properties, 30 expressions, nine operators, all exact |
+| **`quantize`** — median cut, max coverage, fast octree; `RGBA → P`; `remap_palette`, `putpalette` | ✅ with an **error bound**, not byte equality (below) |
 | `ImageDraw`, `ImageFont` | ⏳ P7 |
 | GIF, TIFF, ICO, WebP, PCX, XBM, the read-only long tail, PDF write | ⏳ P8 |
 
@@ -373,6 +377,68 @@ saver (read-only).
 
 ---
 
+## The operation surface
+
+```bantu
+$im.filter(pillow.GaussianBlur(2));             // ImageFilter
+$im.filter(pillow.Kernel(3, $weights, 16, 0));
+$im.filter(pillow.MedianFilter(5));
+
+pillow.chop_screen($a, $b);                     // ImageChops, 24 operations
+pillow.chop_add($a, $b, 2.0, 10);
+
+pillow.enhance(pillow.Contrast($im), 1.6);      // ImageEnhance
+
+pillow.autocontrast($im, 2, null, null, null);  // ImageOps
+pillow.equalize($im, null);
+pillow.fit($im, [320, 240], null, 0.05, [0.5, 0.5]);
+
+$st = pillow.Stat($im, null);                   // ImageStat
+$st.mean $st.median $st.stddev $st.extrema
+
+pillow.imagemath_eval("(a + b) / 2", {"a": $x, "b": $y});     // ImageMath
+$op = pillow.MorphOp(null, "dilation4", null);  // ImageMorph
+pillow.morph_apply($op, $bilevel);              // [changed, image]
+
+$p = $im.quantize(64, null, null, null, null);  // an adaptive palette
+```
+
+**Three contracts worth knowing before you port code**, because each is Pillow's and not the obvious
+choice:
+
+* a convolution's **border is copied, not filtered**, the kernel is applied **vertically flipped**,
+  and only 3×3 and 5×5 exist — a 7×7 `Kernel` raises `bad kernel size`, and an image smaller than
+  the kernel comes back unchanged (that check comes first, so a 7×7 kernel on a 5×5 image is a copy).
+* `add_modulo` and `subtract_modulo` **wrap**; `add` and `subtract` **clamp** after truncating
+  `(a ± b) / scale + offset` toward zero. `difference`, `soft_light`, `hard_light` and `overlay` use
+  the wrapping macro too, where it is provably unreachable.
+* `ImageMath` divides by zero to **zero**, `%` takes the **dividend's** sign, and `pow` in mode I
+  rounds and saturates. `pillow.imagemath_eval` parses a fixed grammar — `+ - * / // % ** & | ^ << >>
+  ~`, the comparisons, parentheses, numbers, names and `abs min max convert float int equal
+  notequal` — because Pillow's `unsafe_eval` compiles a *Python* expression and there is no Python
+  here. Anything outside the grammar names the offending token; the grammar is the sandbox.
+
+### quantize is the one call with an error bound
+
+An adaptive palette is a heuristic. Pillow's `Quant.c` hashes colours into a 65,536-entry table and
+merges colours whose hashes collide; `pillow` works from the exact distinct colours. The algorithm is
+reproduced — the luminance-weighted split axis, the count median, the pixel-weighted mean rounded
+half up, an exact nearest-entry mapping — but the palette can differ, so what is promised and tested
+is the **error against the source**, measured:
+
+| colours | median cut (pillow / Pillow) | fast octree (pillow / Pillow) |
+|---|---|---|
+| 4 | 2749 / 2745 | 5392 / 8263 |
+| 16 | 1677 / 1845 | **1122 / 6166** |
+| 64 | 396 / 390 | 261 / 273 |
+
+(mean squared error, lower is better). `MAXCOVERAGE` is median cut with a coverage-weighted selection
+rather than Pillow's own `quantize2`, a different algorithm; it stays within 2× of Pillow's error.
+`LIBIMAGEQUANT` is declined by name — it is an external C library, and half of it would be worse than
+none.
+
+---
+
 ## EXIF
 
 EXIF is a TIFF block inside a JPEG's APP1 segment, so one tag reader serves both (and `codecs/tiff.b`
@@ -472,6 +538,23 @@ About **10 µs per pixel**, linear, at every scale. Two consequences worth plann
   Baseline files of any size are unaffected.
 * **An open JPEG keeps its file bytes** in `info["jpeg_src"]`, which is what `draft()` re-decodes
   from, since an `Image` here is never lazy. That is the file's own size, per open image.
+
+### What the operation surface costs
+
+Measured on a 160×120 RGB image, Darwin/Apple silicon:
+
+| operation | cost |
+|---|---|
+| a 3×3 convolution (`SMOOTH`) | 23 ms |
+| `GaussianBlur(1)` | 22 ms |
+| `GaussianBlur(10)` | 22 ms — **the same**, which is what a prefix-sum blur means |
+| `MedianFilter(5)` | 63 ms |
+| `quantize(64)` | 314 ms |
+
+A convolution costs ~20 whole-array passes for 3×3 and ~50 for 5×5, because each float32 rounding is
+one pass and bit-exactness with Pillow needs every one of them. `ModeFilter` and the rank filters
+hold `size²` taps per band at once, so a large radius on a large image is memory as well as time:
+`RankFilter(5)` on 1080p is about 300 MB per band.
 
 **The rule the whole design exists to satisfy:** no operation is proportional to the pixel count in
 *interpreted* work. An interpreted per-pixel pass over a 1080p image costs 4.1 s; the same operation

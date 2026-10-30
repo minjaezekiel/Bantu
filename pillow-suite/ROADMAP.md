@@ -329,22 +329,40 @@ records the trigger for the one atom that would change it.
 
 ---
 
-## Phase P6 — The operation surface
+## Phase P6 — The operation surface ✅
 
-- [ ] `pillow/filter.b` — `BLUR CONTOUR DETAIL EDGE_ENHANCE EDGE_ENHANCE_MORE EMBOSS FIND_EDGES
+- [x] `pillow/filter.b` — `BLUR CONTOUR DETAIL EDGE_ENHANCE EDGE_ENHANCE_MORE EMBOSS FIND_EDGES
       SHARPEN SMOOTH SMOOTH_MORE`, `GaussianBlur BoxBlur UnsharpMask Kernel`, `RankFilter
       MedianFilter MinFilter MaxFilter ModeFilter`, `Color3DLUT`
-- [ ] `pillow/chops.b` — all 24 channel operations
-- [ ] `pillow/enhance.b` — `Color Contrast Brightness Sharpness`
-- [ ] `pillow/ops.b` — `autocontrast colorize contain cover crop deform equalize expand fit flip
+- [x] `pillow/chops.b` — all 24 channel operations
+- [x] `pillow/enhance.b` — `Color Contrast Brightness Sharpness`
+- [x] `pillow/ops.b` — `autocontrast colorize contain cover crop deform equalize expand fit flip
       grayscale invert mirror pad posterize scale solarize exif_transpose`
-- [ ] `pillow/stat.b`, `pillow/math.b`, `pillow/morph.b`
+- [x] `pillow/stat.b`, `pillow/math.b`, `pillow/morph.b`
+- [x] `pillow/quantize.b` — median cut, max coverage and fast octree, which is what `convert("P")`
+      needed for a source with alpha; `remap_palette`, `putpalette`, `getpalette`,
+      `apply_transparency`
+- [x] the Image methods that were waiting on this phase: `filter quantize entropy point histogram`
+      with a mask, `convert` with a **matrix**, `tobitmap`, `effect_spread`, `getim`, and
+      `Image.linear_gradient` / `radial_gradient` / `effect_noise`
 
-| gate | form |
-|---|---|
-| differential | every filter, every chop, every op × every applicable mode, byte-identical to Pillow |
-| differential | `GaussianBlur` against Pillow's three-box-pass approximation, not against a true Gaussian — Pillow's answer is the contract |
-| stress | a 25×25 kernel; a rank filter at 1080p within the linear curve; `ImageMath` fed a hostile expression |
+| gate | form | result |
+|---|---|---|
+| differential | every filter, every chop, every op × every applicable mode | **294 whole images byte-identical** to Pillow: 190 filter results over seven modes, 38 ImageOps, 60 enhancements (four classes × three modes × five factors), the convert matrix, both gradients |
+| differential | the channel operations | **all 26 exact over every one of the 65,536 input pairs**, which is what proves Chops.c's two rounding regimes rather than sampling them |
+| differential | the numbers | ImageStat's nine properties over four modes, `entropy`, **30 ImageMath expressions**, nine ImageMorph operators (table, change count, matches and image), all exact |
+| differential | `GaussianBlur` against Pillow's three-box-pass approximation | exact, including the Gwosdek radius transform in float32 |
+| stress | a 25-tap kernel, a rank filter at 1080p, a hostile `ImageMath` expression | the 5×5 kernel and `RankFilter(5, 7)` are in the corpus; the grammar refuses what it does not parse, naming the token |
+| stress | the timing curve | `GaussianBlur(1)` and `GaussianBlur(10)` cost the same (22 ms on 160×120), which is what a prefix-sum blur means and is asserted |
+
+**quantize is the one call with an error bound rather than byte equality**, because an adaptive
+palette is a heuristic: Quant.c hashes colours into a 65,536-entry table and merges hash collisions,
+while this works from the exact distinct colours. The gate is that our mean squared error against the
+source is no worse than Pillow's, measured per method and colour count — and median cut and the
+octree are usually *better* (the octree by 5× at 16 colours). `MAXCOVERAGE` is median cut with a
+coverage-weighted selection rather than Pillow's own `quantize2`, which is a different algorithm;
+its bound is 2× and the deviation is published. `LIBIMAGEQUANT` is declined by name, for PW10's
+reason.
 
 ---
 

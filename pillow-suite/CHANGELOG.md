@@ -5,6 +5,70 @@ here only once all five tiers of its gate are green.
 
 ---
 
+## Phase P6 — The operation surface ✅ (2026-10-30)
+
+**149 checks green.** 294 whole images byte-identical to Pillow — every filter over every mode it
+accepts, every `ImageOps` call, four enhancements at five factors over three modes, `Color3DLUT`,
+the `convert()` matrix and both gradients. All 24 channel operations exact over **every one of the
+65,536 input pairs**. ImageStat's nine properties, `entropy`, 30 `ImageMath` expressions and nine
+`ImageMorph` operators exact.
+
+- `[feature]` **`pillow/filter.b`** — the ten built-ins and `Kernel` (3×3 and 5×5 only, as
+  `ImagingFilter` allows, with the border copied and the kernel applied vertically flipped),
+  `BoxBlur` and `GaussianBlur` as prefix sums (six array operations per axis per pass, so radius 1
+  and radius 10 cost the same — asserted), `UnsharpMask`, `RankFilter`/`Median`/`Min`/`Max` as one
+  `nd_sort` over stacked taps, `ModeFilter`, and `Color3DLUT` with ColorLUT.c's fixed-point
+  trilinear interpolation. The convolution accumulates in **float32**, rounding at every multiply
+  and every add, because in f64 the result differs by one on a few pixels in a thousand.
+- `[feature]` **`pillow/chops.b`** — 24 operations across Chops.c's two rounding regimes: `CHOP`
+  clamps, `CHOP2` wraps. The four operations that use the wrap unreachably are implemented with it
+  anyway, and the test states the bound that makes it unobservable over all 65,536 pairs.
+- `[feature]` **`pillow/ops.b`** — the look-up-table operations with their integer quirks
+  (`equalize`'s step subtracts the last NON-ZERO bin; `autocontrast`'s cutoff empties bins from both
+  ends; `colorize` interpolates by floor division over segments of different lengths) and the six
+  that are geometry, with Python's round-half-to-even on every target size.
+- `[feature]` **`pillow/enhance.b`, `pillow/stat.b`, `pillow/morph.b`** — the four enhancements as
+  `blend(degenerate, image, factor)`; every statistic from the 256-bin histogram, Pillow's `extrema`
+  wart included; morphology as a 512-entry table over the 3×3 neighbourhood, with the pattern
+  language (`4`, `M`, `N`) compiled the way `LutBuilder` compiles it.
+- `[feature]` **`pillow/math.b`** — the operators of `_imagingmath.c` (division by zero yields
+  **zero**; `%` takes the dividend's sign; `pow` in mode I rounds and saturates) plus **an
+  expression evaluator** for the grammar Pillow's examples use, since `unsafe_eval` compiles Python
+  and there is no Python here. An expression outside the grammar names the offending token; the
+  grammar is the sandbox.
+- `[feature]` **`pillow/quantize.b`** — median cut, max coverage and fast octree. This is what
+  `convert("P")` needed for a source with alpha, and what GIF will need in P8. Every split is an
+  array operation — `nd_cumsum` for the count median, `nd_compress` for the partition, `nd_min`/`max`
+  for the bounds — so the cost is ~15 array calls per split whatever the box holds.
+- `[feature]` **The Image methods that were waiting on P6** — `filter`, `quantize`, `entropy`,
+  `histogram` with a **mask**, `convert` with a **matrix**, `putpalette`, `getpalette`,
+  `remap_palette`, `apply_transparency`, `tobitmap`, `effect_spread`, `getim`, and
+  `linear_gradient` / `radial_gradient` / `effect_noise`.
+- `[bug fix]` **`Image.blend` rounded where Pillow truncates.** `ImagingBlend` is
+  `(UINT8)(in1 + alpha * (in2 - in1))` — a C cast, so it truncates toward zero — and it is an 8-bit
+  operation that refuses I and F with "image has wrong mode". Ours computed
+  `im1*(1-a) + im2*a` and rounded, which is off by one on **half** of all inputs. The 65,536-pair
+  chops corpus caught it; `ImageEnhance` depends on `blend`, so this was four modules wide.
+- `[bug fix]` **Mode 1 packed a bit only for 255, where Pack.c packs any non-zero value.** Visible
+  the moment a mode-1 image goes through a filter, whose interior holds the convolution's 0..255
+  output: four of the corpus images differed until `_packBilevel` tested `!= 0`.
+- `[bug fix]` **`ModeFilter` had RankFilter's border.** RankFilter expands the image with edge
+  replication (in Pillow's *Python*, before the C sees it); ModeFilter does not — it filters every
+  pixel with the window CLIPPED to the image. Two neighbouring filters, two different edge rules,
+  and the fix is to pad with 256: a value no histogram bin can match.
+- `[bug fix]` **`Color3DLUT`'s table conversion rounded the wrong way.** The 16-bit fixed point is
+  `round(v * (255 << 6))` away from zero, not `trunc(v * (255 << 6 | 32))`; the difference moved 24
+  of 429 values by one.
+- `[bug fix]` **`ImageMorph`'s change count included the border.** `_imagingmorph.c` counts only the
+  interior it writes, so every operator was inflated by the same number of border pixels — which is
+  how it was spotted: every count was off by exactly 21.
+- `[patch]` **quantize was 145× too slow, twice over, and both times for PW14's reason.** Reading
+  `$h.r[$c]` inside a loop copies the whole list (a list comes out of a dict by copy), which cost 48
+  seconds on a 160×120 image; localising the four columns took it to 8.7 s; vectorising the splits
+  took it to 0.3 s. The rule PW2 states for pixels applies to distinct colours too.
+
+---
+
 ## Phase P5 — JPEG and EXIF ✅ (2026-10-30)
 
 **87 checks green.** The corpus in `tests/fixtures/pillow/reference/jpeg/` — 54 files spanning every

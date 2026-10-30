@@ -760,7 +760,306 @@ def gen_jpeg():
          "fields: tag file mode width height byte_exact options"] + emans
 
 
+
+def gen_ops():
+    """The operation surface: ImageFilter, ImageChops, ImageEnhance, ImageOps,
+    ImageStat, ImageMath, ImageMorph, quantize and the Image methods P6 adds.
+
+    Four kinds of fixture, because four kinds of claim:
+
+      * `.exp` files -- whole images, byte for byte. Every filter over every
+        legal mode, every ImageOps call, every enhancement at five factors,
+        Color3DLUT, the convert() matrix.
+      * the CHOPS corpus -- a 256x256 pair covering ALL 65,536 input
+        combinations of every two-image operation, so the two rounding
+        regimes of Chops.c are proved rather than sampled.
+      * text files -- the numbers: ImageStat's nine properties, ImageMath
+        over twenty expressions, ImageMorph's LUT sums and change counts,
+        entropy.
+      * quantize -- Pillow's mean squared error per method and colour count,
+        because an adaptive palette is a heuristic and the honest claim is
+        "no worse than Pillow against the source", measured.
+    """
+    import math
+    import random
+
+    random.seed(9091)
+    out = os.path.join(OUT, "ops")
+    os.makedirs(out, exist_ok=True)
+    man = []
+
+    def pattern(w, h, mode="RGB"):
+        im = Image.new("RGB", (w, h))
+        px = im.load()
+        for y in range(h):
+            for x in range(w):
+                n = random.randrange(40)
+                px[x, y] = ((x * 37 + y * 11 + n) % 256,
+                            (x * 7 + y * 53 + n) % 256,
+                            (x * 101 + y * 3 + n) % 256)
+        if mode == "RGB":
+            return im
+        if mode == "1":
+            return im.convert("L").point(lambda v: 255 if v > 110 else 0, mode="1")
+        return im.convert(mode)
+
+    def record(group, tag, im, extra=""):
+        name = f"{group}_{tag}.exp"
+        open(os.path.join(out, name), "wb").write(im.tobytes())
+        man.append(f"{group} {tag} {name} {im.mode} {im.size[0]} {im.size[1]} {extra}".strip())
+
+    W, H = 13, 11
+    srcs = {m: pattern(W, H, m) for m in ("RGB", "L", "RGBA", "1", "I", "F", "CMYK", "LA")}
+    for m, im in srcs.items():
+        open(os.path.join(out, f"src_{m.replace(';', '_')}.raw"), "wb").write(im.tobytes())
+
+    # ── ImageFilter, every filter over every mode it accepts ──
+    from PIL import ImageFilter
+    builtins_ = ["BLUR", "CONTOUR", "DETAIL", "EDGE_ENHANCE", "EDGE_ENHANCE_MORE",
+                 "EMBOSS", "FIND_EDGES", "SHARPEN", "SMOOTH", "SMOOTH_MORE"]
+    filters = [(n, getattr(ImageFilter, n)) for n in builtins_]
+    # An ASYMMETRIC kernel, because every built-in is vertically symmetric
+    # and so cannot catch the vertical flip.
+    filters += [
+        ("kernel_asym", ImageFilter.Kernel((3, 3), [1, 2, 3, 0, 1, 0, -1, -2, -3], 4, 10)),
+        ("kernel_sum0", ImageFilter.Kernel((3, 3), [0, -1, 0, -1, 4, -1, 0, -1, 0], 1, 128)),
+        ("kernel5_asym", ImageFilter.Kernel((5, 5), list(range(25)), 300, 5)),
+        ("box0_5", ImageFilter.BoxBlur(0.5)),
+        ("box2", ImageFilter.BoxBlur(2)),
+        ("box7", ImageFilter.BoxBlur(7)),
+        ("box_xy", ImageFilter.BoxBlur((3, 1))),
+        ("gauss1", ImageFilter.GaussianBlur(1)),
+        ("gauss2_5", ImageFilter.GaussianBlur(2.5)),
+        ("gauss_xy", ImageFilter.GaussianBlur((2, 0.5))),
+        ("unsharp", ImageFilter.UnsharpMask(2, 150, 3)),
+        ("unsharp_hard", ImageFilter.UnsharpMask(1, 300, 0)),
+        ("median3", ImageFilter.MedianFilter(3)),
+        ("median5", ImageFilter.MedianFilter(5)),
+        ("min3", ImageFilter.MinFilter(3)),
+        ("max3", ImageFilter.MaxFilter(3)),
+        ("rank5_7", ImageFilter.RankFilter(5, 7)),
+        ("mode3", ImageFilter.ModeFilter(3)),
+        ("mode5", ImageFilter.ModeFilter(5)),
+    ]
+    for mode in ("L", "RGB", "RGBA", "I", "1", "CMYK", "LA"):
+        for tag, f in filters:
+            try:
+                r = srcs[mode].filter(f)
+            except Exception:
+                continue
+            record("FILTER", f"{tag}_{mode}", r)
+
+    # Color3DLUT, which has its own fixed-point interpolation
+    def lut_table(n, fn):
+        return [v for b in range(n) for g in range(n) for r in range(n)
+                for v in fn(r / (n - 1), g / (n - 1), b / (n - 1))]
+    luts = [
+        ("lut3_identity", ImageFilter.Color3DLUT(3, lut_table(3, lambda r, g, b: (r, g, b)))),
+        ("lut5_swap", ImageFilter.Color3DLUT(5, lut_table(5, lambda r, g, b: (b, g ** 0.5, r)))),
+        ("lut2_flat", ImageFilter.Color3DLUT(2, lut_table(2, lambda r, g, b: (0.25, r, 1.0)))),
+        ("lut4_alpha", ImageFilter.Color3DLUT(4, lut_table(4, lambda r, g, b: (r, g, b, 0.5)), 4)),
+    ]
+    for tag, f in luts:
+        for mode in ("RGB", "RGBA"):
+            try:
+                r = srcs[mode].filter(f)
+            except Exception:
+                continue
+            record("FILTER", f"{tag}_{mode}", r)
+
+    # ── ImageChops, exhaustively over all 65,536 input pairs ──
+    from PIL import ImageChops
+    ca = Image.new("L", (256, 256))
+    cb = Image.new("L", (256, 256))
+    ca.putdata([x for y in range(256) for x in range(256)])
+    cb.putdata([y for y in range(256) for x in range(256)])
+    open(os.path.join(out, "chops_a.raw"), "wb").write(ca.tobytes())
+    open(os.path.join(out, "chops_b.raw"), "wb").write(cb.tobytes())
+    ca1 = ca.point(lambda v: 255 if v > 128 else 0, mode="1")
+    cb1 = cb.point(lambda v: 255 if v > 100 else 0, mode="1")
+    open(os.path.join(out, "chops_a1.raw"), "wb").write(ca1.convert("L").tobytes())
+    open(os.path.join(out, "chops_b1.raw"), "wb").write(cb1.convert("L").tobytes())
+    chop_cases = {
+        "lighter": ImageChops.lighter(ca, cb),
+        "darker": ImageChops.darker(ca, cb),
+        "difference": ImageChops.difference(ca, cb),
+        "multiply": ImageChops.multiply(ca, cb),
+        "screen": ImageChops.screen(ca, cb),
+        "soft_light": ImageChops.soft_light(ca, cb),
+        "hard_light": ImageChops.hard_light(ca, cb),
+        "overlay": ImageChops.overlay(ca, cb),
+        "add": ImageChops.add(ca, cb),
+        "add_s2_o10": ImageChops.add(ca, cb, 2.0, 10),
+        "add_s07_on5": ImageChops.add(ca, cb, 0.7, -5),
+        "subtract": ImageChops.subtract(ca, cb),
+        "subtract_s2_o10": ImageChops.subtract(ca, cb, 2.0, 10),
+        "subtract_s3_on20": ImageChops.subtract(ca, cb, 3.0, -20),
+        "add_modulo": ImageChops.add_modulo(ca, cb),
+        "subtract_modulo": ImageChops.subtract_modulo(ca, cb),
+        "invert": ImageChops.invert(ca),
+        "offset_3_5": ImageChops.offset(ca, 3, 5),
+        "offset_n2": ImageChops.offset(ca, -2),
+        "blend_025": Image.blend(ca, cb, 0.25),
+        "blend_075": Image.blend(ca, cb, 0.75),
+        "blend_15": Image.blend(ca, cb, 1.5),
+        "blend_n05": Image.blend(ca, cb, -0.5),
+        "logical_and": ImageChops.logical_and(ca1, cb1).convert("L"),
+        "logical_or": ImageChops.logical_or(ca1, cb1).convert("L"),
+        "logical_xor": ImageChops.logical_xor(ca1, cb1).convert("L"),
+    }
+    for tag, im in chop_cases.items():
+        name = f"CHOP_{tag}.exp"
+        open(os.path.join(out, name), "wb").write(im.tobytes())
+        man.append(f"CHOP {tag} {name} {im.mode} {im.size[0]} {im.size[1]}")
+
+    # ── ImageOps ──
+    from PIL import ImageOps
+    g = srcs["L"]
+    rgb = srcs["RGB"]
+    op_cases = [
+        ("autocontrast", ImageOps.autocontrast(rgb)),
+        ("autocontrast_L", ImageOps.autocontrast(g)),
+        ("autocontrast_cut5", ImageOps.autocontrast(rgb, 5)),
+        ("autocontrast_cut_pair", ImageOps.autocontrast(rgb, (2, 8))),
+        ("autocontrast_ignore", ImageOps.autocontrast(g, 0, 0)),
+        ("autocontrast_tone", ImageOps.autocontrast(rgb, 2, preserve_tone=True)),
+        ("equalize", ImageOps.equalize(rgb)),
+        ("equalize_L", ImageOps.equalize(g)),
+        ("invert", ImageOps.invert(rgb)),
+        ("invert_L", ImageOps.invert(g)),
+        ("solarize", ImageOps.solarize(rgb, 100)),
+        ("solarize_L", ImageOps.solarize(g)),
+        ("colorize2", ImageOps.colorize(g, "red", "yellow")),
+        ("colorize3", ImageOps.colorize(g, (0, 0, 0), (255, 255, 255), (128, 0, 0), 20, 200, 100)),
+        ("grayscale", ImageOps.grayscale(rgb)),
+        ("flip", ImageOps.flip(rgb)),
+        ("mirror", ImageOps.mirror(rgb)),
+        ("crop2", ImageOps.crop(rgb, 2)),
+        ("crop_quad", ImageOps.crop(rgb, (1, 2, 3, 4))),
+        ("expand3_blue", ImageOps.expand(rgb, 3, "blue")),
+        ("expand_pair", ImageOps.expand(g, (2, 1), 200)),
+        ("contain_10_7", ImageOps.contain(rgb, (10, 7))),
+        ("contain_20_20", ImageOps.contain(rgb, (20, 20))),
+        ("cover_10_7", ImageOps.cover(rgb, (10, 7))),
+        ("pad_10_7", ImageOps.pad(rgb, (10, 7), color="red")),
+        ("pad_20_5", ImageOps.pad(rgb, (20, 5), color=(1, 2, 3), centering=(0.25, 0.75))),
+        ("scale15", ImageOps.scale(rgb, 1.5)),
+        ("scale05", ImageOps.scale(rgb, 0.5)),
+        ("fit_10_7", ImageOps.fit(rgb, (10, 7))),
+        ("fit_bleed", ImageOps.fit(rgb, (10, 7), bleed=0.1, centering=(0.3, 0.7))),
+    ]
+    for bits in range(1, 9):
+        op_cases.append((f"posterize{bits}", ImageOps.posterize(rgb, bits)))
+    for tag, im in op_cases:
+        record("OPS", tag, im)
+
+    # ── ImageEnhance ──
+    from PIL import ImageEnhance
+    for cls in ("Color", "Contrast", "Brightness", "Sharpness"):
+        for mode in ("RGB", "L", "RGBA"):
+            for factor in (0.0, 0.5, 1.0, 1.8, 3.0):
+                e = getattr(ImageEnhance, cls)(srcs[mode])
+                record("ENH", f"{cls}_{mode}_{factor}".replace(".", "_"), e.enhance(factor))
+
+    # ── the Image methods P6 adds ──
+    from PIL import ImageMorph
+    meth = [
+        ("matrix_L", rgb.convert("L", (0.299, 0.587, 0.114, 0))),
+        ("matrix_L_off", rgb.convert("L", (0.5, 0.25, 0.25, 10))),
+        ("matrix_RGB", rgb.convert("RGB", (0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0))),
+        ("linear_gradient_L", Image.linear_gradient("L")),
+        ("radial_gradient_L", Image.radial_gradient("L")),
+        # The MAPPED COLOURS, not the indexes: RGBA -> P goes through the
+        # fast octree, whose palette ORDER is a heuristic's choice, so the
+        # claim worth checking is that the colours come out the same.
+        ("rgba_to_p_rgb", srcs["RGBA"].convert("P").convert("RGB")),
+    ]
+    for tag, im in meth:
+        record("METH", tag, im)
+    open(os.path.join(out, "tobitmap.txt"), "w").write(
+        srcs["1"].tobitmap("t").decode("ascii"))
+
+    # ── numbers: ImageStat, entropy, ImageMath, ImageMorph, quantize ──
+    from PIL import ImageStat
+    lines = []
+    for mode in ("RGB", "L", "RGBA", "CMYK"):
+        st = ImageStat.Stat(srcs[mode])
+        lines.append("STAT " + mode + " " + " ".join([
+            "extrema=" + ",".join(f"{a}:{b}" for a, b in st.extrema),
+            "count=" + ",".join(str(v) for v in st.count),
+            "sum=" + ",".join(f"{v:.6f}" for v in st.sum),
+            "sum2=" + ",".join(f"{v:.6f}" for v in st.sum2),
+            "mean=" + ",".join(f"{v:.6f}" for v in st.mean),
+            "median=" + ",".join(str(v) for v in st.median),
+            "rms=" + ",".join(f"{v:.6f}" for v in st.rms),
+            "var=" + ",".join(f"{v:.6f}" for v in st.var),
+            "stddev=" + ",".join(f"{v:.6f}" for v in st.stddev),
+        ]))
+    mask = srcs["1"].convert("L").point(lambda v: 255 if v else 0, mode="1")
+    open(os.path.join(out, "mask.raw"), "wb").write(mask.convert("L").tobytes())
+    st = ImageStat.Stat(srcs["RGB"], mask)
+    lines.append("STATMASK RGB mean=" + ",".join(f"{v:.6f}" for v in st.mean) +
+                 " count=" + ",".join(str(v) for v in st.count))
+    for mode in ("RGB", "L", "RGBA"):
+        lines.append(f"ENTROPY {mode} {srcs[mode].entropy():.9f}")
+
+    from PIL import ImageMath
+    exprs = ["a + b", "a - b", "a * b", "a / b", "a % b", "a ** 2", "a & b", "a | b",
+             "a ^ b", "~a", "a << 1", "a >> 2", "a > b", "a <= b", "a == b", "a != b",
+             "min(a, b)", "max(a, b)", "abs(a - b)", "equal(a, b)", "notequal(a, b)",
+             "float(a) / 3", "int(float(a) / 3)", "(a + 2) * 3 - 1",
+             # NOT "a + 0.5": Pillow raises on a float constant beside an
+             # I-mode operand, because its fixup builds Image.new("I", ..., 0.5).
+
+             "-a", "a - b * 2", "(a & 15) << 2", "float(a) ** 0.5", "a / 0", "a % 0"]
+    ma = Image.new("L", (6, 1))
+    ma.putdata([0, 1, 10, 127, 200, 255])
+    mb = Image.new("L", (6, 1))
+    mb.putdata([3, 0, 7, 128, 255, 1])
+    open(os.path.join(out, "math_a.raw"), "wb").write(ma.tobytes())
+    open(os.path.join(out, "math_b.raw"), "wb").write(mb.tobytes())
+    for e in exprs:
+        r = ImageMath.unsafe_eval(e, a=ma, b=mb)
+        vals = list(r.get_flattened_data() if hasattr(r, "get_flattened_data") else r.getdata())
+        fmt = ",".join(f"{v:.6f}" if isinstance(v, float) else str(v) for v in vals)
+        lines.append(f"MATH {r.mode} {fmt} {e}")
+
+    morph_src = srcs["1"]
+    open(os.path.join(out, "morph_src.raw"), "wb").write(morph_src.convert("L").tobytes())
+    morph_ops = [("corner", None), ("dilation4", None), ("dilation8", None),
+                 ("erosion4", None), ("erosion8", None), ("edge", None),
+                 (None, ["4:(... .1. .0.)->0", "N:(11. .1. ...)->1"]),
+                 (None, ["M:(1.. .1. ..0)->1"]),
+                 (None, ["4:(.0. .1. ...)->0"])]
+    for i, (name, pats) in enumerate(morph_ops):
+        op = ImageMorph.MorphOp(op_name=name) if name else ImageMorph.MorphOp(patterns=pats)
+        count, res = op.apply(morph_src)
+        tag = name or f"custom{i}"
+        name_f = f"MORPH_{tag}.exp"
+        open(os.path.join(out, name_f), "wb").write(res.convert("L").tobytes())
+        lut = ImageMorph.LutBuilder(op_name=name) if name else ImageMorph.LutBuilder(patterns=pats)
+        lut_bytes = lut.build_lut()
+        lines.append(f"MORPH {tag} {name_f} count={count} lutsum={sum(lut_bytes)} "
+                     f"match={len(op.match(morph_src))} "
+                     f"lut={''.join(str(v) for v in lut_bytes[:64])}")
+
+    for colors in (4, 16, 64, 256):
+        for method, mname in ((0, "mediancut"), (1, "maxcoverage"), (2, "fastoctree")):
+            q = srcs["RGB"].quantize(colors, method=method)
+            back = list(q.convert("RGB").tobytes())
+            ref = list(srcs["RGB"].tobytes())
+            mse = sum((a - b) ** 2 for a, b in zip(ref, back)) / len(ref)
+            lines.append(f"QUANT {mname} {colors} entries={len(set(q.tobytes()))} "
+                         f"mse={mse:.4f}")
+
+    open(os.path.join(out, "NUMBERS"), "w").write("\n".join(lines) + "\n")
+    open(os.path.join(out, "MANIFEST"), "w").write("\n".join(man) + "\n")
+    return header("operation-surface index (images in reference/ops/); "
+                  "fields: group tag file mode width height") + man + lines
+
+
 GENERATORS = {
+    "ops_index.txt": gen_ops,
     "jpeg_index.txt": gen_jpeg,
     "codec_index.txt": gen_codecs,
     "geometry_index.txt": gen_geometry,

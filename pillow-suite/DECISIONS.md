@@ -273,3 +273,56 @@ Pillow's, including the mode change to `L` or `YCbCr`; the *saving* is not, beca
 already happened. A caller who wants the saving asks for the scale at open time:
 `pillow.decode_jpeg($data, 8, null)`. The cost is the file's own size held per open JPEG, which is
 stated in the docs rather than hidden.
+
+### PW17 — `quantize` has an error bound, not byte equality, and says so
+
+**Alternative:** reproduce `Quant.c` exactly, or decline adaptive palettes.
+
+Median cut as an algorithm is reproducible and is reproduced: the luminance-weighted split axis
+(77, 150, 29), the count median rather than the midpoint, equal axis values never separated, a box of
+volume 1 discarded rather than split, the pixel-weighted mean rounded half up, and an exact
+nearest-entry mapping in squared RGB. What is *not* reproducible is the bookkeeping around it:
+`Quant.c` hashes colours into a 65,536-entry table and **merges colours whose hashes collide**,
+coarsening the whole colour space with a right shift when the table overflows. Matching that means
+matching a hash function and a table size, which is matching an implementation detail rather than an
+algorithm.
+
+So this works from the **exact distinct colours**, and the gate is an error bound: our mean squared
+error against the source, against Pillow's. Measured on a 16×16 photograph:
+
+| colours | median cut (ours / Pillow) | fast octree (ours / Pillow) |
+|---|---|---|
+| 4 | 2749 / 2745 | 5392 / 8263 |
+| 16 | 1677 / 1845 | 1122 / 6166 |
+| 64 | 396 / 390 | 261 / 273 |
+
+Median cut is a wash and the octree is better, by 5× at 16 colours. `MAXCOVERAGE` is median cut with
+a coverage-weighted box selection rather than Pillow's own `quantize2`, which is a different
+algorithm; it is within 2× and that is published rather than papered over. `LIBIMAGEQUANT` is
+declined for PW10's reason: it is someone else's C library, and half of it would be worse than none.
+
+Two things make the honest version worth more than a closer one would be: the mapping is an *exact*
+nearest-neighbour search, so no pixel is further from its palette entry than it has to be; and the
+whole thing is array work, so it costs 0.3 s on a 160×120 image rather than the 48 s the first
+transcription took.
+
+### PW18 — The operation surface is where Pillow's own bugs become contracts, and four were found
+
+P6 is ninety calls that are each three lines once the layer underneath is right. The content is in
+the places where the obvious implementation is subtly not Pillow's, and the 65,536-pair chops corpus
+plus 294 whole-image comparisons found four defects in code that had been green for two phases:
+
+* **`Image.blend` rounded where `ImagingBlend` truncates**, and accepted I and F where Pillow
+  refuses them. Off by one on half of all inputs, and `ImageEnhance` is built on `blend`, so the
+  error reached four modules.
+* **Mode 1 packed a bit only for the value 255**, where `Pack.c` packs any non-zero value. Invisible
+  until a mode-1 image went through a filter and its interior held 0..255.
+* **`ModeFilter` had been given `RankFilter`'s border.** RankFilter expands with edge replication;
+  ModeFilter clips the window instead. Two neighbouring filters, two different edge rules, and
+  nothing in either name says so.
+* **`ImageMorph`'s change count included the border** that `_imagingmorph.c` never writes.
+
+The lesson is the one PW4 states and this phase paid for again: *fit against the reference, do not
+reason from the formula.* Each of these four is a defensible reading of the documentation and wrong
+against the code. An exhaustive corpus — all 65,536 input pairs, not twelve probe pixels — is what
+turns "looks right" into "is right", and it costs seconds to run.
