@@ -138,3 +138,41 @@ And one addition to §3's list of things that cannot be matched: §2 should have
 `x_pos` cursor so two spans of one row cannot blend over each other, and which draws flat edges in a
 *pre-pass per span* rather than once per row. It is reachable, it is tested, and it is 30 of the 694
 images.
+
+---
+
+## Addendum 2: what building `font.b` corrected in §3
+
+§3 said text cannot be pixel-exact, that the gate must be a measured one, and that "the advance
+widths and bounding boxes (`getlength`, `getbbox`, `textbbox`) compared exactly, since those come
+from `hmtx` and the layout rather than from the rasteriser". The first two are right. The third is
+two claims and they came out differently.
+
+1. **The advances are exact, for a reason §3 did not know.** It is not that they come from `hmtx`;
+   it is that Pillow's default layout engine is **libraqm**, which asks HarfBuzz, which loads glyphs
+   **unhinted**. So an advance is `FT_MulFix(hmtx, x_scale)` and nothing else — and the GPOS pair
+   adjustment beside it is **HarfBuzz's `em_scale`**, a *different* rounding,
+   `floor((v·size₆₄ + upem/2) / upem)`. The two halves of one number come from two libraries, and
+   eight of DejaVu's seventy kern pairs land on a tie where they disagree by 1/64 of a pixel. 735
+   comparisons are exact once both rules are implemented.
+
+   Pillow's *fallback* layout engine is the one that cannot be matched: it uses **hinted** advances,
+   and adds kerning as `PIXEL(delta)` — a whole-pixel count added to a 26.6 value, so 64× too small.
+   `layout_engine=BASIC` is therefore not a target; the default is.
+
+2. **The bounding boxes are not exact.** `FT_Glyph_Get_CBox` reads the *hinted* outline. At 24 px
+   Pillow's "Hello, world!" is 21 pixels tall where the unhinted control box is 22, because vertical
+   hinting pulls `l` and `d` onto the cap-height grid. The box joins the measured half of the gate:
+   mean edge error 0.18 px, worst 1 px.
+
+3. **And §3 missed a font that CAN be byte-exact.** `ImageFont.load_default()` is not a fixed target
+   — true, since Pillow 10.1 it returns an embedded **Aileron**, which is a CFF font this `glyf`
+   reader cannot read. But the font Pillow falls back to without FreeType, still exposed as
+   `load_default_imagefont()`, is a **PILfont**: a glyph sheet plus a 256-entry metric table,
+   rendered by forty lines of `ImagingPaste` with no scaling, no hinting and no rasteriser. That is
+   byte-exact, and it is what `load_default()` returns here — so the package renders text with no
+   file and no dependency, and 71 drawings of it are byte-identical to Pillow's.
+
+§4's build order survived intact. The one thing worth adding to it: **measure the gate before
+writing the code it gates.** Every correction above came from an hour of comparing numbers, and each
+one would have cost a day to find afterwards by staring at a rasteriser.

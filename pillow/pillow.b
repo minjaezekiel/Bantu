@@ -54,6 +54,7 @@ include "./inflate.b" as inflate;
 include "./deflate.b" as deflate;
 include "./bitio.b" as bitio;
 include "./draw.b" as draw;
+include "./font.b" as font;
 
 $VERSION = "0.7.0";
 
@@ -396,6 +397,42 @@ def floodfill($im, $xy, $value, $border, $thresh) {
     return draw.floodfill($im, $xy, $value, $border, $thresh);
 }
 
+// ─── ImageFont ──────────────────────────────────────────────────────────
+//
+// A font is a plain dict, not an object, because every call that takes one
+// takes it as an argument -- Pillow's ImageFont methods are
+// font.getlength(text), and the Bantu spelling of that is
+// pillow.font_getlength($font, $text, ...).
+def load_default($size)  { return font.load_default($size); }
+def load_default_imagefont() { return font.load_default_imagefont(); }
+def font_load($path)     { return font.load($path); }
+def font_load_path($path) { return font.load_path($path); }
+def truetype($path, $size, $index, $encoding, $layout_engine) {
+    return font.truetype($path, $size, $index, $encoding, $layout_engine);
+}
+def font_getlength($f, $text, $mode, $direction, $features, $language) {
+    return font.getlength($f, $text, $mode, $direction, $features, $language);
+}
+def font_getbbox($f, $text, $mode, $direction, $features, $language, $anchor, $stroke_width) {
+    return font.getbbox($f, $text, $mode, $direction, $features, $language,
+                        $anchor, $stroke_width);
+}
+def font_getmask($f, $text, $mode, $direction, $features, $language, $stroke_width) {
+    return font.getmask($f, $text, $mode, $direction, $features, $language, $stroke_width);
+}
+def font_getmask2($f, $text, $mode, $direction, $features, $language, $anchor, $stroke_width) {
+    return font.getmask2($f, $text, $mode, $direction, $features, $language,
+                         $anchor, $stroke_width);
+}
+def font_getmetrics($f)  { return font.getmetrics($f); }
+def font_getname($f)     { return font.getname($f); }
+def font_variant($f, $size, $index, $encoding, $layout_engine) {
+    return font.font_variant($f, $size, $index, $encoding, $layout_engine);
+}
+def font_get_variation_axes($f)        { return font.get_variation_axes($f); }
+def font_set_variation_by_name($f, $n) { return font.set_variation_by_name($f, $n); }
+def font_gid($f, $cp)                  { return font.gid($f, $cp); }
+
 // ─── help() ─────────────────────────────────────────────────────────────
 def help() {
     print("pillow " + $VERSION + " -- imaging for Bantu, in the shape of Python's Pillow");
@@ -434,11 +471,14 @@ def help() {
     print("             TAGS GPSTAGS IFD ExifBase GPS Interop");
     print("  ImagePath  Path path_getbbox path_tolist path_transform path_compact");
     print("  ImageDraw  Draw getdraw Outline floodfill");
+    print("  ImageFont  load_default truetype font_load font_getlength font_getbbox");
+    print("             font_getmask font_getmetrics font_getname font_variant");
     print("             $d = pillow.Draw($im, null); then on $d:");
     print("             point line rectangle polygon regular_polygon ellipse circle");
     print("             arc chord pieslice rounded_rectangle shape bitmap");
+    print("             text multiline_text textlength textbbox multiline_textbbox");
     print("");
-    print("  This build is phase P7. Text and the remaining formats arrive in");
-    print("  P7's second half and P8 -- see pillow-suite/ROADMAP.md.");
+    print("  This build is phase P7. The remaining formats arrive in P8 --");
+    print("  see pillow-suite/ROADMAP.md.");
     return null;
 }

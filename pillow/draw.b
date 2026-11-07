@@ -76,6 +76,7 @@ include "./mode.b" as mode;
 include "./pxbuf.b" as pxbuf;
 include "./color.b" as color;
 include "./palette.b" as pal;
+include "./font.b" as font;
 
 // ════════════════════════════════════════════════════════════════════════
 //  Arithmetic that has to match the C exactly
@@ -1916,6 +1917,118 @@ class PillowDraw {
         return _fillMask(this.c, _int($xy[0]), _int($xy[1]), $bitmap, $ink);
     }
 
+    // ─── text ───────────────────────────────────────────────────────────
+    //
+    // Bantu has no keyword arguments, so Pillow's eleven text options arrive
+    // as ONE dict -- the same arrangement save() uses for its keywords:
+    //
+    //   {"anchor": "mm", "spacing": 4, "align": "center", "direction": null,
+    //    "features": null, "language": null, "stroke_width": 2,
+    //    "stroke_fill": "black", "embedded_color": false, "font_size": 16}
+    //
+    // THE ONE DEVIATION, and it is published rather than hidden: Pillow
+    // passes the FRACTIONAL part of the position into getmask2, so FreeType
+    // rasterises the glyph shifted by a sub-pixel amount and text at x = 10.5
+    // is a different bitmap from text at x = 10. Glyph masks here are cached
+    // per (font, size, glyph) and positioned on the pixel grid, so a
+    // fractional xy rounds down to it. For integer coordinates -- which is
+    // what every caller writes -- there is no difference at all.
+    def getfont() {
+        if (this.font == null) { this.font = font.load_default(null); }
+        return this.font;
+    }
+
+    def _getfont($size) {
+        if ($size != null) { return font.load_default($size); }
+        return this.getfont();
+    }
+
+    def text($xy, $txt, $fill, $fnt, $opts) {
+        $o = $opts;
+        if ($o == null) { $o = {}; }
+        $f = $fnt;
+        if ($f == null) { $f = this._getfont($o.font_size); }
+        $sw = $o.stroke_width;
+        if ($sw == null) { $sw = 0; }
+        if ($o.embedded_color != null && $o.embedded_color) {
+            throw "ImageDraw.text: embedded_color needs a colour font (COLR, CBDT " +
+                  "or sbix), which this build does not read";
+        }
+        $r = this._getink($fill, null);
+        $ink = $r[0];
+        if ($ink == null) { $ink = $r[1]; }
+        if ($ink == null) { return null; }
+        $strokeInk = null;
+        if ($sw != 0) {
+            $strokeInk = $ink;
+            if ($o.stroke_fill != null) {
+                $sr = this._getink($o.stroke_fill, null);
+                $strokeInk = $sr[0];
+                if ($strokeInk == null) { $strokeInk = $sr[1]; }
+            }
+        }
+        $lines = _splitText(this, $f, $txt, $xy, $o, $sw);
+        $i = 0;
+        while ($i < len($lines)) {
+            $L = $lines[$i];
+            if ($strokeInk != null) {
+                _drawTextLine(this, $f, $L, $strokeInk, $sw, $o);
+                if (_inkDiff($ink, $strokeInk)) {
+                    _drawTextLine(this, $f, $L, $ink, 0, $o);
+                }
+            } else {
+                _drawTextLine(this, $f, $L, $ink, 0, $o);
+            }
+            $i = $i + 1;
+        }
+        return null;
+    }
+
+    // multiline_text is text: Pillow's two entry points have been the same
+    // function since the line splitting moved into ImageText.
+    def multiline_text($xy, $txt, $fill, $fnt, $opts) {
+        return this.text($xy, $txt, $fill, $fnt, $opts);
+    }
+
+    def textlength($txt, $fnt, $opts) {
+        $o = $opts;
+        if ($o == null) { $o = {}; }
+        $f = $fnt;
+        if ($f == null) { $f = this._getfont($o.font_size); }
+        return font.getlength($f, $txt, this.fontmode, $o.direction, $o.features,
+                              $o.language);
+    }
+
+    def textbbox($xy, $txt, $fnt, $opts) {
+        $o = $opts;
+        if ($o == null) { $o = {}; }
+        $f = $fnt;
+        if ($f == null) { $f = this._getfont($o.font_size); }
+        $sw = $o.stroke_width;
+        if ($sw == null) { $sw = 0; }
+        $lines = _splitText(this, $f, $txt, $xy, $o, $sw);
+        $box = null;
+        $i = 0;
+        while ($i < len($lines)) {
+            $L = $lines[$i];
+            $b = font.getbbox($f, $L[3], this.fontmode, $o.direction, $o.features,
+                              $o.language, $L[2], $sw);
+            $b = [$b[0] + $L[0], $b[1] + $L[1], $b[2] + $L[0], $b[3] + $L[1]];
+            if ($box == null) { $box = $b; }
+            else {
+                $box = [min($box[0], $b[0]), min($box[1], $b[1]),
+                        max($box[2], $b[2]), max($box[3], $b[3])];
+            }
+            $i = $i + 1;
+        }
+        if ($box == null) { return [$xy[0], $xy[1], $xy[0], $xy[1]]; }
+        return $box;
+    }
+
+    def multiline_textbbox($xy, $txt, $fnt, $opts) {
+        return this.textbbox($xy, $txt, $fnt, $opts);
+    }
+
     def shape($outline, $fill, $outlineInk) {
         $outline.close();
         $r = this._getink($outlineInk, $fill);
@@ -1925,6 +2038,99 @@ class PillowDraw {
         }
         return null;
     }
+}
+
+// _splitText -> one [x, y, anchor, text] per laid-out line.
+//
+// ImageText._split, whole: the line spacing is the bbox height of a capital
+// "A" plus the stroke width plus `spacing`; a `t` or `b` vertical anchor is
+// refused on multiline text; `m` and `d` shift the block up by half or all
+// of its height; and `align` shifts each line within the widest, with
+// "justify" spreading the words of every line but the last.
+def _splitText($d, $f, $txt, $xy, $o, $sw) {
+    $anchor = $o.anchor;
+    if ($anchor == null || $anchor == "") { $anchor = "la"; }
+    if (len($anchor) != 2) { throw "ImageDraw.text: anchor must be a 2 character string"; }
+    $align = $o.align;
+    if ($align == null || $align == "") { $align = "left"; }
+    $spacing = $o.spacing;
+    if ($spacing == null) { $spacing = 4; }
+    $lines = split($txt, "\n");
+    if (len($lines) == 1) { return [[$xy[0], $xy[1], $anchor, $lines[0]]]; }
+    if ($anchor[1] == "t" || $anchor[1] == "b") {
+        throw "ImageDraw.text: anchor \"" + $anchor + "\" is not supported for " +
+              "multiline text";
+    }
+    $ls = font.getbbox($f, "A", $d.fontmode, $o.direction, $o.features, $o.language,
+                       null, $sw)[3] + $sw + $spacing;
+    $widths = [];
+    $maxw = 0;
+    each ($ln in $lines) {
+        $wd = font.getlength($f, $ln, $d.fontmode, $o.direction, $o.features, $o.language);
+        push($widths, $wd);
+        if ($wd > $maxw) { $maxw = $wd; }
+    }
+    $top = $xy[1];
+    if ($anchor[1] == "m") { $top = $top - (len($lines) - 1) * $ls / 2.0; }
+    else if ($anchor[1] == "d") { $top = $top - (len($lines) - 1) * $ls; }
+    $parts = [];
+    $idx = 0;
+    while ($idx < len($lines)) {
+        $ln = $lines[$idx];
+        $left = $xy[0];
+        $diff = $maxw - $widths[$idx];
+        if ($align == "center") { $left = $left + $diff / 2.0; }
+        else if ($align == "right") { $left = $left + $diff; }
+        else if ($align != "left" && $align != "justify") {
+            throw "ImageDraw.text: align must be \"left\", \"center\", \"right\" " +
+                  "or \"justify\"";
+        }
+        $done = false;
+        if ($align == "justify" && $diff != 0 && $idx != len($lines) - 1) {
+            $words = split($ln, " ");
+            if (len($words) > 1) {
+                if ($anchor[0] == "m") { $left = $left - $maxw / 2.0; }
+                else if ($anchor[0] == "r") { $left = $left - $maxw; }
+                $ww = [];
+                $sum = 0;
+                each ($wd in $words) {
+                    $v = font.getlength($f, $wd, $d.fontmode, $o.direction, $o.features,
+                                        $o.language);
+                    push($ww, $v);
+                    $sum = $sum + $v;
+                }
+                $gap = ($maxw - $sum) / (len($words) - 1);
+                $wa = "l" + $anchor[1];
+                $k = 0;
+                while ($k < len($words)) {
+                    push($parts, [$left, $top, $wa, $words[$k]]);
+                    $left = $left + $ww[$k] + $gap;
+                    $k = $k + 1;
+                }
+                $top = $top + $ls;
+                $done = true;
+            }
+        }
+        if (!$done) {
+            if ($anchor[0] == "m") { $left = $left - $diff / 2.0; }
+            else if ($anchor[0] == "r") { $left = $left - $diff; }
+            push($parts, [$left, $top, $anchor, $ln]);
+            $top = $top + $ls;
+        }
+        $idx = $idx + 1;
+    }
+    return $parts;
+}
+
+// One line, through the font's mask and then ImagingFill2.
+def _drawTextLine($d, $f, $L, $ink, $sw, $o) {
+    $r = font.getmask2($f, $L[3], $d.fontmode, $o.direction, $o.features,
+                       $o.language, $L[2], $sw);
+    $mask = $r[0];
+    if ($mask.width <= 0 || $mask.height <= 0) { return null; }
+    $x = _int($L[0]) + $r[1][0];
+    $y = _int($L[1]) + $r[1][1];
+    return _fillMask($d.c, $x, $y, $mask, $ink);
 }
 
 // Draw($im, $mode) -> a drawing context over $im, which it mutates.

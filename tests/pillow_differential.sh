@@ -208,7 +208,30 @@ while (\$i < len(\$ld)) {
 }
 writefile(\$D + "lab.expect", join(\$parts, "\n"));
 
-print("pillow wrote 5 + 17 + 10 + 3 files");
+// Phase P7's second half: text. The bitmap font is byte copying on both
+// sides, so this is the one text comparison that can be exact -- and it is
+// the live one, against whatever Pillow is installed.
+\$bf = pillow.load_default(null);
+\$tx = pillow.new("L", [220, 40], 0);
+\$dt = pillow.Draw(\$tx, null);
+\$dt.text([2, 2], "Sphinx of black quartz,", 255, \$bf, null);
+\$dt.text([2, 14], "judge my vow! 0123456789", 200, \$bf, null);
+\$dt.text([2, 26], "one\ntwo", 128, \$bf, {"spacing": 1});
+writefile(\$D + "text_pil.raw", \$tx.tobytes());
+
+// And the TrueType half, where the ADVANCES are the exact claim: the whole
+// line's length, in 1/64ths, for Pillow to agree with.
+\$tf = pillow.truetype("tests/fixtures/pillow/fonts/DejaVuSans.ttf", 24, null, null, null);
+// AS 26.6 INTEGERS, not as decimals: str() gives six significant digits
+// (roadmap rule 4), and 151.8125 comes back as "151.812", which would make
+// this comparison fail on the printing rather than on the arithmetic.
+\$lens = [];
+each (\$s in ["H", "Hello, world!", "AV", "To", "Wavy ij", "The quick brown fox"]) {
+    push(\$lens, str(round(pillow.font_getlength(\$tf, \$s, null, null, null, null) * 64)));
+}
+writefile(\$D + "text_tt.expect", join(\$lens, "\n"));
+
+print("pillow wrote 5 + 17 + 10 + 3 + 2 files");
 BANTU_EOF
 
 "$BANTU" --quiet run "$TMP/emit.b" || { echo "[FAIL] the emitter did not run"; exit 1; }
@@ -465,6 +488,36 @@ try:
           px(lab) == exp, f"got {px(lab)[:3]} want {exp[:3]}")
 except Exception as e:
     check("the LAB comparison runs", False, f"{type(e).__name__}: {e}")
+
+# ── Phase P7's second half: text ──────────────────────────────────────────
+print()
+try:
+    from PIL import ImageFont
+    bf = ImageFont.load_default_imagefont()
+    tx = Image.new("L", (220, 40), 0)
+    dt = ImageDraw.Draw(tx)
+    dt.text((2, 2), "Sphinx of black quartz,", fill=255, font=bf)
+    dt.text((2, 14), "judge my vow! 0123456789", fill=200, font=bf)
+    dt.text((2, 26), "one\ntwo", fill=128, font=bf, spacing=1)
+    ours = open(os.path.join(D, 'text_pil.raw'), 'rb').read()
+    check("bitmap-font text is identical to Pillow's, pixel for pixel",
+          ours == tx.tobytes(),
+          f"{sum(1 for a, b in zip(ours, tx.tobytes()) if a != b)} bytes differ")
+except Exception as e:
+    check("the bitmap-font text comparison runs", False, f"{type(e).__name__}: {e}")
+
+try:
+    from PIL import ImageFont
+    tf = ImageFont.truetype("tests/fixtures/pillow/fonts/DejaVuSans.ttf", 24)
+    want = [round(tf.getlength(s) * 64) for s in
+            ("H", "Hello, world!", "AV", "To", "Wavy ij", "The quick brown fox")]
+    got = [int(v) for v in
+           open(os.path.join(D, 'text_tt.expect')).read().split("\n")]
+    bad_n = sum(1 for a, b in zip(got, want) if a != b)
+    check("TrueType advances are exactly Pillow's, kerning included",
+          bad_n == 0, f"{bad_n} of {len(want)} differ: got {got} want {want}")
+except Exception as e:
+    check("the TrueType advance comparison runs", False, f"{type(e).__name__}: {e}")
 
 print()
 sys.exit(1 if bad else 0)

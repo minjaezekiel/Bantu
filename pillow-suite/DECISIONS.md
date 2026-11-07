@@ -373,3 +373,54 @@ corpus does. The fix is at the wire, where the offset belongs, and
 The lesson is PW18's, again, and it is cheap to state and expensive to learn: *fit against the
 reference, do not reason from the formula.* Every one of these is a defensible reading of the
 documentation and wrong against the code.
+
+### PW20 — Text has two gates, because it has two kinds of font
+
+P7-NOTES §3 said text cannot be pixel-exact and would need a measured gate. That was right about
+TrueType and wrong about the shape of the phase, because it missed two things that only measurement
+finds.
+
+**A bitmap font can be exact, and that is worth building for.** A PILfont is a glyph sheet plus a
+256-entry metric table, and Pillow's renderer (`_font_getmask` in `_imaging.c`) is forty lines of
+`ImagingPaste`: no scaling, no hinting, no rasteriser. So `load_default()` text is held to **byte
+equality**, like every other image in this suite — 71 of 71 drawings, every anchor, every alignment,
+every mode a stencil can reach. The font is Pillow's own embedded courB08 sheet, carried here as
+base64 with its HPND notice, so the comparison is against Pillow's
+`load_default_imagefont()` and the package needs no font file to render text at all.
+
+Pillow's own `load_default()` returns something else when FreeType is present — an embedded Aileron,
+which is **CFF**. This reader reads `glyf`. So `load_default()` here returns the font Pillow falls
+back to without FreeType, and says so.
+
+**For TrueType, the advances ARE exact — and that was not obvious.** §3 assumed the metrics come
+from `hmtx` and so would be exact, and the bounding boxes with them. Both halves of that were wrong:
+
+* Pillow's default layout engine is **libraqm**, not its own fallback. libraqm asks HarfBuzz, which
+  loads glyphs **unhinted**, so an advance is `FT_MulFix(hmtx, x_scale)` and nothing else. Exact.
+  Pillow's *fallback* engine, by contrast, uses hinted advances and adds its kerning with
+  `PIXEL(delta)` — a whole-pixel count added to a 26.6 value, so 64× too small — and is the one path
+  that cannot be matched. We target the default.
+* The GPOS pair adjustment is scaled by **HarfBuzz's `em_scale`**, which is a different rounding
+  from `FT_MulFix`: `floor((v·size₆₄ + upem/2) / upem)`, so a tie goes toward positive infinity
+  rather than away from zero. The two halves of one advance come from two libraries. Eight of
+  DejaVu's seventy kern pairs land on a tie, and the first draft was wrong by 1/64 of a pixel in
+  exactly those eight. Found by comparing every pair at every size, not by reading either library.
+* **Bounding boxes are not exact**, because `FT_Glyph_Get_CBox` reads the *hinted* outline. At 24 px
+  Pillow's "Hello, world!" is 21 pixels tall where the unhinted control box is 22: vertical hinting
+  pulls `l` and `d` onto the cap-height grid. Measured instead: mean edge error 0.18 px, worst 1 px.
+
+**So the gate is three-part**, and each part is held to the strongest claim that is true of it:
+byte equality for the bitmap font, exact arithmetic for TrueType advances, and PW17's measured
+bound for TrueType boxes and pixels — inked IoU, coverage-weighted agreement, and the fraction
+within a tolerance, all published in `docs/pillow.md` beside the call.
+
+The published bounds sit under the measured numbers with room to spare, and that is deliberate. The
+residual is FreeType's grid fitting, so a FreeType release that changes its hinting moves these
+numbers; a test tightened onto them would be measuring Pillow's version rather than this package's
+correctness. A regression of our own blows straight through them — the draft without kerning scored
+0.28 where the finished one scores 0.88.
+
+**One number settled a design question rather than being argued about.** The rasteriser uses sixteen
+sub-scanlines per pixel row. Thirty-two were tried: the agreement moved by 0.0003. The residual is
+grid fitting, not quantisation, so the extra work buys nothing and the cheaper number is the right
+one. The comment in `font.b` records the measurement, so the next person does not re-run it.

@@ -366,10 +366,9 @@ reason.
 
 ---
 
-## Phase P7 — Drawing and text
+## Phase P7 — Drawing and text ✅
 
-**Drawing is done. Text is next. The research that preceded both is written down in
-[`P7-NOTES.md`](P7-NOTES.md)**: the prior art in this repository (`scripts/gen_font_tables.b` is
+**Done. The research that preceded it is written down in [`P7-NOTES.md`](P7-NOTES.md)**: the prior art in this repository (`scripts/gen_font_tables.b` is
 already a TrueType reader in Bantu), every rasterisation rule `draw.b` has to match from `Draw.c`
 (the endpoint a line never draws, the rectangle that does not normalise x, the polygon's float32
 crossings and corner joins, the ellipse quarter-tracer and its unrefreshed third candidate), and why
@@ -379,11 +378,14 @@ PW17's shape rather than byte equality.
 - [x] `pillow/draw.b` — `Draw getdraw floodfill Outline`; `arc bitmap chord circle ellipse line
       pieslice point polygon rectangle regular_polygon rounded_rectangle shape`; `width=`,
       `joint="curve"`, `corners=`, RGBA-on-RGB blending
-- [ ] `pillow/font.b` — `load_default` (embedded bitmap font), `truetype` (a **TrueType reader in
-      Bantu**: `cmap` 0/4/6/12, `glyf`/`loca`, `hmtx`, `kern`/`GPOS`, composite glyphs, `fvar`),
-      `load`/`load_path` for BDF/PCF; `getbbox getlength getmask getmask2 font_variant`; glyph cache
-- [ ] `text multiline_text textbbox multiline_textbbox textlength`
-- [ ] `anchor spacing align direction stroke_width stroke_fill embedded_color`
+- [x] `pillow/font.b` — `load_default` (the embedded bitmap font, no file needed), `truetype` (a
+      **TrueType reader in Bantu**: `cmap` 0/4/6/12, `glyf`/`loca`, `hmtx`, `kern` + GPOS pair
+      kerning, composite glyphs with scale and point matching, `fvar` introspection),
+      `load`/`load_path`; `getbbox getlength getmask getmask2 getmetrics getname font_variant`;
+      glyph cache
+- [x] `text multiline_text textbbox multiline_textbbox textlength`
+- [x] `anchor spacing align stroke_width stroke_fill` — `direction`, `features`, `language` and
+      `embedded_color` raise, naming what each would take (a shaping engine; a colour font)
 
 | gate | form | result |
 |---|---|---|
@@ -391,8 +393,10 @@ PW17's shape rather than byte equality.
 | differential | live, against the installed Pillow | `tests/pillow_differential.sh` draws the same composite scene on both sides and compares it, plus a floodfill and the LAB wire packing |
 | stress | a 100,000-point polygon; a self-intersecting polygon; degenerate ellipses; coordinates 100,000 outside the image; a comb of 100 one-pixel channels flood-filled | all green |
 | stress | the timing curve | a 1600×100 filled polygon costs 12 ms and a 100×1600 one 140 ms — the cost follows the **height**, not the area, which is what PW8 claims and is asserted |
-| differential | text with DejaVu at 8/12/24/72 px | ⏳ second half |
-| stress | a 2,000-character string; a hostile/truncated font file (fuzz tier) | ⏳ second half |
+| differential | bitmap-font text | **71 of 71 drawings byte-identical**: every string, every mode a stencil can reach, all 18 anchors, four alignments, the multiline spacing, the blended path, both edges |
+| differential | TrueType advances with DejaVu at 8/9/12/17/24/33/72 px | **665 of 665 single-glyph advances and 70 of 70 kerned pairs exact**, and 44 of 44 whole-string lengths — to the last 1/64 of a pixel |
+| differential | TrueType boxes and pixels | **measured**, in PW17's shape: bounding-box mean edge error 0.18 px (worst 1 px); inked IoU mean 0.88, worst 0.71; coverage-weighted mean 0.85; within 64/255 on 90% of pixels at worst; never more than 1 px of offset. The residual is FreeType's grid fitting — 32 sub-scanlines instead of 16 moved it by 0.0003 |
+| stress | a 2,000-character string; a 4,500-character measurement; sizes 6 to 48 and 400; a hostile/truncated font file | all green |
 
 **Five deviations, all under PW11, all asserted**: `Outline.transform` discarding the edges it just
 computed; `fill_mask_L`/`fill_mask_1` blending the *bytes* of an `I`, `F` or `I;16` pixel rather than

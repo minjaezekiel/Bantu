@@ -5,6 +5,51 @@ here only once all five tiers of its gate are green.
 
 ---
 
+## Phase P7 — Text ✅ (2026-11-07)
+
+**69 checks green.** Bitmap-font text is **byte-identical to Pillow**: 71 drawings covering every
+string, every mode a stencil can reach, all eighteen anchors, four alignments, the multiline
+spacing, the blended path and both edges. TrueType **advances are exact**: 665 single-glyph
+advances and 70 kerned pairs over seven sizes, plus 44 whole-string lengths, all to the last 1/64 of
+a pixel. TrueType boxes and pixels are **measured**, in PW17's shape.
+
+- `[feature]` **`pillow/font.b`** — `load_default` (Pillow's own embedded courB08 sheet, carried as
+  base64 with its HPND notice, so text works with no file and no dependency), `truetype` (a
+  TrueType reader in Bantu: `cmap` formats 0/4/6/12, `glyf`/`loca`, `hmtx`, `kern` format 0 and
+  GPOS lookup type 2 pair kerning, composite glyphs with scaling and point matching, `fvar`
+  introspection, `name`), `load`/`load_path`, `getbbox getlength getmask getmask2 getmetrics
+  getname font_variant`, and a glyph cache keyed by (font, size, glyph) — 43 glyphs at 24 px cost
+  17 ms cold and 4 ms warm.
+- `[feature]` **A non-zero-winding glyph rasteriser**, sixteen sub-scanlines per pixel row with
+  exact horizontal coverage. Non-zero and not even-odd, because a counter is wound against its
+  outer contour and the two rules part company the moment two same-direction contours overlap.
+- `[feature]` **`text multiline_text textlength textbbox multiline_textbbox`** on a `Draw`, with
+  `anchor spacing align stroke_width stroke_fill` — ImageText's line splitting whole, including
+  `justify` and the vertical anchors it refuses on multiline text.
+- `[found]` **The advances come from two libraries, and round differently.** Pillow's default layout
+  engine is libraqm, so a glyph advance is FreeType's `FT_MulFix(hmtx, x_scale)` while the GPOS pair
+  adjustment is HarfBuzz's `em_scale`, `floor((v·size₆₄ + upem/2) / upem)`. Eight of DejaVu's
+  seventy kern pairs land on a tie where the two rules disagree by 1/64 of a pixel. Found by
+  comparing every pair at every size.
+- `[found]` **A Bantu string is a byte string**, so `len` on an eight-letter Swedish word is 10.
+  Every string that reaches a font is decoded to codepoints first, with a Latin-1 fallback for
+  invalid UTF-8 — which is also how Pillow treats a `bytes` argument.
+- `[found]` **Three more mutations applied to a copy**, in the rasteriser this time: `_quad` pushed
+  its flattened segments into a copy of the caller's list, the per-row active-edge table pushed into
+  a copy of a list element, and the coverage accumulator was handed to a helper by value. All three
+  produced a correctly sized, entirely empty glyph. The active-edge table is now one sorted flat
+  list of `(row, edge)` keys and the span accumulation is inlined.
+- `[patch]` **`stroke_width` is a dilation by a disc**, not `FT_Stroker`: a round stroke of radius
+  *r* is the Minkowski sum of the glyph with a disc of radius *r*, so the same shape is computed on
+  the raster. The loop is over the disc's offsets, each one a whole-array maximum.
+- `[patch]` `direction`, `features`, `language` and `embedded_color` **raise**, naming what each
+  would take, rather than being accepted and ignored. So does a CFF `.otf`, a WOFF, and
+  `set_variation_by_name`.
+- `[patch]` **16 sub-scanlines, measured not chosen.** 32 moved the agreement with Pillow by 0.0003,
+  because the residual is FreeType's grid fitting. The comment records it so nobody re-runs it.
+
+---
+
 ## Phase P7 — Drawing ✅ (2026-11-07)
 
 **75 checks green, and 694 of 694 drawings byte-identical to Pillow.** Every geometric primitive at

@@ -1476,7 +1476,168 @@ def gen_draw():
                   "tag file mode width height bg inkmode call") + man
 
 
+def gen_text():
+    """Phase P7's text corpus, in two halves because text has two gates.
+
+    A **bitmap font** is rendered by byte copying -- no scaling, no hinting,
+    no rasteriser -- so `load_default_imagefont()` text is compared BYTE FOR
+    BYTE, like every other image in this suite.
+
+    A **TrueType font** is rendered by FreeType, which grid-fits the outline
+    and anti-aliases it with its own coverage arithmetic. Byte equality is
+    not reachable and claiming otherwise would be a lie, so the TrueType half
+    records three different things:
+
+      * the ADVANCES, which are exact: Pillow's default layout engine is
+        libraqm, which asks HarfBuzz, which loads glyphs unhinted, so a
+        length is `FT_MulFix(hmtx, x_scale)` summed with GPOS pair kerning
+        and nothing else.
+      * the BOUNDING BOXES, which are not, because FreeType takes them from
+        the hinted outline. Recorded so the deviation can be measured.
+      * the rendered MASK, as raw "L" bytes, so the Bantu side can report the
+        inked region's intersection-over-union and the fraction of pixels
+        within a tolerance -- the shape of gate PW17 uses for `quantize`.
+
+    Row formats, both space-free so a Bantu test can split on whitespace:
+
+        BT <tag> <file> <mode> <w> <h> <call>
+        TT <tag> <file> <size> <b64 text> <length> <l,t,r,b> <mw> <mh>
+
+    A `call` is pipe-separated: `text|x,y|s=<b64>|fill=i:255|anchor=mm|...`.
+    The text travels base64-encoded because a manifest row cannot hold a
+    space or a newline and text is mostly both.
+    """
+    import base64 as _b64
+    from PIL import ImageDraw, ImageFont
+
+    out = os.path.join(OUT, "text")
+    os.makedirs(out, exist_ok=True)
+    man = []
+    fontpath = os.path.join(HERE, os.pardir, "tests", "fixtures", "pillow",
+                            "fonts", "DejaVuSans.ttf")
+
+    def b64(s):
+        return _b64.b64encode(s.encode("utf-8")).decode("ascii")
+
+    def ink(v):
+        if v is None:
+            return "none"
+        if isinstance(v, tuple):
+            return "t:" + ",".join(str(x) for x in v)
+        if isinstance(v, str):
+            return "c:" + v
+        return "i:" + str(v)
+
+    # ── A: the bitmap font, byte for byte ─────────────────────────────
+    bf = ImageFont.load_default_imagefont()
+
+    def bt(tag, mode, size, bg, xy, text, fill, **kw):
+        w, h = size
+        im = Image.new(mode, (w, h), bg)
+        d = ImageDraw.Draw(im)
+        d.text(xy, text, fill=fill, font=bf, **kw)
+        name = f"BT_{tag}.exp"
+        open(os.path.join(out, name), "wb").write(im.tobytes())
+        call = [f"text|{xy[0]},{xy[1]}", "s=" + b64(text), "fill=" + ink(fill)]
+        for k, v in kw.items():
+            call.append(f"{k}={v}")
+        man.append(f"BT BT_{tag} {name} {mode} {w} {h} " + "|".join(call))
+
+    strings = {
+        "hello": "Hello, world!",
+        "empty": "",
+        "space": " ",
+        "kern": "AVWwij",
+        "desc": "gjpqy,;",
+        "ascii1": "".join(chr(c) for c in range(32, 80)),
+        "ascii2": "".join(chr(c) for c in range(80, 127)),
+        "latin1": "Ängström ÿ æ",
+        "digits": "0123456789",
+        "punct": "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~",
+    }
+    for tag, s in strings.items():
+        bt(tag, "L", (320, 16), 0, (2, 2), s, 255)
+    # off the edges, in both directions
+    bt("neg", "L", (60, 16), 0, (-14, -4), "Hello", 255)
+    bt("over", "L", (60, 16), 0, (40, 9), "Hello", 255)
+    # every mode a bitmap mask can stencil. I;16 is left out: fill_mask_1 has
+    # no 16-bit case, so Pillow's own output there is half-width and
+    # byte-interleaved, which decision PW11 calls a defect and this package
+    # fixes -- asserted in tests/pillow_font_test.b instead.
+    for m, col in (("L", 200), ("1", 255), ("P", 7), ("I", 100000), ("F", 3),
+                   ("RGB", (200, 60, 20)), ("RGBA", (200, 60, 20, 150)),
+                   ("LA", (200, 150)), ("CMYK", (200, 60, 20, 40)),
+                   ("YCbCr", (200, 60, 20)), ("HSV", (200, 60, 20))):
+        bt(f"mode_{m.replace(';', '_')}", m, (90, 14), 0, (1, 1), "Mode", col)
+    # on a non-zero background, which is what proves the stencil
+    bt("onwhite", "L", (90, 14), 255, (1, 1), "Mode", 0)
+    bt("onwhite_rgb", "RGB", (90, 14), "white", (1, 1), "Mode", (200, 0, 0))
+    # multiline: spacing, align, and the vertical anchors that are legal
+    multi = "one\ntwo three\nfour"
+    for sp in (0, 4, 11):
+        bt(f"ml_sp{sp}", "L", (120, 48), 0, (2, 2), multi, 255, spacing=sp)
+    for al in ("left", "center", "right", "justify"):
+        bt(f"ml_{al}", "L", (120, 48), 0, (2, 2), multi, 255, align=al)
+        bt(f"ml_{al}_sp0", "L", (120, 48), 0, (2, 2), multi, 255, align=al, spacing=0)
+    for an in ("la", "ma", "ra", "ls", "ms", "rs", "lm", "mm", "rm", "ld", "md", "rd"):
+        bt(f"ml_a{an}", "L", (140, 60), 0, (70, 30), multi, 255, anchor=an)
+    for an in ("la", "ma", "ra", "ls", "ms", "rs", "lt", "mt", "rt", "lb", "mb", "rb",
+               "lm", "mm", "rm", "ld", "md", "rd"):
+        bt(f"an_{an}", "L", (120, 24), 0, (60, 12), "Anchor", 255, anchor=an)
+    # a stroke, which a bitmap font has no outline for and Pillow silently
+    # drops -- so the result is the plain text in the fill colour
+    bt("stroke", "L", (90, 14), 0, (1, 1), "Mode", 255, stroke_width=2)
+    bt("stroke_fill", "L", (90, 14), 0, (1, 1), "Mode", 255, stroke_width=2,
+       stroke_fill=90)
+    # blended, through Draw(im, "RGBA")
+    for a in (0, 90, 255):
+        w, h = 90, 14
+        im = Image.new("RGB", (w, h), "white")
+        d = ImageDraw.Draw(im, "RGBA")
+        d.text((1, 1), "Mode", fill=(200, 60, 20, a), font=bf)
+        name = f"BT_blend{a}.exp"
+        open(os.path.join(out, name), "wb").write(im.tobytes())
+        man.append(f"BT BT_blend{a} {name} RGB {w} {h} "
+                   f"text|1,1|s={b64('Mode')}|fill=t:200,60,20,{a}|dm=RGBA")
+
+    # ── B: TrueType, measured ─────────────────────────────────────────
+    tt_strings = ["H", "Hello, world!", "AV", "To", "Wavy ij", "gjpqy",
+                  "The quick brown fox", "0123456789", "iiiiii", "@#%&",
+                  "Ängström"]
+    for size in (8, 12, 24, 72):
+        f = ImageFont.truetype(fontpath, size)
+        for i, s in enumerate(tt_strings):
+            tag = f"TT_{size}_{i}"
+            length = f.getlength(s)
+            box = f.getbbox(s)
+            m = f.getmask(s, "L")
+            name = f"{tag}.exp"
+            open(os.path.join(out, name), "wb").write(bytes(m))
+            man.append(f"TT {tag} {name} {size} {b64(s)} {length} "
+                       f"{box[0]},{box[1]},{box[2]},{box[3]} {m.size[0]} {m.size[1]}")
+    # per-glyph advances, which is the claim that can be exact
+    advs = []
+    for size in (8, 12, 24, 72, 9, 17, 33):
+        f = ImageFont.truetype(fontpath, size)
+        for c in range(32, 127):
+            advs.append(f"ADV {size} {c} {f.getlength(chr(c))}")
+        for pair in ("AV", "To", "Ta", "Yo", "LT", "we", "r.", "f)", "ij", "oo"):
+            advs.append(f"PAIR {size} {b64(pair)} {f.getlength(pair)}")
+    # the face metrics
+    for size in (8, 12, 24, 72):
+        f = ImageFont.truetype(fontpath, size)
+        a, dsc = f.getmetrics()
+        advs.append(f"METRICS {size} {a} {dsc}")
+        advs.append(f"NAME {size} {b64(f.font.family or '')} {b64(f.font.style or '')}")
+
+    open(os.path.join(out, "MANIFEST"), "w").write("\n".join(man) + "\n")
+    open(os.path.join(out, "NUMBERS"), "w").write("\n".join(advs) + "\n")
+    return header("text index (images in reference/text/); BT rows are byte-exact, "
+                  "TT rows are measured") + man + advs
+
+
 GENERATORS = {
+    "text_index.txt": gen_text,
     "draw_index.txt": gen_draw,
     "ops_index.txt": gen_ops,
     "jpeg_index.txt": gen_jpeg,

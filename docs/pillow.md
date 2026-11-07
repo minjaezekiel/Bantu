@@ -35,8 +35,8 @@ tests/pillow_differential.sh            # live, against Python's Pillow
 
 ## ⚠ What is in this build, and what is not
 
-`pillow` is being built in nine phases. **This is phase P7 of 9, drawing half complete.** The table
-below is the honest state; nothing is stubbed to look present.
+`pillow` is being built in nine phases. **This is phase P7 of 9.** The table below is the honest
+state; nothing is stubbed to look present.
 
 | | status |
 |---|---|
@@ -61,7 +61,8 @@ below is the honest state; nothing is stubbed to look present.
 | **`ImageStat`**, **`ImageMath`**, **`ImageMorph`** | ✅ nine properties, 30 expressions, nine operators, all exact |
 | **`quantize`** — median cut, max coverage, fast octree; `RGBA → P`; `remap_palette`, `putpalette` | ✅ with an **error bound**, not byte equality (below) |
 | **`ImageDraw`** — `Draw getdraw floodfill Outline`; `point line rectangle polygon regular_polygon ellipse circle arc chord pieslice rounded_rectangle shape bitmap`, every `width=`, `joint="curve"`, `corners=`, RGBA-on-RGB blending | ✅ **694 of 694 drawings byte-identical to Pillow** |
-| `ImageFont` and the text calls — `truetype load_default getbbox getlength getmask textbbox textlength text multiline_text`, `anchor spacing align direction stroke_width embedded_color` | ⏳ P7's second half |
+| **`ImageFont`** — `load_default` (an embedded bitmap font, no file needed), `truetype` (a **TrueType reader in Bantu**: `cmap` 0/4/6/12, `glyf`/`loca`, `hmtx`, composite glyphs, GPOS pair kerning), `load`/`load_path`, `getbbox getlength getmask getmask2 getmetrics getname font_variant` | ✅ bitmap text **byte-identical**; TrueType **advances exact**, pixels measured (below) |
+| **Text on a `Draw`** — `text multiline_text textlength textbbox multiline_textbbox`, `anchor spacing align stroke_width stroke_fill` | ✅ **71 of 71** bitmap-font drawings byte-identical |
 | GIF, TIFF, ICO, WebP, PCX, XBM, the read-only long tail, PDF write | ⏳ P8 |
 
 **Never implemented, and why** — `ImageTk`, `ImageQt`, `ImageWin`, `ImageShow`, `ImageGrab`: each
@@ -506,6 +507,74 @@ A few rules are worth knowing because they are Pillow's and they surprise people
   `ImageDraw2`'s pen/brush wrapper is declined for PW10's reason — it is a convenience layer with no
   behaviour of its own.
 
+### Text
+
+```bantu
+$f = pillow.load_default(null);                       // no file, no dependency
+$f = pillow.truetype("DejaVuSans.ttf", 24, null, null, null);
+
+$d.text([10, 10], "Hello", "black", $f, null);
+$d.text([60, 40], "Hello", "white", $f, {"anchor": "mm", "stroke_width": 2,
+                                         "stroke_fill": "black"});
+$d.text([10, 60], "one\ntwo\nthree", "black", $f, {"spacing": 6, "align": "center"});
+$d.textlength("Hello", $f, null);                     // 1/64-pixel precision
+$d.textbbox([10, 10], "Hello", $f, null);
+
+pillow.font_getlength($f, "Hello", null, null, null, null);
+pillow.font_getbbox($f, "Hello", "L", null, null, null, "mm", 0);
+pillow.font_getmetrics($f);                           // [ascent, descent]
+pillow.font_getname($f);                              // ["DejaVu Sans", "Book"]
+pillow.font_variant($f, 12, null, null, null);        // a copy at another size
+```
+
+Pillow's eleven text keywords arrive as **one options dict**, the same arrangement `save` uses:
+`anchor spacing align direction features language stroke_width stroke_fill embedded_color font_size`.
+
+**Text is UTF-8.** A Bantu string is a byte string, so `len` on "Ångström" is 10 and not 8; every
+string that reaches a font is decoded to codepoints first. An invalid sequence falls back to
+Latin-1 byte for byte, which is what Pillow does when handed `bytes` rather than `str`.
+
+#### How exact is text?
+
+Two kinds of font, two different answers, and the difference is structural rather than a matter of
+effort:
+
+| | gate | result |
+|---|---|---|
+| **`load_default()`** — a bitmap font | **byte-identical.** A PILfont is a glyph sheet plus a 256-entry metric table, and Pillow's renderer is forty lines of `ImagingPaste`: no scaling, no hinting, no rasteriser, so there is nothing to approximate | **71 of 71** drawings byte-identical — every string, every mode a stencil can reach, all 18 anchors, all four alignments, the multiline spacing, the blended path and both edges |
+| **`truetype()`** — advances | **exact.** Pillow's default layout engine is libraqm, which asks HarfBuzz, which loads glyphs *unhinted* — so an advance is `FT_MulFix(hmtx, x_scale)` plus the GPOS pair adjustment and nothing else | **665 of 665** single-glyph advances and **70 of 70** kerned pairs exact over seven sizes, to the last 1/64 of a pixel; **44 of 44** whole-string lengths |
+| **`truetype()`** — bounding boxes | **measured.** `FT_Glyph_Get_CBox` is taken from the *hinted* outline, so vertical hinting pulls `l` and `d` onto the cap-height grid and Pillow's "Hello, world!" at 24 px is 21 pixels tall where the unhinted control box is 22 | mean edge error **0.18 px**, worst **1 px** |
+| **`truetype()`** — pixels | **measured**, in the shape decision PW17 uses for `quantize`: the inked region's intersection-over-union against Pillow's, plus a coverage-weighted agreement and the fraction of pixels within a tolerance | inked IoU mean **0.88**, worst **0.71**; coverage-weighted mean **0.85**, worst **0.60**; within 64/255 on **90%** of pixels at worst; the two rasters never more than **1 px** apart |
+
+Per size, the inked IoU is 0.81 at 8 px, 0.87 at 12, 0.89 at 24 and **0.96 at 72** — the agreement
+improves with size because what is left is grid fitting, which moves a stem by a whole pixel and so
+matters less the more pixels a stem has. Raising the rasteriser from 16 sub-scanlines per row to 32
+moved the number by 0.0003, which is how we know the residual is not the anti-aliasing.
+
+#### What text does not do
+
+- **No OpenType shaping beyond pair kerning.** No GSUB, so no ligature substitution; no mark
+  attachment, no reordering, no bidi. `direction`, `features` and `language` therefore **raise**
+  rather than being accepted and ignored — which is also what Pillow does without libraqm. DejaVu's
+  `fi` ligature is the visible consequence and it is one 64th of a pixel wide.
+- **No CFF outlines.** `truetype()` reads `glyf`; a `.otf` with PostScript outlines raises and says
+  so. That includes the Aileron face Pillow's own `load_default()` returns when FreeType is present,
+  which is why `load_default()` here returns the bitmap font Pillow falls back to without it — and
+  matches Pillow's `load_default_imagefont()` byte for byte.
+- **No colour fonts**, so `embedded_color` raises: COLR, CBDT and sbix are not read.
+- **No variation instances.** `fvar` is read, so `font_get_variation_axes` reports what a font
+  offers, but applying an instance needs `gvar` point-delta interpolation and
+  `font_set_variation_by_name` declines by name.
+- **`stroke_width` is a dilation, not a stroker.** Pillow hands the outline to `FT_Stroker`; a round
+  stroke of radius *r* is the Minkowski sum of the glyph with a disc of radius *r*, so this dilates
+  the coverage by that disc — the same shape, computed on the raster instead of the outline. The
+  mask grows by exactly `2 × width` in each dimension, as Pillow's does, and the unstroked glyph is
+  contained in the stroked one; the difference is at the sub-pixel edge.
+- **Sub-pixel positioning rounds to the grid.** Pillow passes the fractional part of the position
+  into `getmask2`, so text at *x* = 10.5 is a different bitmap from text at *x* = 10. Glyph masks
+  here are cached per (font, size, glyph) and placed on the pixel grid. For integer coordinates —
+  what every caller writes — there is no difference.
+
 ### Drawing on a `P` image: pass an index
 
 `ImagePalette.getcolor` in Pillow **appends** an unknown colour to the palette as a side effect of
@@ -526,6 +595,9 @@ Nothing in `draw.b` loops over pixels (rule PW2):
 | a 1080p filled rectangle | **118 ms** |
 | a 100,000-point polygon | fills; the edge table is a list of lists rather than of dicts for exactly this reason |
 | `floodfill` | a scanline span fill over a fillability mask computed in one array pass, so the loop is over spans. A 200×200 image combed into 100 one-pixel channels — the worst shape there is — takes **2.2 s**; an ordinary region is milliseconds |
+| a glyph | proportional to the glyph's **area**, which is the one place rule PW2 gives way — a glyph is small, and it is **cached by (font, size, glyph)**. 43 distinct glyphs at 24 px cost 17 ms cold and 4 ms warm |
+| `getlength` | one array gather for the whole string's glyph ids, then arithmetic. A 4,500-character line measures in 87 ms |
+| bitmap text | byte copying, one array paste per character. 2,000 characters in 93 ms |
 
 ---
 
