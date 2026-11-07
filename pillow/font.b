@@ -276,23 +276,6 @@ $_PILFONT_SHEET_B64 = join([
 //  PILfont
 // ════════════════════════════════════════════════════════════════════════
 
-// _pilfont($metrics, $sheetSpec, $name) -> a font dict.
-//
-// `_font_new` in _imaging.c, including its clamping: a source rectangle that
-// would reach outside the sheet is pulled back in and the DESTINATION
-// rectangle is pulled in by the same amount, so a malformed table cannot
-// make the mask bigger than the sheet. That is a denial-of-service guard
-// upstream and a correctness one here, because the destination rectangle is
-// what sets the mask's height.
-def _pilfont($metrics, $sheetSpec, $name) {
-    $b = bytes($metrics);
-    if (len($b) != 5120) {
-        throw "ImageFont: a PILfont metric table is 256 x 20 bytes, got " +
-              str(len($b));
-    }
-    return _pilfontFromTable($b, $sheetSpec, $name);
-}
-
 // _pilfontData($file, $sheetSpec, $name) -> a font from a whole PILfont
 // file: the magic, the header line, the info lines, "DATA", and then the
 // table. Pillow's _load_pilfont_data, with its own order of reads.
@@ -333,6 +316,15 @@ def _pilfontData($file, $sheetSpec, $name) {
     return _pilfontFromTable($table, $sheetSpec, $name);
 }
 
+// _pilfontFromTable($b, $sheetSpec, $name) -> a font from the 256 x 20
+// metric table alone.
+//
+// `_font_new` in _imaging.c, including its clamping: a source rectangle that
+// would reach outside the sheet is pulled back in and the DESTINATION
+// rectangle is pulled in by the same amount, so a malformed table cannot
+// make the mask bigger than the sheet. That is a denial-of-service guard
+// upstream and a correctness one here, because the destination rectangle is
+// what sets the mask's height.
 def _pilfontFromTable($b, $sheetSpec, $name) {
     $sw = $sheetSpec.size[0];
     $sh = $sheetSpec.size[1];
@@ -1000,8 +992,6 @@ def _gposPair($data, $off, $out) {
         $g2 = _readClassDef($data, $cd2);
         // class 0 of ClassDef1 is "every covered glyph not otherwise
         // classified", so the coverage list supplies it.
-        $byClass1 = {};
-        for $g, $c in $g1.items() { }
         $i = 0;
         while ($i < len($cov)) {
             $g = $cov[$i];
