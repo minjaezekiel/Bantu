@@ -981,18 +981,38 @@ return coordinate lists, which `nd_nonzero` answers directly. The border is left
 §1.1 demands:
 
 - **`rectangle`** is a slice assignment. Free.
-- **`line`** is Bresenham, but **vectorised**: the major-axis coordinates are an `nd_arange`, the
-  minor-axis coordinates an integer division of it, and the pixels are written with one `nd_put`.
-  One array call per line, whatever its length.
+- **`line`** is Bresenham, decomposed into its **runs**. The design of record said one `nd_arange`
+  and one `nd_put`; building it showed that `nd_put` materialises the whole destination's flat walk
+  order on every call, so a polyline would pay for the image once per segment. What it does instead
+  is invert the error recurrence: after `i` steps of the x-major loop the minor coordinate has
+  advanced `floor((2·dy·i + dx) / (2·dx))` times, so the run at minor value `k` covers the major
+  indices `[ceil(dx(2k−1)/2dy), ceil(dx(2k+1)/2dy) − 1]`. A line is therefore
+  `min(|dx|, |dy|) + 1` span writes instead of `max(|dx|, |dy|)` pixel writes — the same pixels,
+  every tie included, and the span writer is the one every other primitive uses. A near-horizontal
+  1080p line is two array calls; a 45° one is one call per pixel, because it touches that many
+  pixels and so does Pillow.
 - **`polygon` / `ellipse` / `pieslice` / `chord` / `arc` / `rounded_rectangle`** are scanline
   fills: per output row, the edge crossings are sorted and each span is a slice assignment. The
   loop is over **rows**, and within a row over **spans** — not over pixels. A filled 1080p polygon
   is ~1,080 iterations.
 - **`floodfill`** is a scanline flood fill, same shape: a stack of spans, each span an array write.
+  Its predicate — 1-norm distance from the seed's colour within `thresh`, or "neither the fill value
+  nor the border value" — depends only on the original pixel and two constants, so **fillability is
+  one array pass** and the flood walks that boolean mask. Each row's blocker positions are one
+  `nd_nonzero`, cached, and held as a numba array rather than a Bantu list: a list read out of a
+  dict or handed to a function is copied (PW14), and copying a row's blockers three times per span
+  was the difference between 0.2 s and 7 s on a comb-shaped region.
 - **Anti-aliasing** is not in Pillow's `ImageDraw` and is not here either. Pillow's documented
   idiom — draw at 4× and `resize` down — works, because `resize` is fast.
 - **`width=`** on lines and outlines, `joint="curve"`, and the `ImagePath`/`ImageDraw.Outline`
   surfaces all behave as Pillow's do.
+- **Mutable state crosses a call boundary in a dict, never in a list.** Bantu copies a list on the
+  way into a function and on the way out of a dict, and it copies it on *every* member read — so
+  `$table[$i]` through a dict is quadratic. The polygon filler's edge table is therefore a local,
+  and the corner-join fix-up is **inlined into the row loop** rather than factored out. That is not
+  a style choice; a `_cornerJoin(table, …)` helper copied the whole table once per corner, which on
+  a 100,000-point polygon does not finish. Three defects of this family were found and fixed while
+  P7 was being written, each of them a mutation silently applied to a copy.
 
 ### 8.2 Fonts
 

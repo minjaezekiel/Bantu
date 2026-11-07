@@ -1138,7 +1138,7 @@ class PillowImage {
 
     def tobytes() {
         if (this.mode == "1") { return _packBilevel(this.px); }
-        return nd_tobytes(this.px, mode.wire_elem(this.mode));
+        return nd_tobytes(_labWire(this.px, this.mode), mode.wire_elem(this.mode));
     }
 
     // ─── output ─────────────────────────────────────────────────────────
@@ -1399,7 +1399,33 @@ def frombytes($m, $size, $data) {
     $nb = mode.bands($m);
     $elem = mode.wire_elem($m);
     $px = nd_frombytes($data, $elem, [$h, $w, $nb]);
-    return _wrap($m, $px, null, {}, null);
+    return _wrap($m, _labWire($px, $m), null, {}, null);
+}
+
+// _labWire($px, $m) -> LAB's a and b bands shifted by 128, or $px unchanged.
+//
+// Pillow's LAB rawmode is PACKED WITH AN OFFSET: Pack.c writes a + 128 and
+// b + 128, and Unpack.c takes it back off, so a store value of 180 travels
+// as the byte 52 and a store of 0 travels as 128. Our store keeps Pillow's
+// own store convention -- it is what getpixel reports, what putpixel takes
+// and what ImageDraw's ink writes -- so the offset belongs at the wire and
+// nowhere else. It was missing, which made tobytes() and frombytes() the one
+// pair of calls in the package that disagreed with Pillow for a whole mode;
+// P7's drawing corpus is what found it, because the only way to see it is to
+// compare LAB bytes with Pillow's.
+//
+// One function serves both directions: -128 and +128 are the same shift
+// modulo 256.
+def _labWire($px, $m) {
+    if ($m != "LAB") { return $px; }
+    $out = pxbuf.materialise($px, "i64");
+    $i = 1;
+    while ($i < 3) {
+        $b = pxbuf.band($out, $i);
+        nd_add(nd_mod(nd_add($b, 128), 256), 0, $b);
+        $i = $i + 1;
+    }
+    return $out;
 }
 
 // fromarray($array, $mode) -> an image over a numba array.

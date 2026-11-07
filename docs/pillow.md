@@ -35,8 +35,8 @@ tests/pillow_differential.sh            # live, against Python's Pillow
 
 ## ⚠ What is in this build, and what is not
 
-`pillow` is being built in nine phases. **This is phase P6 of 9.** The table below is the honest
-state; nothing is stubbed to look present.
+`pillow` is being built in nine phases. **This is phase P7 of 9, drawing half complete.** The table
+below is the honest state; nothing is stubbed to look present.
 
 | | status |
 |---|---|
@@ -60,7 +60,8 @@ state; nothing is stubbed to look present.
 | **`ImageOps`** — `autocontrast colorize contain cover crop deform equalize expand fit flip grayscale invert mirror pad posterize scale solarize exif_transpose` | ✅ 38 results byte-identical |
 | **`ImageStat`**, **`ImageMath`**, **`ImageMorph`** | ✅ nine properties, 30 expressions, nine operators, all exact |
 | **`quantize`** — median cut, max coverage, fast octree; `RGBA → P`; `remap_palette`, `putpalette` | ✅ with an **error bound**, not byte equality (below) |
-| `ImageDraw`, `ImageFont` | ⏳ P7 |
+| **`ImageDraw`** — `Draw getdraw floodfill Outline`; `point line rectangle polygon regular_polygon ellipse circle arc chord pieslice rounded_rectangle shape bitmap`, every `width=`, `joint="curve"`, `corners=`, RGBA-on-RGB blending | ✅ **694 of 694 drawings byte-identical to Pillow** |
+| `ImageFont` and the text calls — `truetype load_default getbbox getlength getmask textbbox textlength text multiline_text`, `anchor spacing align direction stroke_width embedded_color` | ⏳ P7's second half |
 | GIF, TIFF, ICO, WebP, PCX, XBM, the read-only long tail, PDF write | ⏳ P8 |
 
 **Never implemented, and why** — `ImageTk`, `ImageQt`, `ImageWin`, `ImageShow`, `ImageGrab`: each
@@ -277,6 +278,15 @@ test asserting the *containment* of the difference:
 | `ImagingConvertRGB2YCbCr` casts with `(UINT8)`, so an out-of-range input *wraps* — 256 becomes 0 | clamp. Identical on all valid input |
 | a negative bicubic undershoot is cast to `UINT8`, which is undefined behaviour and on x86 wraps −5 to 251 — a bright speck in a dark area | clamp at zero |
 | Pillow verifies metadata chunk CRCs but **not IDAT's**, so it accepts a PNG with a corrupted image checksum | verify every CRC. `png.allow_truncated(true)` is the opt-out, and it recovers Pillow's exact pixels |
+| `ImagingOutlineTransform` frees the edge buffer it has just transformed and sets the count to zero, so `shape()` after `transform()` draws only the closing edge. The C marks the spot `/* FIXME: ugly! */` | transform in place, and move the cursor and start point with the edges. A transformed outline fills **exactly the polygon of its transformed vertices** |
+| `fill_mask_L` has no case for a 4-byte or 2-byte pixel, so a `bitmap` matte on `I` or `F` blends the four **bytes** of the value independently, and on `I;16` the two. `fill_mask_1` has no 16-bit case at all, so a `"1"` stencil on `I;16` writes the ink's low byte into byte *x* of the row — half the width, every second byte corrupted. Paste.c's own comment: "FIXME: fix Fill2 to properly support matte for I+F images" | blend the **value**. A matte of 0 leaves the destination, 255 writes the ink exactly, and anything between is monotone; a `"1"` stencil is a stencil |
+| `DIV255`'s shift form, `(((a+128)>>8) + (a+128)) >> 8`, is exact only while `a ≤ 65,025`. Every product of two bytes is, so it is right for the 8-bit modes — but a 16-bit matte of 255 over ink 40,000 lands on 39,999 | the same number written as `round(a / 255)`: identical on every 8-bit input, right on the rest |
+| `hline8` orders `I;16B`'s bytes from the mode and `point8` ignores the mode, so Pillow's own `I;16B` rectangle outline comes out big-endian along the horizontals and host-order along the verticals | store a value and let the mode's wire element order the bytes. Every pixel of the outline reads back the same number |
+| a wide polygon outline is masked by the polygon's own fill, and `ImageDraw` builds that mode-`"1"` mask with the ink for `1` **in the target's mode** — on `F` the float32 bits of 1.0, whose low byte is zero, so the mask stays empty and the outline silently vanishes | use 255, the only ink a mode-`"1"` mask has. `F` gets the outline every other mode gets |
+| `LAB`'s rawmode is packed with an offset — `Pack.c` writes `a + 128` and `b + 128` — and `tobytes`/`frombytes` here did not apply it, which made them the one pair of calls in the package that disagreed with Pillow for a whole mode | apply it at the wire, where it belongs. Found by P7's corpus, because comparing `LAB` bytes with Pillow's is the only way to see it |
+
+Each row has a named test in `tests/pillow_draw_test.b` or `tests/pillow_core_test.b`, under the rule
+that **a deviation that is not asserted is indistinguishable from a bug of our own**.
 
 ---
 
@@ -436,6 +446,86 @@ is the **error against the source**, measured:
 rather than Pillow's own `quantize2`, a different algorithm; it stays within 2× of Pillow's error.
 `LIBIMAGEQUANT` is declined by name — it is an external C library, and half of it would be worse than
 none.
+
+---
+
+## `ImageDraw`
+
+```bantu
+$im = pillow.new("RGB", [320, 240], "white");
+$d  = pillow.Draw($im, null);                   // or Draw($im, "RGBA") to blend
+
+$d.point([[10, 10], [11, 10]], "red");
+$d.line([[0, 0], [319, 239]], "navy", 3, null);         // xy, fill, width, joint
+$d.line($pts, "navy", 9, "curve");                      // rounded joints
+$d.rectangle([10, 10, 100, 80], "gold", "black", 2);    // xy, fill, outline, width
+$d.polygon([20, 20, 90, 30, 60, 90], "teal", "white", 1);
+$d.regular_polygon([160, 120, 50], 6, 17, "pink", null, 1);
+$d.ellipse([120, 20, 200, 90], "orange", "black", 2);
+$d.circle([160, 120], 40, "plum", null, 1);
+$d.arc([10, 10, 110, 90], 30, 210, "black", 4);         // xy, start, end, fill, width
+$d.chord([10, 10, 110, 90], 30, 210, "grey", "black", 1);
+$d.pieslice([10, 10, 110, 90], 30, 210, "grey", "black", 1);
+$d.rounded_rectangle([10, 10, 110, 90], 8, "ivory", "black", 2, null);
+$d.rounded_rectangle($box, 8, "ivory", null, 1, [true, false, true, false]);
+$d.bitmap([20, 20], $maskImage, "black");               // a "1" stencil or "L" matte
+
+pillow.floodfill($im, [5, 5], "pink", null, 0);         // im, xy, value, border, thresh
+
+$o = pillow.Outline();                                  // ImageDraw.Outline
+$o.move(10, 10);  $o.line(90, 20);  $o.curve(95, 50, 70, 80, 20, 70);  $o.close();
+$d.shape($o, "seagreen", "black");
+```
+
+**Bantu has no keyword arguments, so every optional argument is positional and `null` means
+"default".** The order is Pillow's own: `fill` before `outline` before `width`. An ink is a colour
+name, a `#rrggbb` string, a number, or a list of band values — the same specs `ImageColor` takes
+everywhere else in the package.
+
+**No anti-aliasing**, because Pillow's `ImageDraw` has none. Pillow's documented idiom works and
+works well here: draw at 4× and `resize` down, because `resize` is fast.
+
+A few rules are worth knowing because they are Pillow's and they surprise people:
+
+- **A reversed box raises.** `rectangle`, `ellipse`, `arc`, `chord` and `pieslice` all require
+  `x1 ≥ x0` and `y1 ≥ y0`, as Pillow 12 does.
+- **`width = 0` draws nothing** on every outline — including a rectangle's. The C promotes a zero
+  rectangle width to 1, but `ImageDraw` never reaches that line: it guards on `width != 0` first.
+- **An outline whose ink equals the fill is skipped**, so `rectangle(box, "red", "red", 4)` is just
+  the fill.
+- **Outlines grow inward.** A rectangle's `width` eats into the box, and an ellipse's ring is
+  measured inward from the bounding box, so a shape never spills past the coordinates you gave.
+- **The default ink is not white.** With no `fill`, a `Draw` uses `draw_ink(-1)`, which clips to
+  **0 on `L`, `1` and `P`** and comes out white only on the packed multi-band modes. On `I` and `F`
+  it is 1.
+- **A bare integer ink on a multi-band mode is ABGR**, which is `getink`'s documented compatibility
+  case: `0x00FF00FF` is magenta.
+- **`Draw($im, "RGBA")` on an `RGB` image blends** the ink's alpha into the destination instead of
+  replacing it. Any other mode mismatch raises.
+- **`getdraw` returns the context, not a pair.** Pillow's returns `(context, ImageDraw2)`;
+  `ImageDraw2`'s pen/brush wrapper is declined for PW10's reason — it is a convenience layer with no
+  behaviour of its own.
+
+### Drawing on a `P` image: pass an index
+
+`ImagePalette.getcolor` in Pillow **appends** an unknown colour to the palette as a side effect of
+drawing. A palette here is a 256×3 buffer with no record of how many entries are in use, so there
+is no slot to append into, and inventing one would change what `getpalette()` reports. A colour
+tuple on a `P` image therefore resolves to an **exact match if the palette has one and the nearest
+entry otherwise**. Pass an index for an exact result.
+
+### What drawing costs
+
+Nothing in `draw.b` loops over pixels (rule PW2):
+
+| | cost |
+|---|---|
+| a horizontal span | one array fill per band over a crop view — a 1,920-pixel span costs what a 3-pixel one does |
+| `line` | decomposed into its **runs**, not its pixels. A Bresenham segment is `min(\|dx\|, \|dy\|) + 1` spans of constant minor coordinate, and the run boundaries are a closed form derived from the error recurrence rather than stepped. A 1080p diagonal is **55 ms**; a near-horizontal line of the same length is two array calls |
+| `polygon`, `ellipse`, `arc`, `chord`, `pieslice` | one pass per **row**, with the spans within a row sorted. Measured: a 1600×100 filled polygon **12 ms**, a 100×1600 one **140 ms** — the cost follows the height, not the area, which is the claim and is asserted |
+| a 1080p filled rectangle | **118 ms** |
+| a 100,000-point polygon | fills; the edge table is a list of lists rather than of dicts for exactly this reason |
+| `floodfill` | a scanline span fill over a fillability mask computed in one array pass, so the loop is over spans. A 200×200 image combed into 100 one-pixel channels — the worst shape there is — takes **2.2 s**; an ordinary region is milliseconds |
 
 ---
 

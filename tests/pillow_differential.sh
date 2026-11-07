@@ -161,7 +161,54 @@ pillow.exif_put(\$ex, "interop", 1, "R98");
 \$rgb.save(\$D + "out_exif.jpg", null, {"quality": 80, "exif": pillow.exif_tobytes(\$ex)});
 writefile(\$D + "exif.bin", pillow.exif_tobytes(\$ex));
 
-print("pillow wrote 5 + 17 + 10 files");
+// Phase P7: ImageDraw. A composite scene drawn here, and the SAME scene
+// drawn by Python's ImageDraw on the other side -- compared pixel for pixel.
+// The checked-in corpus already pins every primitive, but that corpus is a
+// recording; this is the live comparison, and it is the one that would notice
+// a Pillow release changing a rasterisation rule.
+\$sc = pillow.new("RGB", [120, 90], "white");
+\$d = pillow.Draw(\$sc, null);
+\$d.rectangle([4, 4, 60, 40], [40, 90, 180], [0, 0, 0], 3);
+\$d.ellipse([64, 4, 116, 44], [240, 200, 20], [30, 30, 30], 2);
+\$d.polygon([6, 86, 40, 50, 70, 86], [200, 40, 40], [255, 255, 255], 2);
+\$d.pieslice([70, 48, 118, 88], 30, 290, [20, 160, 90], [0, 0, 0], 2);
+\$d.line([[0, 0], [119, 89], [0, 89]], [120, 0, 160], 5, "curve");
+\$d.arc([20, 20, 100, 70], 200, 20, [0, 0, 0], 4);
+\$d.rounded_rectangle([30, 30, 90, 60], 9, null, [255, 0, 255], 2, null);
+\$d.regular_polygon([60, 45, 18], 7, 23, null, [0, 128, 128], 1);
+writefile(\$D + "draw_scene.raw", \$sc.tobytes());
+
+\$ff = pillow.new("L", [60, 40], 255);
+\$dff = pillow.Draw(\$ff, null);
+\$dff.rectangle([5, 5, 54, 34], null, 0, 1);
+\$dff.line([[0, 0], [59, 39]], 0, 1, null);
+pillow.floodfill(\$ff, [30, 20], 128, null, 0);
+writefile(\$D + "draw_flood.raw", \$ff.tobytes());
+
+// LAB's wire packing: Pillow offsets a and b by 128 and we had not. Written
+// here for Pillow's own frombytes to read back.
+\$lab = pillow.new("LAB", [5, 3], null);
+\$y = 0;
+while (\$y < 3) {
+    \$x = 0;
+    while (\$x < 5) {
+        \$lab.putpixel([\$x, \$y], [(\$x * 37) % 256, (\$x * 61 + \$y * 13) % 256,
+                                   (\$y * 91 + \$x * 7) % 256]);
+        \$x = \$x + 1;
+    }
+    \$y = \$y + 1;
+}
+writefile(\$D + "lab.raw", \$lab.tobytes());
+\$parts = [];
+\$ld = \$lab.getdata();
+\$i = 0;
+while (\$i < len(\$ld)) {
+    push(\$parts, str(\$ld[\$i][0]) + "," + str(\$ld[\$i][1]) + "," + str(\$ld[\$i][2]));
+    \$i = \$i + 1;
+}
+writefile(\$D + "lab.expect", join(\$parts, "\n"));
+
+print("pillow wrote 5 + 17 + 10 + 3 files");
 BANTU_EOF
 
 "$BANTU" --quiet run "$TMP/emit.b" || { echo "[FAIL] the emitter did not run"; exit 1; }
@@ -370,6 +417,54 @@ try:
           ex2.get(271) == 'Bantu' and ex2.get(274) == 6, str(dict(ex2)))
 except Exception as e:
     check("Exif.load runs", False, f"{type(e).__name__}: {e}")
+
+# ── Phase P7: ImageDraw, drawn twice and compared ─────────────────────────
+print()
+from PIL import ImageDraw
+
+try:
+    sc = Image.new("RGB", (120, 90), "white")
+    d = ImageDraw.Draw(sc)
+    d.rectangle([4, 4, 60, 40], fill=(40, 90, 180), outline=(0, 0, 0), width=3)
+    d.ellipse([64, 4, 116, 44], fill=(240, 200, 20), outline=(30, 30, 30), width=2)
+    d.polygon([6, 86, 40, 50, 70, 86], fill=(200, 40, 40), outline=(255, 255, 255),
+              width=2)
+    d.pieslice([70, 48, 118, 88], 30, 290, fill=(20, 160, 90), outline=(0, 0, 0),
+               width=2)
+    d.line([(0, 0), (119, 89), (0, 89)], fill=(120, 0, 160), width=5, joint="curve")
+    d.arc([20, 20, 100, 70], 200, 20, fill=(0, 0, 0), width=4)
+    d.rounded_rectangle([30, 30, 90, 60], 9, outline=(255, 0, 255), width=2)
+    d.regular_polygon((60, 45, 18), 7, 23, outline=(0, 128, 128), width=1)
+    ours = open(os.path.join(D, 'draw_scene.raw'), 'rb').read()
+    theirs = sc.tobytes()
+    nbad = sum(1 for a, b in zip(ours, theirs) if a != b)
+    check("a composite ImageDraw scene is identical to Pillow's, pixel for pixel",
+          ours == theirs, f"{nbad} of {len(theirs)} bytes differ")
+except Exception as e:
+    check("the ImageDraw comparison runs", False, f"{type(e).__name__}: {e}")
+
+try:
+    ff = Image.new("L", (60, 40), 255)
+    dff = ImageDraw.Draw(ff)
+    dff.rectangle([5, 5, 54, 34], outline=0, width=1)
+    dff.line([(0, 0), (59, 39)], fill=0)
+    ImageDraw.floodfill(ff, (30, 20), 128)
+    ours = open(os.path.join(D, 'draw_flood.raw'), 'rb').read()
+    check("floodfill reaches exactly the region Pillow's does",
+          ours == ff.tobytes(),
+          f"{sum(1 for a, b in zip(ours, ff.tobytes()) if a != b)} bytes differ")
+except Exception as e:
+    check("the floodfill comparison runs", False, f"{type(e).__name__}: {e}")
+
+try:
+    data = open(os.path.join(D, 'lab.raw'), 'rb').read()
+    lab = Image.frombytes('LAB', (5, 3), data)
+    exp = [tuple(int(v) for v in l.split(',')) for l in
+           open(os.path.join(D, 'lab.expect')).read().split('\n')]
+    check("Pillow reads back every LAB pixel pillow wrote (the +128 wire offset)",
+          px(lab) == exp, f"got {px(lab)[:3]} want {exp[:3]}")
+except Exception as e:
+    check("the LAB comparison runs", False, f"{type(e).__name__}: {e}")
 
 print()
 sys.exit(1 if bad else 0)

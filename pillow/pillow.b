@@ -13,14 +13,17 @@
 //  and nesting them would mean a caller writing pillow.Image.new, which is
 //  one more indirection for nothing. The names themselves are Pillow's.
 //
-//  WHAT IS IN THIS BUILD: phase P5. The object model, the full 20-mode
+//  WHAT IS IN THIS BUILD: phase P7. The object model, the full 20-mode
 //  table, the conversion matrix, ImageColor, ImagePalette, the six
 //  resampling filters with resize/rotate/transpose/thumbnail/reduce/
 //  transform, ImageTransform, ImagePath, PNG, BMP, TGA and PPM read and
-//  write, and -- new in P5 -- JPEG read and write (baseline, progressive,
-//  every subsampling, restart markers, draft-mode scaled decoding) with
-//  EXIF and ExifTags. Phases P6-P9 add the operation surface, drawing,
-//  text and the remaining formats; pillow-suite/ROADMAP.md tracks them
+//  write, JPEG read and write (baseline, progressive, every subsampling,
+//  restart markers, draft-mode scaled decoding) with EXIF and ExifTags,
+//  the whole operation surface (ImageFilter, ImageChops, ImageEnhance,
+//  ImageOps, ImageStat, ImageMath, ImageMorph, quantize), and -- new in
+//  P7 -- ImageDraw: every geometric primitive, pixel for pixel with
+//  Pillow's, plus floodfill and ImageDraw.Outline. Phases P8 and P9 add
+//  the remaining formats and ship; pillow-suite/ROADMAP.md tracks them
 //  item by item.
 // ════════════════════════════════════════════════════════════════════════
 
@@ -50,8 +53,9 @@ include "./codecs/tga.b" as tga;
 include "./inflate.b" as inflate;
 include "./deflate.b" as deflate;
 include "./bitio.b" as bitio;
+include "./draw.b" as draw;
 
-$VERSION = "0.6.0";
+$VERSION = "0.7.0";
 
 // ─── Register the codecs this build ships ───────────────────────────────
 //
@@ -380,6 +384,18 @@ def ExifBase()                { return exif.BASE(); }
 def GPS()                     { return exif.GPS(); }
 def Interop()                 { return exif.INTEROP(); }
 
+// ─── ImageDraw ──────────────────────────────────────────────────────────
+//
+// Draw() returns an object with Pillow's own method names, so a caller
+// writes $d.ellipse(...) rather than a module function per primitive. It
+// draws INTO the image it is given and keeps no copy.
+def Draw($im, $drawMode) { return draw.Draw($im, $drawMode); }
+def getdraw($im)         { return draw.getdraw($im); }
+def Outline()            { return draw.Outline(); }
+def floodfill($im, $xy, $value, $border, $thresh) {
+    return draw.floodfill($im, $xy, $value, $border, $thresh);
+}
+
 // ─── help() ─────────────────────────────────────────────────────────────
 def help() {
     print("pillow " + $VERSION + " -- imaging for Bantu, in the shape of Python's Pillow");
@@ -417,8 +433,12 @@ def help() {
     print("  ExifTags   getexif exif_load exif_put exif_tobytes exif_transpose");
     print("             TAGS GPSTAGS IFD ExifBase GPS Interop");
     print("  ImagePath  Path path_getbbox path_tolist path_transform path_compact");
+    print("  ImageDraw  Draw getdraw Outline floodfill");
+    print("             $d = pillow.Draw($im, null); then on $d:");
+    print("             point line rectangle polygon regular_polygon ellipse circle");
+    print("             arc chord pieslice rounded_rectangle shape bitmap");
     print("");
-    print("  This build is phase P6. Drawing, text and the remaining formats");
-    print("  arrive in P7 and P8 -- see pillow-suite/ROADMAP.md.");
+    print("  This build is phase P7. Text and the remaining formats arrive in");
+    print("  P7's second half and P8 -- see pillow-suite/ROADMAP.md.");
     return null;
 }

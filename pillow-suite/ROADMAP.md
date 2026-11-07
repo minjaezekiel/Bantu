@@ -368,7 +368,7 @@ reason.
 
 ## Phase P7 — Drawing and text
 
-**Not started. The research that precedes it is written down in
+**Drawing is done. Text is next. The research that preceded both is written down in
 [`P7-NOTES.md`](P7-NOTES.md)**: the prior art in this repository (`scripts/gen_font_tables.b` is
 already a TrueType reader in Bantu), every rasterisation rule `draw.b` has to match from `Draw.c`
 (the endpoint a line never draws, the rectangle that does not normalise x, the polygon's float32
@@ -376,18 +376,30 @@ crossings and corner joins, the ellipse quarter-tracer and its unrefreshed third
 **text cannot be pixel-exact** — Pillow hands outlines to FreeType — so its gate is a measured one in
 PW17's shape rather than byte equality.
 
-- [ ] `pillow/draw.b` — `Draw getdraw floodfill`; `arc bitmap chord ellipse line pieslice point
-      polygon rectangle regular_polygon rounded_rectangle shape text multiline_text textbbox
-      multiline_textbbox textlength`; `width=`, `joint="curve"`, `ImageDraw.Outline`
+- [x] `pillow/draw.b` — `Draw getdraw floodfill Outline`; `arc bitmap chord circle ellipse line
+      pieslice point polygon rectangle regular_polygon rounded_rectangle shape`; `width=`,
+      `joint="curve"`, `corners=`, RGBA-on-RGB blending
 - [ ] `pillow/font.b` — `load_default` (embedded bitmap font), `truetype` (a **TrueType reader in
       Bantu**: `cmap` 0/4/6/12, `glyf`/`loca`, `hmtx`, `kern`/`GPOS`, composite glyphs, `fvar`),
       `load`/`load_path` for BDF/PCF; `getbbox getlength getmask getmask2 font_variant`; glyph cache
+- [ ] `text multiline_text textbbox multiline_textbbox textlength`
 - [ ] `anchor spacing align direction stroke_width stroke_fill embedded_color`
 
-| gate | form |
-|---|---|
-| differential | every primitive at every `width` compared to Pillow pixel for pixel; text with DejaVu at 8/12/24/72 px |
-| stress | a 100,000-point polygon; a self-intersecting polygon; degenerate ellipses; a 2,000-character string; a hostile/truncated font file (fuzz tier) |
+| gate | form | result |
+|---|---|---|
+| differential | every primitive at every `width` compared to Pillow pixel for pixel | **694 whole images byte-identical**: 52 line slopes and signs, 56 wide lines, 3 curve joints, 56 polygons over nine shapes, 70 ellipses over ten bounding-box parities, 234 arcs, chords and pieslices over eighteen angle pairs, 30 rounded rectangles plus six corner masks and three degenerate forms, 18 regular polygons, 30 bitmaps, 30 blended RGBA-on-RGB, 17 floodfills, and one composite scene in each of the twenty modes |
+| differential | live, against the installed Pillow | `tests/pillow_differential.sh` draws the same composite scene on both sides and compares it, plus a floodfill and the LAB wire packing |
+| stress | a 100,000-point polygon; a self-intersecting polygon; degenerate ellipses; coordinates 100,000 outside the image; a comb of 100 one-pixel channels flood-filled | all green |
+| stress | the timing curve | a 1600×100 filled polygon costs 12 ms and a 100×1600 one 140 ms — the cost follows the **height**, not the area, which is what PW8 claims and is asserted |
+| differential | text with DejaVu at 8/12/24/72 px | ⏳ second half |
+| stress | a 2,000-character string; a hostile/truncated font file (fuzz tier) | ⏳ second half |
+
+**Five deviations, all under PW11, all asserted**: `Outline.transform` discarding the edges it just
+computed; `fill_mask_L`/`fill_mask_1` blending the *bytes* of an `I`, `F` or `I;16` pixel rather than
+its value; `DIV255`'s shift form overflowing past 16 bits; `point8` and `hline8` disagreeing about
+`I;16B`'s byte order; and the wide-outline mask built with the target mode's ink for 1, which is
+zero on `F`. Each is in `docs/pillow.md` beside the call. P7 also found and fixed a **pre-existing
+defect**: `LAB`'s wire packing was missing Pillow's `+128` offset on `a` and `b`.
 
 ---
 

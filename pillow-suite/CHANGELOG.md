@@ -5,6 +5,55 @@ here only once all five tiers of its gate are green.
 
 ---
 
+## Phase P7 — Drawing ✅ (2026-11-07)
+
+**75 checks green, and 694 of 694 drawings byte-identical to Pillow.** Every geometric primitive at
+every width that changes its shape: 52 line slopes and signs from the centre of a 29×29 field, 56
+wide lines, 3 curve joints, 56 polygons over nine shapes including a self-intersecting star and a
+run of collinear horizontal edges, 70 ellipses over ten bounding-box parities, 234 arcs, chords and
+pieslices over eighteen angle pairs both filled and outlined, 30 rounded rectangles with their
+corner masks and three degenerate forms, 18 regular polygons, 30 bitmaps through both a `"1"`
+stencil and an `"L"` matte, 30 blended RGBA-on-RGB, 17 floodfills, and one composite scene in each
+of the twenty modes. `tests/pillow_differential.sh` now also draws the same scene on both sides live
+against the installed Pillow.
+
+- `[feature]` **`pillow/draw.b`** — `Draw getdraw floodfill Outline`, and on the context `point line
+  rectangle polygon regular_polygon ellipse circle arc chord pieslice rounded_rectangle shape
+  bitmap`, with `width=`, `joint="curve"`, `corners=` and RGBA-on-RGB blending. Ported from
+  `Draw.c` rule by rule: the endpoint a line never draws, the strict `dx > dy` that sends a 45°
+  tie to the y-major loop, `hline`'s refusal to swap its ends, the rectangle that normalises only
+  `y`, the polygon's float32 crossings with their doubled count at an edge's last row and the
+  corner-join fix-up, and the ellipse quarter-tracer whose third candidate does not refresh the
+  running minimum.
+- `[feature]` **A line is decomposed into its runs, not its pixels.** Inverting Bresenham's error
+  recurrence gives the run boundaries in closed form, so a segment is `min(|dx|, |dy|) + 1` span
+  writes rather than `max(|dx|, |dy|)` pixel writes — the same pixels, every tie included. The
+  design of record said `nd_put`; `nd_put` materialises the whole destination's walk order per call,
+  which a polyline cannot afford. A 1080p diagonal is 55 ms.
+- `[feature]` **`floodfill` is a span fill over a one-pass fillability mask**, with each row's
+  blocker positions a cached `nd_nonzero` held as an array. The timing curve is asserted: a
+  1600×100 filled polygon costs 12 ms and a 100×1600 one 140 ms, so the cost follows the height and
+  not the area (decision PW8).
+- `[found]` **Three latent Bantu defects of one family**, all of them a mutation applied to a copy:
+  the polygon corner-join adjusted a copy of the crossings list, the horizontal-edge merge widened a
+  copy of the last edge, and moving the edge table into a dict to make it mutable turned
+  `$T.t[$i]` quadratic. The rule is now written down in the architecture: mutable state crosses a
+  call boundary in a dict, never in a list, and a list read in a hot loop stays a local.
+- `[bug fix]` **`LAB`'s wire packing was missing Pillow's `+128` offset on `a` and `b`** —
+  `tobytes` and `frombytes` were the one pair of calls in the package that disagreed with Pillow
+  for a whole mode, and had been for five phases because nothing had ever compared `LAB` bytes.
+  Fixed at the wire; `tests/pillow_core_test.b` pins all three numbers.
+- `[found]` **Five upstream defects, fixed under PW11 rather than reproduced**, each published in
+  `docs/pillow.md` beside the call with a test asserting what the fix preserves:
+  `ImagingOutlineTransform` frees the edges it has just transformed; `fill_mask_L` and
+  `fill_mask_1` blend the *bytes* of an `I`, `F` or `I;16` pixel instead of its value;
+  `DIV255`'s shift form overflows past 16 bits, so a 16-bit matte of 255 over ink 40,000 lands on
+  39,999; `point8` and `hline8` disagree about `I;16B`'s byte order, so Pillow's own `I;16B`
+  rectangle outline is half big-endian; and a wide outline's mask is built with the *target* mode's
+  ink for 1, which on `F` is a float32 whose low byte is zero, so the outline silently vanishes.
+
+---
+
 ## Phase P6 — The operation surface ✅ (2026-10-30)
 
 **149 checks green.** 294 whole images byte-identical to Pillow — every filter over every mode it

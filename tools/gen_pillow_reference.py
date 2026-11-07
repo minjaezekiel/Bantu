@@ -1058,7 +1058,426 @@ def gen_ops():
                   "fields: group tag file mode width height") + man + lines
 
 
+def gen_draw():
+    """Phase P7's drawing corpus: every ImageDraw primitive, at every width
+    that changes its shape, compared whole image for whole image.
+
+    THE FORM. Each row of the manifest is one drawing, encoded so that the
+    Bantu suite can replay it without a hand-written list that could drift
+    from this one:
+
+        <tag> <file> <mode> <w> <h> <bg> <inkmode> <call>
+
+    `bg` is `z` (zeros), a colour name, or `s1` (the prebuilt scene the
+    floodfill cases need). `inkmode` is `-` or the mode passed to Draw(),
+    which is how RGBA-on-RGB blending is reached. `call` is a pipe-separated
+    operation: the name, then its coordinates as a comma-separated list, then
+    `key=value` arguments. An ink value is `none`, a CSS colour name, `iN`
+    for an integer or `tA,B,C[,D]` for a tuple.
+
+    No field contains a space, so the whole row splits on whitespace and the
+    call splits on `|` -- which a Bantu test can do with split() and nothing
+    else.
+    """
+    from PIL import ImageDraw
+
+    out = os.path.join(OUT, "draw")
+    os.makedirs(out, exist_ok=True)
+    man = []
+
+    def ink(v):
+        if v is None:
+            return "none"
+        if isinstance(v, str):
+            return "c:" + v
+        if isinstance(v, tuple):
+            return "t:" + ",".join(str(x) for x in v)
+        return "i:" + str(v)
+
+    def parse_ink(s):
+        if s == "none":
+            return None
+        kind, _, rest = s.partition(":")
+        if kind == "i":
+            return int(rest)
+        if kind == "t":
+            return tuple(int(x) for x in rest.split(","))
+        if kind == "c":
+            return rest
+        raise ValueError("bad ink " + s)
+
+    def mask_image(mode, w, h):
+        im = Image.new(mode, (w, h))
+        px = im.load()
+        for y in range(h):
+            for x in range(w):
+                if mode == "1":
+                    px[x, y] = 255 if (x * 5 + y * 3) % 7 < 3 else 0
+                else:
+                    px[x, y] = (x * 37 + y * 17) % 256
+        return im
+
+    def scene(mode, w, h, name):
+        if name == "z":
+            return Image.new(mode, (w, h))
+        if name == "s1":
+            im = Image.new(mode, (w, h), 255)
+            d = ImageDraw.Draw(im)
+            d.rectangle([2, 2, w - 3, h - 3], outline=0, width=1)
+            d.line([(0, 0), (w - 1, h - 1)], fill=0)
+            return im
+        return Image.new(mode, (w, h), name)
+
+    def run(im, inkmode, call):
+        """Replay one encoded call on im. The Bantu suite mirrors this."""
+        parts = call.split("|")
+        op = parts[0]
+        xy = [float(v) for v in parts[1].split(",")] if parts[1] else []
+        kw = {}
+        for f in parts[2:]:
+            k, _, v = f.partition("=")
+            kw[k] = v
+        d = ImageDraw.Draw(im, None if inkmode == "-" else inkmode)
+        fill = parse_ink(kw.get("fill", "none"))
+        outline = parse_ink(kw.get("outline", "none"))
+        width = int(kw.get("width", 1))
+        if op == "point":
+            d.point(xy, fill=fill)
+        elif op == "line":
+            d.line(xy, fill=fill, width=width,
+                   joint=kw.get("joint") or None)
+        elif op == "rectangle":
+            d.rectangle(xy, fill=fill, outline=outline, width=width)
+        elif op == "polygon":
+            d.polygon(xy, fill=fill, outline=outline, width=width)
+        elif op == "ellipse":
+            d.ellipse(xy, fill=fill, outline=outline, width=width)
+        elif op == "circle":
+            d.circle(xy, float(kw["r"]), fill=fill, outline=outline, width=width)
+        elif op == "arc":
+            d.arc(xy, float(kw["start"]), float(kw["end"]), fill=fill, width=width)
+        elif op == "chord":
+            d.chord(xy, float(kw["start"]), float(kw["end"]), fill=fill,
+                    outline=outline, width=width)
+        elif op == "pieslice":
+            d.pieslice(xy, float(kw["start"]), float(kw["end"]), fill=fill,
+                       outline=outline, width=width)
+        elif op == "rounded":
+            corners = None
+            if "corners" in kw:
+                corners = tuple(v == "1" for v in kw["corners"].split(","))
+            d.rounded_rectangle(xy, float(kw["radius"]), fill=fill, outline=outline,
+                                width=width, corners=corners)
+        elif op == "regular":
+            d.regular_polygon((xy[0], xy[1], xy[2]), int(kw["n"]),
+                              float(kw.get("rot", 0)), fill=fill, outline=outline,
+                              width=width)
+        elif op == "shape":
+            o = ImageDraw.Outline()
+            o.move(xy[0], xy[1])
+            i = 2
+            while i + 1 < len(xy):
+                o.line(xy[i], xy[i + 1])
+                i += 2
+            if "transform" in kw:
+                o.transform(tuple(float(v) for v in kw["transform"].split(",")))
+            d.shape(o, fill=fill, outline=outline)
+        elif op == "shapec":
+            o = ImageDraw.Outline()
+            o.move(xy[0], xy[1])
+            o.curve(xy[2], xy[3], xy[4], xy[5], xy[6], xy[7])
+            o.close()
+            d.shape(o, fill=fill, outline=outline)
+        elif op == "bitmap":
+            bm, bw, bh = kw["bm"].split(",")
+            d.bitmap((xy[0], xy[1]), mask_image(bm, int(bw), int(bh)), fill=fill)
+        elif op == "floodfill":
+            ImageDraw.floodfill(im, (int(xy[0]), int(xy[1])), fill,
+                                border=parse_ink(kw.get("border", "none")),
+                                thresh=float(kw.get("thresh", 0)))
+        else:
+            raise ValueError("unknown op " + op)
+
+    def record(tag, mode, size, bg, inkmode, call):
+        w, h = size
+        im = scene(mode, w, h, bg)
+        run(im, inkmode, call)
+        name = f"{tag}.exp"
+        open(os.path.join(out, name), "wb").write(im.tobytes())
+        man.append(f"{tag} {name} {mode} {w} {h} {bg} {inkmode} {call}")
+
+    # ── point ──────────────────────────────────────────────────────────
+    record("PT_scatter", "L", (24, 18), "z", "-",
+           "point|1,1,5,3,23,17,0,0,12,9,-1,4,24,4|fill=i:200")
+    record("PT_rgb", "RGB", (24, 18), "z", "-",
+           "point|2,2,10,10,20,15|fill=t:200,60,20")
+
+    # ── line: every slope and sign, from the centre of a 29x29 field ───
+    steps = [-13, -8, -5, -3, 0, 3, 5, 8, 13]
+    for dx in steps:
+        for dy in steps:
+            if dx == 0 and dy == 0:
+                continue
+            record(f"LN_{dx}_{dy}", "L", (29, 29), "z", "-",
+                   f"line|14,14,{14 + dx},{14 + dy}|fill=i:255")
+    # a line that leaves the image on both ends
+    record("LN_clip", "L", (29, 29), "z", "-", "line|-40,-9,60,33|fill=i:255")
+    record("LN_vert_clip", "L", (29, 29), "z", "-", "line|7,-20,7,50|fill=i:255")
+    record("LN_zero", "L", (29, 29), "z", "-", "line|10,10,10,10|fill=i:255")
+    record("LN_poly5", "L", (29, 29), "z", "-",
+           "line|1,1,27,4,5,20,25,27,2,14|fill=i:255")
+
+    # ── line width, which goes through the wide-line quad ──────────────
+    for w in (0, 1, 2, 3, 4, 5, 8, 13):
+        for dx, dy in ((16, 0), (0, 16), (16, 16), (16, 7), (7, 16),
+                       (-16, 9), (16, -9)):
+            record(f"LW_{w}_{dx}_{dy}", "L", (41, 41), "z", "-",
+                   f"line|20,20,{20 + dx},{20 + dy}|fill=i:255|width={w}")
+    for w in (5, 9, 14):
+        record(f"LJ_{w}", "L", (61, 61), "z", "-",
+               f"line|5,30,30,8,55,40|fill=i:255|width={w}|joint=curve")
+
+    # ── rectangle ──────────────────────────────────────────────────────
+    for w in (0, 1, 2, 3, 4, 7):
+        record(f"RC_out_{w}", "L", (24, 18), "z", "-",
+               f"rectangle|2,2,21,15|outline=i:255|width={w}")
+        record(f"RC_both_{w}", "L", (24, 18), "z", "-",
+               f"rectangle|2,2,21,15|fill=i:90|outline=i:255|width={w}")
+    record("RC_fill", "L", (24, 18), "z", "-", "rectangle|3,3,20,14|fill=i:200")
+    record("RC_same", "L", (24, 18), "z", "-",
+           "rectangle|3,3,20,14|fill=i:200|outline=i:200|width=3")
+    record("RC_flat", "L", (24, 18), "z", "-", "rectangle|3,7,20,7|fill=i:200")
+    record("RC_point", "L", (24, 18), "z", "-", "rectangle|9,9,9,9|outline=i:200|width=1")
+    record("RC_over", "L", (24, 18), "z", "-", "rectangle|-5,-3,40,30|fill=i:200")
+    record("RC_edge", "L", (24, 18), "z", "-",
+           "rectangle|0,0,23,17|outline=i:255|width=2")
+
+    # ── polygon ────────────────────────────────────────────────────────
+    shapes = {
+        "quad": "6,3,33,7,30,25,4,21",
+        "star": "20,2,25,18,38,18,27,26,32,28,20,20,8,28,13,26,2,18,15,18",
+        "tri": "4,27,20,2,36,27",
+        "ell": "4,4,16,4,16,16,30,16,30,27,4,27",
+        "stair": "3,3,10,3,16,3,22,3,30,9,30,16,22,16,16,16,9,16,3,9",
+        "thin": "2,9,35,9,35,10,2,10",
+        "flat": "2,14,34,14",
+        "self": "4,4,34,24,4,24,34,4",
+        "dup": "6,6,6,6,30,6,30,24,6,24",
+    }
+    for name, pts in shapes.items():
+        record(f"PG_fill_{name}", "L", (40, 30), "z", "-",
+               f"polygon|{pts}|fill=i:200")
+        for w in (1, 2, 3, 5):
+            record(f"PG_out_{name}_{w}", "L", (40, 30), "z", "-",
+                   f"polygon|{pts}|outline=i:255|width={w}")
+        record(f"PG_both_{name}", "L", (40, 30), "z", "-",
+               f"polygon|{pts}|fill=i:90|outline=i:255|width=3")
+    record("PG_clip", "L", (40, 30), "z", "-",
+           "polygon|-10,-10,50,5,20,40|fill=i:200")
+
+    # ── ellipse ────────────────────────────────────────────────────────
+    boxes = {
+        "ee": "2,2,21,15", "eo": "2,2,21,16", "oe": "2,2,22,15", "oo": "2,2,22,16",
+        "dot": "8,8,8,8", "w1": "8,8,9,8", "h1": "8,8,8,9",
+        "wide": "3,10,36,13", "tall": "17,2,20,27", "big": "0,0,39,29",
+    }
+    for name, box in boxes.items():
+        record(f"EL_fill_{name}", "L", (40, 30), "z", "-", f"ellipse|{box}|fill=i:200")
+        for w in (0, 1, 2, 3, 5, 9):
+            record(f"EL_out_{name}_{w}", "L", (40, 30), "z", "-",
+                   f"ellipse|{box}|outline=i:255|width={w}")
+        record(f"EL_both_{name}", "L", (40, 30), "z", "-",
+               f"ellipse|{box}|fill=i:90|outline=i:255|width=2")
+    for r in (0, 1, 2, 7, 13):
+        record(f"CI_{r}", "L", (40, 30), "z", "-",
+               f"circle|20,15|r={r}|fill=i:90|outline=i:255|width=2")
+
+    # ── arc, chord, pieslice ───────────────────────────────────────────
+    angles = [(0, 90), (0, 180), (0, 270), (0, 359), (45, 135), (90, 270),
+              (270, 90), (-45, 45), (350, 10), (30, 60), (30, 110), (10, 80),
+              (0, 360), (0, 720), (120, 480), (180, 180), (200, 340), (95, 265)]
+    for a0, a1 in angles:
+        t = f"{a0}_{a1}".replace("-", "n")
+        for w in (1, 4):
+            record(f"AR_{t}_{w}", "L", (40, 30), "z", "-",
+                   f"arc|3,3,36,26|start={a0}|end={a1}|fill=i:255|width={w}")
+            record(f"CH_out_{t}_{w}", "L", (40, 30), "z", "-",
+                   f"chord|3,3,36,26|start={a0}|end={a1}|outline=i:255|width={w}")
+            record(f"PS_out_{t}_{w}", "L", (40, 30), "z", "-",
+                   f"pieslice|3,3,36,26|start={a0}|end={a1}|outline=i:255|width={w}")
+        record(f"CH_fill_{t}", "L", (40, 30), "z", "-",
+               f"chord|3,3,36,26|start={a0}|end={a1}|fill=i:200")
+        record(f"PS_fill_{t}", "L", (40, 30), "z", "-",
+               f"pieslice|3,3,36,26|start={a0}|end={a1}|fill=i:200")
+        # a tall box, which is the transposed branch of arc_init
+        record(f"AR_tall_{t}", "L", (30, 40), "z", "-",
+               f"arc|3,3,26,36|start={a0}|end={a1}|fill=i:255|width=3")
+
+    # ── rounded rectangle ──────────────────────────────────────────────
+    for r in (0, 1, 2, 5, 9, 20):
+        record(f"RR_fill_{r}", "L", (40, 30), "z", "-",
+               f"rounded|3,3,36,26|radius={r}|fill=i:200")
+        record(f"RR_out_{r}", "L", (40, 30), "z", "-",
+               f"rounded|3,3,36,26|radius={r}|outline=i:255|width=1")
+        record(f"RR_out3_{r}", "L", (40, 30), "z", "-",
+               f"rounded|3,3,36,26|radius={r}|outline=i:255|width=3")
+        record(f"RR_both_{r}", "L", (40, 30), "z", "-",
+               f"rounded|3,3,36,26|radius={r}|fill=i:90|outline=i:255|width=2")
+    for c in ("1,1,1,1", "0,0,0,0", "1,0,0,0", "1,1,0,0", "1,0,1,0", "0,1,1,0"):
+        t = c.replace(",", "")
+        record(f"RR_c{t}", "L", (40, 30), "z", "-",
+               f"rounded|3,3,36,26|radius=7|fill=i:90|outline=i:255|width=2|corners={c}")
+    record("RR_fullx", "L", (40, 30), "z", "-",
+           "rounded|3,3,20,26|radius=20|fill=i:200")
+    record("RR_fully", "L", (40, 30), "z", "-",
+           "rounded|3,3,36,14|radius=20|fill=i:200")
+    record("RR_circle", "L", (40, 30), "z", "-",
+           "rounded|3,3,22,22|radius=40|fill=i:200")
+
+    # ── regular polygon ────────────────────────────────────────────────
+    for n in (3, 4, 5, 6, 8, 12):
+        for rot in (0, 17, 90):
+            record(f"RP_{n}_{rot}", "L", (40, 30), "z", "-",
+                   f"regular|20,15,12|n={n}|rot={rot}|fill=i:90|outline=i:255|width=2")
+
+    # ── shape / Outline ────────────────────────────────────────────────
+    record("SH_quad", "L", (40, 30), "z", "-",
+           "shape|5,5,34,8,30,25,6,22|fill=i:200")
+    record("SH_out", "L", (40, 30), "z", "-",
+           "shape|5,5,34,8,30,25,6,22|outline=i:255")
+    record("SH_curve", "L", (40, 30), "z", "-",
+           "shapec|4,25,10,2,30,2,36,25|fill=i:200")
+    # NO SH_xform CASE. ImagingOutlineTransform frees the edge buffer it has
+    # just written and sets count = 0, so a transformed outline is empty and
+    # shape() draws only the one closing edge close() then appends -- from the
+    # untransformed cursor to the untransformed start. The C marks the spot
+    # "/* FIXME: ugly! */". Under decision PW11 that is a defect, not a
+    # contract, so pillow transforms the edges in place and
+    # tests/pillow_draw_test.b asserts the containment instead: a transformed
+    # outline fills exactly the polygon of its transformed vertices, and that
+    # polygon IS recorded here, from Pillow.
+    record("SH_xform_ref", "L", (40, 30), "z", "-",
+           "polygon|8,6,23,8,21,16,9,15|fill=i:200")
+
+    # ── bitmap ─────────────────────────────────────────────────────────
+    for m in ("L", "RGB", "RGBA", "LA", "1", "I", "F", "I;16", "CMYK"):
+        col = {"L": "i:200", "1": "i:255", "I": "i:100000", "F": "i:3",
+               "I;16": "i:40000"}.get(m)
+        if col is None:
+            col = "t:200,60,20,150" if len(Image.new(m, (1, 1)).getbands()) == 4 \
+                  else ("t:200,60,20" if len(Image.new(m, (1, 1)).getbands()) == 3
+                        else "t:200,150")
+        # THE MATTE ON I, F AND I;16 IS NOT RECORDED, under decision PW11.
+        # Paste.c's fill_mask_L has no case for a 4-byte or 2-byte pixel: for
+        # I and F it blends the FOUR BYTES of the int32/float32 against the
+        # four bytes of the ink independently, and for I;16 the two bytes,
+        # which is arithmetic on the representation rather than on the value.
+        # fill_mask_1 is worse for I;16 -- it has no 16-bit case at all, so a
+        # "1" stencil writes the ink's low byte into byte x of the row,
+        # corrupting every second byte and covering half the width. Pillow's
+        # own ImageDraw sets fontmode="1" for I and F to keep text away from
+        # it, and Paste.c carries the comment "FIXME: fix Fill2 to properly
+        # support matte for I+F images". pillow blends the VALUE; the
+        # properties that fixes are asserted in tests/pillow_draw_test.b.
+        broken = {("I", "L"), ("F", "L"), ("I;16", "1"), ("I;16", "L")}
+        for bm in ("1", "L"):
+            if (m, bm) in broken:
+                continue
+            record(f"BM_{m.replace(';', '_')}_{bm}", m, (24, 18), "z", "-",
+                   f"bitmap|6,4|bm={bm},11,9|fill={col}")
+        if (m, "L") not in broken:
+            record(f"BM_neg_{m.replace(';', '_')}", m, (24, 18), "z", "-",
+                   f"bitmap|-4,-3|bm=L,11,9|fill={col}")
+            record(f"BM_over_{m.replace(';', '_')}", m, (24, 18), "z", "-",
+                   f"bitmap|18,13|bm=L,11,9|fill={col}")
+    # onto a non-zero background, which is what proves the matte
+    record("BM_onwhite_LA", "LA", (24, 18), "white", "-",
+           "bitmap|6,4|bm=L,11,9|fill=t:20,200")
+    record("BM_onwhite_RGBA", "RGBA", (24, 18), "white", "-",
+           "bitmap|6,4|bm=L,11,9|fill=t:20,60,200,150")
+    record("BM_onwhite_RGB", "RGB", (24, 18), "white", "-",
+           "bitmap|6,4|bm=L,11,9|fill=t:20,60,200")
+
+    # ── RGBA ink on an RGB image: the blending path ────────────────────
+    for a in (0, 1, 64, 128, 254, 255):
+        record(f"BL_rect_{a}", "RGB", (24, 18), "white", "RGBA",
+               f"rectangle|3,3,20,14|fill=t:200,60,20,{a}")
+        record(f"BL_poly_{a}", "RGB", (24, 18), "white", "RGBA",
+               f"polygon|3,3,20,5,16,15|fill=t:200,60,20,{a}")
+        record(f"BL_line_{a}", "RGB", (24, 18), "white", "RGBA",
+               f"line|0,0,23,17|fill=t:200,60,20,{a}|width=3")
+        record(f"BL_ell_{a}", "RGB", (24, 18), "white", "RGBA",
+               f"ellipse|3,3,20,14|outline=t:200,60,20,{a}|width=2")
+        record(f"BL_pt_{a}", "RGB", (24, 18), "white", "RGBA",
+               f"point|4,4,10,9,19,13|fill=t:200,60,20,{a}")
+
+    # ── floodfill ──────────────────────────────────────────────────────
+    for sx, sy in ((12, 5), (12, 12), (0, 17), (1, 1), (2, 2)):
+        record(f"FF_{sx}_{sy}", "L", (24, 18), "s1", "-",
+               f"floodfill|{sx},{sy}|fill=i:128")
+        record(f"FF_b_{sx}_{sy}", "L", (24, 18), "s1", "-",
+               f"floodfill|{sx},{sy}|fill=i:128|border=i:0")
+        record(f"FF_t_{sx}_{sy}", "L", (24, 18), "s1", "-",
+               f"floodfill|{sx},{sy}|fill=i:128|thresh=200")
+    record("FF_out", "L", (24, 18), "s1", "-", "floodfill|40,40|fill=i:128")
+    record("FF_same", "L", (24, 18), "s1", "-", "floodfill|12,5|fill=i:255")
+
+    # ── every mode, one composite scene ────────────────────────────────
+    for m in ALL_MODES:
+        nb = len(Image.new(m, (1, 1)).getbands())
+        if m == "1":
+            col, col2 = "i:255", "i:255"
+        elif m == "I":
+            col, col2 = "i:1000000", "i:-40"
+        elif m == "F":
+            col, col2 = "i:3", "i:-2"
+        elif m.startswith("I;16"):
+            col, col2 = "i:40000", "i:600"
+        elif nb == 1:
+            col, col2 = "i:200", "i:90"
+        elif nb == 2:
+            col, col2 = "t:200,150", "t:90,255"
+        elif nb == 3:
+            col, col2 = "t:200,60,20", "t:20,180,90"
+        else:
+            col, col2 = "t:200,60,20,150", "t:20,180,90,255"
+        t = m.replace(";", "_")
+        # MD_rect_I_16B IS NOT RECORDED, under decision PW11. A rectangle
+        # outline is the one primitive that draws with both hline and line,
+        # and for I;16B those two disagree about byte order: hline8 computes
+        # `bigendian` from the mode and writes the high byte first, while
+        # point8 -- which is what line is made of -- ignores the mode and
+        # always writes host order. Pillow's own I;16B rectangle therefore
+        # comes out with big-endian horizontals and little-endian verticals.
+        # pillow stores a value and lets wire_elem order the bytes, so its
+        # output is consistent; tests/pillow_draw_test.b asserts that.
+        if not (m == "I;16B"):
+            record(f"MD_rect_{t}", m, (24, 18), "z", "-",
+                   f"rectangle|2,2,21,15|fill={col2}|outline={col}|width=2")
+        record(f"MD_ell_{t}", m, (24, 18), "z", "-",
+               f"ellipse|2,2,21,15|fill={col2}|outline={col}|width=2")
+        record(f"MD_line_{t}", m, (24, 18), "z", "-",
+               f"line|0,0,23,17,2,16|fill={col}|width=3")
+        # MD_poly_F IS NOT RECORDED, under decision PW11. A polygon outline
+        # wider than one pixel is masked by the polygon's own fill, and
+        # ImageDraw builds that mask with `self._getink(1)[0]` -- the ink for
+        # ONE in the TARGET's mode, not in the mask's. On an F image that is
+        # the float32 bits of 1.0, 0x3F800000, whose low byte is zero, so the
+        # mode-"1" mask is never set and the outline silently vanishes.
+        # pillow uses 255, the only sensible ink for a mode-"1" mask.
+        if not (m == "F"):
+            record(f"MD_poly_{t}", m, (24, 18), "z", "-",
+                   f"polygon|2,2,21,6,16,15|fill={col2}|outline={col}|width=2")
+        record(f"MD_pie_{t}", m, (24, 18), "z", "-",
+               f"pieslice|2,2,21,15|start=30|end=200|fill={col2}|outline={col}|width=2")
+
+    open(os.path.join(out, "MANIFEST"), "w").write("\n".join(man) + "\n")
+    return header("drawing index (images in reference/draw/); fields: "
+                  "tag file mode width height bg inkmode call") + man
+
+
 GENERATORS = {
+    "draw_index.txt": gen_draw,
     "ops_index.txt": gen_ops,
     "jpeg_index.txt": gen_jpeg,
     "codec_index.txt": gen_codecs,

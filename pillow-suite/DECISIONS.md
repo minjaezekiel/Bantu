@@ -326,3 +326,50 @@ The lesson is the one PW4 states and this phase paid for again: *fit against the
 reason from the formula.* Each of these four is a defensible reading of the documentation and wrong
 against the code. An exhaustive corpus — all 65,536 input pairs, not twelve probe pixels — is what
 turns "looks right" into "is right", and it costs seconds to run.
+
+### PW19 — `ImageDraw` is ported from `Draw.c`, and the five places it is not
+
+P7's 694-image corpus started at 673 and the 21 that differed were not twenty-one bugs. They were
+five upstream defects and one of ours, and separating the two is the whole content of the phase.
+
+**Ours was a Bantu defect, three times over.** A list handed to a function is copied, a list read
+out of a dict is copied, and a list read out of a dict is copied *on every member access*. So:
+
+* `_cornerJoin($xx, …)` adjusted a crossing in a copy of the crossings list and threw it away. One
+  pixel, on one row, of one ten-pointed star — which is exactly what a corner-join fix-up is for.
+* the polygon builder's merge of consecutive horizontal edges widened `$edges[n−1]`, read out of the
+  list, and dropped it.
+* moving the edge table into a dict to make it mutable made `$T.t[$i]` quadratic, and a
+  30,000-element probe did not finish in two minutes.
+
+The rule that came out of it is in §8.1 of the architecture: **mutable state crosses a call boundary
+in a dict, never in a list; and a list that is read in a hot loop stays a local.** The corner-join
+fix-up is inlined into the row loop for that reason and no other.
+
+**The five upstream ones are PW11 cases, every one of them a value computed and discarded or a
+buffer read past its meaning**, and each is published in `docs/pillow.md` beside the call with a
+test asserting what the fix preserves:
+
+1. `ImagingOutlineTransform` frees the edges it has just transformed and zeroes the count, so
+   `shape()` afterwards draws one closing edge. The C says `/* FIXME: ugly! */`.
+2. `fill_mask_L` has no 4-byte or 2-byte case, so a `bitmap` matte on `I`, `F` or `I;16` blends the
+   *representation*; `fill_mask_1` has no 16-bit case at all. Paste.c: "FIXME: fix Fill2 to properly
+   support matte for I+F images."
+3. `DIV255`'s shift form is exact only to `a ≤ 65,025`, which is every product of two bytes and not
+   a 16-bit value. Written as `round(a / 255)` it is the same number on every 8-bit input — checked
+   over the whole range — and right past it.
+4. `point8` ignores the mode's byte order and `hline8` honours it, so Pillow's own `I;16B` rectangle
+   outline is big-endian along the horizontals and host-order along the verticals.
+5. a wide polygon outline is masked by its own fill, and the mask's ink is taken in the *target's*
+   mode — on `F`, the float32 bits of 1.0, low byte zero, so the mask is empty and the outline
+   silently vanishes.
+
+**And one defect of our own, older than this phase.** `LAB`'s rawmode is packed with an offset —
+`Pack.c` writes `a + 128`, `Unpack.c` takes it off — and `tobytes`/`frombytes` did not. It had been
+green for five phases because nothing compared `LAB` bytes with Pillow's; one line of a drawing
+corpus does. The fix is at the wire, where the offset belongs, and
+`tests/pillow_core_test.b` now pins all three numbers.
+
+The lesson is PW18's, again, and it is cheap to state and expensive to learn: *fit against the
+reference, do not reason from the formula.* Every one of these is a defensible reading of the
+documentation and wrong against the code.

@@ -4,7 +4,8 @@ Phase P7 is `draw.b` and `font.b`. This file is the research that precedes them,
 because it was read out of Pillow's C and out of this repository rather than reasoned from the
 documentation — the same discipline §6.4 used for libjpeg. Nothing here is implemented yet.
 
-Status: **P0–P6 are done, tested and pushed.** P7 starts here.
+Status: **P0–P6 are done, tested and pushed. P7's drawing half is now done too** — see the
+addendum at the foot of this file for the four places building it corrected the research below.
 
 ---
 
@@ -101,3 +102,39 @@ in `docs/pillow.md` beside the call, not in a footnote.
 5. Text layout — `anchor`, `spacing`, `align`, `direction`, `stroke_width`, `stroke_fill`,
    `embedded_color` — which is arithmetic over the metrics and can be exact even where the pixels
    are not.
+
+
+---
+
+## Addendum: what building `draw.b` corrected in §2
+
+The rules in §2 were read out of `Draw.c` alone. Four of them are right about the C and wrong about
+what `ImageDraw` can actually reach, and one was simply misread. Recorded here rather than silently
+edited above, because the difference between "what the C does" and "what the API does" is the thing
+that cost the most time.
+
+1. **A reversed box does not draw nothing — it raises.** `_draw_rectangle`, `_draw_ellipse`,
+   `_draw_arc`, `_draw_chord` and `_draw_pieslice` in `_imaging.c` all check `xy[2] < xy[0]` and
+   `xy[3] < xy[1]` and raise `ValueError` before the C primitive is called. `hline`'s refusal to
+   swap its ends is still real, and still reachable through `polygon` and the ellipse family's
+   internals; it is just not reachable by handing `rectangle` a backwards box.
+
+2. **`rectangle`'s promotion of `width = 0` to `1` is unreachable.** `ImageDraw.rectangle` guards on
+   `width != 0` before calling the C, so a zero width draws nothing on a rectangle exactly as it
+   does on an ellipse. The asymmetry §2 describes exists only in the C API.
+
+3. **A line's endpoint IS drawn — by the Python layer.** `line` emits `max(|dx|, |dy|)` pixels and
+   never the last one, as §2 says, but `_draw_lines` then calls `ImagingDrawPoint` on the final
+   point of the whole polyline. That is why `draw.line` looks closed and why `polygon(width=1)`
+   draws each vertex exactly once as a *start* point. Without the second half of that sentence the
+   corpus is off by one pixel per polyline.
+
+4. **The default ink is not white.** `draw_ink(-1)` goes through `getink`, which for a single 8-bit
+   band runs `CLIP8(-1)` and gets **0**. So a `Draw` with no `fill` paints black on `L`, `1` and
+   `P`, white on the packed multi-band modes, and `1` on `I` and `F` (which take `draw_ink(1)`).
+
+And one addition to §3's list of things that cannot be matched: §2 should have said that the
+*blending* path (`Draw(im, "RGBA")` on an RGB image) has its own polygon filler, which carries an
+`x_pos` cursor so two spans of one row cannot blend over each other, and which draws flat edges in a
+*pre-pass per span* rather than once per row. It is reachable, it is tested, and it is 30 of the 694
+images.

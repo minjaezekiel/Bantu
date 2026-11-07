@@ -351,6 +351,21 @@ eq(bytes($fb.tobytes()), [1, 2, 3, 4, 5, 6], "tobytes round-trips");
 throws(def() { return pillow.frombytes("RGB", [2, 1], frombytes([1, 2, 3])); },
        "frombytes with too few bytes");
 
+// LAB IS PACKED WITH AN OFFSET. Pillow's LAB rawmode writes a + 128 and
+// b + 128 (Pack.c) and takes it back off on the way in, so the store value
+// 180 travels as the byte 52 and a store of 0 travels as 128. Our store is
+// Pillow's store -- what getpixel reports and what ImageDraw's ink writes --
+// so the shift lives at the wire. It was MISSING until phase P7's drawing
+// corpus compared LAB bytes with Pillow's and found tobytes() to be the one
+// call in the package that disagreed with Pillow for a whole mode. These
+// three numbers are Pillow 12.3.0's own.
+eq(bytes(pillow.new("LAB", [1, 1], [20, 180, 90]).tobytes()), [20, 52, 218],
+   "LAB tobytes offsets a and b by 128, as Pillow's Pack.c does");
+eq(bytes(pillow.new("LAB", [1, 1], null).tobytes()), [0, 128, 128],
+   "...so a zero LAB pixel is 0, 128, 128 on the wire");
+eq(pillow.frombytes("LAB", [1, 1], frombytes([20, 52, 218])).getpixel([0, 0]),
+   [20, 180, 90], "...and frombytes takes the offset back off");
+
 $arr = nd([[1, 2], [3, 4]], "i64");
 $fa = pillow.fromarray($arr, null);
 eq($fa.mode, "L", "fromarray guesses L for a 2-D integer array");
