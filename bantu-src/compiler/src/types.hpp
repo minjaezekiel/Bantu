@@ -482,6 +482,44 @@ public:
     static void throwReferenceError(const std::string& msg, int line = 0, int col = 0) {
         throwError(msg, line, col, REFERENCE_ERROR);
     }
+
+    // The message for an unbound name, with one piece of added diagnosis.
+    //
+    // A name that LOOKS like a native builtin but is not bound is almost never
+    // a typo. It is a `bantu` binary OLDER than the code it is running: the
+    // library was written against a kernel this interpreter does not have. That
+    // mistake has been made repeatedly -- a missing `nd_*` is the single most
+    // common confusing failure in this tree -- and the bare text "Undefined
+    // variable: nd_index_add" gives the reader nothing to go on.
+    //
+    // So the prefix is recognised and the error says where to look. The list is
+    // of PREFIXES, not names, on purpose: a new kernel in an existing family is
+    // covered the day it is written, with nothing to keep in sync.
+    static std::string undefinedName(const std::string& name) {
+        static const char* kNativeFamilies[][2] = {
+            { "nd_",       "numba (arrays)"         },
+            { "col_",      "arctic (columns)"       },
+            { "bp_",       "bplot / raster"         },
+            { "aead_",     "crypto (AEAD)"          },
+            { "sodium_",   "crypto (libsodium)"     },
+            { "pwhash_",   "crypto (argon2id)"      },
+            { "b64url_",   "crypto (base64url)"     },
+            { "ct_",       "crypto (constant time)" },
+            { "webpush_",  "Web Push"               },
+            { "gc_",       "the collector"          },
+        };
+        std::string msg = "Undefined variable: " + name;
+        for (const auto& fam : kNativeFamilies) {
+            if (name.rfind(fam[0], 0) != 0) continue;
+            msg += "\n         '" + name + "' is in the " + fam[1] + " native family ('"
+                 + fam[0] + "*'), so an unbound one usually means this bantu binary is "
+                 "OLDER than the code it is running -- not that the name is wrong.";
+            msg += "\n         Run 'bantu doctor': it compares this binary with the one "
+                   "on your PATH and says which is stale.";
+            break;
+        }
+        return msg;
+    }
 };
 
 class Log {

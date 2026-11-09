@@ -30,33 +30,50 @@ public:
         staticMethods[methodName] = method;
     }
 
+    // How deep an inheritance graph may be walked before we declare it
+    // malformed. Real hierarchies are a handful of levels; this only has to be
+    // smaller than the C++ stack and larger than anything sane.
+    static const int kMaxInheritWalk = 256;
+
     // Look up method: own methods -> parent chain -> implements chain
-    Value getMethod(const std::string& methodName) {
+    //
+    // `depth` bounds the walk. These are raw pointers with no owner and the
+    // only termination condition is a null parent, so a cycle anywhere in the
+    // graph used to mean unbounded recursion and a stack overflow -- a SIGSEGV
+    // with no diagnostic. evalClassDecl now makes a cycle unreachable AND
+    // rejects one explicitly, so this is defence in depth: it turns the crash
+    // into a value the caller can reason about, for the cost of one integer
+    // compare per level.
+    Value getMethod(const std::string& methodName, int depth = 0) {
+        if (depth > kMaxInheritWalk) return Value();
+
         // 1. Check own methods
         auto it = methods.find(methodName);
         if (it != methods.end()) return it->second;
 
         // 2. Check extends (parent) — single inheritance chain
         if (parentClass) {
-            Value parentMethod = parentClass->getMethod(methodName);
+            Value parentMethod = parentClass->getMethod(methodName, depth + 1);
             if (!parentMethod.isNull()) return parentMethod;
         }
 
         // 3. Check implements — multiple inheritance (depth-first, left-to-right)
         for (auto* impl : implementsClasses) {
-            Value implMethod = impl->getMethod(methodName);
+            Value implMethod = impl->getMethod(methodName, depth + 1);
             if (!implMethod.isNull()) return implMethod;
         }
 
         return Value();
     }
 
-    // Check if this class is or extends a given class (for isinstance)
-    bool isInstanceOf(const std::string& className) {
+    // Check if this class is or extends a given class (for isinstance).
+    // Depth-bounded for the same reason as getMethod.
+    bool isInstanceOf(const std::string& className, int depth = 0) {
+        if (depth > kMaxInheritWalk) return false;
         if (name == className) return true;
-        if (parentClass && parentClass->isInstanceOf(className)) return true;
+        if (parentClass && parentClass->isInstanceOf(className, depth + 1)) return true;
         for (auto* impl : implementsClasses) {
-            if (impl->isInstanceOf(className)) return true;
+            if (impl->isInstanceOf(className, depth + 1)) return true;
         }
         return false;
     }

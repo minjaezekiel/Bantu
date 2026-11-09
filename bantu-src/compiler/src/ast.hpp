@@ -191,6 +191,18 @@ struct AssignNode : ASTNodeK<NodeKind::Assign> {
     // append is the difference between O(n) and O(n^2), since the value it
     // would produce is a copy of the whole accumulated string.
     bool resultDiscarded = false;
+    // Set by parseExpressionStatement for the self-mutating list idiom
+    //
+    //     $x = push($x, v);
+    //
+    // where the call's first argument is this very variable. The mutator
+    // already edits the caller's list through resolveLValue, so the only work
+    // the assignment adds is copying the whole list out as a return value and
+    // storing it back over itself. Marking the shape here lets evalAssign skip
+    // both, turning a quadratic loop linear. Measured: 20,000 appends written
+    // this way took 12,781 ms against 22 ms for `push($x, v);` -- a 581x gap
+    // for two forms the documentation presents as equivalent.
+    bool selfMutatingCall = false;
 
     // Memo for evalAssign's in-place-append test: is this `$x = $x + …`, with
     // operands that cannot rebind $x? -1 not yet computed, 0 no, and otherwise

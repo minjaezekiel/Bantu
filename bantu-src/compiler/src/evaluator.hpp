@@ -3287,7 +3287,7 @@ private:
         try {
             return env_->get(n->name);
         } catch (const std::exception& e) {
-            ErrorHandler::throwReferenceError("Undefined variable: " + n->name, n->line, n->col);
+            ErrorHandler::throwReferenceError(ErrorHandler::undefinedName(n->name), n->line, n->col);
             return Value();
         }
     }
@@ -3587,6 +3587,26 @@ private:
             }
         }
 
+        // `$x = push($x, v);` — the mutator has already edited this very list in
+        // place through resolveLValue, so there is nothing to store: the store
+        // would write the list back over itself, having first copied it to
+        // produce a return value. Skipping both is what makes the idiom linear.
+        // parseExpressionStatement proves the shape (same variable, a mutator
+        // that returns the list, result unused), so this is a flag test.
+        if (n->selfMutatingCall) {
+            // One thing the parser cannot know: a USER-DEFINED function of the
+            // same name wins over the builtin (evalCall checks exactly this),
+            // and a user function cannot mutate its argument in place, so its
+            // return value really does have to be stored. Re-checking here
+            // costs one environment lookup, and only for this shape.
+            CallNode* rhs = nodeIf<CallNode>(n->value.get());
+            VariableNode* callee = rhs ? nodeIf<VariableNode>(rhs->callee.get()) : nullptr;
+            if (callee && !env_->has(callee->name)) {
+                evalNode(n->value);
+                return Value();
+            }
+        }
+
         Value val = evalNode(n->value);
         // Function-local assignment: resolve up to the enclosing function
         // boundary only, else define locally. Prevents a callee from clobbering
@@ -3777,6 +3797,90 @@ private:
         }
     }
 
+    // ── operator dispatch for class instances ───────────────────────────────
+    // Which method implements an operator. `reflected` means the instance was
+    // on the RIGHT, as in `2 * $vec`.
+    //
+    // A comparison's reflection IS the swapped operator, exactly as in Python:
+    // `0 < $t` asks $t the same question as `$t > 0`, so there is no
+    // `__rlt__`. Arithmetic is not symmetric, so it gets real `__r*__` names.
+    static const char* dunderFor(BantuTokenType op, bool reflected) {
+        switch (op) {
+            case BantuTokenType::PLUS:     return reflected ? "__radd__"     : "__add__";
+            case BantuTokenType::MINUS:    return reflected ? "__rsub__"     : "__sub__";
+            case BantuTokenType::MULTIPLY: return reflected ? "__rmul__"     : "__mul__";
+            case BantuTokenType::DIVIDE:   return reflected ? "__rtruediv__" : "__truediv__";
+            case BantuTokenType::MODULO:   return reflected ? "__rmod__"     : "__mod__";
+            case BantuTokenType::LESSTHAN:         return reflected ? "__gt__" : "__lt__";
+            case BantuTokenType::GREATERTHAN:      return reflected ? "__lt__" : "__gt__";
+            case BantuTokenType::LESSTHANEQUAL:    return reflected ? "__ge__" : "__le__";
+            case BantuTokenType::GREATERTHANEQUAL: return reflected ? "__le__" : "__ge__";
+            case BantuTokenType::EQUALTO:    return "__eq__";
+            case BantuTokenType::NOTEQUALTO: return "__ne__";
+            default: return nullptr;
+        }
+    }
+
+    // Bind a method to its receiver and call it, the same way evalPropertyAccess
+    // binds `this` for `$obj.method()`.
+    Value callBoundMethod(const Value& recv, const Value& method, std::vector<Value> args) {
+        auto fn = method.functionVal;
+        auto boundEnv = std::make_shared<Environment>(fn->closure);
+        boundEnv->define("this", recv);
+        boundEnv->define("self", recv);
+        Value bound(std::make_shared<BantuFunction>(fn->name, fn->params, fn->body, boundEnv));
+        return invokeCallable(bound, std::move(args));
+    }
+
+    // `$a + $b` on two class instances used to return 0 -- silently, with no
+    // error. There is no CLASS_INSTANCE arm below, so instances fell through to
+    // `case PLUS: return Value(left.numberVal + right.numberVal)`, and
+    // numberVal is always 0 for an instance. `($a + $b).x` then read as null.
+    //
+    // This is the THIRD time this file has fixed this exact shape of defect:
+    // see the comments below for `$handle + 1` silently giving 1, and
+    // `[1] + [2,3]` silently giving 0. Instances were the case still open, and
+    // it affects every class already shipped -- arctic's Series and DataFrame,
+    // pillow's Image.
+    //
+    // Two things are deliberately NOT changed, because code depends on them:
+    //   * `$obj + "str"` still concatenates via toString(), so printing keeps
+    //     working. Only a class that defines __add__ takes the new path.
+    //   * `==` / `!=` still compare identity unless the class defines __eq__ /
+    //     __ne__. Making every == call a method would change the meaning of
+    //     existing comparisons.
+    // Anything else arithmetic on an instance now RAISES, naming the method
+    // the class would need, instead of quietly computing with zero.
+    bool tryInstanceOperator(BantuTokenType op, const Value& left, const Value& right,
+                             int line, int col, Value& out) {
+        const bool leftInst  = left.isClassInstance()  && left.classInstanceVal;
+        const bool rightInst = right.isClassInstance() && right.classInstanceVal;
+        if (!leftInst && !rightInst) return false;
+
+        const char* name = dunderFor(op, !leftInst);
+        if (!name) return false;            // &&/|| and the rest: untouched
+
+        const Value& recv  = leftInst ? left  : right;
+        const Value& other = leftInst ? right : left;
+
+        Value method = recv.classInstanceVal->classDef->getMethod(name);
+        if (method.isFunction()) {
+            out = callBoundMethod(recv, method, { other });
+            return true;
+        }
+
+        // No such method. Identity comparison and string concatenation are
+        // existing behaviour and stay.
+        if (op == BantuTokenType::EQUALTO || op == BantuTokenType::NOTEQUALTO) return false;
+        if (op == BantuTokenType::PLUS && (left.isString() || right.isString())) return false;
+
+        ErrorHandler::throwRuntimeError(
+            std::string("unsupported operand for this operator: class '") +
+            recv.classInstanceVal->classDef->name + "' does not define " + name +
+            "() (it used to return 0 here, silently)", line, col);
+        return true;
+    }
+
     Value evalBinaryOp(BinaryOpNode* n) {
         // && and || SHORT-CIRCUIT, and must be handled before the right-hand
         // side is evaluated at all.
@@ -3837,6 +3941,13 @@ private:
                         return Value();
                     }
                 }
+            }
+            // A class instance operand: dispatch to __add__ and friends. Same
+            // dead path as the two cases documented here -- it silently
+            // computed with numberVal, which is 0 for an instance.
+            if (left.type == Value::CLASS_INSTANCE || right.type == Value::CLASS_INSTANCE) {
+                Value res;
+                if (tryInstanceOperator(n->op, left, right, n->line, n->col, res)) return res;
             }
             // `[1] + [2, 3]` read numberVal from both lists and silently gave
             // 0. Two lists now concatenate, as in Python. Both operands are
@@ -3935,6 +4046,19 @@ private:
                         ErrorHandler::throwRuntimeError(e.what(), n->line, n->col);
                         return Value();
                     }
+                }
+                // -$instance read numberVal too, so it gave -0 for every
+                // object. A class that defines __neg__ now gets it called; one
+                // that does not says so instead of returning zero.
+                if (BANTU_UNLIKELY(operand.type == Value::CLASS_INSTANCE) && operand.classInstanceVal) {
+                    Value method = operand.classInstanceVal->classDef->getMethod("__neg__");
+                    if (method.isFunction()) return callBoundMethod(operand, method, {});
+                    ErrorHandler::throwRuntimeError(
+                        std::string("cannot negate an instance of class '") +
+                        operand.classInstanceVal->classDef->name +
+                        "': it does not define __neg__() (it used to return -0 here, silently)",
+                        n->line, n->col);
+                    return Value();
                 }
                 return Value(-operand.numberVal);
             default: return Value();
@@ -6109,13 +6233,55 @@ private:
 
     // Store class definitions for lookup during instantiation
     std::unordered_map<std::string, ClassDefinition*> classRegistry_;
+    // Owns every ClassDefinition ever declared, for the life of the
+    // interpreter. The registry above holds non-owning pointers into this, as
+    // do ClassDefinition::parentClass and ::implementsClasses. See the note in
+    // evalClassDecl for why these outlive a redefinition on purpose.
+    std::vector<std::unique_ptr<ClassDefinition>> classArena_;
     std::string currentClassName_ = "";  // for super() resolution
 
     Value evalClassDecl(ClassDeclNode* n) {
-        auto* classDef = new ClassDefinition(n->name);
-        classRegistry_[n->name] = classDef;
+        // OWNED by an arena that lives as long as the interpreter.
+        //
+        // This was a bare `new ClassDefinition(...)` with no delete anywhere,
+        // so every class declaration leaked its definition for the life of the
+        // process. The leak is bounded by the number of `class` statements in a
+        // program -- it does not grow with instances or requests -- but it also
+        // meant nothing owned these objects at all.
+        //
+        // The arena, rather than a unique_ptr in the registry: parentClass and
+        // implementsClasses are RAW back-pointers held by other definitions, and
+        // redefining a class overwrites its registry slot. Freeing the old
+        // definition at that point would leave every subclass pointing into
+        // freed memory -- turning a bounded, harmless leak into a
+        // use-after-free. The arena keeps every definition alive until exit,
+        // which is what those raw pointers already assume, and releases them on
+        // shutdown so the process is clean. Making the pointers shared_ptr is
+        // the deeper fix and is recorded as future work rather than done here,
+        // because it touches every inheritance site.
+        classArena_.push_back(std::make_unique<ClassDefinition>(n->name));
+        ClassDefinition* classDef = classArena_.back().get();
 
-        // Resolve extends (single inheritance)
+        // Resolve extends (single inheritance).
+        //
+        // This resolution USED to run AFTER `classRegistry_[n->name] = classDef`,
+        // and that ordering was a real defect: for `class A extends A` the
+        // lookup of the parent found the class being declared -- itself -- and
+        // set `parentClass = classDef`, a self-referential cycle in the
+        // inheritance graph. getMethod() and isInstanceOf() both walk that
+        // chain, so the next inherited lookup recursed forever:
+        //
+        //     class A { def init($n) { this.n = $n; } }
+        //     class A extends A { }
+        //     new A(1);           // SIGSEGV (stack overflow), exit 139
+        //
+        // Registering only after the parent is resolved removes the cycle by
+        // construction: a redefinition now extends the PREVIOUS definition of
+        // that name, which is the only coherent reading of it, and a first
+        // definition naming itself still finds nothing and warns, exactly as
+        // before. Nothing else can observe the move -- the name is bound into
+        // the environment further down, and a method referring to its own class
+        // resolves at call time, not here.
         if (!n->parentClass.empty()) {
             auto it = classRegistry_.find(n->parentClass);
             if (it != classRegistry_.end()) {
@@ -6144,6 +6310,26 @@ private:
                 std::cout << "  [class] " << n->name << " implements " << implNames << "\n";
             }
         }
+
+        // Defence in depth: refuse to install a definition whose ancestry
+        // reaches back to itself. The ordering above makes that unreachable
+        // today, but getMethod() and isInstanceOf() recurse over these raw
+        // pointers with no termination condition other than a null parent, so
+        // a cycle arriving by any future route is a stack overflow rather than
+        // a diagnosable error. Checked once per class declaration, never on a
+        // method call, so it costs nothing measurable.
+        for (ClassDefinition* p = classDef->parentClass; p; p = p->parentClass) {
+            if (p == classDef) {
+                ErrorHandler::throwRuntimeError(
+                    "class '" + n->name + "' cannot inherit from itself "
+                    "(its 'extends' chain leads back to it)");
+                return Value();
+            }
+        }
+
+        // Only NOW is the name bound to this definition -- see the note on the
+        // extends resolution above for why the order matters.
+        classRegistry_[n->name] = classDef;
 
         // Process class body - register methods
         auto prevEnv = env_;
@@ -6224,7 +6410,40 @@ private:
 
             auto prevEnv = env_;
             env_ = callEnv;
-            runStatements(fn->body);
+
+            // The parent constructor has to run under the PARENT's class name,
+            // because that is what a `super()` inside IT will resolve against.
+            //
+            // It did not, and a three-level hierarchy crashed the interpreter:
+            //
+            //     class Base       { def init($n) { this.n = $n; } }
+            //     class Child      extends Base  { def init($n) { super($n); } }
+            //     class GrandChild extends Child { def init($n) { super($n); } }
+            //     $g = new GrandChild(3);        // SIGSEGV, exit 139, NO output
+            //
+            // currentClassName_ stayed "GrandChild" for the whole chain, so
+            // `super($n)` inside Child::init looked up GrandChild, found its
+            // parent Child, and called Child::init again -- unbounded
+            // recursion until the stack died. Two levels happened to work,
+            // which is why it survived this long; every deeper hierarchy
+            // crashed with no diagnostic at all.
+            //
+            // Restored on the exception path too: a constructor that throws
+            // must not leave the interpreter resolving `super` against the
+            // wrong class for the rest of the program. The depth guard in
+            // instantiateClass turns genuine pathological recursion into a
+            // catchable error, now that this no longer recurses by itself.
+            const std::string savedSuperClass = currentClassName_;
+            currentClassName_ = parentClass->name;
+            try {
+                runStatements(fn->body);
+            } catch (...) {
+                currentClassName_ = savedSuperClass;
+                env_ = prevEnv;
+                throw;
+            }
+            currentClassName_ = savedSuperClass;
+
             env_ = prevEnv;
             finishCall(Value());                 // a constructor's return value is ignored
         }
@@ -6287,11 +6506,46 @@ private:
             finishCall(Value());                 // a constructor's return value is ignored
             currentClassName_ = savedClassName;
         } else {
-            // No explicit constructor — try to call parent constructor
-            if (classDef->parentClass) {
-                auto parentCtor = classDef->parentClass->methods.find("__constructor__");
-                if (parentCtor != classDef->parentClass->methods.end() && parentCtor->second.isFunction()) {
-                    auto fn = parentCtor->second.functionVal;
+            // No explicit constructor — inherit one.
+            //
+            // This used to read `parentClass->methods.find(...)`, which looks
+            // at the IMMEDIATE parent's own table only. So a constructor two
+            // or more levels up was never found:
+            //
+            //     class Q0 { def init($n) { this.n = $n; } }
+            //     class Q1 extends Q0 { def extra() { return 42; } }  // no ctor
+            //     class Q2 extends Q1 { }                             // no ctor
+            //     (new Q2(12)).n      // -> null, silently
+            //
+            // Nothing ran and every field stayed null, with no error. Q1 worked
+            // and Q2 did not, which is the signature of a one-level lookup.
+            //
+            // An inherited ordinary method already gets this lookup; a
+            // constructor had no reason to be the exception. Found by the
+            // 3-level case in tests/lang_inherit_test.b.
+            //
+            // The chain is walked explicitly rather than via getMethod()
+            // because we need the class that DEFINES the constructor, not just
+            // the Value: that class's name is what a super() inside it must
+            // resolve against. Using the immediate parent's name here would
+            // reintroduce the recursion this release just fixed -- Q0's
+            // constructor running under the name "Q1" would find parent Q0 and
+            // call itself.
+            ClassDefinition* ctorOwner = classDef->parentClass;
+            // Depth-bounded like the other walks over these raw pointers: a
+            // cycle here would be an infinite LOOP rather than a stack
+            // overflow, which hangs the process instead of crashing it.
+            for (int walked = 0; ctorOwner && walked <= ClassDefinition::kMaxInheritWalk; walked++) {
+                auto own = ctorOwner->methods.find("__constructor__");
+                if (own != ctorOwner->methods.end() && own->second.isFunction()) break;
+                ctorOwner = ctorOwner->parentClass;
+                if (!ctorOwner) break;
+                if (walked == ClassDefinition::kMaxInheritWalk) { ctorOwner = nullptr; break; }
+            }
+            if (ctorOwner) {
+                Value parentCtor = ctorOwner->methods["__constructor__"];
+                {
+                    auto fn = parentCtor.functionVal;
                     auto callEnv = std::make_shared<Environment>(fn->closure);
 
                     Value thisVal(instance);
@@ -6302,9 +6556,23 @@ private:
                         callEnv->define(fn->params[i], i < args.size() ? args[i] : Value());
                     }
 
+                    // The inherited constructor may itself call super(), so it
+                    // has to run under the name of the class that DEFINES it,
+                    // not the one being instantiated -- the same rule as the
+                    // super() handler, and for the same reason.
+                    const std::string savedName = currentClassName_;
+                    currentClassName_ = ctorOwner->name;
+
                     auto prevEnv = env_;
                     env_ = callEnv;
-                    runStatements(fn->body);
+                    try {
+                        runStatements(fn->body);
+                    } catch (...) {
+                        currentClassName_ = savedName;
+                        env_ = prevEnv;
+                        throw;
+                    }
+                    currentClassName_ = savedName;
                     env_ = prevEnv;
                     finishCall(Value());
                 }

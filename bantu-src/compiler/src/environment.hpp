@@ -42,7 +42,7 @@ public:
         auto it = variables.find(name);
         if (it != variables.end()) return it->second;
         if (parent) return parent->get(name);
-        ErrorHandler::throwReferenceError("Undefined variable: " + name);
+        ErrorHandler::throwReferenceError(ErrorHandler::undefinedName(name));
         return Value();
     }
 
@@ -83,7 +83,7 @@ public:
         auto it = variables.find(name);
         if (it != variables.end()) return it->second;
         if (parent) return parent->getRef(name);
-        ErrorHandler::throwReferenceError("Undefined variable: " + name);
+        ErrorHandler::throwReferenceError(ErrorHandler::undefinedName(name));
         static Value nullVal;
         return nullVal;
     }
@@ -99,7 +99,7 @@ public:
             return;
         }
         if (parent) { parent->set(name, value); return; }
-        ErrorHandler::throwReferenceError("Undefined variable: " + name);
+        ErrorHandler::throwReferenceError(ErrorHandler::undefinedName(name));
     }
 
     bool has(const std::string& name) const {
