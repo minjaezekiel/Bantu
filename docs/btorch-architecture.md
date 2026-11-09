@@ -698,3 +698,195 @@ Nothing here is scheduled; each lands only on a concrete measured need.
   arrays, not over tensors, so second derivatives would need those closures to
   be differentiable too — a deliberate design limit, recorded as **B4**.
 - **ONNX export.**
+
+---
+
+## 11. Sequence layers — phase 8 (ecosystem stage 5)
+
+Paired with `btext` ([`btext-architecture.md`](btext-architecture.md)) because
+neither is useful alone. Tracked as phase 8 in
+[`../btorch-suite/ROADMAP.md`](../btorch-suite/ROADMAP.md).
+
+**Every primitive this needs already exists.** Verified, not assumed:
+`cat`, `chunk`, `permute`, `transpose`, `matmul`, `reshape`, `split` in
+`btorch.b`; `nn.log_softmax` / `nn.softmax`, numerically stable, in `nn.b`;
+`nd_where` for masking; `clip_grad_norm` in `optim.b`. **No new native kernel,
+and no new gradient.** That is the B18 principle applied again — compose, do
+not add a special case.
+
+### 11.1 The fused gate matmul
+
+An LSTM cell computes four gates from the same two inputs. The naive form is
+eight matmuls per timestep; the right form is two:
+
+```
+gates = x @ W_ih^T + h @ W_hh^T + b          // [N, 4H] in one matmul each
+i, f, g, o = chunk(gates, 4, 1)              // views, so the split is free
+```
+
+`chunk` returns views over the existing storage (A6: `nd_split` returns views),
+so the split costs nothing and the backward is a `cat` of four gradients. Four
+times fewer tape nodes and four times fewer kernel launches per timestep.
+
+### 11.2 The tape cost, computed before building
+
+A Bantu call costs **1.78 µs** (B1), and a recurrence is a Bantu loop over
+timesteps — so this is the one place in btorch where per-*op* overhead could
+dominate. The arithmetic, for one LSTM layer:
+
+| quantity | value |
+|---|---|
+| ops per timestep (fused) | ~14 |
+| calls at `T = 128` | ~1,800 |
+| interpreter overhead | ~3.2 ms per layer per forward |
+| tape nodes at `T = 128` | ~1,800 |
+
+Acceptable, and well inside the 1,000-call depth guard's concern (B14) because
+the loop is iterative, not recursive. But it sets the honest limit: **`T` in
+the hundreds, not the tens of thousands.** A 4,096-token context would spend
+~100 ms per layer in interpreter overhead alone, before any arithmetic. Recorded
+as a limit of the design, not something to be discovered later.
+
+### 11.3 Causal masks compose; no `nd_tril` needed
+
+`nd_tril`/`nd_triu` do not exist, and should not be added. A causal mask is a
+comparison of two broadcast index grids:
+
+```bantu
+$rows = nd_reshape(nd_arange(0.0, $T * 1.0, null), [$T, 1]);
+$cols = nd_reshape(nd_arange(0.0, $T * 1.0, null), [1, $T]);
+$mask = nd_greater_equal($rows, $cols, null);        // [T, T], lower triangular
+```
+
+Three existing calls instead of a new kernel, and it generalises to any
+banded or windowed mask for free. `masked_fill` is `nd_where` with a scalar.
+
+### 11.4 Scope
+
+| item | phase |
+|---|---|
+| `RNNCell`, `GRUCell`, `LSTMCell` | 8.1 |
+| `RNN`, `GRU`, `LSTM` sequence wrappers — `batch_first`, `num_layers`, `bidirectional` | 8.2 |
+| `MultiheadAttention` — heads via `reshape`+`permute`, scaled dot product, stable softmax | 8.3 |
+| `TransformerEncoderLayer`, `TransformerEncoder` | 8.4 |
+| positional encodings: sinusoidal, learned, rotary | 8.5 |
+| KV cache for autoregressive inference (`no_grad` only) | 8.6 |
+| packed sequences / padding masks | 8.7 |
+
+### 11.5 The gates
+
+Tier 3 (gradcheck) is where this phase lives or dies, with one wrinkle:
+
+**A gradcheck over a `T`-step recurrence is numerically fragile.** Central
+differences on a deep composition accumulate error, and an exploding recurrence
+makes the finite-difference estimate meaningless. So gradchecks run at
+**`T ≤ 4` with small, well-conditioned weights**, which is enough to exercise
+every path through the cell — the recurrence is the same closure at every step,
+so a correct gradient at `T = 4` is correct at `T = 128`.
+
+Separately, a **stress tier** runs `T = 512` and asserts the gradient norm is
+finite and that `clip_grad_norm` bounds it, which is the property that actually
+matters at depth.
+
+And the phase gate: **an LSTM trained on a character-level language-modelling
+task reaches a stated perplexity**, measured from a reloaded checkpoint. B10
+applies — a falling loss proves nothing, so the gradcheck is the real test and
+the training run is the integration test.
+
+---
+
+## 12. int8 quantization — `quant.b` (ecosystem stage 6)
+
+Lives inside btorch ([E5]) because it must know every layer type in order to
+swap it; a separate package would break every time `nn.b` adds a layer.
+
+**Why it matters here more than elsewhere.** This stack has no GPU, so int8 is
+*the* inference performance story: 4× the arithmetic throughput and 4× less
+memory, pairing exactly with the single-static-binary deployment wedge
+(`ecosystem-architecture.md` §7.6). A 61,706-parameter LeNet is not the target;
+an imported ResNet (`bonnx`, stage 4) running at the edge is.
+
+### 12.1 The `q8_` family, and a real `I8` dtype
+
+Unlike `bkit`'s binned matrix and `btext`'s merge tables — both opaque handles
+— **quantized weights must be a real `NdArray`**. Users inspect them, save them
+to `.btsd`, and load them back. So stage 6 adds `DType::I8` properly.
+
+This is the third dtype the templating pass ([E16]) pays for, and the reason
+that pass is phase D1 rather than something done inline with f32.
+
+| kernel | purpose |
+|---|---|
+| `q8_quantize` | `f32/f64 → i8` given scale and zero-point, saturating |
+| `q8_dequantize` | `i8 → f32/f64` |
+| `q8_gemm` | int8 × int8 → **i32 accumulate** → requantize to i8 |
+| `q8_gemm_f` | int8 × int8 → i32 → dequantize to f32 (for the last layer) |
+
+The i32 accumulator is not optional: `127 × 127 × K` overflows `int16` at
+`K = 5`, and silently wrapping is a wrong answer that looks like noise.
+
+### 12.2 Scheme: per-channel symmetric weights, per-tensor asymmetric activations
+
+| tensor | scheme | why |
+|---|---|---|
+| weights | **per-output-channel, symmetric** (`zero_point = 0`) | per-channel recovers most of the accuracy lost to quantization, because channel ranges differ by orders of magnitude. Symmetric removes the zero-point cross-term from the GEMM inner loop entirely |
+| activations | **per-tensor, asymmetric** | activations after ReLU are one-sided, so asymmetric uses the full 255 levels instead of 127. Per-tensor because per-channel activation scales would have to be tracked at runtime |
+
+The asymmetry is deliberate and standard: it puts the cheap scheme where the
+hot loop is (weights, symmetric → two-term GEMM) and the accurate scheme where
+the dynamic range is unpredictable (activations).
+
+### 12.3 Phases
+
+| item | phase |
+|---|---|
+| `q8_` kernels + `DType::I8` | Q1 |
+| observers — `MinMax`, `MovingAverageMinMax`, `Histogram` (percentile clipping) | Q2 |
+| **dynamic** quantization — weights offline, activations per-batch; no calibration data needed | Q3 |
+| **static** PTQ — a calibration pass over representative data, then layer swap | Q4 |
+| `QuantizedLinear`, `QuantizedConv2d`, and `Module.quantize($scheme)` | Q5 |
+| accuracy and throughput gates | Q6 |
+
+Dynamic before static, deliberately: it needs no calibration dataset, so it is
+usable the day it lands and it validates the kernels before the calibration
+machinery is written.
+
+### 12.4 The gates
+
+| gate | target |
+|---|---|
+| **accuracy** | MNIST CNN int8 within **0.5%** of the f32 result (f32 baseline established at D2; f64 reference is 98.98%) |
+| **throughput** | `q8_gemm` measurably faster than `gemmContig` on the same shapes — recorded whatever it is |
+| **round-trip** | `dequantize(quantize(x))` within the quantization step of `x`, for every scale, including saturation at both ends |
+| **no silent overflow** | a fuzz test driving accumulators toward `int32` limits, asserting saturation rather than wrap |
+| **container** | a quantized model saves and loads from `.btsd` and predicts bit-identically ([C3]) |
+
+### 12.5 The honest uncertainty
+
+**The 4× throughput figure assumes SIMD integer dot-product instructions**
+(AVX-512 VNNI on x86, SDOT on ARM). Without them, int8 GEMM on a generic
+scalar path may be no faster than f32 — the win would be only in memory
+bandwidth and cache residency, perhaps 1.5–2×.
+
+Whether the compiler auto-vectorises the i32 accumulation well enough is the
+**first measurement of Q1**, before the rest of the phase is scoped. If it does
+not, the options are intrinsics behind a feature check, or accepting the
+memory-bandwidth win alone and saying so. What is not acceptable is publishing
+a 4× claim that the measurement does not support — phase 9's rule: measure,
+because two of three suspects were wrong.
+
+---
+
+## 13. Deferred items that now have homes
+
+Updating §10, where these were listed as deferred with no plan:
+
+| item | now |
+|---|---|
+| f32 | ecosystem stage 1, phase D2 ([`numba-dtype-architecture.md`](numba-dtype-architecture.md)) |
+| FFT, sparse | ecosystem stage 6 — FFT in `numba` (D5), sparse in `bsci` ([E4], [`bsci-architecture.md`](bsci-architecture.md)) |
+| ONNX export | `bonnx` phase O8, unscheduled; import is the asymmetric win ([`bonnx-architecture.md`](bonnx-architecture.md) §6) |
+| graph fusion / `torch.compile` | still deferred; stage 1's threading and packed GEMM are the cheaper wins first |
+| distributed training | still deferred; stage 1's threading is the honest ceiling |
+| `vmap`, forward-mode AD, double backward | still deferred, by design (B4) |
+| `device` strings | still `"cpu"`; the wedge is explicitly CPU + static binary |

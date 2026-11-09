@@ -592,3 +592,128 @@ Under ASan, **timing** assertions fail because the sanitizer runs 4-8× slower.
 Set `BANTU_SKIP_PERF=1` for sanitizer runs: `numba_fastpath_test` honours it and
 reports those three assertions as skipped. `numba_linalg_test`'s pre-existing
 4 GFLOP/s gate has the same property and does not.
+
+---
+
+## Phase 8 — Sequence layers (ecosystem stage 5)
+
+Design: [`../docs/btorch-architecture.md`](../docs/btorch-architecture.md) §11.
+Paired with `btext` ([`../btext-suite/ROADMAP.md`](../btext-suite/ROADMAP.md))
+because neither is useful alone: a tokenizer with nothing to feed, or an
+attention layer with no way to turn text into ids.
+
+**Every primitive this needs already exists — verified, not assumed.**
+`cat`, `chunk`, `permute`, `transpose`, `matmul`, `reshape`, `split` in
+`btorch.b`; `nn.log_softmax`/`nn.softmax`, numerically stable, in `nn.b`;
+`nd_where` for masking; `clip_grad_norm` in `optim.b`. **No new native kernel
+and no new gradient** — B18 applied again: compose, do not add a special case.
+
+| Item | How | Feature test | Stress test | Status |
+|---|---|---|---|---|
+| **8.1** `RNNCell`, `GRUCell`, `LSTMCell` | **one fused matmul for all gates**, then `chunk` — `chunk` returns views (A6), so the split is free and the backward is a `cat` | gradcheck at `T=1`; gate values against hand-computed references | — | [ ] |
+| **8.2** `RNN`/`GRU`/`LSTM` wrappers | `batch_first`, `num_layers`, `bidirectional`, `dropout` between layers | output and final state shapes; bidirectional equals two runs concatenated | `T=512`: gradient norm **finite**, and `clip_grad_norm` bounds it | [ ] |
+| **8.3** `MultiheadAttention` | heads via `reshape`+`permute`; scaled dot product; `nn.log_softmax` for stability | gradcheck; equals a single-head reference at `num_heads=1`; masking verified | attention over `T=1024` within the allocation ceiling | [ ] |
+| **8.4** `TransformerEncoderLayer`, `TransformerEncoder` | pre-norm, residuals, feed-forward | gradcheck through a 2-layer stack | 12-layer stack | [ ] |
+| **8.5** positional encodings | sinusoidal, learned, rotary | sinusoidal matches a closed form; rotary preserves norms | — | [ ] |
+| **8.6** KV cache | `no_grad` only, append-in-place | cached decode equals full recompute **exactly** | 1000-step decode: memory flat | [ ] |
+| **8.7** packed sequences / padding masks | — | a padded batch equals per-sequence runs | ragged batches | [ ] |
+
+### The gradcheck wrinkle, decided in advance
+
+**A gradcheck over a `T`-step recurrence is numerically fragile.** Central
+differences on a deep composition accumulate error, and an exploding recurrence
+makes the finite-difference estimate meaningless.
+
+So gradchecks run at **`T ≤ 4` with small, well-conditioned weights** — enough
+to exercise every path, because the recurrence is *the same closure at every
+step*, so a correct gradient at `T=4` is correct at `T=128`. The stress tier
+then runs `T=512` and asserts the gradient norm is finite and that
+`clip_grad_norm` bounds it, which is the property that actually matters at
+depth.
+
+### The interpreter cost, computed before building
+
+A Bantu call costs **1.78 µs** (B1), and a recurrence is a Bantu loop over
+timesteps — the one place in btorch where per-*op* overhead could dominate:
+
+| quantity | value |
+|---|---|
+| ops per timestep, fused | ~14 |
+| calls at `T=128` | ~1,800 |
+| interpreter overhead | **~3.2 ms per layer per forward** |
+
+Acceptable, and inside B14's concern because the loop is iterative not
+recursive. It sets the honest limit: **`T` in the hundreds, not the tens of
+thousands.** A 4,096-token context would spend ~100 ms per layer in overhead
+before any arithmetic. Recorded now rather than discovered later.
+
+### Phase gate
+An LSTM trained on character-level language modelling reaches a stated
+perplexity, **measured from a reloaded checkpoint**. B10 applies: the gradcheck
+is the real test, the training run is the integration test.
+
+---
+
+## Phase Q — int8 quantization (ecosystem stage 6)
+
+Design: [`../docs/btorch-architecture.md`](../docs/btorch-architecture.md) §12.
+Lives in btorch ([E5]) because it must know every layer type to swap it; a
+separate package would break every time `nn.b` adds a layer.
+
+**Why it matters here more than elsewhere:** this stack has no GPU, so int8 is
+*the* inference performance story — 4× arithmetic throughput and 4× less
+memory, pairing exactly with the single-static-binary deployment wedge. The
+target is not a 61,706-parameter LeNet; it is an imported ResNet (`bonnx`,
+stage 4) running at the edge.
+
+**Prerequisite:** ecosystem stage 1 item D1 (the templating pass). Quantized
+weights must be a **real `NdArray`** — users inspect them, save them to
+`.btsd` and load them back — so this phase adds `DType::I8` properly. It is the
+third dtype D1 pays for.
+
+| Item | How | Feature test | Stress test | Status |
+|---|---|---|---|---|
+| **Q1** `q8_` family + `DType::I8` | `q8_quantize` (saturating), `q8_dequantize`, `q8_gemm` (**i32 accumulate** → requantize), `q8_gemm_f` (→ f32) | round-trip within one quantization step, for every scale, including saturation at both ends | **fuzz accumulators toward `int32` limits: saturation, never wrap** | [ ] |
+| **Q2** observers | `MinMax`, `MovingAverageMinMax`, `Histogram` (percentile clipping) | observed range matches a reference over the same data | 1M-batch calibration, memory flat | [ ] |
+| **Q3** **dynamic** quantization | weights offline, activations per batch; **no calibration data needed** | MNIST CNN dynamic-int8 accuracy recorded | — | [ ] |
+| **Q4** **static** PTQ | a calibration pass, then layer swap | matches a hand-quantized reference | — | [ ] |
+| **Q5** `QuantizedLinear`, `QuantizedConv2d`, `Module.quantize($scheme)` | per-output-channel **symmetric** weights; per-tensor **asymmetric** activations | a quantized module's output within tolerance of the dequantized reference | every layer type in `nn.b` covered, or refused by name | [ ] |
+| **Q6** gates | — | **MNIST CNN int8 within 0.5% of the f32 result**; a quantized model saves to `.btsd` and predicts bit-identically ([C3]) | — | [ ] |
+
+Dynamic before static, deliberately: it needs no calibration dataset, so it is
+usable the day it lands and it validates the kernels before the calibration
+machinery exists.
+
+The i32 accumulator is not optional — `127 × 127 × K` overflows `int16` at
+`K = 5`, and silently wrapping is a wrong answer that looks like noise.
+
+### The honest uncertainty, stated before the work starts
+
+**The 4× throughput figure assumes SIMD integer dot-product instructions**
+(AVX-512 VNNI on x86, SDOT on ARM). Without them, int8 GEMM on a generic
+scalar path may be no faster than f32, and the win would be memory bandwidth
+and cache residency alone — perhaps 1.5–2×.
+
+Whether the compiler auto-vectorises the i32 accumulation well enough is the
+**first measurement of Q1**, before the rest of the phase is scoped. If it does
+not, the options are intrinsics behind a feature check, or accepting the
+bandwidth win and saying so. What is not acceptable is publishing a 4× claim
+the measurement does not support — phase 9's rule, where two of three suspects
+were wrong.
+
+---
+
+## WHERE TO RESUME (updated)
+
+Phases 0–10 are **done**. Next work, in ecosystem order
+([`../docs/ecosystem-architecture.md`](../docs/ecosystem-architecture.md)):
+
+1. **not btorch** — ecosystem stage 1 (numba items D1–D4), then stage 2, 3, 4
+2. **btorch phase 8** — sequence layers (ecosystem stage 5)
+3. **btorch phase Q** — int8 quantization (ecosystem stage 6)
+
+Still open from earlier phases, unblocked and small:
+`ReduceLROnPlateau`, `ConvTranspose2d`, `AdaptiveAvgPool2d`, `groups`/depthwise
+conv (**forced by `bonnx`'s MobileNetV2 gate in stage 4**), A4
+(`super.method()` — and `bkit` K3 confirms it is still not needed),
+`bantu publish btorch` to the local registry.

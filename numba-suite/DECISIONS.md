@@ -270,3 +270,96 @@ machine the Linux binary actually runs on.
 every contributor. `std::thread` is already used in the tree (`server.hpp`), so a small fixed-size
 pool adds nothing. It must be threshold-gated (thread wake-up is microseconds) and must not multiply
 against sua's per-connection threads, the same interaction that forced N18.
+
+---
+
+### N23 — The dtype templating pass precedes f32, not the other way round
+Every kernel today has an f64 fast path and a generic path. Adding f32 by hand
+makes that a 3×2 matrix of hand-written branches; adding int8 in ecosystem
+stage 6 makes it 4×2. Template each kernel once over `T` **first** (item D1),
+then add dtypes.
+
+More boring, and it is the difference between a week and a quarter by the time
+`q8_` lands. Grounded in a count rather than an impression: the surface is
+**76 `DType::F64` branches** and ~44 `double*` sites, and `NdArray::ptr<T>()`
+is already templated with strides in elements (N4), so the job is bounded.
+
+Ecosystem-wide this is [E16].
+
+---
+
+### N24 — The accumulator type is separate from the storage type
+`dtypeTraits<T>::acc`, introduced in D1 and load-bearing from D2 onward.
+
+An f32 sum accumulated in f32 is unusable: a 10M-element f32 reduction has
+~1e-3 relative error, against the ~2e-16 this library already guarantees for
+f64. So `dtypeTraits<float>::acc = double` — f32 **arrays** with f64-quality
+**reductions**, which is what NumPy does and what makes f32 viable for training
+at all.
+
+Without this split, f32 would halve memory and quietly destroy the accuracy
+property that N-era pairwise summation was built to provide.
+
+---
+
+### N25 — Threading uses a fixed partition, never work stealing; default 1
+Floating-point addition is not associative, so a work-stealing pool assigns
+different element ranges on every run, changing the last bits of every
+reduction run to run. That makes results irreproducible — and reproducibility
+is the property that makes this stack worth choosing over the alternatives in a
+regulated setting. A few percent of scheduling efficiency is not worth it.
+
+So: a fixed partition computed from shape, giving **bit-identical results at
+any thread count**, plus `nd_set_threads(n)`.
+
+**Default 1, opt-in.** A library whose numeric results change when it is
+installed on a machine with more cores is a support nightmare; opt-in means the
+user chooses the moment their results change, and `nd_set_threads(1)` is always
+an exact reproduction path. No pool is created at `n == 1`.
+
+Ecosystem-wide this is [E15]. **Rejected:** language-level threads — they touch
+the GC and the evaluator, a far larger change for the same arithmetic benefit.
+
+---
+
+### N26 — `nd_sum`'s last bits change once, deliberately, and it is announced
+A consequence of N25 that deserves its own entry because it is a user-visible
+change to a shipped function.
+
+`Pairwise` is a binary-counter tree whose shape is a function of the element
+count alone (`ndarray_reduce.hpp:21`), so **no partitioning of a threaded
+reduction reproduces the single-threaded answer.** The chosen scheme — fixed
+chunks combined by ascending index, used at *all* thread counts including one —
+is self-consistent and reproducible, but differs from today's answer in the
+last bits.
+
+Alternatives were: partition by thread count (not reproducible at all —
+disqualified), or keep reductions sequential forever (reproducible, but
+forfeits the largest available win on the most common operation).
+
+Accuracy is unharmed: it is still a tree, so error still grows as `log n`, and
+the existing 10M-values-to-2e-16 gate must be re-verified before D3 ships.
+Below `kReduceChunk` the current path is untouched, so small arrays keep their
+exact current bits.
+
+Any test asserting an exact f64 sum is re-baselined with it, and the change is
+called out in the CHANGELOG and the release notes rather than discovered.
+
+---
+
+### N27 — FFT belongs here, not in `bsci`
+NumPy has `numpy.fft`, and that is the correct layering: a DFT is an array
+transform. So `nd_fft`/`nd_ifft`/`nd_rfft`/`nd_irfft`/`nd_fftfreq` are kernels
+in this package (item D5), and `bsci.signal` builds windows, spectrograms,
+filters, `convolve` and `resample` on top.
+
+**Rejected:** FFT in `bsci`. A numba user would be unable to transform an array
+without a scipy-class dependency, which inverts the layering.
+
+Three size regimes, because **every length must work**: radix-4 for powers of
+two, mixed-radix for small prime factors, and **Bluestein** for arbitrary
+lengths. Skipping Bluestein is the tempting shortcut and it is a silent bug —
+`nd_fft` on 1000 points would either error or zero-pad to 1024, and a silently
+zero-padded spectrum is wrong in a way that looks entirely plausible.
+
+Ecosystem-wide this is [E4].

@@ -210,3 +210,81 @@ Nothing here is scheduled. Each item lands only on a concrete measured wall, wit
   inside the interpreter needs care.
 - `F32` dtype; complex; FFT.
 - `BANTU_BLAS` — revisit only on a concrete user wall, macOS/Accelerate first (N12).
+
+---
+
+## Phase 8 — Dtypes and parallelism (ecosystem stage 1)
+
+Three of Phase 7's deferred items now have a plan and an order: **f32**,
+**threading** and **FFT**. Full design:
+[`../docs/numba-dtype-architecture.md`](../docs/numba-dtype-architecture.md).
+Ecosystem context:
+[`../docs/ecosystem-architecture.md`](../docs/ecosystem-architecture.md)
+(stage 1 — first, because it multiplies every stage after it).
+
+Items are **D1–D5** (`N*` is taken by decisions in
+[`DECISIONS.md`](DECISIONS.md)).
+
+**What the ground actually looks like, measured before planning:**
+
+| fact | value | where |
+|---|---|---|
+| `NdArray::ptr<T>()` | **already templated** | `ndarray_native.hpp:344` |
+| `offset`, `strides` | **in elements, signed — not bytes** (N4) | `ndarray_native.hpp:332` |
+| `DType::F64` branches | **76** across 9 files | `ndarray_*` |
+| `double*` / 8-byte sites | **~44**, concentrated in linalg (11), ufunc (6), native.cpp (5) | `ndarray_*` |
+| compute-dtype decision | one function, `computeDType` | `ndarray_ufunc.hpp:22` |
+
+Strides being in elements (N4) is why f32 is tractable at all: **a 4-byte dtype
+changes no stride arithmetic anywhere.**
+
+| Item | How | Feature test | Stress test | Status |
+|---|---|---|---|---|
+| **D1 dtype templating pass** — no new dtype; every kernel body written once over `T` | `NB_DISPATCH_REAL`/`NB_DISPATCH_ALL` macros replace the hand-written `if (cdt == F64) {…} else {…}` pairs; `loadD`/`storeD` → `load<T>`/`store<T>`; `itemsize` becomes a real table; a `dtypeTraits<T>` struct carrying **`acc`, the accumulator type, separately from the storage type** | **every existing test bit-identical**, with `numba_fastpath_test.b`'s exact-equality assertions the canary | `benchmarks/run.sh` paired A/B against the pre-refactor binary: no regression beyond noise (if the compiler fails to inline through the macro, it shows up here) | [ ] |
+| **D2 `f32`** | `DType::F32` through the enum, `itemsize`, `dtypeName`, `parseElem`, `promote`, `nd_astype`, every constructor, every kernel, `nd_frombytes`/`nd_tobytes`, `.btsd` | f32 within 1e-6 relative of the f64 answer for every op; the promotion lattice asserted exhaustively; `inf`/`NaN`/subnormal round-trips; `astype` overflow lands on `±inf` | **f64 paths bit-identical**; `nd_live_bytes` for an f32 array is **exactly half**; **btorch's MLP gate re-run in f32 — within 0.3% of 98.16%** | [ ] |
+| **D3 deterministic threading** | a pool with a **fixed partition computed from shape and thread count-independently**, `nd_set_threads(n)`, default **1** (opt-in) | **bit-identical output at 1, 2, 4, 8, 16 threads**, asserted with exact equality | TSan (new tier) + ASan + UBSan; `nd_live_bytes` returns to its pre-call value; 20,000 threaded calls leak 0 bytes; **no per-call heap allocation** | [ ] |
+| **D4 packed GEMM** for skinny shapes (`K=25, N=6`) | register-blocked `A`/`B` panels, a measured `4×4` or `8×4` micro-kernel, shape-gated | `numba_fastpath_test.b` unchanged and passing | no regression at the large square shapes already at 7.8 GFLOP/s | [ ] |
+| **D5 FFT** (for `bsci`, ecosystem stage 6) | radix-4 for powers of two, mixed-radix for small prime factors, **Bluestein for arbitrary lengths**; `nd_rfft`/`nd_irfft` for real input | `ifft(fft(x)) == x` to 1e-12; **Parseval**; `rfft` agrees with `fft` on the first `N/2+1` bins | 10M-point transform; **every length works** — no silent zero-padding | [ ] |
+
+### The `Pairwise` problem — why D3 is not a scheduling exercise
+
+`Pairwise` (`ndarray_reduce.hpp:21`) is a binary-counter tree: after `n`
+elements, set bit `k` of `n` holds the sum of exactly `2^k` values. **Its tree
+shape is a function of `n` alone.** Split 1M elements as 2×500k and each thread
+builds a tree over 500k; adding the two partials is a *different summation
+order* and therefore a different answer in the last bits.
+
+There is no partitioning that reproduces the single-threaded answer. Chosen:
+**fixed chunks of `kReduceChunk` elements regardless of thread count, chunk
+totals combined by a second `Pairwise` in ascending chunk index, used at all
+thread counts including 1.** One thread and sixteen then agree bit for bit.
+
+The cost, stated plainly: **`nd_sum`/`nd_mean` change in their last bits,
+once** — a deliberate, documented, announced re-baseline. Accuracy is not
+harmed (still a tree, error still `log n`), and the existing 10M-to-2e-16 gate
+must be re-verified. Below `kReduceChunk` nothing changes at all.
+
+### What is *not* threaded in D3, and why
+
+| kernel | threaded | reason |
+|---|---|---|
+| `nd_matmul` | **yes** | each thread owns distinct output rows, so per-`(i,j)` summation order is untouched and bit-identity is trivial |
+| element-wise ufuncs | yes | no cross-element dependency |
+| reductions | above `kReduceChunk` | fixed chunks, combined by index |
+| `nd_im2col` | yes | disjoint output rows |
+| **`nd_col2im`** | **no** | it *accumulates* into overlapping destinations — a data race and order-dependent. Left sequential until a per-thread-accumulator design is measured |
+| sort, scans | no | sequential by nature |
+| **`nd_random_*`** | **no** | `nd_seed` is thread-local; parallel generation needs a per-partition seeding decision that would break [C4] |
+
+### Order, and why
+```
+D1 templating ──► D2 f32 ──► D3 threading ──► D4 packed GEMM ──► D5 FFT
+```
+D1 first (N23): hand-adding f32 to 76 branch sites, then int8 to the resulting
+152, is the path that turns a week into a quarter. D2 before D3 because these
+kernels are memory-bound — threading an f64 kernel measures the memory bus, not
+the cores, so f32 first makes D3's scaling numbers the real ones. D3 before D4
+because the packed GEMM's benefit depends on how much of the matmul is already
+parallel.
+
+Each item is independently shippable and independently revertible.
