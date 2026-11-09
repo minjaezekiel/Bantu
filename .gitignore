@@ -1,4 +1,7 @@
 # Local dev artifacts
+# benchmarks/run.sh writes this; the committed baseline is results.md, which is
+# written by hand after a measurement is understood rather than dumped.
+benchmarks/results.txt
 *.db
 *.db-wal
 *.db-shm
@@ -44,6 +47,14 @@ bantu-src/compiler/build_pg/
 samples/*
 !samples/numba/
 !samples/bplot/
+# samples/btorch/ for the third time, for the reason the notes below record
+# twice already: `samples/*` stops git descending into the directory, so every
+# file in a new sample gallery is silently dropped from the commit that claims
+# to add it. tests/btorch_samples_test.sh executes all of these in CI, which it
+# can only do if they are in the repository. The MNIST dataset itself is NOT
+# here -- get_mnist.sh fetches it to ~/.bantu/datasets/mnist, verified by
+# SHA-256, because 54 MB of binary does not belong in a git history.
+!samples/btorch/
 # [found] This line used to read `samples/webrtc-chat/server.b` -- with no `!`,
 # so it ADDED an ignore rule for the one file it was meant to keep. The mistake
 # was invisible because server.b was already tracked and .gitignore does not

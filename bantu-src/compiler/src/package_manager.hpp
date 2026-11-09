@@ -59,6 +59,10 @@
     #include <pwd.h>             // getpwuid
     #include <limits.h>          // PATH_MAX
     #include <dirent.h>          // opendir, readdir
+    #ifdef __APPLE__
+        #include <mach-o/dyld.h> // _NSGetExecutablePath -- the only correct
+                                 // way to find argv[0]'s real file on Darwin
+    #endif
     #define PATH_SEP "/"
     #define PATH_SEP_CH '/'
 #endif
@@ -269,18 +273,31 @@ inline std::string getSystemInstallBinDir() {
 }
 
 // Find the path to the currently-running bantu binary.
+//
+// The macOS arm used to be wrong: it tried /proc/self/exe (Linux) and then
+// /proc/curproc/file (FreeBSD), neither of which exists on Darwin, and so
+// returned the literal string "bantu". Everything built on it was therefore
+// quietly useless on the platform this is developed on -- `bantu doctor`
+// printed "Running binary: bantu" and no staleness check could work.
+// _NSGetExecutablePath is the Darwin answer.
 inline std::string getSelfBinaryPath() {
 #ifdef _WIN32
     char buf[MAX_PATH];
     DWORD len = GetModuleFileNameA(NULL, buf, MAX_PATH);
     if (len == 0) return "";
     return std::string(buf, len);
+#elif defined(__APPLE__)
+    char buf[PATH_MAX];
+    uint32_t size = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &size) != 0) return "bantu";
+    char resolved[PATH_MAX];
+    if (realpath(buf, resolved)) return std::string(resolved);
+    return std::string(buf);
 #else
     char buf[PATH_MAX];
     ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
     if (len <= 0) {
-        // macOS fallback
-        len = readlink("/proc/curproc/file", buf, sizeof(buf) - 1);
+        len = readlink("/proc/curproc/file", buf, sizeof(buf) - 1);   // BSD
     }
     if (len <= 0) {
         // Last-ditch: try argv[0] via $PATH
@@ -289,6 +306,81 @@ inline std::string getSelfBinaryPath() {
     buf[len] = '\0';
     return std::string(buf);
 #endif
+}
+
+// ─── Staleness: which bantu would the shell actually run? ────────────────
+//
+// "Is the install dir on PATH" and "which binary does PATH resolve to" are
+// different questions, and the gap between them is where a stale install
+// lives. On this machine PATH answered /usr/local/bin/bantu, twelve days
+// older than the build directory, and nothing reported the difference.
+
+// Resolve symlinks and ".." so two spellings of one file compare equal.
+inline std::string realPathOf(const std::string& p) {
+#ifndef _WIN32
+    char buf[PATH_MAX];
+    if (realpath(p.c_str(), buf)) return std::string(buf);
+#endif
+    return p;
+}
+
+// The first `bantu` on PATH, or "" if there is none. Deliberately does NOT
+// shell out to which(1): that would find a shell function or alias, and what
+// matters here is the file.
+inline std::string whichBantuOnPath() {
+    const char* pe = std::getenv("PATH");
+    if (!pe) return "";
+#ifdef _WIN32
+    const char sep = ';';
+    const std::string exe = "bantu.exe";
+#else
+    const char sep = ':';
+    const std::string exe = "bantu";
+#endif
+    std::string path(pe), dir;
+    size_t start = 0;
+    while (start <= path.size()) {
+        size_t end = path.find(sep, start);
+        if (end == std::string::npos) end = path.size();
+        dir = path.substr(start, end - start);
+        if (!dir.empty()) {
+            std::string cand = join(dir, exe);
+#ifdef _WIN32
+            if (fileExists(cand)) return cand;
+#else
+            if (access(cand.c_str(), X_OK) == 0 && fileExists(cand)) return cand;
+#endif
+        }
+        if (end == path.size()) break;
+        start = end + 1;
+    }
+    return "";
+}
+
+// Ask another bantu binary for its build id. A binary older than the
+// --build-id flag prints a usage/error instead, which is itself the answer --
+// so an unparseable reply is reported as "pre-build-id", not as a failure.
+inline std::string buildIdOf(const std::string& bin) {
+    std::string cmd = "\"" + bin + "\" --build-id 2>/dev/null";
+#ifdef _WIN32
+    FILE* f = _popen(cmd.c_str(), "r");
+#else
+    FILE* f = popen(cmd.c_str(), "r");
+#endif
+    if (!f) return "";
+    char buf[256] = {0};
+    std::string out;
+    while (fgets(buf, sizeof(buf), f)) out += buf;
+#ifdef _WIN32
+    _pclose(f);
+#else
+    pclose(f);
+#endif
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' ')) out.pop_back();
+    // A real id is one short token. Anything else came from an older binary
+    // that did not recognise the flag.
+    if (out.empty() || out.find(' ') != std::string::npos || out.size() > 64) return "pre-build-id";
+    return out;
 }
 
 inline std::string getBasename(const std::string& path) {
@@ -1212,7 +1304,7 @@ inline bool publishPackage(const std::string& publishDir, const std::string& asN
 //  Doctor — diagnose install + registry state
 // ════════════════════════════════════════════════════════════════════
 
-inline int runDoctor() {
+inline int runDoctor(const std::string& selfBuildId = "unknown") {
     int issues = 0;
     std::cout << "\n  Bantu install diagnostics\n";
     std::cout << "  ════════════════════════════\n\n";
@@ -1270,6 +1362,43 @@ inline int runDoctor() {
         std::cout << "      ⚠ Run 'bantu setup' to add it.\n";
         issues++;
     }
+
+    // ─── [6b] Staleness ──────────────────────────────────────────────────
+    // The check this file did not have, and the reason a twelve-day-old
+    // binary could sit on PATH unnoticed while the source tree moved on.
+    // The symptom was always the same and always misread: an "Undefined
+    // variable: nd_<something>" from a library newer than its interpreter.
+    std::cout << "\n  [6b] Build identity\n";
+    std::cout << "      this binary:      " << selfBuildId << "\n";
+    std::string pathBin = whichBantuOnPath();
+    if (pathBin.empty()) {
+        std::cout << "      on PATH:          (no bantu found on PATH)\n";
+    } else {
+        std::cout << "      PATH resolves to: " << pathBin << "\n";
+        std::string selfReal = realPathOf(self);
+        std::string pathReal = realPathOf(pathBin);
+        if (!self.empty() && self != "bantu" && selfReal == pathReal) {
+            std::cout << "      same file as this binary  [ OK ]\n";
+        } else {
+            std::string otherId = buildIdOf(pathBin);
+            std::cout << "      its build:        " << otherId << "\n";
+            if (otherId == selfBuildId && selfBuildId != "unknown") {
+                std::cout << "      different file, same build  [ OK ]\n";
+            } else {
+                std::cout << "\n      ⚠ STALE INSTALL. The bantu on your PATH is a DIFFERENT\n";
+                std::cout << "        build from the one you just ran. Anything using a native\n";
+                std::cout << "        builtin added since that build will fail with\n";
+                std::cout << "        \"Undefined variable: nd_...\" and look like a typo.\n";
+                if (otherId == "pre-build-id") {
+                    std::cout << "        It does not even understand --build-id, so it predates\n";
+                    std::cout << "        this check and is certainly the older of the two.\n";
+                }
+                std::cout << "\n        Fix:  cd bantu-src/compiler && ./build-mac.sh --install\n";
+                issues++;
+            }
+        }
+    }
+    std::cout << "\n";
 
     // Project manifest
     std::string manifestPath = join(getcwd_str(), "bantu.json");

@@ -57,6 +57,26 @@
 #endif
 
 const std::string BANTU_VERSION = "1.3.2";
+
+// ─── Build identity ──────────────────────────────────────────────────────
+// The version string alone cannot tell two binaries apart, and for a long time
+// it did not: three bantu binaries on one machine, dated twelve days apart, all
+// reported "v1.3.2". A stale install was therefore invisible, and the only
+// symptom was an "Undefined variable: nd_<something>" from a library that was
+// newer than the interpreter running it.
+//
+// The build scripts now pass -DBANTU_BUILD_ID (a short digest of the compiler
+// sources) and -DBANTU_BUILD_DATE. A build without them still compiles and
+// reports "unknown", which is itself the useful answer -- it means the binary
+// predates this mechanism, so it is certainly older than this source tree.
+#ifndef BANTU_BUILD_ID
+#define BANTU_BUILD_ID "unknown"
+#endif
+#ifndef BANTU_BUILD_DATE
+#define BANTU_BUILD_DATE __DATE__ " " __TIME__
+#endif
+const std::string BANTU_BUILD_ID_STR   = BANTU_BUILD_ID;
+const std::string BANTU_BUILD_DATE_STR = BANTU_BUILD_DATE;
 const std::string BANTU_LANG = "Bantu";
 
 // ─── Helpers ──────────────────────────────────────────────────────────
@@ -952,7 +972,7 @@ int cmdUninstall() {
 }
 
 int cmdDoctor() {
-    return bantu_pkg::runDoctor();
+    return bantu_pkg::runDoctor(BANTU_BUILD_ID_STR);
 }
 
 // ─── bantu install / add / remove / update / list / search / publish ─
@@ -2813,6 +2833,23 @@ int main(int argc, char* argv[]) {
 
     if (command == "--version" || command == "-v") {
         std::cout << "Bantu v" << BANTU_VERSION << "\n";
+        std::cout << "  build  " << BANTU_BUILD_ID_STR
+                  << "   (" << BANTU_BUILD_DATE_STR << ")\n";
+        std::string selfp = bantu_pkg::getSelfBinaryPath();
+        if (!selfp.empty()) std::cout << "  binary " << selfp << "\n";
+        if (BANTU_BUILD_ID_STR == "unknown") {
+            std::cout << "\n  This binary carries no build id, so it predates the staleness\n"
+                         "  check and is older than the source tree it came from.\n"
+                         "  Rebuild and install:  cd bantu-src/compiler && ./build-mac.sh --install\n";
+        }
+        return 0;
+    }
+
+    // Just the build id, one line, nothing else -- so `bantu doctor` can ask
+    // the binary on PATH what it is without parsing a banner. A binary that
+    // predates this flag will fail here, which is the answer doctor needs.
+    if (command == "--build-id") {
+        std::cout << BANTU_BUILD_ID_STR << "\n";
         return 0;
     }
 

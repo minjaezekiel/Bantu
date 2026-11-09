@@ -8,6 +8,24 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+
+# ─── Arguments ───────────────────────────────────────────────────────────
+#   --install           install the built binary over the one on PATH
+#   --install-to <path> install it to an explicit path
+DO_INSTALL=0
+INSTALL_TO=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --install)    DO_INSTALL=1 ;;
+        --install-to) DO_INSTALL=1; shift; INSTALL_TO="${1:-}" ;;
+        -h|--help)
+            echo "usage: $0 [--install] [--install-to <path>]"
+            exit 0 ;;
+        *) echo "unknown option: $1  (try --help)"; exit 2 ;;
+    esac
+    shift
+done
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Macros
 # ═══════════════════════════════════════════════════════════════════════
@@ -90,6 +108,38 @@ CPP_FLAGS=(
     -I"$BREW_PREFIX/include"
     -DBANTU_FFI          # enable the FFI builtins (loadlib/func)
 )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Build identity — so a stale install is visible
+#
+#  Three bantu binaries once sat on one machine, built twelve days apart,
+#  and all three reported "v1.3.2". A stale install was therefore invisible
+#  and its only symptom was "Undefined variable: nd_<something>" from a
+#  library newer than the interpreter running it.
+#
+#  BANTU_BUILD_ID is a short digest of the compiler sources, so it changes
+#  exactly when the binary's behaviour can. `bantu --version` prints it and
+#  `bantu doctor` compares it against the binary your PATH resolves to.
+# ═══════════════════════════════════════════════════════════════════════
+compute_build_id() {
+    # One digest over every compiler source. Sorted so the id does not depend
+    # on the shell's glob order. Falls back through three tools because none of
+    # shasum/sha256sum/cksum is present everywhere this script runs.
+    local hasher=""
+    if   command -v shasum    >/dev/null 2>&1; then hasher="shasum -a 256"
+    elif command -v sha256sum >/dev/null 2>&1; then hasher="sha256sum"
+    elif command -v cksum     >/dev/null 2>&1; then hasher="cksum"
+    fi
+    if [ -z "$hasher" ]; then echo "nohash"; return; fi
+    # shellcheck disable=SC2086
+    LC_ALL=C find src -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) \
+        | sort | xargs cat 2>/dev/null | $hasher | cut -c1-12
+}
+BUILD_ID="$(compute_build_id)"
+BUILD_DATE="$(date -u '+%Y-%m-%d %H:%MZ')"
+echo "  build id:   $BUILD_ID  ($BUILD_DATE)"
+CPP_FLAGS+=( "-DBANTU_BUILD_ID=\"$BUILD_ID\"" "-DBANTU_BUILD_DATE=\"$BUILD_DATE\"" )
 
 LINK_LIBS=(
     -L"$BREW_PREFIX/lib"
@@ -202,3 +252,54 @@ echo
 hr
 echo "  ✓ Build complete: $(pwd)/build/bantu"
 hr
+
+BIN_NAME=bantu
+hr_or_line() { hr; }
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Install, and the staleness warning that should have existed all along
+#
+#  This script used to end at build/BIN and say nothing more, so every
+#  build silently left whatever was on PATH in place. That is the whole
+#  mechanism by which the installed binary fell twelve days behind.
+# ═══════════════════════════════════════════════════════════════════════
+path_bantu() { command -v bantu 2>/dev/null || true; }
+
+ON_PATH="$(path_bantu)"
+if [ "${DO_INSTALL:-0}" = "1" ]; then
+    TARGET="${INSTALL_TO:-$ON_PATH}"
+    if [ -z "$TARGET" ]; then
+        TARGET="/usr/local/bin/$BIN_NAME"
+        echo "  No bantu on PATH; installing to $TARGET"
+    fi
+    echo
+    hr_or_line
+    echo "  Installing build/$BIN_NAME -> $TARGET"
+    if install -m 0755 "build/$BIN_NAME" "$TARGET" 2>/dev/null; then
+        echo "  [OK] installed"
+    elif sudo install -m 0755 "build/$BIN_NAME" "$TARGET"; then
+        echo "  [OK] installed (via sudo)"
+    else
+        echo "  [FAIL] could not install to $TARGET"
+        echo "         copy it yourself:  sudo install -m 0755 build/$BIN_NAME $TARGET"
+        exit 1
+    fi
+    echo "  Verify:  bantu --version   # build should read $BUILD_ID"
+elif [ -n "$ON_PATH" ]; then
+    # Not installing. Say whether what is on PATH matches what was just built,
+    # because the difference is otherwise completely silent.
+    OTHER_ID="$("$ON_PATH" --build-id 2>/dev/null | head -1 || true)"
+    case "$OTHER_ID" in
+        "$BUILD_ID") echo "  PATH binary ($ON_PATH) is this build. [ OK ]" ;;
+        "")          echo
+                     echo "  ⚠ $ON_PATH does not understand --build-id, so it PREDATES"
+                     echo "    this build. Code using any newer native builtin will fail"
+                     echo "    there with \"Undefined variable: nd_...\"."
+                     echo "    Install this build:  $0 --install" ;;
+        *)           echo
+                     echo "  ⚠ STALE: $ON_PATH is build $OTHER_ID, this is $BUILD_ID."
+                     echo "    Install this build:  $0 --install" ;;
+    esac
+else
+    echo "  (no bantu on PATH; run '$0 --install' to install this build)"
+fi
