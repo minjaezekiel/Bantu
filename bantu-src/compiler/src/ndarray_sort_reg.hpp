@@ -441,6 +441,140 @@ inline void registerSorting(const DefineFn& define) {
         });
         return args[0];
     });
+
+    // nd_index_add(a, indices, values, axis?) -- scatter ACCUMULATE, in place.
+    //
+    // The exact adjoint of nd_take. nd_take lifts slabs out along `axis`;
+    // nd_index_add adds slabs back in at the same positions. Duplicate indices
+    // ACCUMULATE, and that is the entire reason this exists separately from
+    // nd_put: nd_put's last write wins, so scattering a gradient with it
+    // silently discards every repeated index -- the exact case an embedding
+    // table hits on its first batch with a repeated token.
+    //
+    // `axis` defaults the way nd_take's does (the last axis, via axisArg). An
+    // adjoint that disagreed with its forward about the default would be a
+    // trap rather than an API.
+    //
+    // O(len(indices) x slab), never O(a.size()): nd_put materialises the
+    // destination's whole flat index list per call (above, and it has to --
+    // it indexes the flattened array), which makes a 3-index write into a 10M
+    // array cost 10M. Scattering along an axis needs only stride arithmetic,
+    // so nothing here is proportional to the parts of `a` left untouched.
+    define("nd_index_add", [](std::vector<Value> args) -> Value {
+        if (args.size() < 3) {
+            throw std::runtime_error("nd_index_add(a, indices, values, axis?) needs three arguments");
+        }
+        // args[0] is taken unconverted: this writes through to the caller's
+        // array, so a list that merely converts to one would accumulate into a
+        // temporary and vanish.
+        ArrayPtr a = asArray(args[0]);
+        requireWritable(*a, "nd_index_add");
+        if (a->ndim() == 0) {
+            throw std::runtime_error("nd_index_add: a 0-d array has no axis to scatter along");
+        }
+        ArrayPtr ix = asArray(toArrayValue(args[1], "nd_index_add"));
+        ArrayPtr vs = asArray(toArrayValue(args[2], "nd_index_add"));
+        const size_t    axis   = axisArg(args, 3, a->ndim(), "nd_index_add");
+        const ptrdiff_t extent = (ptrdiff_t)a->shape[axis];
+
+        std::vector<ptrdiff_t> idx; idx.reserve(ix->size());
+        const NdArray& IX = *ix;
+        forEachIndex(IX, [&](size_t o, size_t) {
+            const double d = getAsDouble(IX, o);
+            if (std::isnan(d) || std::isinf(d) || d != std::floor(d)) {
+                throw std::runtime_error("nd_index_add: indices must be whole numbers (got " +
+                                         std::to_string(d) + ")");
+            }
+            ptrdiff_t i = (ptrdiff_t)d;
+            if (i < 0) i += extent;                 // -1 is the last element
+            if (i < 0 || i >= extent) {
+                throw std::runtime_error("nd_index_add: index " + std::to_string((ptrdiff_t)d) +
+                    " is out of range for axis " + std::to_string(axis) + " with " +
+                    std::to_string(extent) + " elements");
+            }
+            idx.push_back(i);
+        });
+
+        // One value splats over every scattered position; otherwise `values`
+        // has to be exactly the shape nd_take would have produced.
+        const bool splat = (vs->size() == 1);
+        std::vector<size_t> want = a->shape;
+        want[axis] = idx.size();
+        if (!splat && vs->shape != want) {
+            throw std::runtime_error("nd_index_add: values is " + shapeStr(vs->shape) +
+                " but scattering " + std::to_string(idx.size()) + " indices along axis " +
+                std::to_string(axis) + " of a " + shapeStr(a->shape) +
+                " array needs " + shapeStr(want) + " (or one value to splat)");
+        }
+        if (idx.empty() || a->size() == 0) return args[0];
+
+        // Reading the source while writing the destination through the same
+        // buffer would make the answer depend on the scatter order -- and the
+        // natural caller, `x.index_add(ix, x.take(ix))`, does exactly that.
+        // Snapshot rather than raise: an accumulate has no reason to refuse.
+        if (!splat && sharesMemory(*a, *vs)) vs = contiguousCopy(vs, vs->dtype);
+
+        std::vector<size_t>    outer;
+        std::vector<ptrdiff_t> astr, vstr;
+        for (size_t d = 0; d < a->ndim(); d++) {
+            if (d == axis) continue;
+            outer.push_back(a->shape[d]);
+            astr.push_back(a->strides[d]);
+            vstr.push_back(splat ? 0 : vs->strides[d]);
+        }
+
+        NdArray&       A    = *a;
+        const NdArray& V    = *vs;
+        const ptrdiff_t aAx = A.strides[axis];
+        const ptrdiff_t vAx = splat ? 0 : V.strides[axis];
+        const double    sval = splat ? getAsDouble(V, V.offset) : 0.0;
+
+        // The slab is one unit-stride f64 run on both sides for a C-contiguous
+        // 2-D table scattered along axis 0 -- which is the embedding gradient,
+        // and so most of what ever calls this.
+        //
+        // `slab1` is load-bearing on BOTH lines, not just the first: a 1-D
+        // destination leaves `outer` empty, and `vstr[0]` on an empty vector is
+        // undefined behaviour that reads whatever follows the allocation. The
+        // first draft guarded only `astr[0]`, and every 1-D scatter whose
+        // values were f64 crashed -- while the same scatter with a Bantu list
+        // of whole numbers passed, because the list infers i64 and short-
+        // circuited the dtype test before the bad subscript.
+        const bool slab1  = (outer.size() == 1);
+        const bool aTight = slab1 && (A.dtype == DType::F64) && astr[0] == 1;
+        const bool vTight = slab1 && (splat || ((V.dtype == DType::F64) && vstr[0] == 1));
+
+        for (size_t k = 0; k < idx.size(); k++) {
+            const ptrdiff_t ab = (ptrdiff_t)A.offset + idx[k] * aAx;
+            const ptrdiff_t vb = splat ? (ptrdiff_t)V.offset
+                                       : (ptrdiff_t)V.offset + (ptrdiff_t)k * vAx;
+            if (outer.empty()) {            // 1-D: one element per index
+                setFromDouble(A, (size_t)ab, getAsDouble(A, (size_t)ab) +
+                                             (splat ? sval : getAsDouble(V, (size_t)vb)));
+                continue;
+            }
+            if (aTight && vTight) {
+                double* dst = static_cast<double*>(A.buf->data) + ab;
+                const size_t n = outer[0];
+                if (splat) {
+                    for (size_t i = 0; i < n; i++) dst[i] += sval;
+                } else {
+                    const double* s = static_cast<const double*>(V.buf->data) + vb;
+                    for (size_t i = 0; i < n; i++) dst[i] += s[i];
+                }
+                continue;
+            }
+            // Generic: any stride pattern, any dtype. An integer destination
+            // rounds at every step (setFromDouble's policy, as nd_put's does),
+            // so accumulating halves into i64 is lossy by design, not by slip.
+            nditer(outer, { astr, vstr }, { (size_t)ab, (size_t)vb },
+                   [&](const size_t* o) {
+                setFromDouble(A, o[0], getAsDouble(A, o[0]) +
+                                       (splat ? sval : getAsDouble(V, o[1])));
+            });
+        }
+        return args[0];
+    });
 }
 
 }   // namespace numba

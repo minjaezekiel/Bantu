@@ -144,17 +144,35 @@ inline ReducePlan planReduce(const NdArray& a, const std::vector<size_t>& axes,
     return p;
 }
 
-// Walk one inner slice starting at `base`, calling body(offset) per element.
-template <class Body>
-inline void innerSweep(const ReducePlan& p, size_t base, Body&& body) {
-    nditer(p.innerShape, { p.innerStrides }, { base },
-           [&](const size_t* o) { body(o[0]); });
-}
-
 // True when the inner sweep is a single stride-1 run, so the raw-pointer path
 // applies. Computed, never assumed -- the same argument as isCContig (N4).
 inline bool innerIsContig(const ReducePlan& p) {
     return p.innerShape.size() == 1 && p.innerStrides.size() == 1 && p.innerStrides[0] == 1;
+}
+
+// Walk one inner slice starting at `base`, calling body(offset) per element.
+//
+// The contiguous case gets a straight run, and this is load-bearing rather
+// than tidy. A reduction calls innerSweep ONCE PER OUTPUT, and `nditer` heap-
+// allocates three std::vectors on every call -- so reducing the last axis of a
+// [150528, 4] array meant 150,528 calls and ~450,000 allocations to do 600,000
+// comparisons. That is where the time went: `nd_max` over that array took
+// **102 ms**, which is ~680 ns per output for four comparisons.
+//
+// `nd_sum` already had a fast path of its own (sumContig), which is why sums
+// looked fine while max, min, prod, any, all, argmax, argmin, ptp, var and std
+// -- every reduction that funnels through here -- did not. Fixing the
+// chokepoint fixes all of them at once, and the visit order is unchanged: a
+// stride-1 run walked in order is the same sequence nditer produced.
+template <class Body>
+inline void innerSweep(const ReducePlan& p, size_t base, Body&& body) {
+    if (innerIsContig(p)) {
+        const size_t n = p.innerCount;
+        for (size_t i = 0; i < n; i++) body(base + i);
+        return;
+    }
+    nditer(p.innerShape, { p.innerStrides }, { base },
+           [&](const size_t* o) { body(o[0]); });
 }
 
 // ── the generic reduction driver ─────────────────────────────────────────────

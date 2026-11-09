@@ -16,6 +16,7 @@
 #include "ndarray_ufunc_reg.hpp"
 #include "ndarray_reduce_reg.hpp"
 #include "ndarray_sort_reg.hpp"
+#include "ndarray_manip_reg.hpp"
 #include "ndarray_linalg_reg.hpp"
 #include "ndarray_dispatch.hpp"
 
@@ -794,7 +795,7 @@ void registerBuiltins(const DefineFn& rawDefine) {
             // error rather than a silent u8.
             if (s.empty()) {
                 throw std::runtime_error(std::string(who) + ": element type is empty. "
-                    "Use u8 i8 u16 i16 u32 i32 f32 f64, optionally suffixed le or be, "
+                    "Use u8 i8 u16 i16 u32 i32 i64 u64 f32 f64, optionally suffixed le or be, "
                     "or omit it for u8");
             }
             std::string n = s;
@@ -810,10 +811,17 @@ void registerBuiltins(const DefineFn& rawDefine) {
             if (n == "i16")                 return { 2, true,  false, big,   DType::I64 };
             if (n == "u32")                 return { 4, false, false, big,   DType::I64 };
             if (n == "i32")                 return { 4, true,  false, big,   DType::I64 };
+            // i64/u64 exist because numba HAS an i64 dtype and could not
+            // serialize it: nd_tobytes offered nothing wider than i32, so an
+            // i64 array could only be written lossily. btorch's state_dict
+            // format needs every dtype the array library has to survive a
+            // round trip, so the gap is closed rather than worked around.
+            if (n == "i64" || n == "long")  return { 8, true,  false, big,   DType::I64 };
+            if (n == "u64")                 return { 8, false, false, big,   DType::I64 };
             if (n == "f32" || n == "float") return { 4, false, true,  big,   DType::F64 };
             if (n == "f64" || n == "double")return { 8, false, true,  big,   DType::F64 };
             throw std::runtime_error(std::string(who) + ": unknown element type '" + s +
-                "'. Use u8 i8 u16 i16 u32 i32 f32 f64, optionally suffixed le or be");
+                "'. Use u8 i8 u16 i16 u32 i32 i64 u64 f32 f64, optionally suffixed le or be");
         };
 
         define("nd_frombytes", [parseElem](std::vector<Value> a) -> Value {
@@ -947,12 +955,21 @@ void registerBuiltins(const DefineFn& rawDefine) {
                     // NumPy's astype does -- it does not clamp. A caller that
                     // wants clamping calls nd_clip first, which is explicit and
                     // free; silent clamping here would hide a mode bug.
-                    const double v = getAsDouble(*src, src->offset + i);
                     int64_t iv;
-                    if (std::isnan(v)) iv = 0;
-                    else if (v >= 9.2e18) iv = INT64_MAX;
-                    else if (v <= -9.2e18) iv = INT64_MIN;
-                    else iv = (int64_t)std::llround(v);
+                    if (src->dtype == DType::I64) {
+                        // Read the int64 DIRECTLY. This used to go through a
+                        // double for every dtype, which is lossless only below
+                        // 2^53 -- invisible while nothing wider than i32 could
+                        // be written, and a silent corruption the moment an
+                        // 8-byte integer element exists. Now one does.
+                        iv = static_cast<const int64_t*>(src->buf->data)[src->offset + i];
+                    } else {
+                        const double v = getAsDouble(*src, src->offset + i);
+                        if (std::isnan(v)) iv = 0;
+                        else if (v >= 9.2e18) iv = INT64_MAX;
+                        else if (v <= -9.2e18) iv = INT64_MIN;
+                        else iv = (int64_t)std::llround(v);
+                    }
                     uint64_t raw = (uint64_t)iv;
                     for (int k = 0; k < el.width; k++) {
                         const int shift = el.bigEndian ? (el.width - 1 - k) * 8 : k * 8;
@@ -1279,6 +1296,7 @@ void registerBuiltins(const DefineFn& rawDefine) {
     registerUfuncExtras(define);
     registerReductions(define);
     registerSorting(define);
+    registerManip(define);
     registerLinalg(define);
 }
 

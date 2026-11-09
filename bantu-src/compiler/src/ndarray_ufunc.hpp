@@ -211,6 +211,81 @@ inline Value applyBinary(const char* what, Kind kind,
         return wrap(plan.finalOut ? plan.finalOut : out);
     }
 
+    // ── tier 1 ──────────────────────────────────────────────────────────────
+    // One side is a single value, splatted over the other. The kernels for this
+    // (tier1/tier1r, ndarray_kernels.hpp) were written with a comment
+    // explaining why they earn their keep -- and then never called from
+    // anywhere. A tree-wide search found exactly two mentions, the two
+    // definitions, against ten call sites for tier0.
+    //
+    // So every scalar operand fell through to tier 2's strided odometer, which
+    // re-reads the scalar through a stride-0 walk and does a loadD/storeD per
+    // element instead of a vectorizable loop. Measured on 1M f64 before this
+    // block existed:
+    //
+    //     nd_add($a, $b)       1.76 ms   14.3 GB/s   tier 0
+    //     nd_add($a, 1.0)      7.86 ms    3.2 GB/s   tier 2   <- 4.5x slower
+    //     nd_maximum($a, $b)   1.54 ms   16.3 GB/s   tier 0
+    //     nd_maximum($a, 0.0)  7.38 ms    3.4 GB/s   tier 2   <- 4.8x slower
+    //
+    // A scalar operand does LESS memory traffic and ran 4.5x slower. And it is
+    // not an exotic path: `relu(x)` is maximum(x, 0), a bias add broadcasts,
+    // and `grad * lr`, `p - lr*g` and the 1/n in every mean are all scalars.
+    // An `out=` destination did not help (218 vs 226 us at 32k), which is what
+    // confirmed the cost was the walk and not the allocation.
+    //
+    // The scalar side only has to be size 1 -- its single element is converted
+    // to the compute dtype here, which is free for one value, so a `[1]` i64
+    // array against an f64 array takes this path too rather than falling back.
+    {
+        const bool outFlat = out->isCContig() && out->dtype == rdt;
+        // Which side is the array, which the single value?
+        const bool aFull = a->shape == shape && a->isCContig() && a->dtype == cdt;
+        const bool bFull = b->shape == shape && b->isCContig() && b->dtype == cdt;
+        const bool aOne  = a->size() == 1;
+        const bool bOne  = b->size() == 1;
+        // n > 1 so that a 1-element result (where both sides are size 1) keeps
+        // going to tier 2 -- there is nothing to vectorize and the odometer is
+        // already correct for it.
+        if (outFlat && n > 1 && (cdt == DType::F64 || cdt == DType::I64) &&
+            ((aFull && bOne) || (bFull && aOne))) {
+            const bool scalarRight = (aFull && bOne);
+            const NdArray& arr = scalarRight ? *a : *b;
+            const NdArray& scl = scalarRight ? *b : *a;
+            if (cdt == DType::F64) {
+                const double* p = arr.ptr<double>();
+                const double  s = loadD(scl, scl.offset);
+                if (rdt == DType::BOOL) {
+                    uint8_t* o = out->ptr<uint8_t>();
+                    if (scalarRight)
+                        for (size_t i = 0; i < n; i++) o[i] = fd(p[i], s) != 0.0 ? 1 : 0;
+                    else
+                        for (size_t i = 0; i < n; i++) o[i] = fd(s, p[i]) != 0.0 ? 1 : 0;
+                } else {
+                    double* o = out->ptr<double>();
+                    if (scalarRight) tier1(p, s, o, n, fd);
+                    else             tier1r(s, p, o, n, fd);
+                }
+            } else {
+                const int64_t* p = arr.ptr<int64_t>();
+                const int64_t  s = loadI(scl, scl.offset);
+                if (rdt == DType::BOOL) {
+                    uint8_t* o = out->ptr<uint8_t>();
+                    if (scalarRight)
+                        for (size_t i = 0; i < n; i++) o[i] = fi(p[i], s) != 0 ? 1 : 0;
+                    else
+                        for (size_t i = 0; i < n; i++) o[i] = fi(s, p[i]) != 0 ? 1 : 0;
+                } else {
+                    int64_t* o = out->ptr<int64_t>();
+                    if (scalarRight) tier1(p, s, o, n, fi);
+                    else             tier1r(s, p, o, n, fi);
+                }
+            }
+            if (plan.finalOut) copyInto(*out, *plan.finalOut, what);
+            return wrap(plan.finalOut ? plan.finalOut : out);
+        }
+    }
+
     // ── tier 2 ──────────────────────────────────────────────────────────────
     // General strided, after coalescing collapses whatever it can back into a
     // flat walk.

@@ -83,6 +83,88 @@ inline ArrayPtr fromVec(const std::vector<double>& v, const char* what) {
     return out;
 }
 
+// ── matmul, straight on the buffers ──────────────────────────────────────────
+// The blocked kernel below is fine. Its PLUMBING was not: `toMat` allocates a
+// std::vector, ZERO-FILLS it, then copies element by element through
+// getAsDouble's dtype switch, and `fromMat` copies the result back. For a
+// convolution's first layer -- [100352, 25] x [25, 6] -- that is ~45 MB of
+// avoidable traffic and 2.5M switch dispatches to perform 15 MFLOP. Measured at
+// 20.6 ms, against a ~1.2 ms memory bound.
+//
+// So when both operands are already f64 and C-contiguous, which is every array
+// a ufunc or im2col just produced, the kernel runs on the buffers directly and
+// writes into the destination. Identical arithmetic in an identical order --
+// including the `aik == 0.0` skip, kept so that a zero multiplied by an
+// infinity behaves exactly as it did before. Anything else still goes through
+// toMat, so LU, QR, SVD and the strided and integer cases are untouched.
+inline void gemmContig(const double* NB_RESTRICT A, const double* NB_RESTRICT B,
+                       double* NB_RESTRICT C, size_t M, size_t K, size_t N) {
+    const size_t BS = 64;                       // 64x64 f64 tiles: 32 KB, L1-resident
+    for (size_t i = 0; i < M * N; i++) C[i] = 0.0;
+    for (size_t ii = 0; ii < M; ii += BS) {
+        const size_t iMax = std::min(ii + BS, M);
+        for (size_t kk = 0; kk < K; kk += BS) {
+            const size_t kMax = std::min(kk + BS, K);
+            for (size_t jj = 0; jj < N; jj += BS) {
+                const size_t jMax = std::min(jj + BS, N);
+                for (size_t i = ii; i < iMax; i++) {
+                    double* NB_RESTRICT cp = C + i * N;
+                    for (size_t k = kk; k < kMax; k++) {
+                        const double aik = A[i * K + k];
+                        if (aik == 0.0) continue;
+                        const double* NB_RESTRICT bp = B + k * N;
+                        for (size_t j = jj; j < jMax; j++) cp[j] += aik * bp[j];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// C[M,N] = A[M,K] . B[K,N] where A is stored TRANSPOSED: its buffer holds a
+// [K,M] C-contiguous matrix, so A[i,k] lives at buf[k*M + i].
+//
+// This is the shape of EVERY weight gradient -- dW = A^T . G -- and it is the
+// one case where materialising the transpose means copying the *larger*
+// operand: for a convolution's first layer that is a 20 MB copy to produce a
+// 150-element result. Here both inputs are read along their contiguous axis
+// and the accumulator is the small output, which stays in L1.
+//
+// The accumulation order is identical to the blocked kernel's. That is not a
+// coincidence to be hoped for: in the blocked loop, for a fixed (i, j), `k`
+// still ascends monotonically across the whole computation, so summing k in
+// order here gives bit-for-bit the same answer. Floating-point addition is not
+// associative, and a matmul that changed its rounding would be a silent change
+// to every result in the library.
+inline void gemmTransA(const double* NB_RESTRICT At, const double* NB_RESTRICT B,
+                       double* NB_RESTRICT C, size_t M, size_t K, size_t N) {
+    for (size_t i = 0; i < M * N; i++) C[i] = 0.0;
+    for (size_t k = 0; k < K; k++) {
+        const double* NB_RESTRICT ak = At + k * M;      // M values, contiguous
+        const double* NB_RESTRICT bk = B  + k * N;      // N values, contiguous
+        for (size_t i = 0; i < M; i++) {
+            const double a = ak[i];
+            if (a == 0.0) continue;
+            double* NB_RESTRICT cp = C + i * N;
+            for (size_t j = 0; j < N; j++) cp[j] += a * bk[j];
+        }
+    }
+}
+
+// True when `x` is an f64 array whose elements sit consecutively, so
+// gemmContig may read it in place. Computed, never assumed.
+inline bool gemmReady(const NdArray& x) {
+    return x.dtype == DType::F64 && x.isCContig();
+}
+
+// True when `x` is a 2-d f64 array that is the transpose of a C-contiguous
+// one: shape [M,K] with strides [1,M], i.e. the buffer holds [K,M] in C order.
+// nd_transpose produces exactly this, and it is what gemmTransA consumes.
+inline bool gemmTransposed(const NdArray& x) {
+    return x.dtype == DType::F64 && x.ndim() == 2 &&
+           x.strides[0] == 1 && x.strides[1] == (ptrdiff_t)x.shape[0];
+}
+
 // ── matmul ───────────────────────────────────────────────────────────────────
 // Blocked, with the inner order i-k-j so B streams at unit stride and C is
 // accumulated in registers. The naive i-j-k order strides through B by `cols`

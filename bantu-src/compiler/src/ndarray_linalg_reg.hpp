@@ -52,6 +52,50 @@ inline void registerLinalg(const DefineFn& define) {
             throw std::runtime_error("nd_matmul: only 1- and 2-dimensional operands are supported "
                                      "(got " + shapeStr(A->shape) + " and " + shapeStr(B->shape) + ")");
         }
+        // ── the fast path ────────────────────────────────────────────────
+        // Both operands already f64 and contiguous: no copies at all.
+        {
+            const size_t M = aVec ? 1 : A->shape[0];
+            const size_t K = aVec ? A->shape[0] : A->shape[1];
+            const size_t Kb = bVec ? B->shape[0] : B->shape[0];
+            const size_t N = bVec ? 1 : B->shape[1];
+            if (K != Kb) {
+                throw std::runtime_error("nd_matmul: cannot multiply a " +
+                    std::to_string(M) + "x" + std::to_string(K) + " by a " +
+                    std::to_string(Kb) + "x" + std::to_string(N) +
+                    " (the inner dimensions must match: " + std::to_string(K) +
+                    " vs " + std::to_string(Kb) + ")");
+            }
+            // A small operand that is merely strided is cheaper to
+            // normalise than to route around: B^T in a matmul backward is the
+            // weight matrix, a few hundred doubles. The threshold is on the
+            // OPERAND, so the big one is never copied here.
+            const size_t kSmall = 1u << 16;          // 64K doubles = 512 KB
+            ArrayPtr Af = A, Bf = B;
+            if (!gemmReady(*Af) && !gemmTransposed(*Af) && Af->size() <= kSmall) {
+                Af = contiguousCopy(Af, DType::F64);
+            }
+            if (!gemmReady(*Bf) && Bf->size() <= kSmall) {
+                Bf = contiguousCopy(Bf, DType::F64);
+            }
+
+            const bool bOK = gemmReady(*Bf);
+            const bool aC  = gemmReady(*Af);
+            const bool aT  = !aVec && !bVec && gemmTransposed(*Af);
+            if (bOK && (aC || aT)) {
+                std::vector<size_t> shape;
+                if (!aVec) shape.push_back(M);
+                if (!bVec) shape.push_back(N);
+                ArrayPtr out = makeArray(shape, DType::F64, "nd_matmul", false);
+                const double* ap = static_cast<const double*>(Af->buf->data) + Af->offset;
+                const double* bp = static_cast<const double*>(Bf->buf->data) + Bf->offset;
+                double* cp = static_cast<double*>(out->buf->data);
+                if (aC) gemmContig(ap, bp, cp, M, K, N);
+                else    gemmTransA(ap, bp, cp, M, K, N);
+                return wrap(out);
+            }
+        }
+
         Mat ma, mb;
         if (aVec) { ma = Mat(1, A->shape[0]); size_t k = 0;
                     forEachIndex(*A, [&](size_t o, size_t) { ma.a[k++] = getAsDouble(*A, o); }); }

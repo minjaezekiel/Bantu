@@ -165,6 +165,17 @@ inline size_t checkedMul(size_t a, size_t b, const char* what) {
     return a * b;
 }
 
+// The additive counterpart, which nd_pad needs: a pad of SIZE_MAX would wrap
+// the padded extent round to something small and allocate an array far too
+// little for the writes that follow.
+inline size_t checkedAdd(size_t a, size_t b, const char* what) {
+    if (a > SIZE_MAX - b) {
+        throw std::runtime_error(std::string(what) + ": size overflows (the shape is too large "
+                                 "to describe, let alone allocate)");
+    }
+    return a + b;
+}
+
 // The SIGNED counterpart, for stride arithmetic. This one is not a style
 // preference: signed overflow is undefined behaviour, so it cannot be detected
 // after the fact by inspecting the result the way the unsigned form can. It was

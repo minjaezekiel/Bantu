@@ -124,6 +124,34 @@ inline void registerReductions(const DefineFn& define) {
             requireNonEmptySlice(r.plan, what);
             const DType rdt = r.a->dtype == DType::BOOL ? DType::I64 : r.a->dtype;
             const NdArray& A = *r.a; const ReducePlan& P = r.plan;
+            // f64 over a contiguous run is the hot case (every pooling layer),
+            // so it reads the buffer directly instead of paying getAsDouble's
+            // dtype switch per element. NaN handling is identical: the first
+                // NaN seen wins and sticks, which is numba's documented rule.
+            const bool fast = (A.dtype == DType::F64) && innerIsContig(P);
+            if (fast) {
+                const double* data = static_cast<const double*>(A.buf->data);
+                const size_t n = P.innerCount;
+                return wrap(runReduce(A, P, rdt, what, [&](size_t base) {
+                    const double* q = data + base;
+                    double best = q[0];
+                    if (std::isnan(best)) return best;
+                    if (wantMax) {
+                        for (size_t i = 1; i < n; i++) {
+                            const double x = q[i];
+                            if (std::isnan(x)) return x;
+                            if (x > best) best = x;
+                        }
+                    } else {
+                        for (size_t i = 1; i < n; i++) {
+                            const double x = q[i];
+                            if (std::isnan(x)) return x;
+                            if (x < best) best = x;
+                        }
+                    }
+                    return best;
+                }));
+            }
             return wrap(runReduce(A, P, rdt, what, [&](size_t base) {
                 bool first = true; double best = 0.0;
                 innerSweep(P, base, [&](size_t o) {
