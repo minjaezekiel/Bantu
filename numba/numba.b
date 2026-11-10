@@ -18,6 +18,23 @@
 //  this layer exists, and why every builtin gets a wrapper even when the
 //  wrapper looks like it does nothing.
 //
+//  EVERY nd_* BUILTIN HAS A WRAPPER HERE, with seven deliberate exceptions,
+//  listed so an audit does not keep re-finding them:
+//
+//    nd_im2col, nd_col2im, nd_conv_outsize   btorch's convolution internals;
+//                                            the public surface is a Conv2d
+//                                            layer, not a lowering primitive
+//    nd_from_column, nd_to_column,
+//    nd_from_frame                           arctic's zero-copy bridge
+//                                            between a DataFrame column and
+//                                            an array
+//    nd_base_id                              a view-identity hook the tests
+//                                            use to prove two arrays share
+//                                            one buffer
+//
+//  Anything else missing is a gap, not a decision. tests/numba_surface_test.b
+//  asserts that by diffing this file against `bantu engine --builtins`.
+//
 //  Source:  numba/numba.b
 //  Docs:    docs/numba.md
 //  Tests:   tests/numba_*_test.b
@@ -109,6 +126,26 @@ def astype($a, $dtype)    { return nd_astype($a, $dtype); }
 def ascontiguous($a)      { return nd_ascontiguous($a); }
 def to_list($a)           { return nd_to_list($a); }
 
+// ── joining, splitting, repeating ────────────────────────────────────────
+// concat joins along an axis that already exists; stack makes a NEW axis and
+// so needs every input to have the same shape. The distinction is NumPy's and
+// it is worth keeping: `concat` of two (3,) vectors is a (6,) vector, `stack`
+// of them is a (2,3) matrix, and reaching for the wrong one silently gives a
+// wrongly-shaped answer rather than an error.
+//
+// `concatenate` is the NumPy spelling and is an alias, not a second
+// implementation -- both land on the same kernel.
+def concat($arrays, $axis)      { return nd_concat($arrays, $axis); }
+def concatenate($arrays, $axis) { return nd_concat($arrays, $axis); }
+def stack($arrays, $axis)       { return nd_stack($arrays, $axis); }
+// sections: a count (equal parts, and it must divide) or a list of cut points.
+def split($a, $sections, $axis) { return nd_split($a, $sections, $axis); }
+def tile($a, $reps)             { return nd_tile($a, $reps); }
+// repeats: one number for every element, or one per element along `axis`.
+def repeat($a, $repeats, $axis) { return nd_repeat($a, $repeats, $axis); }
+// pads: [[before, after], ...], one pair per axis. value defaults to 0.
+def pad($a, $pads, $value)      { return nd_pad($a, $pads, $value); }
+
 // ── raw binary file I/O ──────────────────────────────────────────────────
 // fromfile(path, dtype?, shape?, byteOffset?) — read a flat buffer of
 // machine-order values straight into an array. No shape means "the rest of
@@ -119,6 +156,12 @@ def fromfile($path, $dtype, $shape, $byteOffset) {
     return nd_fromfile($path, $dtype, $shape, $byteOffset);
 }
 def tofile($a, $path, $append)  { return nd_tofile($a, $path, $append); }
+// The same bytes, through a string instead of a file: tobytes(a, elem?) packs
+// an array into a byte string, frombytes(src, elem?, shape?) unpacks one.
+// `elem` is the on-the-wire width ("f64", "i32", ...), which is how a value
+// crosses a socket or a database column without going through text.
+def tobytes($a, $elem)              { return nd_tobytes($a, $elem); }
+def frombytes($src, $elem, $shape)  { return nd_frombytes($src, $elem, $shape); }
 def get($a, $idx)         { return nd_get($a, $idx); }
 def set($a, $idx, $v)     { return nd_set($a, $idx, $v); }
 
@@ -180,6 +223,21 @@ def logical_and($a, $b, $out)   { return nd_logical_and($a, $b, $out); }
 def logical_or($a, $b, $out)    { return nd_logical_or($a, $b, $out); }
 def logical_xor($a, $b, $out)   { return nd_logical_xor($a, $b, $out); }
 def logical_not($a, $out)       { return nd_logical_not($a, $out); }
+
+// ── bitwise, on the integer dtypes ───────────────────────────────────────
+// A Bantu number is a double, so an integer the caller wrote as an integer
+// arrives as f64 -- and so does any array that came out of divide(). An
+// INTEGRAL float operand is therefore converted, because that is the only
+// reading of such a call; a non-integral one raises and names the value
+// rather than rounding it silently (docs/numba-architecture.md §4.6.1). A
+// shift count outside 0..63 raises too, element-wise, so the error names the
+// offending count.
+def bitwise_and($a, $b, $out) { return nd_bitwise_and($a, $b, $out); }
+def bitwise_or($a, $b, $out)  { return nd_bitwise_or($a, $b, $out); }
+def bitwise_xor($a, $b, $out) { return nd_bitwise_xor($a, $b, $out); }
+def bitwise_not($a, $out)     { return nd_bitwise_not($a, $out); }
+def left_shift($a, $b, $out)  { return nd_left_shift($a, $b, $out); }
+def right_shift($a, $b, $out) { return nd_right_shift($a, $b, $out); }
 def where($cond, $x, $y)   { return nd_where($cond, $x, $y); }
 def clip($a, $lo, $hi, $out) { return nd_clip($a, $lo, $hi, $out); }
 
@@ -231,6 +289,13 @@ def take($a, $indices, $axis) { return nd_take($a, $indices, $axis); }
 def put($a, $indices, $values) { return nd_put($a, $indices, $values); }
 def compress($mask, $a) { return nd_compress($mask, $a); }
 def nonzero($a)         { return nd_nonzero($a); }
+// Scatter-add: out[indices[k]] += values[k], ACCUMULATING on a repeated
+// index rather than letting the last write win. That difference is the whole
+// point -- `put` with a repeated index keeps one value, `index_add` keeps the
+// sum, which is what a gradient for a shared embedding row has to do.
+def index_add($a, $indices, $values, $axis) {
+    return nd_index_add($a, $indices, $values, $axis);
+}
 
 // ── linear algebra ───────────────────────────────────────────────────────
 def matmul($a, $b)   { return nd_matmul($a, $b); }
@@ -408,6 +473,22 @@ def trapz($y, $dx) {
 //  DISCOVERABILITY
 // ════════════════════════════════════════════════════════════════════════
 
+// ── threads ──────────────────────────────────────────────────────────────
+// Threading is OPT-IN: the count starts at 1 and nothing is threaded until
+// you raise it. set_threads(0) means "as many as the hardware reports".
+//
+// The answer does not depend on the count. Chunk boundaries come from the
+// data's shape alone and partials combine in ascending index order, so a
+// result computed on eight cores is BIT-IDENTICAL to the one-core result --
+// not merely close to it (numba-suite/DECISIONS N25, N32).
+//
+// The count is process-global, not per-thread: a shared count cannot leak
+// between sua requests the way a shared PRNG stream could, because every
+// count produces the same output.
+def set_threads($n)      { return nd_set_threads($n); }
+def get_threads()        { return nd_get_threads(); }
+def hardware_threads()   { return nd_hardware_threads(); }
+
 def help($topic) {
     if ($topic != null) {
         $t = str($topic);
@@ -454,7 +535,12 @@ def help($topic) {
     print("              median quantile count_nonzero  nansum nanmean nanmin nanmax");
     print("  scan/sort   cumsum cumprod cummax cummin diff sort argsort unique");
     print("              searchsorted bincount histogram");
-    print("  index       take put compress nonzero");
+    print("  index       take put compress nonzero index_add");
+    print("  join/split  concat concatenate stack split tile repeat pad");
+    print("  bitwise     bitwise_and bitwise_or bitwise_xor bitwise_not");
+    print("              left_shift right_shift");
+    print("  bytes       tobytes frombytes  (and fromfile tofile)");
+    print("  threads     set_threads get_threads hardware_threads");
     print("  linalg      matmul dot outer trace solve inv det slogdet cholesky qr");
     print("              lstsq eigh svd pinv norm matrix_rank cond");
     print("  composed    polyfit polyval interp gradient cov corrcoef meshgrid");
@@ -463,6 +549,7 @@ def help($topic) {
     print("  Operators work directly: $a + $b, 2 * $a, -$a, $a > 0.5, $m[1][2] = 9");
     print("  np.anyof(), not np.any() -- `any` is a reserved word in Bantu.");
     print("  Methods chain:           $x.multiply($x).add($x).sum()");
+    print("  Threading is opt-in:     np.set_threads(0) -- the answer does not move.");
     return null;
 }
 

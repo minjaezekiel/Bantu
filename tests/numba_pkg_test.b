@@ -179,6 +179,80 @@ close(np.get(np.det(np.array([[1.0, 2.0], [3.0, 4.0]], "f64")), []), -2.0, 1e-12
 close(np.get(np.norm(np.array([3.0, 4.0], "f64"), null), []), 5.0, 1e-12, "np.norm");
 
 print("");
+print("-- the wrappers that were missing until the surface test found them --");
+// Thirteen kernels had no wrapper at all: the joining family, the six bitwise
+// ops, the byte codecs and the threading knob. The kernels were tested, the
+// façade was tested, and nobody compared the two SETS -- which is what
+// tests/numba_surface_test.sh now does. These assertions are the other half:
+// that each wrapper routes to the right kernel with the right argument order,
+// which a name-set diff cannot tell you.
+
+$j1 = np.array([[1.0, 2.0], [3.0, 4.0]], "f64");
+$j2 = np.array([[5.0, 6.0]], "f64");
+eq(str(np.shape(np.concat([$j1, $j2], 0))), "[3, 2]", "np.concat joins an EXISTING axis");
+eq(str(np.shape(np.concatenate([$j1, $j2], 0))), "[3, 2]",
+   "np.concatenate is the same kernel under NumPy's spelling");
+// the distinction worth having: stack makes a new axis, so (2,2) + (2,2) is
+// (2,2,2) and not (4,2)
+eq(str(np.shape(np.stack([$j1, $j1], 0))), "[2, 2, 2]", "np.stack makes a NEW axis");
+// axis defaults to 0 when omitted -- the point of the wrapper layer
+eq(str(np.shape(np.concat([$j1, $j2], null))), "[3, 2]", "np.concat's axis defaults to 0");
+
+$parts = np.split(np.arange(0, 6, null), 3, null);
+eq(len($parts), 3, "np.split returns the sections");
+eq(str(np.to_list($parts[1])), "[2, 3]", "and they are in order, with the right contents");
+
+eq(str(np.to_list(np.tile(np.array([1.0, 2.0], "f64"), [3])))
+   , "[1, 2, 1, 2, 1, 2]", "np.tile repeats the WHOLE array");
+eq(str(np.to_list(np.repeat(np.array([1.0, 2.0], "f64"), 3, null)))
+   , "[1, 1, 1, 2, 2, 2]", "np.repeat repeats each ELEMENT -- not the same thing");
+eq(str(np.to_list(np.pad(np.array([1.0, 2.0], "f64"), [[1, 2]], null)))
+   , "[0, 1, 2, 0, 0]", "np.pad, with value defaulting to 0");
+eq(str(np.to_list(np.pad(np.array([1.0], "f64"), [[1, 1]], 9.0)))
+   , "[9, 1, 9]", "np.pad with an explicit fill value");
+
+$bi = np.array([12, 10], "i64");
+eq(str(np.to_list(np.bitwise_and($bi, 6, null))), "[4, 2]", "np.bitwise_and");
+eq(str(np.to_list(np.bitwise_or($bi, 1, null))),  "[13, 11]", "np.bitwise_or");
+eq(str(np.to_list(np.bitwise_xor($bi, 6, null))), "[10, 12]", "np.bitwise_xor");
+eq(str(np.to_list(np.bitwise_not(np.array([0], "i64"), null))), "[-1]", "np.bitwise_not");
+eq(str(np.to_list(np.left_shift($bi, 1, null))),  "[24, 20]", "np.left_shift");
+eq(str(np.to_list(np.right_shift($bi, 2, null))), "[3, 2]", "np.right_shift");
+// An INTEGRAL f64 operand is converted -- it has to be, because a Bantu
+// number is a double and `1` reaches the kernel as 1.0. A non-integral one
+// raises and names the value instead of rounding it, which is the line the
+// policy actually draws (numba-architecture §4.6.1).
+eq(str(np.to_list(np.bitwise_and(np.array([12.0, 10.0], "f64"), 6, null))), "[4, 2]",
+   "np.bitwise_and converts an integral f64 operand");
+raises(def() { return np.bitwise_and(np.array([1.5], "f64"), 1, null); },
+       "np.bitwise_and refuses a NON-integral float and names it");
+
+// tobytes/frombytes round-trip at the declared width
+$bsrc = np.array([1.5, -2.25, 3.0], "f64");
+$back = np.frombytes(np.tobytes($bsrc, "f64"), "f64", [3]);
+ok(np.array_equal($bsrc, $back), "np.tobytes -> np.frombytes round-trips exactly");
+eq(len(np.tobytes($bsrc, "f64")), 24, "and f64 costs eight bytes an element");
+
+// index_add ACCUMULATES on a repeated index where put would overwrite
+$ia = np.zeros([4], "f64");
+np.index_add($ia, [1, 1, 3], [2.0, 5.0, 1.0], null);
+eq(str(np.to_list($ia)), "[0, 7, 0, 1]",
+   "np.index_add sums on a repeated index (put would keep only the last)");
+
+// the threading knob, reachable from the package at last
+eq(np.get_threads(), 1, "np.get_threads() -- threading is opt-in, so 1");
+ok(np.hardware_threads() >= 1, "np.hardware_threads() reports at least one");
+eq(np.set_threads(4), 4, "np.set_threads() adopts the count");
+// and the answer does not depend on it, which is the property the knob is
+// safe to expose at all because of
+$t1 = np.matmul(np.reshape(np.arange(0, 4096, null), [64, 64]),
+                np.reshape(np.arange(0, 4096, null), [64, 64]));
+eq(np.set_threads(1), 1, "np.set_threads(1) restores sequential execution");
+$t2 = np.matmul(np.reshape(np.arange(0, 4096, null), [64, 64]),
+                np.reshape(np.arange(0, 4096, null), [64, 64]));
+ok(np.array_equal($t1, $t2), "a 4-thread matmul is BIT-IDENTICAL to the 1-thread one");
+
+print("");
 print("-- help() and info() run without error --");
 np.help(null);
 np.help("solve");

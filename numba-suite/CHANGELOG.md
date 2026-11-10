@@ -1009,3 +1009,42 @@ threads reported), Apple Clang, `-O3 -ftree-vectorize` for `ndarray_native.cpp`.
   silently. A feature missing from the table shows up there as a file the oracle rejects and the
   detector passes.
 - **[test]** `bantu-src/compiler/tests/engine_req_test.cpp` grown to 82 assertions.
+
+### Stage 3 follow-up — thirteen kernels were unreachable from the package
+
+- **[bug fix]** `numba.b` is the public API and its own header states the rule: *every builtin
+  gets a wrapper even when the wrapper looks like it does nothing*, because a wrapper can have
+  optional arguments and a builtin cannot. Nothing enforced it, and **thirteen kernels had drifted
+  out of reach of the package surface**: `nd_concat`, `nd_stack`, `nd_split`, `nd_tile`,
+  `nd_repeat`, `nd_pad` (NumPy's whole joining family), the six bitwise operations and the two
+  shifts, `nd_tobytes`/`nd_frombytes`, `nd_index_add`, and `nd_set_threads`/`nd_get_threads`/
+  `nd_hardware_threads` — **the entire D3 threading knob**. A user of the `numba` *package* could
+  not turn threading on at all; only someone calling the raw builtin could, and the D3 work had
+  just finished advertising it.
+- **[design]** The gap was invisible from either side, which is the part worth recording. The
+  kernels are registered and have their own tests (`numba_manip_test.b`, `numba_bitwise_test.b`,
+  `numba_bytes_test.b`, `numba_index_add_test.b`, `numba_threading_test.b`); the wrappers that do
+  exist are tested in `numba_pkg_test.b`. No test compared the two **sets**.
+- **[test]** `tests/numba_surface_test.sh` — 4 assertions that close it permanently. It asks the
+  running binary what it registers (`bantu engine --builtins`) rather than grepping the C++ for
+  registration calls, which is ecosystem E24's lesson: 26 builtins are registered through a helper
+  a source grep did not recognise. Seven deliberate omissions are listed as data with their
+  reasons — btorch's three convolution-lowering kernels, arctic's three DataFrame-bridge kernels,
+  and `nd_base_id`, a view-identity hook for tests — and each exemption must still name a kernel
+  that exists, so a stale exemption is also a failure.
+- **[test]** `tests/numba_pkg_test.b` grown by 25 assertions covering every new wrapper, because a
+  name-set diff cannot tell you that `repeat` reached `nd_repeat` with the arguments in the right
+  order. They include the two distinctions that are easy to get backwards — `concat` joins an
+  existing axis while `stack` makes a new one, and `tile` repeats the whole array while `repeat`
+  repeats each element — plus `index_add` accumulating where `put` would overwrite, and a 4-thread
+  matmul asserted bit-identical to the 1-thread one through the façade.
+- **[bug fix]** Two traps in the surface test's own extraction, both of which fired on the first
+  run: a lowercase-only pattern drops `nd_T`, and `nd_[a-z_]+` matches `nd_dims` **inside** the
+  word `expand_dims` and then reports a kernel nobody called. The pattern now anchors at an
+  identifier boundary and is case-sensitive in the right direction.
+- **[test]** The `1000`-cubed matmul throughput gate in `numba_linalg_test.b` is now **best of
+  three**. It read 3.66 GFLOP/s against its 4.0 floor while the rest of the suite ran beside it,
+  and over 5 GFLOP/s on an immediate re-run of the same binary: a single timing measures the
+  machine's instantaneous load, not its capability. The threshold is unchanged — a build that
+  really regressed below 4 GFLOP/s still fails all three — and the two extra matmuls cost about a
+  second.
