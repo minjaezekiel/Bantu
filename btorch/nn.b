@@ -122,6 +122,51 @@ class Module {
         return $n;
     }
 
+    // ── dtype casting (D2c) ─────────────────────────────────────────────
+    // Casts every parameter and buffer IN PLACE, mutating each Tensor's .data
+    // rather than replacing the Tensor. That is deliberate and load-bearing:
+    // named_parameters() deduplicates by tensor identity, so a weight shared
+    // between two layers (tied embeddings) must stay the SAME object or it
+    // would be cast twice and, worse, stepped twice by the optimizer.
+    //
+    // Gradients are dropped: a stale f64 gradient against an f32 parameter is
+    // a dtype mismatch waiting to happen, and after a cast there is no
+    // meaningful gradient to keep.
+    //
+    // Call this BEFORE constructing the optimizer. An optimizer built first
+    // holds the same Tensor objects, so the parameters themselves follow -- but
+    // any moment buffers it has already allocated stay at the old dtype.
+    def to($dtype) {
+        $ps = this.parameters();
+        $i = 0;
+        while ($i < len($ps)) {
+            $ps[$i].data = nd_astype($ps[$i].data, $dtype);
+            $ps[$i].grad = null;
+            $i = $i + 1;
+        }
+        $bs = this.buffers();
+        $j = 0;
+        while ($j < len($bs)) {
+            // A buffer may be an integer count (BatchNorm's num_batches_tracked),
+            // and casting that to a float would be wrong. Only floats convert.
+            $d = nd_dtype($bs[$j].data);
+            if ($d == "f32" || $d == "f64") {
+                $bs[$j].data = nd_astype($bs[$j].data, $dtype);
+            }
+            $j = $j + 1;
+        }
+        return this;
+    }
+    def float()  { return this.to("f32"); }
+    def double() { return this.to("f64"); }
+
+    // The dtype this module's parameters are in, or null if it has none.
+    def dtype() {
+        $ps = this.parameters();
+        if (len($ps) == 0) { return null; }
+        return nd_dtype($ps[0].data);
+    }
+
     def zero_grad() {
         $ps = this.parameters();
         $i = 0;
@@ -227,7 +272,7 @@ class Module {
                         + str(nd_shape($v)) + " in the file but the " + $what
                         + " is " + str(nd_shape($target.data));
                 }
-                nd_add(nd_astype($v, "f64"), 0.0, $target.data);
+                nd_add(nd_astype($v, nd_dtype($target.data)), 0.0, $target.data);
                 if ($g == 0) { $np = $np + 1; } else { $nbuf = $nbuf + 1; }
                 $i = $i + 1;
             }
@@ -405,7 +450,8 @@ class _Dropout extends Module {
     }
     def forward($x) {
         if (!this.training || this.p == 0) { return $x; }
-        $keep = nd_astype(nd_greater_equal(nd_random_uniform($x.shape(), 0.0, 1.0), this.p, null), "f64");
+        $keep = nd_astype(nd_greater_equal(nd_random_uniform($x.shape(), 0.0, 1.0), this.p, null),
+                          nd_dtype($x.data));
         $scaled = nd_divide($keep, 1.0 - this.p, null);
         return bt.mul($x, bt.tensor($scaled, false));
     }
@@ -477,7 +523,8 @@ class _Embedding extends Module {
         $flat = nd_reshape(nd_ascontiguous($ia), [$n]);
         $out = bt.embedding(this.param("weight"), $flat);
         if (this.padding_idx != null) {
-            $keep = nd_astype(nd_not_equal($flat, this.padding_idx, null), "f64");
+            $keep = nd_astype(nd_not_equal($flat, this.padding_idx, null),
+                              nd_dtype($out.data));
             $out = bt.mul($out, bt.tensor(nd_reshape($keep, [$n, 1]), false));
         }
         if (len($sh) != 1) {
@@ -737,7 +784,7 @@ def huber_loss($pred, $target, $delta, $reduction) {
     $a = bt.abs_($d);
     // where(|d| <= delta, 0.5 d^2, delta*(|d| - 0.5 delta))  -- as a blend, so
     // no non-differentiable select is needed
-    $small = nd_astype(nd_less_equal($a.data, $delta, null), "f64");
+    $small = nd_astype(nd_less_equal($a.data, $delta, null), nd_dtype($a.data));
     $big = nd_subtract(1.0, $small, null);
     $quad = bt.mul(bt.mul($d, $d), 0.5);
     $lin = bt.mul(bt.sub($a, 0.5 * $delta), $delta);
@@ -775,7 +822,7 @@ def nll_loss($logp, $targets, $reduction) {
     // evaluator before the loss was even formed. bt.one_hot does the same work
     // in one native scatter (phase A5), and does the range check with two
     // reductions instead of a per-row branch.
-    $onehot = bt.one_hot($targets, $k);
+    $onehot = bt.one_hot($targets, $k, nd_dtype($logp.data));
     if ($onehot.shape()[0] != $n) {
         throw "btorch.nn.nll_loss: " + str($onehot.shape()[0]) + " targets for "
             + str($n) + " rows of predictions";

@@ -251,26 +251,49 @@ $mm32 = nd_matmul(nd_reshape($a32, [16, 32]), nd_reshape($b32, [32, 16]));
 $mm64 = nd_matmul(nd_reshape($a64, [16, 32]), nd_reshape($b64, [32, 16]));
 close32($mm32, $mm64, "matmul agrees with the f64 answer");
 
-// ── linear algebra is still an f64 operation (DECISIONS N31) ────────────────
-// These assertions PIN a known limitation rather than describing a desired
-// state. nd_matmul and the decompositions compute on `double*` buffers and
-// return f64 whatever they were given. The values are right -- what is missing
-// is dtype preservation, and for matmul that matters: until it is fixed, a
-// Linear layer turns an f32 model back into f64 at the first layer, which is
-// why btorch f32 (item D2c) is not reachable yet.
+// ── matmul and dot preserve f32; the decompositions stay f64 (N31) ─────────
+// matmul is f32 in, **f64 accumulate**, f32 out -- the mixed-precision form,
+// not SGEMM's f32 accumulate. For an MNIST layer (K = 784) f32 accumulation
+// would carry ~1.7e-6 relative error; through f64 the answer sits at f32
+// STORAGE resolution, which is what keeps an f32 training run tracking the f64
+// one closely enough for the accuracy gate to mean something.
 //
-// True f32 GEMM (f32 in, f64 accumulator, f32 out, as every real BLAS does)
-// lands in D4, where these kernels are being rewritten anyway. When it does,
-// these four assertions are the ones to change -- deliberately, not by
-// accident.
+// The decompositions deliberately stay f64: LU, QR, Cholesky, Jacobi eigh and
+// SVD are precision-sensitive and are not in a training hot path.
 $sq32 = nd_astype(nd_add(nd_random_uniform([4,4], 0.5, 1.5),
                          nd_multiply(nd_eye(4,4,0,null), 4.0, null), null), "f32");
-eqs(nd_dtype(nd_matmul($sq32, $sq32)), "f64", "matmul(f32,f32) returns f64 today (D4 fixes this)");
-eqs(nd_dtype(nd_inv($sq32)),           "f64", "inv of f32 returns f64 (decompositions stay f64)");
-eqs(nd_dtype(nd_det($sq32)),           "f64", "det of f32 returns f64");
+$sq64 = nd_astype($sq32, "f64");
+eqs(nd_dtype(nd_matmul($sq32, $sq32)), "f32", "matmul(f32,f32) preserves f32");
+eqs(nd_dtype(nd_matmul($sq32, $sq64)), "f64", "matmul(f32,f64) widens to f64 (the lattice)");
+eqs(nd_dtype(nd_matmul($sq64, $sq64)), "f64", "matmul(f64,f64) is unchanged");
 eqs(nd_dtype(nd_dot(nd_astype(nd_full([4], 2.0, "f64"), "f32"),
                     nd_astype(nd_full([4], 3.0, "f64"), "f32"))),
-    "f64", "dot of f32 returns f64");
+    "f32", "dot(f32,f32) preserves f32");
+eqs(nd_dtype(nd_inv($sq32)),           "f64", "inv of f32 returns f64 (decompositions stay f64)");
+eqs(nd_dtype(nd_det($sq32)),           "f64", "det of f32 returns f64");
+
+// the f64 accumulator, measured on a shape where f32 accumulation would show:
+// K = 1024, so an f32 accumulator would drift to ~2e-6 while f64 holds at f32
+// storage resolution (~6e-8).
+$wa = nd_astype(nd_random_uniform([48, 1024], 0.5, 1.5), "f32");
+$wb = nd_astype(nd_random_uniform([1024, 32], 0.5, 1.5), "f32");
+$pf = nd_astype(nd_matmul($wa, $wb), "f64");
+$pd = nd_matmul(nd_astype($wa, "f64"), nd_astype($wb, "f64"));
+$mr = nd_get(nd_max(nd_divide(nd_abs(nd_subtract($pf, $pd, null), null),
+                              nd_abs($pd, null), null), null, null), 0);
+print("        K=1024 f32 matmul vs f64: max rel " + str($mr));
+ok($mr < 5.0e-7, "f32 matmul accumulates in f64 (N24), not f32");
+
+// and the memory actually halves on the result
+ok(nd_nbytes(nd_matmul($wa, $wb)) * 2 == nd_nbytes($pd),
+   "an f32 matmul result is exactly half an f64 one");
+
+// the transposed-A fast path carries f32 too (it is a separate kernel)
+$atr = nd_transpose(nd_astype(nd_random_uniform([1024, 48], 0.5, 1.5), "f32"), null);
+eqs(nd_dtype(nd_matmul($atr, $wb)), "f32", "the transposed-A gemm path preserves f32");
+close32(nd_matmul($atr, $wb),
+        nd_matmul(nd_astype($atr, "f64"), nd_astype($wb, "f64")),
+        "the transposed-A gemm path agrees with f64");
 eqs(nd_dtype(nd_clip($a32, 1.0, 2.0, null)), "f32", "clip preserves f32");
 
 print("");

@@ -73,6 +73,25 @@ inline DType weakDType(const Value& v, const NdArray& self, DType other) {
     return self.dtype;
 }
 
+// The same rule, applied where the RAW arguments are still in hand.
+//
+// Needed because the nd_* registration wrapper calls toArrayValue() on both
+// operands BEFORE applyBinary, so by then a bare number has already become an
+// f64 array and is indistinguishable from a real one -- weakDType above can
+// never fire for it. The operator path (ndarray_dispatch.hpp) does pass raw
+// Values, which is why `$f32 + 0.5` worked while `nd_add($f32, 0.5)` did not.
+//
+// Narrowing a size-1 array is a copy of one element, so this costs nothing on
+// the path it fires on.
+inline void weakenScalars(const Value& rawA, Value& av,
+                          const Value& rawB, Value& bv) {
+    ArrayPtr A = asArray(av), B = asArray(bv);
+    const DType wa = weakDType(rawA, *A, B->dtype);
+    const DType wb = weakDType(rawB, *B, A->dtype);
+    if (wa != A->dtype) av = wrap(contiguousCopy(A, wa));
+    if (wb != B->dtype) bv = wrap(contiguousCopy(B, wb));
+}
+
 inline DType resultDType(Kind k, DType compute) {
     return (k == Kind::COMPARE || k == Kind::LOGIC || k == Kind::PREDICATE)
            ? DType::BOOL : compute;

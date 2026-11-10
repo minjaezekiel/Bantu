@@ -33,9 +33,31 @@ def _need() {
 // A dict, not a plain variable: a function body is an assignment boundary, so
 // `$_BT_GRAD = false` inside a function would make a local and the flag would
 // never change. Mutating a field of a dict reaches the real object.
-$_BT = {"grad": true, "nextid": 0};
+$_BT = {"grad": true, "nextid": 0, "dtype": "f64"};
 
 def _nextId() { $_BT.nextid = $_BT.nextid + 1; return $_BT.nextid; }
+
+// ── the default dtype (D2c) ─────────────────────────────────────────────────
+// f64 stays the default forever (ecosystem E19): changing it would silently
+// alter every published result and every gradcheck tolerance in the tree. f32
+// is opt-in, either per call or for a whole program via set_default_dtype.
+//
+// A tensor's data may be f32 OR f64 and nothing else: a gradient has to be able
+// to hold a fraction, so i64 and bool are refused by name here rather than
+// producing a model that trains to integers.
+def _floatDtype($d, $who) {
+    if ($d == null) { return $_BT.dtype; }
+    if ($d != "f32" && $d != "f64") {
+        throw $who + ": dtype must be \"f32\" or \"f64\" (got " + str($d)
+            + "). A tensor holds floats; i64 and bool cannot carry a gradient.";
+    }
+    return $d;
+}
+def get_default_dtype() { return $_BT.dtype; }
+def set_default_dtype($d) {
+    $_BT.dtype = _floatDtype($d, "btorch.set_default_dtype");
+    return null;
+}
 
 // Is grad recording on? Ops consult this before attaching a tape node.
 def is_grad_enabled() { return $_BT.grad; }
@@ -94,9 +116,16 @@ def is_tensor($x) {
 // Everything in btorch computes in f64 (DECISIONS B6). An i64 array -- which
 // is what nd_arange and nd_sum-of-integers produce -- would silently truncate
 // a gradient to zero, so it is converted on the way in rather than later.
+// Coerce tensor data to a FLOAT dtype. Both f32 and f64 pass through
+// untouched -- a tensor may be either (D2c) -- and anything else (i64, bool)
+// becomes the current default.
+//
+// The name is kept: the guarantee it provides is unchanged ("this is a float
+// array"), and before f32 existed "float" and "f64" were the same statement.
 def _f64($a) {
-    if (nd_dtype($a) == "f64") { return $a; }
-    return nd_astype($a, "f64");
+    $d = nd_dtype($a);
+    if ($d == "f64" || $d == "f32") { return $a; }
+    return nd_astype($a, $_BT.dtype);
 }
 
 // ── the gradient of a broadcast (architecture doc section 4.5) ──────────────
@@ -314,7 +343,10 @@ def _backward($root, $gradient, $retain) {
                 + "the same shape -- call .backward($g), or reduce to a scalar "
                 + "first with .sum(null, null) or .mean(null, null)";
         }
-        $seed = nd_ones(nd_shape($root.data), "f64");
+        // The seed takes the ROOT's dtype, not f64. Seeding an f32 graph with
+        // an f64 one would widen the very first backward step and the whole
+        // gradient chain with it (D2c).
+        $seed = nd_ones(nd_shape($root.data), nd_dtype($root.data));
     } else {
         $seed = _f64(_arr($gradient));
         if (nd_shape($seed) != nd_shape($root.data)) {
@@ -626,7 +658,10 @@ def sigmoid($a) {
 // formulation. At exactly 0 the subgradient is 0, as in PyTorch.
 def _reluBackward($ad) {
     return def($gr) {
-        $mask = nd_astype(nd_greater($ad, 0.0, null), "f64");
+        // The mask takes the GRADIENT's dtype, not f64: an f64 mask against an
+        // f32 gradient promotes the product back to f64 and the whole backward
+        // chain with it (D2c). Same reason at every mask and zero buffer below.
+        $mask = nd_astype(nd_greater($ad, 0.0, null), nd_dtype($gr));
         return [nd_multiply($gr, $mask, null)];
     };
 }
@@ -639,8 +674,9 @@ def relu($a) {
 // ── leaky_relu ──────────────────────────────────────────────────────────────
 def _leakyBackward($ad, $slope) {
     return def($gr) {
-        $pos = nd_astype(nd_greater($ad, 0.0, null), "f64");
-        $neg = nd_multiply(nd_astype(nd_less_equal($ad, 0.0, null), "f64"), $slope, null);
+        $dt = nd_dtype($gr);
+        $pos = nd_astype(nd_greater($ad, 0.0, null), $dt);
+        $neg = nd_multiply(nd_astype(nd_less_equal($ad, 0.0, null), $dt), $slope, null);
         return [nd_multiply($gr, nd_add($pos, $neg, null), null)];
     };
 }
@@ -672,7 +708,7 @@ def _sumBackward($shape, $axis) {
             }
             $g = nd_reshape($g, $target);
         }
-        return [nd_multiply(nd_ones($shape, "f64"), $g, null)];
+        return [nd_multiply(nd_ones($shape, nd_dtype($gr)), $g, null)];
     };
 }
 def sum($a, $axis, $keepdims) {
@@ -697,7 +733,7 @@ def _meanBackward($shape, $axis, $n) {
             }
             $g = nd_reshape($g, $target);
         }
-        return [nd_divide(nd_multiply(nd_ones($shape, "f64"), $g, null), $n, null)];
+        return [nd_divide(nd_multiply(nd_ones($shape, nd_dtype($gr)), $g, null), $n, null)];
     };
 }
 def mean($a, $axis, $keepdims) {
@@ -793,7 +829,7 @@ def _idx($x) {
 // ── take / index_select ─────────────────────────────────────────────────────
 def _takeBackward($shape, $idx, $axis) {
     return def($gr) {
-        $g = nd_zeros($shape, "f64");
+        $g = nd_zeros($shape, nd_dtype($gr));
         nd_index_add($g, $idx, $gr, $axis);
         return [$g];
     };
@@ -830,7 +866,7 @@ def embedding($weight, $ids) {
 // A constant, so it carries no gradient. Built with one native scatter rather
 // than a per-row interpreter loop: this is on the path of every
 // classification step.
-def one_hot($ids, $classes) {
+def one_hot($ids, $classes, $dtype) {
     _need();
     $idx = _idx($ids);
     $n = nd_size($idx);
@@ -851,7 +887,11 @@ def one_hot($ids, $classes) {
                 + str($classes) + " classes";
         }
     }
-    $out = nd_zeros([$n, $classes], "f64");
+    // Optional dtype, because one_hot's input is INTEGER indices -- there is
+    // no float operand to inherit from. nll_loss passes its log-probabilities'
+    // dtype, so an f32 cross_entropy stays f32 instead of being widened by its
+    // own selection mask (D2c).
+    $out = nd_zeros([$n, $classes], _floatDtype($dtype, "bt.one_hot"));
     if ($n > 0) {
         // Flat positions row*classes + class, computed in one vector pass.
         $rows = nd_multiply(nd_astype(nd_arange(0.0, $n * 1.0, null), "f64"),
@@ -899,7 +939,7 @@ def _extremeBackward($ad, $axis, $isMax) {
     return def($gr) {
         $m = nd_max($ad, $axis, true);
         if (!$isMax) { $m = nd_min($ad, $axis, true); }
-        $mask = nd_astype(nd_equal($ad, $m, null), "f64");
+        $mask = nd_astype(nd_equal($ad, $m, null), nd_dtype($gr));
         $cnt = nd_sum($mask, $axis, true);
         $g = $gr;
         if ($axis != null) {
@@ -1338,7 +1378,7 @@ def _gatherBackward($shape, $flat, $oshape) {
         $n = 1;
         $i = 0;
         while ($i < len($shape)) { $n = $n * $shape[$i]; $i = $i + 1; }
-        $g = nd_zeros([$n], "f64");
+        $g = nd_zeros([$n], nd_dtype($gr));
         nd_index_add($g, $flat, nd_reshape(nd_ascontiguous($gr), [nd_size($gr)]), 0);
         return [nd_reshape($g, $shape)];
     };
@@ -1550,7 +1590,7 @@ def _maxPoolBackward($shape, $idx, $g) {
     return def($gr) {
         $R = nd_size($idx);
         $K = $g[0] * $g[1];
-        $flat = nd_zeros([$R * $K], "f64");
+        $flat = nd_zeros([$R * $K], nd_dtype($gr));
         nd_index_add($flat, $idx, nd_reshape(nd_ascontiguous($gr), [$R]), 0);
         return [nd_col2im(nd_reshape($flat, [$R, $K]), $shape,
                           $g[0], $g[1], $g[2], $g[3], $g[4], $g[5], $g[6], $g[7])];
@@ -1606,20 +1646,28 @@ def max_pool2d($x, $kh, $kw, $sh, $sw, $ph, $pw) {
 // ════════════════════════════════════════════════════════════════════════════
 //  Creation
 // ════════════════════════════════════════════════════════════════════════════
-def tensor($data, $requires_grad) {
+// Every constructor takes an OPTIONAL trailing dtype. Bantu passes null for a
+// missing argument, so `bt.zeros([3], false)` still means exactly what it did.
+//
+// With no dtype given, an ARRAY operand passes through at whatever float dtype
+// it already has -- so bt.tensor(f32_array, false) stays f32 rather than being
+// widened back to the default. A LIST has no dtype of its own and is built at
+// the default.
+def tensor($data, $requires_grad, $dtype) {
     _need();
-    if (type($data) == "instance") { return new Tensor($data.data, $requires_grad); }
-    if (_isNd($data))             { return new Tensor($data, $requires_grad); }
-    return new Tensor(nd($data, "f64"), $requires_grad);
+    if (type($data) == "instance") { $data = $data.data; }
+    if (!_isNd($data)) { return new Tensor(nd($data, _floatDtype($dtype, "bt.tensor")), $requires_grad); }
+    if ($dtype != null) { $data = nd_astype($data, _floatDtype($dtype, "bt.tensor")); }
+    return new Tensor($data, $requires_grad);
 }
-def zeros($shape, $requires_grad)  { _need(); return new Tensor(nd_zeros($shape, "f64"), $requires_grad); }
-def ones($shape, $requires_grad)   { _need(); return new Tensor(nd_ones($shape, "f64"), $requires_grad); }
-def full($shape, $v, $requires_grad) { _need(); return new Tensor(nd_full($shape, $v), $requires_grad); }
-def eye($n, $requires_grad)        { _need(); return new Tensor(nd_eye($n, $n, 0), $requires_grad); }
-def arange($a, $b, $requires_grad) { _need(); return new Tensor(nd_astype(nd_arange($a, $b, null), "f64"), $requires_grad); }
-def linspace($a, $b, $n, $requires_grad) { _need(); return new Tensor(nd_linspace($a, $b, $n), $requires_grad); }
-def randn($shape, $requires_grad)  { _need(); return new Tensor(nd_random_normal($shape), $requires_grad); }
-def rand($shape, $requires_grad)   { _need(); return new Tensor(nd_random_uniform($shape, 0.0, 1.0), $requires_grad); }
+def zeros($shape, $requires_grad, $dtype)  { _need(); return new Tensor(nd_zeros($shape, _floatDtype($dtype, "bt.zeros")), $requires_grad); }
+def ones($shape, $requires_grad, $dtype)   { _need(); return new Tensor(nd_ones($shape, _floatDtype($dtype, "bt.ones")), $requires_grad); }
+def full($shape, $v, $requires_grad, $dtype) { _need(); return new Tensor(nd_astype(nd_full($shape, $v), _floatDtype($dtype, "bt.full")), $requires_grad); }
+def eye($n, $requires_grad, $dtype)        { _need(); return new Tensor(nd_astype(nd_eye($n, $n, 0), _floatDtype($dtype, "bt.eye")), $requires_grad); }
+def arange($a, $b, $requires_grad, $dtype) { _need(); return new Tensor(nd_astype(nd_arange($a, $b, null), _floatDtype($dtype, "bt.arange")), $requires_grad); }
+def linspace($a, $b, $n, $requires_grad, $dtype) { _need(); return new Tensor(nd_astype(nd_linspace($a, $b, $n), _floatDtype($dtype, "bt.linspace")), $requires_grad); }
+def randn($shape, $requires_grad, $dtype)  { _need(); return new Tensor(nd_astype(nd_random_normal($shape), _floatDtype($dtype, "bt.randn")), $requires_grad); }
+def rand($shape, $requires_grad, $dtype)   { _need(); return new Tensor(nd_astype(nd_random_uniform($shape, 0.0, 1.0), _floatDtype($dtype, "bt.rand")), $requires_grad); }
 def zeros_like($t, $requires_grad) { _need(); return new Tensor(nd_zeros_like($t.data), $requires_grad); }
 def ones_like($t, $requires_grad)  { _need(); return new Tensor(nd_ones_like($t.data), $requires_grad); }
 def manual_seed($s) { _need(); nd_seed($s); return null; }
@@ -1664,7 +1712,7 @@ def gradcheck($f, $inputs, $h, $tol) {
     $i = 0;
     while ($i < len($inputs)) {
         $gi = $inputs[$i].grad;
-        if ($gi == null) { $gi = nd_zeros(nd_shape($inputs[$i].data), "f64"); }
+        if ($gi == null) { $gi = nd_zeros(nd_shape($inputs[$i].data), nd_dtype($inputs[$i].data)); }
         push($analytic, nd_reshape(nd_copy($gi, null), [nd_size($gi)]));
         $i = $i + 1;
     }

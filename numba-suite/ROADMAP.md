@@ -242,7 +242,8 @@ changes no stride arithmetic anywhere.**
 |---|---|---|---|---|
 | **D1 ✅ dtype templating pass** — no new dtype; every kernel body written once over `T` | six near-duplicate dispatch blocks → five type-templated arms (`binTier0/1/2`, `unTier0/2`), plus `extremeFast<T>` and `sumContigT<T>`; `load<T>`/`store<T>` beside `loadD`/`storeD`; `itemsize` a real table; `dtypeTraits<T>` carrying **`acc` separately from the storage type**; `NB_DISPATCH_COMPUTE` (arithmetic width) and `NB_DISPATCH_STORAGE` (stored width) for the pure-storage sites | **all 18 numba + btorch suites green**, `numba_fastpath_test.b`'s exact bit-equality assertions among them | paired A/B vs the pre-D1 binary, 6 rounds per side, alternating order, each case calibrated to ~400 ms: **no case regressed on both min and median** | [x] |
 | **D2a ✅ `f32` in numba** (stores in 4 bytes; **computes in double** — N29) | `DType::F32` through the enum, `itemsize`, `dtypeName`, `dtypeFromName`, `promote`, the three generic accessors, `loadI`/`storeI`, both dispatch macros, `narrowToFloat` saturation, weak scalars (N28), `reduceDType`/`floatResultDType` (N30), f32 arms in all five ufunc tiers + `extremeFast<float>` + `sumContigT<float>` | `tests/numba_f32_test.b` **74/74**: f32 within 1e-6 of the f64 answer per op class; promotion lattice exhaustive; every reduction's and scan's result dtype asserted by name; `inf`/`NaN`/subnormal round-trips; narrowing overflow saturates rather than UB | **f64 bit-identical** (all 18 prior suites green, `numba_fastpath_test.b` exact); `nd_nbytes` f32 **exactly half** f64; accumulator split proven at **2.89e-08** on a case f32 arithmetic cannot represent | [x] |
-| **D2c btorch f32 plumbing** — `bt.tensor(..., "f32")`, `Module.to("f32")`, `serialize._elemFor` f32 | needed before any f32 training gate can run at all | — | **the MNIST MLP gate re-run in f32: within 0.3% of the f64 98.16%** — NOT yet attempted | [ ] |
+| **D4a ✅ f32 GEMM** (half of D4, pulled forward — E20) | `gemmContigT<T>`/`gemmTransAT<T>` over the input type with the accumulator kept `double`; `gemmReadyIn`/`gemmTransposedIn` take the dtype; `nd_matmul` and `nd_dot` return f32 only when BOTH operands are f32 | `nd_matmul(f32,f32)` is f32, `(f32,f64)` widens, `(f64,f64)` unchanged; the transposed-A path carries f32 too | **f64 bit-identical** (`numba_fastpath_test` exact, green); at K=1024 the f32 answer sits at **5.93e-08** against the f64 one, i.e. f32 *storage* resolution, which is the f64 accumulator doing its job | [x] |
+| **D2c ✅ btorch f32 plumbing** | `bt.set_default_dtype`/`get_default_dtype`, an optional trailing dtype on 9 constructors, `Module.to/float/double/dtype`, f32 in `.btsd`, and **13 hard-coded `"f64"` sites inside backward closures, masks, the backward seed, `one_hot` and the optimizer's state slots** | `tests/btorch_f32_test.b` **36/36** | **the MNIST MLP gate re-run in f32** — see the D2c results below | [x] |
 | **D2b `f32` arithmetic** — the ~55 ufunc functors become generic (`[](auto x, auto y)`) so f32 work happens at f32 width | mechanical; f64 deduces `double` and stays bit-identical | f32 element-wise measurably faster than f64, not merely smaller | — | [ ] |
 | **D3 deterministic threading** | a pool with a **fixed partition computed from shape and thread count-independently**, `nd_set_threads(n)`, default **1** (opt-in) | **bit-identical output at 1, 2, 4, 8, 16 threads**, asserted with exact equality | TSan (new tier) + ASan + UBSan; `nd_live_bytes` returns to its pre-call value; 20,000 threaded calls leak 0 bytes; **no per-call heap allocation** | [ ] |
 | **D4 packed GEMM + f32 GEMM** for skinny shapes (`K=25, N=6`); also makes matmul preserve f32 (**f32 in, f64 accumulator, f32 out** — N31), which is what unblocks D2c | register-blocked `A`/`B` panels, a measured `4×4` or `8×4` micro-kernel, shape-gated | `numba_fastpath_test.b` unchanged and passing | no regression at the large square shapes already at 7.8 GFLOP/s | [ ] |
@@ -287,7 +288,58 @@ Measured relative error **2.89e-08**, against ~2.9e-2 for an f32 accumulator.
 
 Honest limit (N29): f32 **stores** in 4 bytes but **computes** in double,
 because the ufunc functors are declared `[](double, double)`. Half the memory,
-no SIMD-width gain yet. That is D2b.
+no SIMD-width gain yet. That is D2b, now deferred (E20) because its benefit was
+gated behind the f32 GEMM anyway.
+
+**D4a + D2c — f32 training, measured.** The MNIST MLP, same model, same seed,
+same optimizer and schedule, switched only by `BTORCH_DTYPE`:
+
+| | f64 | f32 |
+|---|---|---|
+| live arrays after load | 421.03 MB | **210.78 MB** |
+| epoch 1 loss | 0.271603 | 0.271986 |
+| epoch 4 loss | 0.0522984 | 0.0531816 |
+| final test accuracy | 97.51% | **97.79%** |
+| final train accuracy | 98.60% | 98.87% |
+| wall clock, 4 epochs | 74.5 s | 71.8 s |
+
+**Memory is exactly half** (210.78 x 2 = 421.56 against 421.03; the ~0.1%
+remainder is the label arrays, which are i64 and do not shrink). That is the
+win f32 was adopted for, and it covers the model, the gradients *and* Adam's
+two state slots per parameter — which is why the optimizer's slots had to stop
+being hard-coded f64.
+
+Accuracy **is not worse**: f32 came out 0.28 points *higher*, and the per-epoch
+losses track f64 to within 2% at every epoch, so the two runs are following the
+same trajectory rather than diverging. The small edge is f32's rounding acting
+as mild regularisation, not a real improvement; the honest claim is "f32 tracks
+f64", not "f32 is better".
+
+Speed is near-identical (71.8 s vs 74.5 s), exactly as N29 predicts: the
+arithmetic still happens in double, so what improved is bytes moved, not
+operations issued.
+
+**At 8 epochs — the configuration the published 98.16% came from:**
+
+| | f64 | f32 | gap |
+|---|---|---|---|
+| epoch-8 loss | 0.0212818 | 0.0215144 | 1.1% |
+| **final test accuracy** | **98.16%** | **97.99%** | **0.17 pt** |
+| final train accuracy | 99.615% | 99.433% | 0.18 pt |
+| wall clock | 129.7 s | 140.4 s | — |
+
+**The D2c gate is met:** f32 is within **0.17 points** of f64, against a stated
+band of 0.3. And the f64 run reproduces the previously published **98.16%
+exactly**, which is worth noting twice over — it confirms the earlier figure
+came from 8 epochs (the sample defaults to 4, which gives 97.51%), and it is
+direct evidence for the determinism property the whole stack is being built
+around.
+
+**No speed claim.** f32 was faster at 4 epochs (71.8 s vs 74.5 s) and slower at
+8 (140.4 s vs 129.7 s). That is machine noise, not a signal, and it is exactly
+what N29 predicts: the arithmetic still happens in `double`, so f32 changes
+bytes moved and not operations issued. Anyone wanting f32 to be *faster* wants
+D2b.
 
 ### The `Pairwise` problem — why D3 is not a scheduling exercise
 

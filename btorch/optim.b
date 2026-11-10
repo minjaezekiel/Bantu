@@ -54,7 +54,11 @@ class Optimizer {
         $key = str($p.id) + "/" + $name;
         $v = this.state[$key];
         if ($v == null) {
-            $v = nd_zeros(nd_shape($p.data), "f64");
+            // The slot takes the PARAMETER's dtype, not f64. This is the
+            // largest single memory item in a training run: Adam keeps two
+            // slots per parameter, so f64 state behind f32 parameters would cut
+            // the saving from a half to a third and make f32 barely worth it.
+            $v = nd_zeros(nd_shape($p.data), nd_dtype($p.data));
             this.state[$key] = $v;
         }
         return $v;

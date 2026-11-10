@@ -38,8 +38,12 @@ inline void registerUfuncs(const DefineFn& define) {
             if (a.size() < 2) {
                 throw std::runtime_error(n + "(a, b, out?) needs two operands");
             }
-            const Value av = toArrayValue(a[0], n.c_str());
-            const Value bv = toArrayValue(a[1], n.c_str());
+            Value av = toArrayValue(a[0], n.c_str());
+            Value bv = toArrayValue(a[1], n.c_str());
+            // Weaken BEFORE applyBinary: the raw arguments are only available
+            // here, and toArrayValue has already erased the number/array
+            // distinction the rule depends on (N28).
+            weakenScalars(a[0], av, a[1], bv);
             return applyBinary(n.c_str(), k, av, bv, outOf(a, 2), fd, fi);
         });
     };

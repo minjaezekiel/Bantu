@@ -606,3 +606,81 @@ matmul time is a genuine blocking problem for extreme aspect ratios
 (`K = 25, N = 6` leaves an inner loop too short to vectorise), which wants a
 packed micro-kernel. That is real GEMM engineering and belongs in phase 9 with
 its own gate, not bolted on here.
+
+---
+
+### B30 — a tensor may be f32 or f64, and nothing else
+`_floatDtype()` is the single gate, and it refuses `i64` and `bool` **by name**
+rather than letting them through: a gradient has to be able to hold a fraction,
+and a model whose parameters are integers trains to integers while every test
+that checks shapes still passes.
+
+f64 remains the default forever (ecosystem E19). f32 is opt-in two ways:
+`bt.set_default_dtype("f32")` for a whole program, or an **optional trailing
+dtype** on each of the nine constructors. Bantu passes `null` for a missing
+argument, so `bt.zeros([3], false)` still means exactly what it always did —
+which is why extending nine signatures broke nothing.
+
+One asymmetry, deliberate: with no dtype given, an **array** operand passes
+through at whatever float dtype it already carries, so
+`bt.tensor(f32_array, false)` stays f32. A **list** has no dtype of its own and
+is built at the default. Widening a caller's f32 array back to the default
+would make `bt.tensor` the place f32 quietly died.
+
+---
+
+### B31 — every derived buffer takes its dtype from the tensor it will meet
+**The defect class that made f32 look like it worked when it did not.**
+
+Thirteen places inside btorch built a mask, a zero buffer, a ones buffer, the
+backward seed, `one_hot`'s output or an optimizer state slot at a hard-coded
+`"f64"`. Every one was correct while f64 was the only float dtype. Every one
+silently widened an f32 computation back to f64 the moment there was one:
+
+| site | what it did |
+|---|---|
+| `_reluBackward`, `_leakyBackward`, `_extremeBackward` | an f64 mask times an f32 gradient = f64 gradient |
+| `_sumBackward`, `_meanBackward` | f64 `nd_ones` times an f32 gradient |
+| `_takeBackward`, gather, `_maxPoolBackward` | f64 scatter destination |
+| the `backward()` seed | an f64 seed widened the chain at step one |
+| `one_hot` | f64 selection mask widened every `cross_entropy` |
+| `Optimizer._slot` | f64 momentum behind f32 parameters |
+| `Dropout`, `Embedding` padding, `huber_loss` | f64 masks in forward |
+
+The rule now: **a derived buffer takes `nd_dtype()` of the array it is about to
+be combined with** — the incoming gradient for a backward closure, the input
+tensor for a forward mask, the parameter for an optimizer slot.
+
+The optimizer slot is the one with the largest consequence. Adam keeps two
+slots per parameter, so they outweigh the parameters themselves; f64 slots
+behind f32 weights would have cut the memory saving from a half to a third and
+made the whole exercise marginal. Measured after the fix: **210.8 MB against
+421.0 MB, which is half to within 0.1%** — the remainder being the label arrays,
+which are i64 and correctly do not shrink.
+
+How this was caught is worth recording, because the first version of the test
+missed it: `tests/btorch_f32_test.b` originally asserted that f32 *values*
+agreed with f64 to 1e-6, and they did — a widened f64 result holds an f32 value
+perfectly. Only asserting the **dtype** of each result exposed it. A dtype bug
+is invisible to a value assertion.
+
+---
+
+### B32 — `Module.to()` mutates each tensor in place
+It assigns `$p.data`, it does not replace the `Tensor` object.
+
+That is load-bearing twice over. `named_parameters()` deduplicates by tensor
+identity, so a weight shared between two layers — tied embeddings are a real
+pattern — must stay the *same object*, or it would be cast twice and, far
+worse, **stepped twice by the optimizer**: a silent 2x learning rate on that
+tensor alone (the hazard B5's dedup exists to prevent). And an optimizer built
+before the cast holds those same objects, so the parameters follow it.
+
+Gradients are dropped on a cast: a stale f64 gradient against an f32 parameter
+is a dtype mismatch waiting to happen, and after a cast there is no meaningful
+gradient to preserve.
+
+What does **not** follow: optimizer state slots already allocated. So `to()` is
+documented as "call it before building the optimizer", and the MNIST sample
+does exactly that. An integer buffer — `BatchNorm`'s `num_batches_tracked` — is
+left alone, because casting a count to a float would be wrong.

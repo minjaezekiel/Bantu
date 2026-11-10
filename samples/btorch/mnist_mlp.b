@@ -24,6 +24,16 @@ $EPOCHS = 4;
 $envEpochs = env("BTORCH_EPOCHS");
 if ($envEpochs != "") { $EPOCHS = num($envEpochs); }
 
+// BTORCH_DTYPE=f32 runs the SAME model, seed, optimizer and schedule in f32.
+// Same code and same seed is the point: it makes the two runs comparable, which
+// a separate f32 sample would not be. Unset means f64, exactly as before.
+$DT = env("BTORCH_DTYPE");
+if ($DT == "") { $DT = "f64"; }
+if ($DT != "f32" && $DT != "f64") {
+    print("  BTORCH_DTYPE must be f32 or f64 (got '" + $DT + "')");
+    exit(1);
+}
+
 print("");
 print("  MNIST MLP — the phase-10 gate (>= " + str($GATE * 100.0) + "% test accuracy)");
 print("  ────────────────────────────────────────────────────────────");
@@ -39,6 +49,19 @@ $net = nn.Sequential([
     nn.Linear(128, 10, null)
 ]);
 print("  model:     784-256-128-10 MLP, " + str($net.num_parameters()) + " parameters");
+// Cast BEFORE the optimizer is built, so Adam's two state slots per parameter
+// are allocated at the model's dtype. Those slots are the largest memory item
+// in a training run -- f64 state behind f32 weights would cut the saving from a
+// half to a third.
+if ($DT == "f32") {
+    $net.to("f32");
+    $m.train_x = nd_astype($m.train_x, "f32");
+    $m.test_x  = nd_astype($m.test_x,  "f32");
+}
+print("  dtype:     " + $DT + " (parameters " + $net.dtype()
+    + ", inputs " + nd_dtype($m.train_x) + ")");
+$liveMB = nd_live_bytes() / 1048576.0;
+print("  live arrays after load: " + str($liveMB) + " MB");
 
 $train = btdata.TensorDataset([$m.train_x, $m.train_y]);
 $loader = btdata.DataLoader($train, 128, true, false, 20261109);

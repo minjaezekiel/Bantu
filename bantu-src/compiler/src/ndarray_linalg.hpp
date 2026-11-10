@@ -97,8 +97,20 @@ inline ArrayPtr fromVec(const std::vector<double>& v, const char* what) {
 // including the `aik == 0.0` skip, kept so that a zero multiplied by an
 // infinity behaves exactly as it did before. Anything else still goes through
 // toMat, so LU, QR, SVD and the strided and integer cases are untouched.
-inline void gemmContig(const double* NB_RESTRICT A, const double* NB_RESTRICT B,
-                       double* NB_RESTRICT C, size_t M, size_t K, size_t N) {
+// Templated over the INPUT type; the accumulator C stays `double` whatever the
+// inputs are (N24, and what N31 committed to). So an f32 matmul is f32 in,
+// f64 accumulate, f32 out -- the mixed-precision form, not SGEMM's f32
+// accumulate. For K = 784 (an MNIST layer) f32 accumulation would carry
+// ~1.7e-6 relative error; through f64 it stays at f32 *storage* resolution,
+// which is what keeps an f32 training run tracking the f64 one.
+//
+// With T = double every cast below is a no-op, so that instantiation is the
+// same code -- and crucially the same summation ORDER -- as before D4. The
+// `gemmContig`/`gemmTransA` wrappers underneath preserve the existing call
+// sites and the bit-identity argument numba_fastpath_test asserts.
+template <class T>
+inline void gemmContigT(const T* NB_RESTRICT A, const T* NB_RESTRICT B,
+                        double* NB_RESTRICT C, size_t M, size_t K, size_t N) {
     const size_t BS = 64;                       // 64x64 f64 tiles: 32 KB, L1-resident
     for (size_t i = 0; i < M * N; i++) C[i] = 0.0;
     for (size_t ii = 0; ii < M; ii += BS) {
@@ -110,10 +122,10 @@ inline void gemmContig(const double* NB_RESTRICT A, const double* NB_RESTRICT B,
                 for (size_t i = ii; i < iMax; i++) {
                     double* NB_RESTRICT cp = C + i * N;
                     for (size_t k = kk; k < kMax; k++) {
-                        const double aik = A[i * K + k];
+                        const double aik = (double)A[i * K + k];
                         if (aik == 0.0) continue;
-                        const double* NB_RESTRICT bp = B + k * N;
-                        for (size_t j = jj; j < jMax; j++) cp[j] += aik * bp[j];
+                        const T* NB_RESTRICT bp = B + k * N;
+                        for (size_t j = jj; j < jMax; j++) cp[j] += aik * (double)bp[j];
                     }
                 }
             }
@@ -136,33 +148,48 @@ inline void gemmContig(const double* NB_RESTRICT A, const double* NB_RESTRICT B,
 // order here gives bit-for-bit the same answer. Floating-point addition is not
 // associative, and a matmul that changed its rounding would be a silent change
 // to every result in the library.
-inline void gemmTransA(const double* NB_RESTRICT At, const double* NB_RESTRICT B,
-                       double* NB_RESTRICT C, size_t M, size_t K, size_t N) {
+template <class T>
+inline void gemmTransAT(const T* NB_RESTRICT At, const T* NB_RESTRICT B,
+                        double* NB_RESTRICT C, size_t M, size_t K, size_t N) {
     for (size_t i = 0; i < M * N; i++) C[i] = 0.0;
     for (size_t k = 0; k < K; k++) {
-        const double* NB_RESTRICT ak = At + k * M;      // M values, contiguous
-        const double* NB_RESTRICT bk = B  + k * N;      // N values, contiguous
+        const T* NB_RESTRICT ak = At + k * M;           // M values, contiguous
+        const T* NB_RESTRICT bk = B  + k * N;           // N values, contiguous
         for (size_t i = 0; i < M; i++) {
-            const double a = ak[i];
+            const double a = (double)ak[i];
             if (a == 0.0) continue;
             double* NB_RESTRICT cp = C + i * N;
-            for (size_t j = 0; j < N; j++) cp[j] += a * bk[j];
+            for (size_t j = 0; j < N; j++) cp[j] += a * (double)bk[j];
         }
     }
 }
 
+// The f64 entry points, behaviour and summation order unchanged.
+inline void gemmContig(const double* NB_RESTRICT A, const double* NB_RESTRICT B,
+                       double* NB_RESTRICT C, size_t M, size_t K, size_t N) {
+    gemmContigT<double>(A, B, C, M, K, N);
+}
+inline void gemmTransA(const double* NB_RESTRICT At, const double* NB_RESTRICT B,
+                       double* NB_RESTRICT C, size_t M, size_t K, size_t N) {
+    gemmTransAT<double>(At, B, C, M, K, N);
+}
+
 // True when `x` is an f64 array whose elements sit consecutively, so
 // gemmContig may read it in place. Computed, never assumed.
-inline bool gemmReady(const NdArray& x) {
-    return x.dtype == DType::F64 && x.isCContig();
+inline bool gemmReadyIn(const NdArray& x, DType dt) {
+    return x.dtype == dt && x.isCContig();
 }
+inline bool gemmReady(const NdArray& x) { return gemmReadyIn(x, DType::F64); }
 
 // True when `x` is a 2-d f64 array that is the transpose of a C-contiguous
 // one: shape [M,K] with strides [1,M], i.e. the buffer holds [K,M] in C order.
 // nd_transpose produces exactly this, and it is what gemmTransA consumes.
-inline bool gemmTransposed(const NdArray& x) {
-    return x.dtype == DType::F64 && x.ndim() == 2 &&
+inline bool gemmTransposedIn(const NdArray& x, DType dt) {
+    return x.dtype == dt && x.ndim() == 2 &&
            x.strides[0] == 1 && x.strides[1] == (ptrdiff_t)x.shape[0];
+}
+inline bool gemmTransposed(const NdArray& x) {
+    return gemmTransposedIn(x, DType::F64);
 }
 
 // ── matmul ───────────────────────────────────────────────────────────────────

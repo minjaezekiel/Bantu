@@ -52,8 +52,25 @@ inline void registerLinalg(const DefineFn& define) {
             throw std::runtime_error("nd_matmul: only 1- and 2-dimensional operands are supported "
                                      "(got " + shapeStr(A->shape) + " and " + shapeStr(B->shape) + ")");
         }
+        // ── what dtype does this matmul produce? (D4) ────────────────────
+        // f32 only when BOTH operands are f32; anything mixed follows the
+        // ordinary promotion lattice up to f64. Until this existed, matmul
+        // returned f64 unconditionally and a Linear layer undid f32 at the
+        // first layer, which is what blocked btorch f32 (N31).
+        const DType mmDType = (A->dtype == DType::F32 && B->dtype == DType::F32)
+                            ? DType::F32 : DType::F64;
+        // The generic fallback below computes in f64 whatever it was given, so
+        // its results are narrowed once here rather than at each of its three
+        // exits.
+        auto finish = [mmDType](const ArrayPtr& r) -> Value {
+            if (mmDType == DType::F32 && r->dtype != DType::F32) {
+                return wrap(contiguousCopy(r, DType::F32));
+            }
+            return wrap(r);
+        };
+
         // ── the fast path ────────────────────────────────────────────────
-        // Both operands already f64 and contiguous: no copies at all.
+        // Both operands already the gemm dtype and contiguous: no copies.
         {
             const size_t M = aVec ? 1 : A->shape[0];
             const size_t K = aVec ? A->shape[0] : A->shape[1];
@@ -70,28 +87,47 @@ inline void registerLinalg(const DefineFn& define) {
             // normalise than to route around: B^T in a matmul backward is the
             // weight matrix, a few hundred doubles. The threshold is on the
             // OPERAND, so the big one is never copied here.
-            const size_t kSmall = 1u << 16;          // 64K doubles = 512 KB
+            const size_t kSmall = 1u << 16;          // 64K elements
             ArrayPtr Af = A, Bf = B;
-            if (!gemmReady(*Af) && !gemmTransposed(*Af) && Af->size() <= kSmall) {
-                Af = contiguousCopy(Af, DType::F64);
+            if (!gemmReadyIn(*Af, mmDType) && !gemmTransposedIn(*Af, mmDType) &&
+                Af->size() <= kSmall) {
+                Af = contiguousCopy(Af, mmDType);
             }
-            if (!gemmReady(*Bf) && Bf->size() <= kSmall) {
-                Bf = contiguousCopy(Bf, DType::F64);
+            if (!gemmReadyIn(*Bf, mmDType) && Bf->size() <= kSmall) {
+                Bf = contiguousCopy(Bf, mmDType);
             }
 
-            const bool bOK = gemmReady(*Bf);
-            const bool aC  = gemmReady(*Af);
-            const bool aT  = !aVec && !bVec && gemmTransposed(*Af);
+            const bool bOK = gemmReadyIn(*Bf, mmDType);
+            const bool aC  = gemmReadyIn(*Af, mmDType);
+            const bool aT  = !aVec && !bVec && gemmTransposedIn(*Af, mmDType);
             if (bOK && (aC || aT)) {
                 std::vector<size_t> shape;
                 if (!aVec) shape.push_back(M);
                 if (!bVec) shape.push_back(N);
-                ArrayPtr out = makeArray(shape, DType::F64, "nd_matmul", false);
-                const double* ap = static_cast<const double*>(Af->buf->data) + Af->offset;
-                const double* bp = static_cast<const double*>(Bf->buf->data) + Bf->offset;
-                double* cp = static_cast<double*>(out->buf->data);
-                if (aC) gemmContig(ap, bp, cp, M, K, N);
-                else    gemmTransA(ap, bp, cp, M, K, N);
+                ArrayPtr out = makeArray(shape, mmDType, "nd_matmul", false);
+
+                if (mmDType == DType::F64) {
+                    // Unchanged: straight into the output buffer.
+                    const double* ap = static_cast<const double*>(Af->buf->data) + Af->offset;
+                    const double* bp = static_cast<const double*>(Bf->buf->data) + Bf->offset;
+                    double* cp = static_cast<double*>(out->buf->data);
+                    if (aC) gemmContigT<double>(ap, bp, cp, M, K, N);
+                    else    gemmTransAT<double>(ap, bp, cp, M, K, N);
+                } else {
+                    // f32 in, f64 ACCUMULATE, f32 out. The accumulator is a
+                    // scratch buffer of M*N doubles -- the output, which in a
+                    // neural-network layer is far smaller than either operand
+                    // ([128,784]x[784,256]: C is 32K elements against A's 100K
+                    // and B's 200K), so this still nets a large memory win
+                    // against doing the whole thing in f64.
+                    const float* ap = static_cast<const float*>(Af->buf->data) + Af->offset;
+                    const float* bp = static_cast<const float*>(Bf->buf->data) + Bf->offset;
+                    std::vector<double> acc(checkedMul(M, N, "nd_matmul"), 0.0);
+                    if (aC) gemmContigT<float>(ap, bp, acc.data(), M, K, N);
+                    else    gemmTransAT<float>(ap, bp, acc.data(), M, K, N);
+                    float* cp = static_cast<float*>(out->buf->data);
+                    for (size_t i = 0; i < acc.size(); i++) cp[i] = narrowToFloat(acc[i]);
+                }
                 return wrap(out);
             }
         }
@@ -108,13 +144,13 @@ inline void registerLinalg(const DefineFn& define) {
         if (aVec && bVec) {                       // an inner product: a 0-d scalar
             ArrayPtr out = makeArray({}, DType::F64, "nd_matmul");
             setFromDouble(*out, 0, c(0, 0));
-            return wrap(out);
+            return finish(out);
         }
         if (aVec || bVec) {                       // one axis collapses
             std::vector<double> v(c.a.begin(), c.a.end());
-            return wrap(fromVec(v, "nd_matmul"));
+            return finish(fromVec(v, "nd_matmul"));
         }
-        return wrap(fromMat(c, "nd_matmul"));
+        return finish(fromMat(c, "nd_matmul"));
     });
     define("nd_dot", [](std::vector<Value> args) -> Value {
         if (args.size() < 2) throw std::runtime_error("nd_dot(a, b) needs two arrays");
@@ -134,7 +170,11 @@ inline void registerLinalg(const DefineFn& define) {
             Pairwise acc;
             for (size_t i = 0; i < ao.size(); i++)
                 acc.add(getAsDouble(*A, ao[i]) * getAsDouble(*B, bo[i]));
-            ArrayPtr out = makeArray({}, DType::F64, "nd_dot");
+            // Same rule as nd_matmul: f32 only when both operands are f32. The
+            // accumulation is the pairwise f64 one either way (N24).
+            const DType rdt = (A->dtype == DType::F32 && B->dtype == DType::F32)
+                            ? DType::F32 : DType::F64;
+            ArrayPtr out = makeArray({}, rdt, "nd_dot");
             setFromDouble(*out, 0, acc.total());
             return wrap(out);
         }

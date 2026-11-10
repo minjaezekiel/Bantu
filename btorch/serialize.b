@@ -52,6 +52,10 @@ def _readU32($s, $at) {
 // offer nothing wider than i32 to serialize it with.
 def _elemFor($dtype) {
     if ($dtype == "f64")  { return "f64"; }
+    // f32 is written as f32, not widened to f64 (D2c). Widening would round-trip
+    // correctly but double every checkpoint an f32 model writes, which is half
+    // the reason to train in f32 at all.
+    if ($dtype == "f32")  { return "f32"; }
     if ($dtype == "i64")  { return "i64"; }
     if ($dtype == "bool") { return "u8"; }
     throw "btorch.serialize: no lossless encoding for dtype '" + str($dtype) + "'";

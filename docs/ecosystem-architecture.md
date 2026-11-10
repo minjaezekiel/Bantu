@@ -328,6 +328,65 @@ the manifest cannot say so. The failure mode is the stale-binary bug already
 fixed once (B21), arriving through the registry and reported as
 `Undefined variable: nd_fft`.
 
+### E20 — stage 1 is resequenced: value-ordered, not completion-ordered
+**The original order inside stage 1 was wrong, and re-deriving it from
+dependencies rather than from tidiness is what showed it.**
+
+It said D2b (generic ufunc functors) → D3 (threading) → D4 (packed GEMM). But
+**D2b's entire benefit was gated behind D4.** f32 was unusable for training
+until `nd_matmul` preserved it (N31), so making f32 element-wise arithmetic
+happen at f32 width delivered nothing to anybody: there were no f32 models to
+run it on. Putting the gated item first is the one ordering that cannot pay.
+
+So D4's **f32-GEMM half was pulled forward** and done first, together with D2c
+(the btorch plumbing). That turns f32 from a shipped-but-unusable dtype into a
+working one — the worst state to leave anything in is "built, tested, and
+reachable by nobody".
+
+Revised order, by value delivered per unit of risk:
+
+| | item | why here |
+|---|---|---|
+| ✅ | **f32 GEMM + D2c** | completes a shipped feature; halves model and optimizer memory |
+| next | **D3 deterministic threading** | the largest multiplier that exists (core count), and the one stage 3 also wants |
+| then | **stage 2 + stage 3 (`bkit`)** | where the paying work is |
+| after | **D4 packed GEMM** (skinny shapes) | helps convolution only |
+| after | **D2b** generic functors | helps f32 element-wise only |
+
+### E21 — stage 1 and stage 3 are interleaved, not swapped
+The open trade was: *GBDTs are nearly insensitive to f32 vs f64, so should
+`bkit` jump ahead of the array layer?* Neither "yes" nor "no" is the best
+answer.
+
+**`bkit` does not need f32 at all** — its hot structure is a byte-per-cell
+binned matrix ([K1]) and its hot loop is integer bin indexing with float
+accumulation. True.
+
+**But `bkit` badly wants D3.** `tree_hist` is O(samples x features) per node and
+partitions cleanly over samples: each thread builds a partial histogram and the
+partials are summed in fixed index order, so it is race-free *and*
+deterministic by construction — exactly the shape D3's fixed-partition design
+([E15]) serves. Built before D3, `bkit` either ships single-threaded or gets
+revisited; built after, it gets the cores nearly free.
+
+So the right cut is not between stages, it is **through** stage 1:
+
+- take the stage-1 parts that either complete a shipped feature (f32 GEMM) or
+  multiply `bkit` (D3 threading), **then** do stage 2 and `bkit`;
+- defer the stage-1 parts that serve narrower constituencies — D4's packed-GEMM
+  half (convolution) and D2b (f32 element-wise) — until after.
+
+`bkit` therefore moves **earlier** than the original plan, without `bkit`
+paying for a single-threaded histogram or the array layer being left
+half-finished.
+
+**Requirement this places on D3:** the thread pool must be a *reusable
+primitive*, not something welded into the `nd_*` kernels, because `tree_` and
+later `tok_` need it too. If D3 ships a pool that only `nd_*` can call, this
+interleave stops working and `bkit` is back to single-threaded.
+
+---
+
 ### E18 — `bsci.optimize` does not depend on `btorch`
 See §2. The bridge is a documented pattern, not a dependency edge.
 
@@ -347,7 +406,7 @@ regression cannot hide.
 
 | stage | what | where | design doc |
 |---|---|---|---|
-| **1** | dtype templating → f32 → deterministic threading → packed GEMM | binary + `numba` | [`numba-dtype-architecture.md`](numba-dtype-architecture.md) |
+| **1** | dtype templating → f32 → **f32 GEMM** → deterministic threading → (packed GEMM, generic functors deferred — E20) | binary + `numba` | [`numba-dtype-architecture.md`](numba-dtype-architecture.md) |
 | **2** | the engine field + dependency check | binary (package manager) | §7.2 below |
 | **3** | `bkit` with GBDT | new package | [`bkit-architecture.md`](bkit-architecture.md) |
 | **4** | `bonnx` import | new package | [`bonnx-architecture.md`](bonnx-architecture.md) |
@@ -476,10 +535,12 @@ Recorded rather than guessed, with the measurement that would settle each.
 |---|---|
 | **D1** dtype templating pass | ✅ done — 18 suites green, `numba_fastpath_test.b` exact, paired A/B shows no regression |
 | **D2a** f32 in numba | ✅ done — `tests/numba_f32_test.b` 78/78; stores in 4 bytes, **computes in double** (N29) |
-| **D2b** f32 arithmetic | next — make the ~55 ufunc functors generic so f32 work happens at f32 width |
-| **D2c** btorch f32 plumbing | **blocked on D4**: `nd_matmul` returns f64 for f32 input (N31), so a `Linear` layer would undo f32 at the first layer |
-| **D3** deterministic threading | not started |
-| **D4** packed GEMM **+ f32 GEMM** | not started; the f32-GEMM half is what unblocks D2c |
+| **D4 f32 GEMM** (half of D4, pulled forward — E20) | ✅ done — `nd_matmul`/`nd_dot` preserve f32 with an **f64 accumulator**; measured 5.93e-08 at K=1024 |
+| **D2c** btorch f32 plumbing | ✅ done — `set_default_dtype`, optional dtype on 9 constructors, `Module.to/float/double/dtype`, f32 `.btsd`; `tests/btorch_f32_test.b` 36/36. **MNIST MLP in f32: 97.99% against f64's 98.16%, on exactly half the memory (210.8 MB vs 421.0 MB)** |
+| **D3** deterministic threading | **next** — the largest multiplier, and `bkit` wants it too (E21). Must ship the pool as a *reusable primitive* |
+| **stage 2 + stage 3 (`bkit`)** | after D3, moved earlier than originally planned (E21) |
+| **D4** packed GEMM (skinny shapes) | deferred — helps convolution only |
+| **D2b** generic ufunc functors | deferred — helps f32 element-wise only; its benefit was gated behind D4 (E20) |
 
 Three things f32 falsified, each of which would have been silent, and each now
 pinned by a named assertion rather than by luck:
