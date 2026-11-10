@@ -21,12 +21,14 @@ enum class Kind : uint8_t {
 
 inline DType computeDType(Kind k, DType a, DType b) {
     switch (k) {
-        case Kind::REAL:      return DType::F64;
+        case Kind::REAL:      return (promote(a, b) == DType::F32) ? DType::F32
+                                                                   : DType::F64;
         // A predicate asks a question only a float can answer, so it computes
         // in f64 whatever it was handed. Letting it promote to i64 sent it down
         // the integer path, where these ops have no meaningful kernel at all:
         // nd_isfinite(nd([1], "i64")) returned FALSE.
-        case Kind::PREDICATE: return DType::F64;
+        case Kind::PREDICATE: return (promote(a, b) == DType::F32) ? DType::F32
+                                                                   : DType::F64;
         // Truthiness is `!= 0`, which has to be evaluated in the operand's own
         // type. Computing logic in BOOL meant f64 operands were converted by
         // ROUNDING, so 0.4 was false and 0.6 was true -- llround, not truth.
@@ -50,6 +52,25 @@ inline DType computeDType(Kind k, DType a, DType b) {
         }
     }
     return DType::F64;
+}
+
+// ── a bare Bantu number is a WEAK operand (D2) ───────────────────────────────
+// Without this, `x * 0.5` on an f32 array returns f64, and ONE scalar multiply
+// undoes the entire point of f32. Bantu numbers are doubles, so a literal
+// becomes an f64 array and the promotion lattice dutifully widens the result.
+// NumPy solves this with NEP 50's weak scalars and PyTorch with the same idea.
+//
+// Deliberately narrow: this fires ONLY where a scalar's f64 meets an f32 array.
+// Every pre-f32 combination is untouched and bit-identical -- notably
+// `i64_array + 1.5`, which still gives f64, because the scalar is not being
+// weakened against an f32 operand. A real f64 ARRAY against an f32 array also
+// still widens to f64, since only a bare number is weak.
+inline DType weakDType(const Value& v, const NdArray& self, DType other) {
+    if (self.dtype == DType::F64 && other == DType::F32 &&
+        (v.isNumber() || v.isBool())) {
+        return DType::F32;
+    }
+    return self.dtype;
 }
 
 inline DType resultDType(Kind k, DType compute) {
@@ -139,7 +160,11 @@ inline void copyInto(const NdArray& src, NdArray& dst, const char* what) {
 // integer is the only reading of such a call. Converting 1.5 would be a guess,
 // so that is an error naming the value rather than a silent rounding.
 inline ArrayPtr asIntegerOperand(const ArrayPtr& a, const char* what) {
-    if (a->dtype != DType::F64) return a;
+    // Any FLOAT dtype goes through the integrality check, not just f64 (D2).
+    // Accepting an integral-valued f64 array while refusing the identical f32
+    // one would make f32 a dtype with surprising holes; widening f32 to f64
+    // here is exact, so the check below is unchanged.
+    if (a->dtype != DType::F64 && a->dtype != DType::F32) return a;
     ArrayPtr c = contiguousCopy(a, DType::F64);
     const double* p = c->ptr<double>();
     const size_t n = c->size();
@@ -155,6 +180,81 @@ inline ArrayPtr asIntegerOperand(const ArrayPtr& a, const char* what) {
     return contiguousCopy(c, DType::I64);
 }
 
+// --- one arm of each tier, over the compute type (D1) ------------------------
+// The float and integer arms of all three binary tiers and both unary tiers
+// were structurally identical modulo T and which functor they carried -- six
+// near-duplicate blocks. Each is now written ONCE over T, so:
+//
+//   * a new dtype (f32 in D2, i8 in ecosystem stage 6) is ONE line per call
+//     site instead of a copied block, and
+//   * the tiers cannot drift apart, which is how tier 1 came to be dead code
+//     in the first place (see the tier-1 comment inside applyBinary).
+//
+// BOOL compute keeps its own arm at each site rather than joining these: its
+// functor is called on WIDENED ints (`x ? 1 : 0`) and it has no arithmetic
+// form at all, so folding it in would need a narrower helper for every caller.
+
+template <class T, class Op>
+inline void binTier0(const NdArray& a, const NdArray& b, NdArray& out,
+                     size_t n, bool boolOut, Op op) {
+    const T* ap = a.ptr<T>();
+    const T* bp = b.ptr<T>();
+    if (boolOut) tier0cmp(ap, bp, out.ptr<uint8_t>(), n,
+                          [&](T x, T y) { return op(x, y) != T(0); });
+    else         tier0(ap, bp, out.ptr<T>(), n, op);
+}
+
+template <class T, class Op>
+inline void binTier1(const NdArray& arr, const NdArray& scl, NdArray& out,
+                     size_t n, bool boolOut, bool scalarRight, Op op) {
+    const T* p = arr.ptr<T>();
+    const T  s = load<T>(scl, scl.offset);
+    if (boolOut) {
+        uint8_t* o = out.ptr<uint8_t>();
+        if (scalarRight) for (size_t i = 0; i < n; i++) o[i] = op(p[i], s) != T(0) ? 1 : 0;
+        else             for (size_t i = 0; i < n; i++) o[i] = op(s, p[i]) != T(0) ? 1 : 0;
+    } else {
+        T* o = out.ptr<T>();
+        if (scalarRight) tier1(p, s, o, n, op);
+        else             tier1r(s, p, o, n, op);
+    }
+}
+
+template <class T, class Op>
+inline void binTier2(const NdArray& A, const NdArray& B, NdArray& O,
+                     const std::vector<size_t>& sh,
+                     const std::vector<std::vector<ptrdiff_t>>& st,
+                     const std::vector<size_t>& offs, bool boolOut, Op op) {
+    nditer(sh, st, offs, [&](const size_t* o) {
+        const T r = op(load<T>(A, o[0]), load<T>(B, o[1]));
+        // The bool result goes through storeI deliberately: the destination is
+        // BOOL and the value is already reduced to 0/1, so store<T> would send
+        // a double back through setFromDouble's `!= 0.0` for nothing.
+        if (boolOut) storeI(O, o[2], r != T(0) ? 1 : 0);
+        else         store<T>(O, o[2], r);
+    });
+}
+
+template <class T, class Op>
+inline void unTier0(const NdArray& a, NdArray& out, size_t n, bool boolOut, Op op) {
+    const T* ap = a.ptr<T>();
+    if (boolOut) tier0cmp(ap, ap, out.ptr<uint8_t>(), n,
+                          [&](T x, T) { return op(x) != T(0); });
+    else         tier0u(ap, out.ptr<T>(), n, op);
+}
+
+template <class T, class Op>
+inline void unTier2(const NdArray& A, NdArray& O,
+                    const std::vector<size_t>& sh,
+                    const std::vector<std::vector<ptrdiff_t>>& st,
+                    const std::vector<size_t>& offs, bool boolOut, Op op) {
+    nditer(sh, st, offs, [&](const size_t* o) {
+        const T r = op(load<T>(A, o[0]));
+        if (boolOut) storeI(O, o[1], r != T(0) ? 1 : 0);
+        else         store<T>(O, o[1], r);
+    });
+}
+
 template <class FD, class FI>
 
 inline Value applyBinary(const char* what, Kind kind,
@@ -166,7 +266,8 @@ inline Value applyBinary(const char* what, Kind kind,
         b = asIntegerOperand(b, what);
     }
     const std::vector<size_t> shape = broadcastShapes(a->shape, b->shape, what);
-    const DType cdt = computeDType(kind, a->dtype, b->dtype);
+    const DType cdt = computeDType(kind, weakDType(av, *a, b->dtype),
+                                         weakDType(bv, *b, a->dtype));
     if (kind == Kind::BITWISE && cdt != DType::I64) {
         throw std::runtime_error(std::string(what) +
             ": bitwise operations need integers, got " + dtypeName(cdt));
@@ -187,21 +288,11 @@ inline Value applyBinary(const char* what, Kind kind,
                       a->isCContig() && b->isCContig() && out->isCContig() &&
                       a->dtype == cdt && b->dtype == cdt && out->dtype == rdt;
     if (flat) {
-        if (cdt == DType::F64) {
-            const double* ap = a->ptr<double>();
-            const double* bp = b->ptr<double>();
-            if (rdt == DType::BOOL)
-                tier0cmp(ap, bp, out->ptr<uint8_t>(), n,
-                         [&](double x, double y) { return fd(x, y) != 0.0; });
-            else tier0(ap, bp, out->ptr<double>(), n, fd);
-        } else if (cdt == DType::I64) {
-            const int64_t* ap = a->ptr<int64_t>();
-            const int64_t* bp = b->ptr<int64_t>();
-            if (rdt == DType::BOOL)
-                tier0cmp(ap, bp, out->ptr<uint8_t>(), n,
-                         [&](int64_t x, int64_t y) { return fi(x, y) != 0; });
-            else tier0(ap, bp, out->ptr<int64_t>(), n, fi);
-        } else {   // BOOL compute: logic ops only
+        const bool boolOut0 = (rdt == DType::BOOL);
+        if      (cdt == DType::F64) binTier0<double >(*a, *b, *out, n, boolOut0, fd);
+        else if (cdt == DType::F32) binTier0<float  >(*a, *b, *out, n, boolOut0, fd);
+        else if (cdt == DType::I64) binTier0<int64_t>(*a, *b, *out, n, boolOut0, fi);
+        else {   // BOOL compute: logic ops only, functor called on widened ints
             const uint8_t* ap = a->ptr<uint8_t>();
             const uint8_t* bp = b->ptr<uint8_t>();
             tier0cmp(ap, bp, out->ptr<uint8_t>(), n,
@@ -247,40 +338,18 @@ inline Value applyBinary(const char* what, Kind kind,
         // n > 1 so that a 1-element result (where both sides are size 1) keeps
         // going to tier 2 -- there is nothing to vectorize and the odometer is
         // already correct for it.
-        if (outFlat && n > 1 && (cdt == DType::F64 || cdt == DType::I64) &&
+        if (outFlat && n > 1 &&
+            (cdt == DType::F64 || cdt == DType::F32 || cdt == DType::I64) &&
             ((aFull && bOne) || (bFull && aOne))) {
             const bool scalarRight = (aFull && bOne);
             const NdArray& arr = scalarRight ? *a : *b;
             const NdArray& scl = scalarRight ? *b : *a;
-            if (cdt == DType::F64) {
-                const double* p = arr.ptr<double>();
-                const double  s = loadD(scl, scl.offset);
-                if (rdt == DType::BOOL) {
-                    uint8_t* o = out->ptr<uint8_t>();
-                    if (scalarRight)
-                        for (size_t i = 0; i < n; i++) o[i] = fd(p[i], s) != 0.0 ? 1 : 0;
-                    else
-                        for (size_t i = 0; i < n; i++) o[i] = fd(s, p[i]) != 0.0 ? 1 : 0;
-                } else {
-                    double* o = out->ptr<double>();
-                    if (scalarRight) tier1(p, s, o, n, fd);
-                    else             tier1r(s, p, o, n, fd);
-                }
-            } else {
-                const int64_t* p = arr.ptr<int64_t>();
-                const int64_t  s = loadI(scl, scl.offset);
-                if (rdt == DType::BOOL) {
-                    uint8_t* o = out->ptr<uint8_t>();
-                    if (scalarRight)
-                        for (size_t i = 0; i < n; i++) o[i] = fi(p[i], s) != 0 ? 1 : 0;
-                    else
-                        for (size_t i = 0; i < n; i++) o[i] = fi(s, p[i]) != 0 ? 1 : 0;
-                } else {
-                    int64_t* o = out->ptr<int64_t>();
-                    if (scalarRight) tier1(p, s, o, n, fi);
-                    else             tier1r(s, p, o, n, fi);
-                }
-            }
+            const bool boolOut1 = (rdt == DType::BOOL);
+            if      (cdt == DType::F64)
+                 binTier1<double >(arr, scl, *out, n, boolOut1, scalarRight, fd);
+            else if (cdt == DType::F32)
+                 binTier1<float  >(arr, scl, *out, n, boolOut1, scalarRight, fd);
+            else binTier1<int64_t>(arr, scl, *out, n, boolOut1, scalarRight, fi);
             if (plan.finalOut) copyInto(*out, *plan.finalOut, what);
             return wrap(plan.finalOut ? plan.finalOut : out);
         }
@@ -298,17 +367,14 @@ inline Value applyBinary(const char* what, Kind kind,
 
     const NdArray& A = *a; const NdArray& B = *b; NdArray& O = *out;
     const bool boolOut = (rdt == DType::BOOL);
-    if (cdt == DType::I64 || cdt == DType::BOOL) {
-        nditer(sh, st, offs, [&](const size_t* o) {
-            const int64_t r = fi(loadI(A, o[0]), loadI(B, o[1]));
-            if (boolOut) storeI(O, o[2], r != 0 ? 1 : 0); else storeI(O, o[2], r);
-        });
-    } else {
-        nditer(sh, st, offs, [&](const size_t* o) {
-            const double r = fd(loadD(A, o[0]), loadD(B, o[1]));
-            if (boolOut) storeI(O, o[2], r != 0.0 ? 1 : 0); else storeD(O, o[2], r);
-        });
-    }
+    // One call covers I64 and BOOL compute together: load<int64_t>/store<int64_t>
+    // ARE loadI/storeI, which already widen a BOOL operand to 0/1 and narrow
+    // back on the way out -- exactly what the old two-arm form did by hand.
+    if (cdt == DType::I64 || cdt == DType::BOOL)
+         binTier2<int64_t>(A, B, O, sh, st, offs, boolOut, fi);
+    else if (cdt == DType::F32)
+         binTier2<float  >(A, B, O, sh, st, offs, boolOut, fd);
+    else binTier2<double >(A, B, O, sh, st, offs, boolOut, fd);
     if (plan.finalOut) copyInto(*out, *plan.finalOut, what);
     return wrap(plan.finalOut ? plan.finalOut : out);
 }
@@ -336,19 +402,11 @@ inline Value applyUnary(const char* what, Kind kind,
     const bool flat = a->isCContig() && out->isCContig() &&
                       a->dtype == cdt && out->dtype == rdt;
     if (flat) {
-        if (cdt == DType::F64) {
-            const double* ap = a->ptr<double>();
-            if (rdt == DType::BOOL)
-                tier0cmp(ap, ap, out->ptr<uint8_t>(), n,
-                         [&](double x, double) { return fd(x) != 0.0; });
-            else tier0u(ap, out->ptr<double>(), n, fd);
-        } else if (cdt == DType::I64) {
-            const int64_t* ap = a->ptr<int64_t>();
-            if (rdt == DType::BOOL)
-                tier0cmp(ap, ap, out->ptr<uint8_t>(), n,
-                         [&](int64_t x, int64_t) { return fi(x) != 0; });
-            else tier0u(ap, out->ptr<int64_t>(), n, fi);
-        } else {
+        const bool boolOutU = (rdt == DType::BOOL);
+        if      (cdt == DType::F64) unTier0<double >(*a, *out, n, boolOutU, fd);
+        else if (cdt == DType::F32) unTier0<float  >(*a, *out, n, boolOutU, fd);
+        else if (cdt == DType::I64) unTier0<int64_t>(*a, *out, n, boolOutU, fi);
+        else {   // BOOL compute: functor called on widened ints
             const uint8_t* ap = a->ptr<uint8_t>();
             tier0cmp(ap, ap, out->ptr<uint8_t>(), n,
                      [&](uint8_t x, uint8_t) { return fi(x ? 1 : 0) != 0; });
@@ -363,17 +421,11 @@ inline Value applyUnary(const char* what, Kind kind,
     const std::vector<size_t> offs = { a->offset, out->offset };
     const NdArray& A = *a; NdArray& O = *out;
     const bool boolOut = (rdt == DType::BOOL);
-    if (cdt == DType::I64 || cdt == DType::BOOL) {
-        nditer(sh, st, offs, [&](const size_t* o) {
-            const int64_t r = fi(loadI(A, o[0]));
-            storeI(O, o[1], boolOut ? (r != 0 ? 1 : 0) : r);
-        });
-    } else {
-        nditer(sh, st, offs, [&](const size_t* o) {
-            const double r = fd(loadD(A, o[0]));
-            if (boolOut) storeI(O, o[1], r != 0.0 ? 1 : 0); else storeD(O, o[1], r);
-        });
-    }
+    if (cdt == DType::I64 || cdt == DType::BOOL)
+         unTier2<int64_t>(A, O, sh, st, offs, boolOut, fi);
+    else if (cdt == DType::F32)
+         unTier2<float  >(A, O, sh, st, offs, boolOut, fd);
+    else unTier2<double >(A, O, sh, st, offs, boolOut, fd);
     if (plan.finalOut) copyInto(*out, *plan.finalOut, what);
     return wrap(plan.finalOut ? plan.finalOut : out);
 }

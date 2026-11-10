@@ -246,9 +246,11 @@ inline void registerUfuncExtras(const DefineFn& define) {
         std::vector<size_t> shape = x->shape;
         if (lo) shape = broadcastShapes(shape, lo->shape, "nd_clip");
         if (hi) shape = broadcastShapes(shape, hi->shape, "nd_clip");
+        // Bare numeric bounds are weak, so clip(f32, 1.0, 2.0) stays f32
+        // rather than widening the array to f64 (see weakDType).
         DType rdt = x->dtype;
-        if (lo) rdt = promote(rdt, lo->dtype);
-        if (hi) rdt = promote(rdt, hi->dtype);
+        if (lo) rdt = promote(rdt, weakDType(a[1], *lo, x->dtype));
+        if (hi) rdt = promote(rdt, weakDType(a[2], *hi, x->dtype));
         if (rdt == DType::BOOL) rdt = DType::I64;
 
         const Value* outArg = outOf(a, 3);

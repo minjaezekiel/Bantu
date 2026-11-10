@@ -101,6 +101,75 @@ from the storage type.** An f32 sum accumulated in f32 loses precision badly
 = double` keeps f32 arrays with f64-quality reductions, which is what NumPy
 does and what makes f32 usable for training at all.
 
+### 2.4 What implementation changed about the plan
+
+Two refinements, found while doing the work rather than while planning it.
+
+**A macro was the wrong tool for the ufunc layer.** The plan sketched one
+`NB_DISPATCH_REAL(cdt, T, {...})` replacing each `if (cdt == F64) {...} else
+{...}` pair. That turned out to make the code *longer*, because the three arms
+are not identical modulo `T`: the float arm calls the `fd` functor, the integer
+arm calls `fi`, and the BOOL arm calls `fi` on **widened** ints (`x ? 1 : 0`)
+and has no arithmetic form at all. Folding them under one macro would have
+needed an `if constexpr` ladder inside the macro body — more code, and harder
+to read than what it replaced.
+
+What actually works is extracting each arm into a **type-templated helper**:
+
+```cpp
+template <class T, class Op>
+inline void binTier0(const NdArray& a, const NdArray& b, NdArray& out,
+                     size_t n, bool boolOut, Op op) { ... }
+```
+
+and leaving a one-line dispatch at the call site:
+
+```cpp
+if      (cdt == DType::F64) binTier0<double >(*a, *b, *out, n, boolOut0, fd);
+else if (cdt == DType::I64) binTier0<int64_t>(*a, *b, *out, n, boolOut0, fi);
+else { /* BOOL: widened functor, cmp form only */ }
+```
+
+D2 then adds `else if (cdt == DType::F32) binTier0<float>(..., fd);` — one line
+per site, which was the whole goal. Six near-duplicate blocks across
+`applyBinary`'s three tiers and `applyUnary`'s two became five helpers.
+
+So the deliverable is sharper than "replace branches with a macro": **every
+dtype-specific arm becomes a call to a type-templated helper.** The two macros
+still exist and are still the right tool where arms *are* pure storage moves
+(copy, cast, byte I/O, `blockCopy`) — hence the split between them:
+
+| macro | dispatches on | used by |
+|---|---|---|
+| `NB_DISPATCH_COMPUTE` | the **arithmetic** width (`double` \| `int64_t`) | ufuncs, reductions |
+| `NB_DISPATCH_STORAGE` | the **stored** width (`double` \| `int64_t` \| `uint8_t`) | copy, cast, byte I/O |
+
+That split is itself a finding. The old code conflated the two: BOOL compute
+went down the integer arm and arithmetic happened in `int64_t`, which is
+correct (counting bools in `uint8_t` wraps at 255) but was nowhere stated.
+`dtypeTraits<uint8_t>::acc = int64_t` now says it.
+
+**f32 correctness is nearly free; only speed needs arms.** The second finding
+changes D2's shape. Every generic path in the library funnels through
+`getAsDouble` / `setFromDouble` (`ndarray_native.hpp:519`), and every reduction
+funnels through a `double`-returning callback. So adding an `F32` case to those
+few accessors makes **every kernel in the library work correctly on f32 at
+once** — slowly, through the strided path, but correctly.
+
+The fast paths then become opt-in performance, one templated arm at a time.
+That makes D2 tractable in a way the original phase description did not convey:
+
+1. `DType::F32` through the enum, `itemsize`, `dtypeName`, `dtypeFromName`, `promote`
+2. `F32` cases in `getAsDouble`, `setFromDouble`, `loadI`, `storeI`, `getAsValue`
+   — **this is the point at which f32 works everywhere**
+3. allocation and constructors (`nd_zeros(..., "f32")`), `nd_astype`, `contiguousCopy`
+4. fast-path arms: ufunc tiers (one line each), `extremeFast<float>`, matmul
+5. `nd_frombytes`/`nd_tobytes` (the `f32le`/`f32be` *codes* already exist and
+   widen to f64; D2 makes f32 a storage dtype rather than only a wire format)
+
+Correctness first through the generic path, then speed through arms — rather
+than dtype-by-kernel, which would leave the library half-f32 for a long time.
+
 ### 2.3 D1 gate
 
 - Every test in the tree passes, and **`numba_fastpath_test.b`'s exact-equality

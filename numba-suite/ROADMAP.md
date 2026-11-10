@@ -240,11 +240,54 @@ changes no stride arithmetic anywhere.**
 
 | Item | How | Feature test | Stress test | Status |
 |---|---|---|---|---|
-| **D1 dtype templating pass** — no new dtype; every kernel body written once over `T` | `NB_DISPATCH_REAL`/`NB_DISPATCH_ALL` macros replace the hand-written `if (cdt == F64) {…} else {…}` pairs; `loadD`/`storeD` → `load<T>`/`store<T>`; `itemsize` becomes a real table; a `dtypeTraits<T>` struct carrying **`acc`, the accumulator type, separately from the storage type** | **every existing test bit-identical**, with `numba_fastpath_test.b`'s exact-equality assertions the canary | `benchmarks/run.sh` paired A/B against the pre-refactor binary: no regression beyond noise (if the compiler fails to inline through the macro, it shows up here) | [ ] |
-| **D2 `f32`** | `DType::F32` through the enum, `itemsize`, `dtypeName`, `parseElem`, `promote`, `nd_astype`, every constructor, every kernel, `nd_frombytes`/`nd_tobytes`, `.btsd` | f32 within 1e-6 relative of the f64 answer for every op; the promotion lattice asserted exhaustively; `inf`/`NaN`/subnormal round-trips; `astype` overflow lands on `±inf` | **f64 paths bit-identical**; `nd_live_bytes` for an f32 array is **exactly half**; **btorch's MLP gate re-run in f32 — within 0.3% of 98.16%** | [ ] |
+| **D1 ✅ dtype templating pass** — no new dtype; every kernel body written once over `T` | six near-duplicate dispatch blocks → five type-templated arms (`binTier0/1/2`, `unTier0/2`), plus `extremeFast<T>` and `sumContigT<T>`; `load<T>`/`store<T>` beside `loadD`/`storeD`; `itemsize` a real table; `dtypeTraits<T>` carrying **`acc` separately from the storage type**; `NB_DISPATCH_COMPUTE` (arithmetic width) and `NB_DISPATCH_STORAGE` (stored width) for the pure-storage sites | **all 18 numba + btorch suites green**, `numba_fastpath_test.b`'s exact bit-equality assertions among them | paired A/B vs the pre-D1 binary, 6 rounds per side, alternating order, each case calibrated to ~400 ms: **no case regressed on both min and median** | [x] |
+| **D2a ✅ `f32` in numba** (stores in 4 bytes; **computes in double** — N29) | `DType::F32` through the enum, `itemsize`, `dtypeName`, `dtypeFromName`, `promote`, the three generic accessors, `loadI`/`storeI`, both dispatch macros, `narrowToFloat` saturation, weak scalars (N28), `reduceDType`/`floatResultDType` (N30), f32 arms in all five ufunc tiers + `extremeFast<float>` + `sumContigT<float>` | `tests/numba_f32_test.b` **74/74**: f32 within 1e-6 of the f64 answer per op class; promotion lattice exhaustive; every reduction's and scan's result dtype asserted by name; `inf`/`NaN`/subnormal round-trips; narrowing overflow saturates rather than UB | **f64 bit-identical** (all 18 prior suites green, `numba_fastpath_test.b` exact); `nd_nbytes` f32 **exactly half** f64; accumulator split proven at **2.89e-08** on a case f32 arithmetic cannot represent | [x] |
+| **D2c btorch f32 plumbing** — `bt.tensor(..., "f32")`, `Module.to("f32")`, `serialize._elemFor` f32 | needed before any f32 training gate can run at all | — | **the MNIST MLP gate re-run in f32: within 0.3% of the f64 98.16%** — NOT yet attempted | [ ] |
+| **D2b `f32` arithmetic** — the ~55 ufunc functors become generic (`[](auto x, auto y)`) so f32 work happens at f32 width | mechanical; f64 deduces `double` and stays bit-identical | f32 element-wise measurably faster than f64, not merely smaller | — | [ ] |
 | **D3 deterministic threading** | a pool with a **fixed partition computed from shape and thread count-independently**, `nd_set_threads(n)`, default **1** (opt-in) | **bit-identical output at 1, 2, 4, 8, 16 threads**, asserted with exact equality | TSan (new tier) + ASan + UBSan; `nd_live_bytes` returns to its pre-call value; 20,000 threaded calls leak 0 bytes; **no per-call heap allocation** | [ ] |
-| **D4 packed GEMM** for skinny shapes (`K=25, N=6`) | register-blocked `A`/`B` panels, a measured `4×4` or `8×4` micro-kernel, shape-gated | `numba_fastpath_test.b` unchanged and passing | no regression at the large square shapes already at 7.8 GFLOP/s | [ ] |
+| **D4 packed GEMM + f32 GEMM** for skinny shapes (`K=25, N=6`); also makes matmul preserve f32 (**f32 in, f64 accumulator, f32 out** — N31), which is what unblocks D2c | register-blocked `A`/`B` panels, a measured `4×4` or `8×4` micro-kernel, shape-gated | `numba_fastpath_test.b` unchanged and passing | no regression at the large square shapes already at 7.8 GFLOP/s | [ ] |
 | **D5 FFT** (for `bsci`, ecosystem stage 6) | radix-4 for powers of two, mixed-radix for small prime factors, **Bluestein for arbitrary lengths**; `nd_rfft`/`nd_irfft` for real input | `ifft(fft(x)) == x` to 1e-12; **Parseval**; `rfft` agrees with `fft` on the first `N/2+1` bins | 10M-point transform; **every length works** — no silent zero-padding | [ ] |
+
+### Results so far
+
+**D1 — the templating pass.** Six near-duplicate dispatch blocks across
+`applyBinary`'s three tiers and `applyUnary`'s two became five type-templated
+arms (`binTier0/1/2`, `unTier0/2`), plus `extremeFast<T>` for the reduction
+fast path and `sumContigT<T>` for the summation one. A new dtype is now **one
+line per call site**.
+
+Gate: all 18 numba and btorch suites green, **`numba_fastpath_test.b` included**
+— it asserts exact bit-equality against the generic paths, which makes it the
+right canary for this refactor. Paired A/B against the pre-D1 binary, 6 rounds
+per side with alternating order and each case calibrated to ~400 ms: **no case
+regressed on both min and median.** (A first A/B run was discarded: every case
+shifted ~20-30% *except* the two longest-running ones, the signature of
+session-wide drift rather than of a code change.)
+
+**D2a — f32 exists and is correct.** `tests/numba_f32_test.b`, **74/74**.
+
+The shape of the work was not what the plan assumed. Every generic path funnels
+through `getAsDouble`/`setFromDouble` and every reduction through a
+`double`-returning callback, so adding `F32` to a handful of accessors made the
+whole library work on f32 at once; the fast paths were then one templated arm
+each. Correctness first, speed per-arm — rather than dtype-by-kernel, which
+would have left the library half-f32 for a long time.
+
+Two things f32 falsified, both of which would have been silent:
+
+| finding | effect before the fix |
+|---|---|
+| **N28** a bare Bantu number is an f64 array, so it widened f32 | `f32_array + 0.5` returned **f64** — one scalar multiply undid the dtype |
+| **N30** three kernels encoded "not f64 therefore i64" | `nd_cumsum` on f32 returned **i64**, truncating 1116.8 to 1117 (relative error 1.0, against the 5.9e-8 f32 storage permits) |
+
+Proven, not assumed: the accumulator split (N24) is pinned by summing 2^25
+followed by 999,999 ones — a case f32 arithmetic *cannot* represent, since
+f32's ulp at 2^25 is 4.0 and a naive f32 accumulator cannot move at all.
+Measured relative error **2.89e-08**, against ~2.9e-2 for an f32 accumulator.
+
+Honest limit (N29): f32 **stores** in 4 bytes but **computes** in double,
+because the ufunc functors are declared `[](double, double)`. Half the memory,
+no SIMD-width gain yet. That is D2b.
 
 ### The `Pairwise` problem — why D3 is not a scheduling exercise
 

@@ -363,3 +363,129 @@ lengths. Skipping Bluestein is the tempting shortcut and it is a silent bug —
 zero-padded spectrum is wrong in a way that looks entirely plausible.
 
 Ecosystem-wide this is [E4].
+
+---
+
+### N28 — a bare Bantu number is a WEAK operand against f32
+**Found by implementation, and f32 is useless without it.**
+
+Bantu numbers are doubles, so a literal becomes an f64 array and the promotion
+lattice dutifully widens: `f32_array + 0.5` returned **f64**. One scalar
+multiply — `grad * lr`, `x * 0.5`, the `1/n` in every mean — would promote an
+entire f32 model back to f64 and undo the whole point of the dtype. Measured
+before the fix:
+
+```
+f32 + 0.5  -> f64        f32 * 2  -> f64
+```
+
+So a bare number (or bool) is **weak**: it does not drive the result dtype
+against an f32 array. NumPy reached the same conclusion in NEP 50 and PyTorch
+has always worked this way.
+
+Deliberately narrow — `weakDType` fires **only** where a scalar's f64 meets an
+f32 array:
+
+- `i64_array + 1.5` still gives **f64**. The scalar is not being weakened
+  against an f32 operand, so the pre-f32 lattice is untouched and nothing that
+  worked before changes by a bit.
+- a real f64 **array** against an f32 array still widens to f64. Only a bare
+  number is weak; an array is an explicit statement of precision.
+
+**Rejected:** general value-based casting (inspecting whether `1.0` "looks like"
+an integer). Bantu cannot distinguish `1` from `1.0` — both are doubles — so
+any value-based rule would be guessing, and guessing about precision is how you
+get a library whose dtypes depend on the data.
+
+---
+
+### N29 — f32 stores in 4 bytes but currently COMPUTES in double
+The honest limit of what landed, recorded so the next person does not have to
+measure it to find out.
+
+f32 was meant to buy two things: half the memory and twice the SIMD width. **It
+delivers the first, not yet the second.** The ufunc functors are declared
+`[](double x, double y)` in `ndarray_ufunc_reg.hpp`, so an f32 operand is
+promoted to double, the arithmetic happens in double, and the result is narrowed
+back to float on store.
+
+That is *more* accurate than true f32 arithmetic and perfectly correct — but it
+means no f32 vector-width gain on element-wise work.
+
+Getting it needs the ~55 registered functors to become generic (`[](auto x,
+auto y)`), which is mechanical but touches every ufunc, so it is split out as
+**D2b** rather than smuggled into a change that is already large. For f64 the
+generic form deduces `double` and is bit-identical, so D2b carries no risk to
+existing paths — it was separated for reviewability, not for safety.
+
+Memory is the win that is real today, and for training it is the one that
+matters more: it is what lets a model and its optimizer state fit.
+
+---
+
+### N30 — "not f64" never again means "therefore integer"
+Three separate kernels had independently written the rule
+
+```cpp
+const DType rdt = (x->dtype == DType::F64) ? DType::F64 : DType::I64;
+```
+
+which was correct while the only float dtype was f64, and became **silently
+destructive** the moment f32 existed: `nd_cumsum` on an f32 array returned
+**i64**, truncating every partial sum to a whole number. Measured: a cumsum
+whose true values ran to 1116.8 returned 1117, a relative error of 1.0 against
+the 5.9e-8 that f32 storage actually permits.
+
+`nd_sum`, `nd_prod`, `nd_cumsum`, `nd_cumprod`, `nd_diff` and `nd_unique` all
+carried a copy of it. The replacement is two named rules, written once in
+`ndarray_reduce.hpp`:
+
+| rule | for | behaviour |
+|---|---|---|
+| `reduceDType(in)` | sum, prod, cumsum, cumprod, diff, unique | a float keeps its own width; everything integer-ish becomes i64 |
+| `floatResultDType(in)` | mean, var, std, median, quantile, nan* | always a float; f32 stays f32 rather than widening |
+
+The second rule matters as much as the first and is less obvious: widening
+`mean(f32)` to f64 is not *wrong*, but it promotes a whole f32 pipeline back to
+f64 one call in — the same failure as N28, arriving through reductions instead
+of scalars.
+
+A `grep` for the old pattern across `ndarray_*` now returns nothing, and
+`tests/numba_f32_test.b` asserts the result dtype of **every** reduction and
+scan by name so a fourth copy cannot reappear quietly.
+
+---
+
+### N31 — linear algebra stays f64 for now, and that is why btorch f32 is not reachable yet
+`nd_matmul`, `nd_dot`, `nd_solve`, `nd_inv`, `nd_det` and every decomposition
+compute on `double*` buffers and **return f64 whatever dtype they were given.**
+Values are correct — a 4x4 f32 solve agrees with the f64 answer to 1.37e-07,
+which is f32 input resolution — but the dtype is not preserved.
+
+For the decompositions that is a defensible permanent choice: LU, QR, Cholesky,
+Jacobi eigh and SVD are precision-sensitive and are not in a training hot path,
+so computing and returning f64 is the right default.
+
+**For `nd_matmul` it is a real limitation**, because matmul is the operation a
+neural network is made of. Until it preserves f32, a `Linear` layer turns an
+f32 model back into f64 at the first layer — the same failure as N28 and N30,
+arriving through linear algebra. That is the concrete reason item **D2c**
+(btorch f32 plumbing) is recorded as not yet reachable rather than merely not
+yet done.
+
+The fix is not "return f32": it is **f32 in, f64 accumulator, f32 out**, which
+is what every real BLAS does for mixed precision and what N24 already requires
+elsewhere. Writing it needs the blocked kernels templated over the input type
+with the accumulator held separately — and those kernels are being rewritten in
+**D4** (the packed GEMM) anyway, so doing it twice would be waste.
+
+**Rejected:** widening both inputs to f64, multiplying, and storing the result
+as f32. It would preserve the dtype today and keep full accuracy, but it
+allocates an f64 copy of both operands — doubling peak memory on the largest
+arrays in the program, which is precisely the cost f32 was adopted to avoid.
+Correct dtype bought with the memory f32 exists to save is not a trade worth
+making.
+
+Pinned, not left to chance: `tests/numba_f32_test.b` asserts all four current
+return dtypes by name, with a comment saying these are the assertions to change
+when D4 lands.

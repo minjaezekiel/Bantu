@@ -470,10 +470,29 @@ Recorded rather than guessed, with the measurement that would settle each.
 
 ## Where to resume
 
-**Stage 1, phase D1** — the dtype templating pass. Nothing is built yet; this
-document and the five design docs beside it are the whole of the work so far.
+**Stage 1: D1 and D2a are done. D2b is next, then D3, D4.**
+
+| item | state |
+|---|---|
+| **D1** dtype templating pass | ✅ done — 18 suites green, `numba_fastpath_test.b` exact, paired A/B shows no regression |
+| **D2a** f32 in numba | ✅ done — `tests/numba_f32_test.b` 78/78; stores in 4 bytes, **computes in double** (N29) |
+| **D2b** f32 arithmetic | next — make the ~55 ufunc functors generic so f32 work happens at f32 width |
+| **D2c** btorch f32 plumbing | **blocked on D4**: `nd_matmul` returns f64 for f32 input (N31), so a `Linear` layer would undo f32 at the first layer |
+| **D3** deterministic threading | not started |
+| **D4** packed GEMM **+ f32 GEMM** | not started; the f32-GEMM half is what unblocks D2c |
+
+Three things f32 falsified, each of which would have been silent, and each now
+pinned by a named assertion rather than by luck:
+
+- **N28** — a bare Bantu number is an f64 array, so `f32 + 0.5` returned f64.
+  One scalar multiply undid the dtype. Fixed with weak scalars.
+- **N30** — three kernels encoded "not f64 therefore i64", so `nd_cumsum` on
+  f32 returned **i64** and truncated 1116.8 to 1117.
+- **N31** — linear algebra still returns f64, which is why D2c is *blocked*
+  rather than merely pending.
 
 Read in this order:
 1. this file (you are here)
-2. [`numba-dtype-architecture.md`](numba-dtype-architecture.md) — the next thing to build
-3. [`../numba-suite/ROADMAP.md`](../numba-suite/ROADMAP.md) — D1–D4 phase tables
+2. [`numba-dtype-architecture.md`](numba-dtype-architecture.md) — §2.4 records what implementation changed about the plan
+3. [`../numba-suite/ROADMAP.md`](../numba-suite/ROADMAP.md) — D1–D5 tables and the measured results
+4. [`../numba-suite/DECISIONS.md`](../numba-suite/DECISIONS.md) — N23–N31

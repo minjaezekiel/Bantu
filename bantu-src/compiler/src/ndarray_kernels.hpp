@@ -121,6 +121,7 @@ inline void coalesce(std::vector<size_t>& shape,
 inline int64_t loadI(const NdArray& a, size_t off) {
     switch (a.dtype) {
         case DType::F64:  return (int64_t)std::llround(static_cast<const double*>(a.buf->data)[off]);
+        case DType::F32:  return (int64_t)std::llround((double)static_cast<const float*>(a.buf->data)[off]);
         case DType::I64:  return static_cast<const int64_t*>(a.buf->data)[off];
         case DType::BOOL: return static_cast<const uint8_t*>(a.buf->data)[off] ? 1 : 0;
     }
@@ -132,9 +133,43 @@ inline void storeD(NdArray& a, size_t off, double v) { setFromDouble(a, off, v);
 inline void storeI(NdArray& a, size_t off, int64_t v) {
     switch (a.dtype) {
         case DType::F64:  static_cast<double*>(a.buf->data)[off]  = (double)v; break;
+        case DType::F32:  static_cast<float*>(a.buf->data)[off]   = narrowToFloat((double)v); break;
         case DType::I64:  static_cast<int64_t*>(a.buf->data)[off] = v;         break;
         case DType::BOOL: static_cast<uint8_t*>(a.buf->data)[off] = v ? 1 : 0; break;
     }
+}
+
+// ── the same two accessors, reached by compute type instead of by name (D1) ──
+// `load<T>` reads one element of ANY dtype and converts it to T; `store<T>`
+// writes a T into any dtype. They are the generic-path counterparts of the
+// NB_DISPATCH_COMPUTE macro: a kernel body written over `T` calls load<T>/
+// store<T> and works for every dtype without a second code path.
+//
+// These are thin wrappers over loadD/loadI/storeD/storeI rather than new logic,
+// so the generic path's conversion rules -- llround on the way into i64, `!= 0`
+// on the way into bool -- are unchanged and remain in exactly one place.
+template <class T> inline T    load(const NdArray& a, size_t off);
+template <class T> inline void store(NdArray& a, size_t off, T v);
+
+template <> inline double  load<double>(const NdArray& a, size_t off)  { return loadD(a, off); }
+template <> inline float   load<float>(const NdArray& a, size_t off)   { return narrowToFloat(loadD(a, off)); }
+template <> inline int64_t load<int64_t>(const NdArray& a, size_t off) { return loadI(a, off); }
+template <> inline uint8_t load<uint8_t>(const NdArray& a, size_t off) { return loadI(a, off) ? 1 : 0; }
+
+template <> inline void store<double>(NdArray& a, size_t off, double v)   { storeD(a, off, v); }
+template <> inline void store<float>(NdArray& a, size_t off, float v)    { storeD(a, off, (double)v); }
+template <> inline void store<int64_t>(NdArray& a, size_t off, int64_t v) { storeI(a, off, v); }
+template <> inline void store<uint8_t>(NdArray& a, size_t off, uint8_t v) { storeI(a, off, v ? 1 : 0); }
+
+// Raw typed access for the CONTIGUOUS fast paths, where the dtype is already
+// known to match and the strided accessors above would be pure overhead.
+template <class T> inline const T* rawPtr(const NdArray& a) { return a.ptr<T>(); }
+template <class T> inline       T* rawPtr(NdArray& a)       { return a.ptr<T>(); }
+
+// Is this array stored as T, and flat enough for a raw pointer walk? The
+// precondition every `rawPtr` use needs, in one place.
+template <class T> inline bool isRaw(const NdArray& a) {
+    return a.dtype == dtypeTraits<T>::tag && a.isCContig();
 }
 
 // ── the odometer ─────────────────────────────────────────────────────────────

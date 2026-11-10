@@ -32,6 +32,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cmath>
+#include <limits>
 #include <cstdint>
 #include <cstddef>
 #include <cstdlib>
@@ -58,13 +59,26 @@ static const char* NDARRAY_TAG = "ndarray";
 //   BOOL — one BYTE per element, NOT a bitmask: a bitmask cannot carry a
 //          stride, so boolean views and transposes would be impossible
 // No validity mask: NaN is the null for f64, and nulls stay arctic's concern.
-enum class DType : uint8_t { F64, I64, BOOL };
+enum class DType : uint8_t { F64, I64, BOOL, F32 };
 
-inline size_t itemsize(DType d) { return d == DType::BOOL ? 1 : 8; }
+// A real table, not `BOOL ? 1 : 8`. Behaviour is identical today (8, 8, 1),
+// but the ternary hard-coded the assumption that every non-bool dtype is eight
+// bytes wide -- which f32 (D2) and i8 (ecosystem stage 6) both break. A wrong
+// itemsize is not a crash: it reads half of one value and half of the next.
+inline size_t itemsize(DType d) {
+    switch (d) {
+        case DType::F64:  return sizeof(double);
+        case DType::F32:  return sizeof(float);
+        case DType::I64:  return sizeof(int64_t);
+        case DType::BOOL: return sizeof(uint8_t);
+    }
+    return sizeof(double);
+}
 
 inline const char* dtypeName(DType d) {
     switch (d) {
         case DType::F64:  return "f64";
+        case DType::F32:  return "f32";
         case DType::I64:  return "i64";
         case DType::BOOL: return "bool";
     }
@@ -73,17 +87,121 @@ inline const char* dtypeName(DType d) {
 
 inline DType dtypeFromName(const std::string& s) {
     if (s == "f64" || s == "float" || s == "double") return DType::F64;
+    if (s == "f32" || s == "float32"|| s == "single") return DType::F32;
     if (s == "i64" || s == "int"   || s == "long")   return DType::I64;
     if (s == "bool")                                 return DType::BOOL;
-    throw std::runtime_error("unknown dtype '" + s + "' (use \"f64\", \"i64\" or \"bool\")");
+    throw std::runtime_error("unknown dtype '" + s +
+        "' (use \"f64\", \"f32\", \"i64\" or \"bool\")");
 }
 
 // Promotion, applied everywhere: bool -> i64 -> f64.
 inline DType promote(DType a, DType b) {
     if (a == DType::F64 || b == DType::F64) return DType::F64;
+    if (a == DType::F32 || b == DType::F32) {
+        // f32 against i64 widens to f64, it does NOT narrow to f32: an i64
+        // carries values no f32 can represent, so narrowing would lose data
+        // silently. f64 holds the whole f32 range and i64 to 2^53, which is
+        // already this library's documented integer ceiling.
+        if (a == DType::I64 || b == DType::I64) return DType::F64;
+        return DType::F32;                      // f32 with f32, or f32 with bool
+    }
     if (a == DType::I64 || b == DType::I64) return DType::I64;
     return DType::BOOL;
 }
+
+// double -> float where the value may not fit. Converting an out-of-range
+// double to float is UNDEFINED BEHAVIOUR in C++ -- not merely "gives inf" -- so
+// the saturation is explicit rather than left to whatever the hardware does.
+// The bound is the largest double that still rounds to FLT_MAX; anything above
+// it overflows.
+inline float narrowToFloat(double v) {
+    if (std::isnan(v)) return std::numeric_limits<float>::quiet_NaN();
+    if (v >  3.4028235677973366e38) return  std::numeric_limits<float>::infinity();
+    if (v < -3.4028235677973366e38) return -std::numeric_limits<float>::infinity();
+    return (float)v;
+}
+
+// ── dtype traits, and the two dispatch macros (D1) ───────────────────────────
+// Every kernel used to carry a hand-written `if (dtype == F64) { double... }
+// else { int64_t... }` pair -- 76 of them across nine files. Adding f32 by hand
+// would have made that a 3x2 matrix and i8 a 4x2 one, so each kernel body is
+// written ONCE over `T` and the dtype list lives in one place. See
+// docs/numba-dtype-architecture.md, and N23 for why this precedes f32.
+
+// The C++ storage type behind a DType tag.
+template <DType D> struct storageOf;
+template <> struct storageOf<DType::F64>  { using type = double;  };
+template <> struct storageOf<DType::F32>  { using type = float;   };
+template <> struct storageOf<DType::I64>  { using type = int64_t; };
+template <> struct storageOf<DType::BOOL> { using type = uint8_t; };
+
+// Per-storage-type facts, including the ACCUMULATOR, which is deliberately
+// separate from the storage type (N24).
+//
+// This split is the whole reason the traits exist. An f32 array summed in f32
+// has ~1e-3 relative error over 10M elements, against the ~2e-16 this library
+// guarantees for f64 -- so f32 arrays must reduce through an f64 accumulator.
+// The same applies at the small end: counting BOOLs in a uint8_t wraps at 255,
+// so bool reduces through int64_t. Storage width and arithmetic width are
+// different questions and conflating them is a silent-wrong-answer bug.
+template <class T> struct dtypeTraits;
+template <> struct dtypeTraits<double> {
+    using acc = double;
+    static constexpr DType       tag  = DType::F64;
+    static constexpr const char* name = "f64";
+    static constexpr bool        isFloat = true;
+};
+template <> struct dtypeTraits<float> {
+    using acc = double;                      // N24: f32 storage, f64 reductions
+    static constexpr DType       tag  = DType::F32;
+    static constexpr const char* name = "f32";
+    static constexpr bool        isFloat = true;
+};
+template <> struct dtypeTraits<int64_t> {
+    using acc = int64_t;
+    static constexpr DType       tag  = DType::I64;
+    static constexpr const char* name = "i64";
+    static constexpr bool        isFloat = false;
+};
+template <> struct dtypeTraits<uint8_t> {
+    using acc = int64_t;                     // NOT uint8_t: counting wraps at 255
+    static constexpr DType       tag  = DType::BOOL;
+    static constexpr const char* name = "bool";
+    static constexpr bool        isFloat = false;
+};
+
+// ── NB_DISPATCH_COMPUTE: the ARITHMETIC width ────────────────────────────────
+// What the ufunc and reduction layers want. A float dtype computes in `double`;
+// every integer-ish dtype computes in `int64_t`.
+//
+// BOOL computing in int64_t rather than uint8_t is deliberate and preserves
+// today's behaviour exactly: the old code's `else` branch handled I64 and BOOL
+// together through loadI/storeI, so bool arithmetic has always been 64-bit.
+// Narrowing it to uint8_t would wrap at 255.
+//
+// f32 joins here in D2 as its own `float` arm -- the one edit that gives every
+// kernel in the library an f32 path.
+#define NB_DISPATCH_COMPUTE(dt, T, ...)                                       \
+    do {                                                                      \
+        if      ((dt) == ::numba::DType::F64) { using T = double;  __VA_ARGS__ } \
+        else if ((dt) == ::numba::DType::F32) { using T = float;   __VA_ARGS__ } \
+        else                                  { using T = int64_t; __VA_ARGS__ } \
+    } while (0)
+
+// ── NB_DISPATCH_STORAGE: the STORED width ────────────────────────────────────
+// What copy, cast and byte-level I/O want, where the actual stored type matters
+// and widening would be wrong. Three arms, one per dtype, and the compiler will
+// flag a missing arm when a dtype is added.
+#define NB_DISPATCH_STORAGE(dt, T, ...)                                       \
+    do {                                                                      \
+        switch (dt) {                                                         \
+            case ::numba::DType::F64:  { using T = double;  __VA_ARGS__ } break; \
+            case ::numba::DType::F32:  { using T = float;   __VA_ARGS__ } break; \
+            case ::numba::DType::I64:  { using T = int64_t; __VA_ARGS__ } break; \
+            case ::numba::DType::BOOL: { using T = uint8_t; __VA_ARGS__ } break; \
+        }                                                                     \
+    } while (0)
+
 
 // ── allocation limits ────────────────────────────────────────────────────────
 // A single bad argument must not be able to take the process down. This matters
@@ -519,6 +637,7 @@ inline size_t flatOffset(const NdArray& a, const std::vector<size_t>& idx) {
 inline double getAsDouble(const NdArray& a, size_t flat) {
     switch (a.dtype) {
         case DType::F64:  return static_cast<const double*>(a.buf->data)[flat];
+        case DType::F32:  return (double)static_cast<const float*>(a.buf->data)[flat];
         case DType::I64:  return (double)static_cast<const int64_t*>(a.buf->data)[flat];
         case DType::BOOL: return static_cast<const uint8_t*>(a.buf->data)[flat] ? 1.0 : 0.0;
     }
@@ -528,6 +647,7 @@ inline double getAsDouble(const NdArray& a, size_t flat) {
 inline Value getAsValue(const NdArray& a, size_t flat) {
     switch (a.dtype) {
         case DType::F64:  return Value(static_cast<const double*>(a.buf->data)[flat]);
+        case DType::F32:  return Value((double)static_cast<const float*>(a.buf->data)[flat]);
         // i64 materializes to a Bantu number, which is a double -- the same
         // 2^53 caveat arctic documents for its own i64 columns (decision A4).
         case DType::I64:  return Value((double)static_cast<const int64_t*>(a.buf->data)[flat]);
@@ -539,6 +659,7 @@ inline Value getAsValue(const NdArray& a, size_t flat) {
 inline void setFromDouble(NdArray& a, size_t flat, double v) {
     switch (a.dtype) {
         case DType::F64:  static_cast<double*>(a.buf->data)[flat]  = v; break;
+        case DType::F32:  static_cast<float*>(a.buf->data)[flat]   = narrowToFloat(v); break;
         case DType::I64:  static_cast<int64_t*>(a.buf->data)[flat] = (int64_t)std::llround(v); break;
         case DType::BOOL: static_cast<uint8_t*>(a.buf->data)[flat] = (v != 0.0) ? 1 : 0; break;
     }

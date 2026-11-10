@@ -14,6 +14,7 @@
 
 #include <functional>
 #include <numeric>
+#include <type_traits>
 
 namespace numba {
 
@@ -46,19 +47,51 @@ struct Pairwise {
 // accumulators (so the adds pipeline and the loop vectorizes), each block sum
 // handed to the tree above. Keeps the vectorized loop AND the accurate
 // structure, rather than trading one for the other.
-inline double sumContig(const double* NB_RESTRICT p, size_t n) {
+template <class T>
+inline double sumContigT(const T* NB_RESTRICT p, size_t n) {
     Pairwise acc;
     size_t i = 0;
     for (; i + 128 <= n; i += 128) {
         double s0=0,s1=0,s2=0,s3=0,s4=0,s5=0,s6=0,s7=0;
         for (size_t j = 0; j < 128; j += 8) {
-            s0 += p[i+j+0]; s1 += p[i+j+1]; s2 += p[i+j+2]; s3 += p[i+j+3];
-            s4 += p[i+j+4]; s5 += p[i+j+5]; s6 += p[i+j+6]; s7 += p[i+j+7];
+            s0 += (double)p[i+j+0]; s1 += (double)p[i+j+1];
+            s2 += (double)p[i+j+2]; s3 += (double)p[i+j+3];
+            s4 += (double)p[i+j+4]; s5 += (double)p[i+j+5];
+            s6 += (double)p[i+j+6]; s7 += (double)p[i+j+7];
         }
         acc.add(((s0+s1)+(s2+s3)) + ((s4+s5)+(s6+s7)));
     }
-    for (; i < n; i++) acc.add(p[i]);
+    for (; i < n; i++) acc.add((double)p[i]);
     return acc.total();
+}
+
+// The f64 entry point, unchanged in behaviour: with T = double every cast above
+// is a no-op, so this instantiation is the same code -- and the same summation
+// ORDER -- as before D2. The accumulators stay `double` for every T, which is
+// N24's storage/accumulator split: an f32 array sums through f64 and so keeps
+// this library's ~2e-16 accuracy guarantee instead of f32's ~1e-3.
+inline double sumContig(const double* NB_RESTRICT p, size_t n) {
+    return sumContigT<double>(p, n);
+}
+
+// ── what dtype a reduction produces (D2) ─────────────────────────────────────
+// Two rules, written once each, because getting either wrong for a new dtype is
+// SILENT. An f32 sum landing in i64 truncates every value; an f32 mean landing
+// in f64 promotes a whole f32 pipeline back to f64 one call in and quietly
+// undoes the reason for using f32 at all.
+
+// sum / prod: a float input keeps its own width; everything integer-ish becomes
+// i64, because the point of carrying an integer path is that counts and indices
+// stay exact.
+inline DType reduceDType(DType in) {
+    if (in == DType::F64 || in == DType::F32) return in;
+    return DType::I64;
+}
+
+// mean / var / std / median / quantile: always a float, and an f32 input keeps
+// f32 rather than widening. Matches NumPy.
+inline DType floatResultDType(DType in) {
+    return (in == DType::F32) ? DType::F32 : DType::F64;
 }
 
 // ── the axis plan (docs §4.8) ────────────────────────────────────────────────
@@ -164,6 +197,46 @@ inline bool innerIsContig(const ReducePlan& p) {
 // -- every reduction that funnels through here -- did not. Fixing the
 // chokepoint fixes all of them at once, and the visit order is unchanged: a
 // stride-1 run walked in order is the same sequence nditer produced.
+// ── the contiguous extreme fast path, over the stored type (D1) ──────────────
+// nd_max/nd_min's hot path was written against `const double*` directly. It is
+// now a factory over T, so D2 adds f32 with ONE line at the call site:
+//
+//     if (A.dtype == DType::F32) ... extremeFast<float>(A, P, wantMax) ...
+//
+// The callback still returns `double` whatever T is -- that is N24's
+// storage/accumulator split: an f32 array reduces through an f64 result, so f32
+// does not inherit f32-precision reductions.
+//
+// NaN propagates by early return rather than by comparison, because every
+// comparison against NaN is false and a plain `x > best` loop silently skips
+// NaNs instead of returning one (which is amax semantics, btorch B16).
+template <class T>
+inline auto extremeFast(const NdArray& A, const ReducePlan& p, bool wantMax) {
+    static_assert(std::is_floating_point<T>::value,
+                  "extremeFast is the float fast path; integers have no NaN to propagate");
+    const T* const  data = static_cast<const T*>(A.buf->data);
+    const size_t    n    = p.innerCount;
+    return [data, n, wantMax](size_t base) -> double {
+        const T* q = data + base;
+        T best = q[0];
+        if (std::isnan(best)) return (double)best;
+        if (wantMax) {
+            for (size_t i = 1; i < n; i++) {
+                const T x = q[i];
+                if (std::isnan(x)) return (double)x;
+                if (x > best) best = x;
+            }
+        } else {
+            for (size_t i = 1; i < n; i++) {
+                const T x = q[i];
+                if (std::isnan(x)) return (double)x;
+                if (x < best) best = x;
+            }
+        }
+        return (double)best;
+    };
+}
+
 template <class Body>
 inline void innerSweep(const ReducePlan& p, size_t base, Body&& body) {
     if (innerIsContig(p)) {

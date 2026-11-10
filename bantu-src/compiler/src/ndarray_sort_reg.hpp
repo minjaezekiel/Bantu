@@ -71,7 +71,12 @@ inline void registerSorting(const DefineFn& define) {
                 flattened = true;
             }
             const size_t axis = flattened ? 0 : axisArg(args, 1, src->ndim(), what);
-            const DType rdt = (mode <= 1 && src->dtype != DType::F64) ? DType::I64
+            // cumsum/cumprod (mode <= 1): a float input keeps its OWN width;
+            // everything integer-ish becomes i64 so counts stay exact. The old
+            // `dtype != F64 -> I64` form sent f32 to i64, which truncated every
+            // value. cummax/cummin carry the input dtype through (bool -> i64).
+            const DType rdt = (mode <= 1)
+                            ? reduceDType(src->dtype)
                             : (src->dtype == DType::BOOL ? DType::I64 : src->dtype);
             ArrayPtr out = makeArray(src->shape, rdt, what);
             if (out->size() == 0) return wrap(out);
@@ -114,7 +119,9 @@ inline void registerSorting(const DefineFn& define) {
             throw std::runtime_error("nd_diff: axis " + std::to_string(axis) + " is empty");
         }
         shape[axis] -= 1;
-        const DType rdt = (a->dtype == DType::F64) ? DType::F64 : DType::I64;
+        // reduceDType, not a hand-written F64/I64 ternary: an f32 diff landing
+        // in i64 would truncate every value (ndarray_reduce.hpp).
+        const DType rdt = reduceDType(a->dtype);
         ArrayPtr out = makeArray(shape, rdt, "nd_diff");
         if (out->size() == 0) return wrap(out);
         std::vector<size_t> lanePos;
@@ -229,7 +236,7 @@ inline void registerSorting(const DefineFn& define) {
             if (std::isnan(x) && std::isnan(last)) continue;
             if (x != last) u.push_back(x);
         }
-        ArrayPtr out = makeArray({ u.size() }, a->dtype == DType::F64 ? DType::F64 : DType::I64,
+        ArrayPtr out = makeArray({ u.size() }, reduceDType(a->dtype),
                                  "nd_unique");
         for (size_t i = 0; i < u.size(); i++) setFromDouble(*out, i, u[i]);
         return wrap(out);

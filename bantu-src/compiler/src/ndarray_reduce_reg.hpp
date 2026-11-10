@@ -46,8 +46,13 @@ inline void registerReductions(const DefineFn& define) {
 
     // ── sum / mean, on the pairwise accumulator (docs §4.9) ──────────────────
     auto sumSlice = [](const NdArray& a, const ReducePlan& p, size_t base) -> double {
-        if (a.dtype == DType::F64 && innerIsContig(p)) {
-            return sumContig(static_cast<const double*>(a.buf->data) + base, p.innerCount);
+        if (innerIsContig(p)) {
+            if (a.dtype == DType::F64)
+                return sumContigT<double>(static_cast<const double*>(a.buf->data) + base,
+                                          p.innerCount);
+            if (a.dtype == DType::F32)
+                return sumContigT<float>(static_cast<const float*>(a.buf->data) + base,
+                                         p.innerCount);
         }
         Pairwise acc;
         innerSweep(p, base, [&](size_t o) { acc.add(getAsDouble(a, o)); });
@@ -58,7 +63,7 @@ inline void registerReductions(const DefineFn& define) {
         RedArgs r = redArgs(args, "nd_sum");
         // i64 in, i64 out: the whole point of carrying an integer path is that
         // counts and indices stay exact.
-        const DType rdt = (r.a->dtype == DType::F64) ? DType::F64 : DType::I64;
+        const DType rdt = reduceDType(r.a->dtype);
         const NdArray& A = *r.a; const ReducePlan& P = r.plan;
         return wrap(runReduce(A, P, rdt, "nd_sum",
             [&](size_t base) { return sumSlice(A, P, base); }));
@@ -69,13 +74,13 @@ inline void registerReductions(const DefineFn& define) {
         const NdArray& A = *r.a; const ReducePlan& P = r.plan;
         const double n = (double)P.innerCount;
         // mean of an empty slice is NaN, as in NumPy -- 0/0, not an error.
-        return wrap(runReduce(A, P, DType::F64, "nd_mean",
+        return wrap(runReduce(A, P, floatResultDType(A.dtype), "nd_mean",
             [&](size_t base) { return sumSlice(A, P, base) / n; }));
     });
 
     define("nd_prod", [](std::vector<Value> args) -> Value {
         RedArgs r = redArgs(args, "nd_prod");
-        const DType rdt = (r.a->dtype == DType::F64) ? DType::F64 : DType::I64;
+        const DType rdt = reduceDType(r.a->dtype);
         const NdArray& A = *r.a; const ReducePlan& P = r.plan;
         return wrap(runReduce(A, P, rdt, "nd_prod", [&](size_t base) {
             double acc = 1.0;   // the identity, so an empty slice gives 1
@@ -104,14 +109,14 @@ inline void registerReductions(const DefineFn& define) {
         RedArgs r = redArgs(args, "nd_var");
         const double ddof = (args.size() > 3 && !args[3].isNull()) ? args[3].numberVal : 0.0;
         const NdArray& A = *r.a; const ReducePlan& P = r.plan;
-        return wrap(runReduce(A, P, DType::F64, "nd_var",
+        return wrap(runReduce(A, P, floatResultDType(A.dtype), "nd_var",
             [&](size_t base) { return welford(A, P, base, ddof); }));
     });
     define("nd_std", [welford](std::vector<Value> args) -> Value {
         RedArgs r = redArgs(args, "nd_std");
         const double ddof = (args.size() > 3 && !args[3].isNull()) ? args[3].numberVal : 0.0;
         const NdArray& A = *r.a; const ReducePlan& P = r.plan;
-        return wrap(runReduce(A, P, DType::F64, "nd_std",
+        return wrap(runReduce(A, P, floatResultDType(A.dtype), "nd_std",
             [&](size_t base) { return std::sqrt(welford(A, P, base, ddof)); }));
     });
 
@@ -128,29 +133,15 @@ inline void registerReductions(const DefineFn& define) {
             // so it reads the buffer directly instead of paying getAsDouble's
             // dtype switch per element. NaN handling is identical: the first
                 // NaN seen wins and sticks, which is numba's documented rule.
-            const bool fast = (A.dtype == DType::F64) && innerIsContig(P);
-            if (fast) {
-                const double* data = static_cast<const double*>(A.buf->data);
-                const size_t n = P.innerCount;
-                return wrap(runReduce(A, P, rdt, what, [&](size_t base) {
-                    const double* q = data + base;
-                    double best = q[0];
-                    if (std::isnan(best)) return best;
-                    if (wantMax) {
-                        for (size_t i = 1; i < n; i++) {
-                            const double x = q[i];
-                            if (std::isnan(x)) return x;
-                            if (x > best) best = x;
-                        }
-                    } else {
-                        for (size_t i = 1; i < n; i++) {
-                            const double x = q[i];
-                            if (std::isnan(x)) return x;
-                            if (x < best) best = x;
-                        }
-                    }
-                    return best;
-                }));
+            // D1: the fast path's body now lives in extremeFast<T>
+            // (ndarray_reduce.hpp), so D2 adds f32 as one more arm here.
+            if (innerIsContig(P)) {
+                if (A.dtype == DType::F64)
+                    return wrap(runReduce(A, P, rdt, what,
+                                          extremeFast<double>(A, P, wantMax)));
+                if (A.dtype == DType::F32)
+                    return wrap(runReduce(A, P, rdt, what,
+                                          extremeFast<float>(A, P, wantMax)));
             }
             return wrap(runReduce(A, P, rdt, what, [&](size_t base) {
                 bool first = true; double best = 0.0;
@@ -242,7 +233,7 @@ inline void registerReductions(const DefineFn& define) {
     define("nd_nansum", [](std::vector<Value> args) -> Value {
         RedArgs r = redArgs(args, "nd_nansum");
         const NdArray& A = *r.a; const ReducePlan& P = r.plan;
-        return wrap(runReduce(A, P, DType::F64, "nd_nansum", [&](size_t base) {
+        return wrap(runReduce(A, P, floatResultDType(A.dtype), "nd_nansum", [&](size_t base) {
             Pairwise acc;
             innerSweep(P, base, [&](size_t o) {
                 const double x = getAsDouble(A, o);
@@ -254,7 +245,7 @@ inline void registerReductions(const DefineFn& define) {
     define("nd_nanmean", [](std::vector<Value> args) -> Value {
         RedArgs r = redArgs(args, "nd_nanmean");
         const NdArray& A = *r.a; const ReducePlan& P = r.plan;
-        return wrap(runReduce(A, P, DType::F64, "nd_nanmean", [&](size_t base) {
+        return wrap(runReduce(A, P, floatResultDType(A.dtype), "nd_nanmean", [&](size_t base) {
             Pairwise acc; size_t n = 0;
             innerSweep(P, base, [&](size_t o) {
                 const double x = getAsDouble(A, o);
@@ -269,7 +260,7 @@ inline void registerReductions(const DefineFn& define) {
         return [what, wantMax](std::vector<Value> args) -> Value {
             RedArgs r = redArgs(args, what);
             const NdArray& A = *r.a; const ReducePlan& P = r.plan;
-            return wrap(runReduce(A, P, DType::F64, what, [&](size_t base) {
+            return wrap(runReduce(A, P, floatResultDType(A.dtype), what, [&](size_t base) {
                 bool any = false; double best = 0.0;
                 innerSweep(P, base, [&](size_t o) {
                     const double x = getAsDouble(A, o);
@@ -303,7 +294,7 @@ inline void registerReductions(const DefineFn& define) {
     define("nd_median", [quantileOf](std::vector<Value> args) -> Value {
         RedArgs r = redArgs(args, "nd_median");
         const NdArray& A = *r.a; const ReducePlan& P = r.plan;
-        return wrap(runReduce(A, P, DType::F64, "nd_median", [&](size_t base) {
+        return wrap(runReduce(A, P, floatResultDType(A.dtype), "nd_median", [&](size_t base) {
             std::vector<double> v; v.reserve(P.innerCount);
             innerSweep(P, base, [&](size_t o) { v.push_back(getAsDouble(A, o)); });
             std::vector<double> tmp = v;
@@ -329,7 +320,7 @@ inline void registerReductions(const DefineFn& define) {
         for (size_t i = 2; i < args.size(); i++) shifted.push_back(args[i]);
         RedArgs r = redArgs(shifted, "nd_quantile");
         const NdArray& A = *r.a; const ReducePlan& P = r.plan;
-        return wrap(runReduce(A, P, DType::F64, "nd_quantile", [&](size_t base) {
+        return wrap(runReduce(A, P, floatResultDType(A.dtype), "nd_quantile", [&](size_t base) {
             std::vector<double> v; v.reserve(P.innerCount);
             innerSweep(P, base, [&](size_t o) { v.push_back(getAsDouble(A, o)); });
             return quantileOf(v, q);
