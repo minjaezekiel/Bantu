@@ -33,9 +33,34 @@ All notable changes to the Bantu programming language are documented in this fil
 - **[feature] `bantu engine`** — what this binary provides, the native-family floor table, and the
   grammar an older parser rejects. `bantu engine <dir>` computes the floor a package needs from its
   own sources; `--check-table` asserts every builtin has a stated floor.
+- **[feature] `bkit`, classical machine learning in scikit-learn's shape** — in progress, written
+  in Bantu on numba's kernels. So far: the estimator protocol
+  (`fit`/`predict`/`transform`/`get_params`/`set_params`/`clone`, with `fit_transform`, `score` and
+  `_check_fitted` provided), `Pipeline` with `step__param` addressing and a deep `clone()`, and
+  eleven preprocessing transformers — `StandardScaler`, `MinMaxScaler`, `RobustScaler`,
+  `MaxAbsScaler`, `OrdinalEncoder`, `OneHotEncoder`, `LabelEncoder`, `SimpleImputer`,
+  `PolynomialFeatures`, `Normalizer`, `Binarizer`. A 100,000 × 20 `fit_transform` takes 75 ms.
+  Every estimator's conformance to the protocol is asserted in one table-driven test, because a
+  protocol with eleven implementers fragments silently.
 
 ### Fixed
 
+- **[bug fix] `--quiet` did not silence the `[class] X extends Y` line.** It went to **stdout**,
+  once per class per included file — thirteen lines for a script that includes `bkit`. `--quiet`
+  exists to suppress exactly these informational lines and the neighbouring `[class] Defined:`
+  already honoured it. A library's internals are not its caller's data, and for a `sua` handler or
+  anything emitting JSON they were landing in the output stream. The companion
+  `WARNING: parent class not found` is deliberately **not** silenced: it now goes to stderr and
+  states the consequence, because execution continues with no parent and the first symptom is
+  "X.fit is not implemented" from a class that plainly implements `fit`.
+- **[bug fix] Thirteen array kernels had no wrapper in the `numba` package.** `numba.b` is the
+  public API and its rule is that every builtin gets one, because a wrapper can have optional
+  arguments and a builtin cannot. Missing: `nd_concat`, `nd_stack`, `nd_split`, `nd_tile`,
+  `nd_repeat`, `nd_pad`, the six bitwise operations and two shifts, `nd_tobytes`/`nd_frombytes`,
+  `nd_index_add`, and `nd_set_threads`/`nd_get_threads`/`nd_hardware_threads` — the whole threading
+  knob above. A user of the *package* could not turn threading on at all. The gap was invisible from
+  either side: the kernels had tests and the existing wrappers had tests, and nothing compared the
+  two sets. `tests/numba_surface_test.sh` now does.
 - **[bug fix] A class from an included file could be inherited from but not instantiated.**
   `extends` resolves a parent name against the global class registry; `new X()` resolved it against
   the **scope**, and a class declaration binds its name in the environment where the declaration

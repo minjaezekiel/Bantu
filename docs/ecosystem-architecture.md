@@ -444,10 +444,12 @@ Revised order, by value delivered per unit of risk:
 | | item | why here |
 |---|---|---|
 | ✅ | **f32 GEMM + D2c** | completes a shipped feature; halves model and optimizer memory |
-| next | **D3 deterministic threading** | the largest multiplier that exists (core count), and the one stage 3 also wants |
-| then | **stage 2 + stage 3 (`bkit`)** | where the paying work is |
+| ✅ | **D3 deterministic threading** | the largest multiplier that exists (core count), and the one stage 3 also wants |
+| ✅ | **stage 2** (the `bantu` engine field) | a package can state which binary it needs; nine of them needed one never released |
+| 🔄 | **stage 3 (`bkit`)** | where the paying work is — K1 (protocol) and K2 (preprocessing) done, K3 next |
 | after | **D4 packed GEMM** (skinny shapes) | helps convolution only |
 | after | **D2b** generic functors | helps f32 element-wise only |
+| after | **`nd_nanvar` / `nd_nanstd` / `nd_nanquantile`** | the four scalers refuse `NaN` only because these do not exist ([K14]); the Welford and selection kernels are already written and already thread |
 
 ### E21 — stage 1 and stage 3 are interleaved, not swapped
 The open trade was: *GBDTs are nearly insensitive to f32 vs f64, so should

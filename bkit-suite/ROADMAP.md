@@ -70,11 +70,50 @@ factory pattern is untouched. Regression: `tests/lang_class_include_test.b`.
 
 | Item | Feature test | Status |
 |---|---|---|
-| `StandardScaler`, `MinMaxScaler`, `RobustScaler`, `MaxAbsScaler` | `inverse_transform(transform(x)) == x` to 1e-12; zero-variance column does not divide by zero | [ ] |
-| `OneHotEncoder`, `OrdinalEncoder`, `LabelEncoder` | unseen category at transform time raises by name, or maps to a documented slot under `handle_unknown` | [ ] |
-| `SimpleImputer` (mean/median/most_frequent/constant) | an all-`NaN` column raises rather than producing `NaN` statistics | [ ] |
-| `PolynomialFeatures` | column count and ordering match a reference enumeration | [ ] |
-| `Normalizer`, `Binarizer` | — | [ ] |
+| `StandardScaler`, `MinMaxScaler`, `RobustScaler`, `MaxAbsScaler` | `inverse_transform(transform(x)) == x` to 1e-12; zero-variance column does not divide by zero | [x] one shared `transform` for all four ([K11]); the round trip holds on a constant column too ([K15]) |
+| `OneHotEncoder`, `OrdinalEncoder`, `LabelEncoder` | unseen category at transform time raises by name, or maps to a documented slot under `handle_unknown` | [x] via `nd_searchsorted`, which answers "is this category known" in the same call ([K13]) |
+| `SimpleImputer` (mean/median/most_frequent/constant) | an all-`NaN` column raises rather than producing `NaN` statistics | [x] mode and median by run-length on the sorted column, so neither needs a `nanmedian` kernel ([K16]) |
+| `PolynomialFeatures` | column count and ordering match a reference enumeration | [x] the test asserts the list of NAMES for the small cases, and the width against the closed form over twenty (d, degree) pairs |
+| `Normalizer`, `Binarizer` | — | [x] |
+
+**Gates, all green:** `tests/bkit_preprocess_test.b` 174 assertions (tiers 1, 2, 4),
+`tests/bkit_protocol_test.b` 32 assertions (tier 3, package-wide). Measured on
+an M-series Mac: 100,000 × 20 `fit_transform` in **75 ms**, 50,000 × 4 ordinal
+encode with 200 categories in **44 ms**.
+
+**The suite was mutation-tested.** Thirteen independent breakages of
+`preprocess.b` were each shown to turn it red — the zero-scale guard, the `NaN`
+refusal, the feature-count guard, the polynomial bias position, `ddof=1`, a
+silently-coded unseen category, `>=` for `>`, `MinMaxScaler`'s range offset, a
+`clone()` returning `this`, mode ties, the median's middle index, a one-hot
+inverse claiming category 0, and the polynomial advance rule.
+
+That battery found **two defects of its own**, which is the argument for running
+one at all:
+* an assertion whose own expression throws took the process down and hid
+  everything after it, so one mutation reported one failure — fixed with the
+  `safe_ok` wrapper;
+* one mutant of the combination advance rule **hung** the interpreter for four
+  minutes with no output. The emit loop is now bounded by the exact combination
+  count and raises when it is passed, so the same mutant fails in milliseconds
+  with the reason named. A hang is a worse failure than a wrong answer.
+
+The protocol test stays green under ten of the thirteen, which is correct rather
+than a gap: tier 3 asserts the *contract*, and a scaler with wrong arithmetic
+satisfies the contract perfectly. The two it does catch are the two that break
+the contract itself.
+
+**Two things K2 changed about the plan.**
+1. **Tier 3 moved to its own file** ([K17]). The registry has to name estimators
+   from every module, so wherever it lives that file includes all of `bkit` —
+   and `base.b` is small precisely so `btext` can depend on it alone ([K7]).
+   `tests/bkit_protocol_test.b` carries the registry; `bkit_base_test.b` keeps
+   the doubles that prove the mechanism, including the one that forgets
+   `clone()`.
+2. **Each registry entry brings its own `X` and `y`.** One shared matrix cannot
+   serve the package: `LabelEncoder` takes a single label column, the encoders
+   need repeated categorical values rather than 40 distinct floats, and a
+   regressor needs a `y`.
 
 ## Phase K3 — `selection.b`
 
@@ -171,8 +210,10 @@ Datasets fetched and SHA-256 verified, **never committed** — the method
 
 ## Where to resume
 
-**K0 and K1 are done; K2 (`preprocess.b`) is next.** `base.b` is 330 lines and
-`tests/bkit_base_test.b` is 46 assertions, all green. Read
+**K0, K1 and K2 are done; K3 (`selection.b`) is next.** `base.b` is 330 lines
+and `preprocess.b` is 956; `tests/bkit_base_test.b` is 46 assertions,
+`tests/bkit_preprocess_test.b` is 174 and `tests/bkit_protocol_test.b` is 32,
+all green. Read
 [`../docs/bkit-architecture.md`](../docs/bkit-architecture.md) first, then
 [`DECISIONS.md`](DECISIONS.md).
 
@@ -180,7 +221,7 @@ Ecosystem **stage 2** (the engine field) landed first, as required, and
 `bkit/package.json` declares `"bantu": ">=1.4.0"` — verified against the floor
 its own sources imply with `bantu engine bkit`.
 
-What K2 inherits from K1 and should not re-invent:
+What K3 inherits and should not re-invent:
 
 * every estimator is `_Name` plus a same-named factory `def Name(...)`, because
   a `def Name()` shadows a `class Name`, and `new Name(...)` inside the factory
@@ -189,5 +230,18 @@ What K2 inherits from K1 and should not re-invent:
   `params_`, `name_`, `task_`;
 * `append($list, $v)` **mutates and returns the new LENGTH** — `$l = append($l, $v)`
   replaces the list with a number;
-* every new estimator joins the registry in `tests/bkit_base_test.b`'s protocol
-  section, which is tier 3 for the whole package.
+* every new estimator joins the registry in **`tests/bkit_protocol_test.b`**
+  ([K17]) — not `bkit_base_test.b`, which stays independent of the rest of the
+  package — and brings its own `X` and `y` with it;
+* `preprocess.b`'s module-level helpers are reusable and already tested:
+  `_as2d`, `_as1d`, `_no_nan`, `_check_nfeat`, `_safe_scale`, `_copy_list`,
+  `_encode_col` and `_first_unseen`. `selection.b`'s splitters need `_as2d` and
+  the feature-count discipline immediately;
+* statistics live as `(1, d)` arrays so `transform` is a broadcast, and **no
+  Bantu loop ever runs over rows** (§3.1). K3's K-fold indices are the same
+  rule: build them as arrays and let `nd_take` do the gathering;
+* `nd_sort` puts `NaN` **last**, which is how `median` and the mode avoid
+  needing kernels numba does not have ([K16]);
+* a throwing assertion must not abort a test file — use the `safe_ok` wrapper
+  that `tests/bkit_preprocess_test.b` defines, or the first failure hides the
+  rest.

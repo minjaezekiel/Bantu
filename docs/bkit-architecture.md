@@ -85,11 +85,161 @@ cross-validation**, which is the observable signature of the bug.
 
 ---
 
-## 3. Gradient boosting — the headline
+## 3. Preprocessing — the shape of every transformer
+
+Eleven estimators over two shared base classes, and they are the first
+implementers of the protocol, so
+the decisions here set the pattern the other nine files follow.
+
+### 3.1 Statistics are `(1, d)` arrays, and `transform` is one broadcast
+
+Every column-wise transformer stores its fitted statistics as arrays of shape
+`(1, d)` — `keepdims` true on the reduction that produced them — so `transform`
+is two whole-array kernel calls:
+
+```bantu
+nd_divide(nd_subtract($X, this.center_, null), this.scale_, null)
+```
+
+No Bantu-level loop over columns and none over rows. This is not a
+micro-optimisation: the interpreter is a tree-walker, so a per-element loop in
+Bantu is three orders of magnitude off a kernel, and a scaler is on the hot
+path of every fit in the package.
+
+### 3.2 Four scalers, one `transform` [K11]
+
+`StandardScaler`, `MinMaxScaler`, `RobustScaler` and `MaxAbsScaler` differ
+**only in the two numbers they compute**:
+
+| estimator | `center_` | `scale_` |
+|---|---|---|
+| `StandardScaler` | mean | standard deviation (population, `ddof=0`) |
+| `MinMaxScaler` | `min − lo·scale` | `(max − min) / (hi − lo)` |
+| `RobustScaler` | median | IQR (`q75 − q25`) |
+| `MaxAbsScaler` | 0 | max(\|x\|) |
+
+So `_ScalerBase` holds `transform`, `inverse_transform`, the feature-count
+guard and the `NaN` refusal, and each subclass overrides `fit` alone. The
+round-trip gate — `inverse_transform(transform(x)) == x` to 1e-12 — therefore
+tests one implementation four times instead of four implementations once.
+
+This works **because of** the constraint in §2.1: a child's method body refers
+to `this.center_`, never to `super.transform()`, so inheritance in the one
+direction Bantu supports is enough.
+
+### 3.3 A zero-variance column gets scale 1 [K15]
+
+A constant column has standard deviation, range, IQR and max-abs all zero, and
+dividing by it yields `NaN` for every row — silently, because `NaN` is a
+perfectly good `f64`. Every scaler therefore passes its scale through
+
+```bantu
+this.scale_ = nd_where(nd_equal($s, 0.0, null), 1.0, $s);
+```
+
+which is scikit-learn's handling and has a property worth stating: the column
+transforms to `x − center` = exactly 0, and `inverse_transform` adds `center`
+back, so **the round-trip is exact on a constant column too**. An error here
+would have been defensible; a `NaN` would not.
+
+### 3.4 The feature-count guard is load-bearing, not decorative [K12]
+
+`transform` on a matrix with a different number of columns than `fit` saw must
+raise. In NumPy this is caught for you often enough by accident; here it is
+caught **never**, because `(n, 1)` against a stored `(1, d)` statistic
+**broadcasts** and returns a perfectly well-formed `(n, d)` matrix of nonsense.
+Every transformer records `n_features_` at fit and checks it, and the check is
+in `_ScalerBase` so it cannot be forgotten by one of four.
+
+### 3.5 Encoders map through `searchsorted`, not a dict [K13]
+
+The obvious encoder keeps a Bantu dict from category to code and loops over
+every row. That is O(n) interpreter steps per column and it cannot see a
+missing dtype.
+
+Instead: `nd_unique` gives the sorted categories, and `nd_searchsorted` maps a
+whole column of values to codes in one native O(n log k) call. The
+unseen-category check falls out of the same call rather than needing a second
+pass — clamp the returned positions into range, `nd_take` the category each one
+landed on, and compare it to the input. A mismatch *is* an unseen value:
+
+```bantu
+$pos  = nd_searchsorted($cats, $col, null);
+$safe = nd_clip($pos, 0, len($cats) - 1, null);
+$hit  = nd_equal(nd_take($cats, $safe, 0), $col, null);   // false => unseen
+```
+
+`handle_unknown` then chooses between raising (naming the column and the value)
+and mapping to a documented slot, and both branches are the same two kernels.
+
+### 3.6 The mode is a run-length on a sorted column [K16]
+
+`SimpleImputer(strategy="most_frequent")` needs the most common value per
+column. Counting each unique value costs O(k·n) with a Bantu loop per unique.
+Sorting instead makes it native end to end: the run boundaries are
+`nd_nonzero(nd_diff(sorted) != 0)`, the run lengths are `nd_diff` of those
+boundaries, and `nd_argmax` picks the longest. O(n log n) in kernels, with the
+only Bantu loop being over columns.
+
+Ties go to the smaller value, because the column is sorted ascending and
+`nd_argmax` returns the first maximum — the same rule scikit-learn gets from
+`scipy.stats.mode`.
+
+### 3.7 `NaN` statistics are an error, not a smaller sample [K14]
+
+The four scalers **refuse** a `NaN` anywhere in `X`, naming the column and
+pointing at `SimpleImputer`. scikit-learn instead computes its statistics
+`NaN`-aware and leaves the `NaN` in place.
+
+The reason for the difference is concrete rather than philosophical: numba has
+`nd_nanmean`, `nd_nansum`, `nd_nanmin` and `nd_nanmax`, and **no** `nanvar`,
+`nanstd`, `nanmedian` or `nanquantile`. Three of the four scalers need exactly
+those. Supporting `NaN` in `StandardScaler` and `MinMaxScaler` while
+`RobustScaler` quietly produced `NaN` would be the worst of the three options —
+a surface that looks uniform and is not.
+
+`SimpleImputer` of course accepts `NaN`; it is the one transformer whose job it
+is. An **all**-`NaN` column raises there too, because the alternative is a
+statistic computed from no data at all.
+
+**Forward path:** `nd_nanvar`, `nd_nanstd` and `nd_nanquantile` are a small
+addition to numba's reduction surface — the Welford and selection kernels are
+already written and already thread. When they land, the scalers can follow
+scikit-learn and this decision becomes a one-line change in `_ScalerBase`.
+
+### 3.8 `PolynomialFeatures` enumerates in scikit-learn's order
+
+The column order is not free: a model trained on one ordering and scored
+against another is wrong in a way no test of column *counts* detects. The
+enumeration is combinations-with-replacement of feature indices, degree by
+ascending degree, which for `d=2, degree=2, include_bias=true` gives
+
+```
+[1, x0, x1, x0², x0·x1, x1²]
+```
+
+and the test asserts that list, not its length.
+
+The enumerator is CPython's `itertools` algorithm — hold one index vector, emit
+a snapshot, advance the rightmost index that can still move — with one addition:
+**the emit loop is bounded by the exact combination count** and raises when it
+is passed. The advance rule and the index cap must agree for the loop to
+terminate, and they are written in two places; mutation-testing this file turned
+one mutant of the advance rule into a four-minute hang with no output. A hang is
+a worse failure than a wrong answer, and the bound doubles as a statement of
+what the enumeration is supposed to produce.
+
+The snapshot is not optional either. Bantu lists are references, so appending
+the working vector itself gives a result in which every entry is the same list,
+holding whatever the vector ended up as.
+
+---
+
+## 4. Gradient boosting — the headline
 
 Histogram-based, LightGBM-shaped. The design choices and why.
 
-### 3.1 The algorithm
+### 4.1 The algorithm
 
 1. **Bin once, up front.** Each feature is quantile-binned into at most 256
    bins. All later work reads bin indices, never raw values. This is what makes
@@ -106,7 +256,7 @@ Histogram-based, LightGBM-shaped. The design choices and why.
    `max_depth` as a separate guard.
 6. **Predict** by traversing the node array.
 
-### 3.2 The `tree_` native family
+### 4.2 The `tree_` native family
 
 Five kernels. The Bantu side runs the boosting loop, computes gradients and
 hessians (vectorised over `nd_*`), handles early stopping and feature
@@ -125,7 +275,7 @@ A Bantu function call costs **1.78 µs** (btorch B1). `tree_hist` on a
 what Bantu can do per element. These five are not an optimisation; without them
 there is no GBDT.
 
-### 3.3 The binned matrix is an opaque handle, not an `NdArray`
+### 4.3 The binned matrix is an opaque handle, not an `NdArray`
 
 **A real blocker, found while writing this.** The binned matrix wants to be
 `u8` — one byte per cell. numba's `DType` is `{F64, I64, BOOL}`: there is no
@@ -151,7 +301,7 @@ entirely from the dtype roadmap.
 quantization, the handle can migrate to an `NdArray` behind the same API. It is
 not a dead end, just not a dependency.
 
-### 3.4 Objectives
+### 4.4 Objectives
 
 Gradients and hessians are pure Bantu over `nd_*` — one vectorised call per
 boosting iteration.
@@ -170,7 +320,7 @@ deliberately.
 
 ---
 
-## 4. Data input: arrays, with arctic as an adapter
+## 5. Data input: arrays, with arctic as an adapter
 
 Resolves open question 4 in the ecosystem doc.
 
@@ -187,7 +337,7 @@ arrays would pay for a column store they do not use, and every algorithm would
 carry two code paths — the condition that B18 avoided in btorch by composing
 convolution out of im2col and matmul rather than writing a second path.
 
-### 4.1 Missing values in the GBDT
+### 5.1 Missing values in the GBDT
 
 `NaN` goes to a dedicated bin, and each split learns a default direction (the
 side with the higher gain) which is also used for unseen `NaN` at predict time.
@@ -196,7 +346,7 @@ first is both lossy and a different model.
 
 ---
 
-## 5. Persistence
+## 6. Persistence
 
 `.btsd` with `kind: "bkit.estimator"` ([C3]). One container, one SHA-256, one
 set of twelve load-failure messages — already written for btorch, not rewritten
@@ -214,7 +364,7 @@ memory.
 
 ---
 
-## 6. Gates
+## 7. Gates
 
 Six tiers, as every phase in this project. Gradcheck does not apply (no
 autograd here); its slot is taken by **differential testing against published
@@ -233,7 +383,7 @@ Tier 3 is new to this project and exists because a protocol with eleven
 implementers fragments silently. It enumerates the estimators and asserts the
 contract on each, so a new estimator that forgets `clone()` fails immediately.
 
-### 6.1 The accuracy gates
+### 7.1 The accuracy gates
 
 Public datasets, fetched and SHA-256 verified, never committed — the method
 btorch's `get_mnist.sh` established (B25).
@@ -252,7 +402,7 @@ measured from a reloaded `.btsd` model, not from memory.
 
 ---
 
-## 7. What is deliberately out
+## 8. What is deliberately out
 
 | item | why |
 |---|---|
@@ -265,7 +415,7 @@ measured from a reloaded `.btsd` model, not from memory.
 
 ---
 
-## 8. Open items
+## 9. Open items
 
 | # | item | settled by |
 |---|---|---|

@@ -34,6 +34,7 @@ None can run on v1.3.2, which has no `nd_*` builtins at all.
 | [`pillow`](pillow/) | Imaging in the shape of Python's Pillow: all 20 modes, the six resampling filters, PNG/BMP/TGA/PPM. Fidelity is **differential** — checked against Pillow 13, not against its documentation |
 | [`arctic`](arctic/) | Columnar frames: CSV, Feather, Parquet and SQLite readers and writers, group-by, joins |
 | [`bplot`](bplot/) | Plotting on a raster backend written from scratch, straight to PNG |
+| [`bkit`](bkit/) | Classical machine learning in scikit-learn's shape — **in progress**. The estimator protocol (`fit`/`predict`/`transform`/`get_params`/`set_params`/`clone`), `Pipeline` with `step__param` addressing, and eleven preprocessing transformers: four scalers, three encoders, `SimpleImputer`, `PolynomialFeatures`, `Normalizer`, `Binarizer`. Every estimator's conformance to the protocol is asserted in one table-driven test |
 | [`hash`](hash/) · [`crypto`](crypto/) · [`uuid`](uuid/) | SHA-1/2, HMAC, AES-GCM, Ed25519, X25519, P-256, Argon2, PBKDF2, scrypt, base64/32/hex, and UUIDs v1/v3/v4/v5/v7 |
 | [`orm`](orm/) · [`lugha`](lugha/) · [`random`](random/) | A Django-style ORM, natural-language helpers, and distributions |
 
@@ -623,6 +624,7 @@ Bantu/
 ├── pillow/                  # [v1.4.0] imaging, differential-checked against Pillow 13
 ├── arctic/                  # [v1.4.0] columnar frames (CSV/Feather/Parquet/SQLite)
 ├── bplot/                   # [v1.4.0] plotting on a from-scratch raster backend
+├── bkit/                    # [v1.4.0] classical ML, scikit-learn's shape (in progress)
 ├── hash/ crypto/ uuid/      # [v1.4.0] SHA-2, HMAC, AES-GCM, Ed25519, P-256, UUIDs
 ├── orm/ lugha/ random/      # [v1.4.0] ORM, language helpers, distributions
 ├── tests/                   # 80+ Bantu suites, run by tests/*.sh and bantu run
@@ -640,6 +642,7 @@ Bantu/
 - **The ecosystem plan:** [`docs/ecosystem-architecture.md`](docs/ecosystem-architecture.md) — what belongs in a package and what belongs in the binary, the dependency DAG, and every decision with the reason it was made
 - **Array internals:** [`docs/numba-architecture.md`](docs/numba-architecture.md) and [`docs/numba-dtype-architecture.md`](docs/numba-dtype-architecture.md) — the three-tier kernel loop, dtypes, the thread pool's determinism contract
 - **Library docs:** [`docs/numba.md`](docs/numba.md) · [`docs/btorch.md`](docs/btorch.md) · [`docs/pillow.md`](docs/pillow.md) · [`docs/arctic.md`](docs/arctic.md) · [`docs/bplot.md`](docs/bplot.md)
+- **Machine learning design:** [`docs/bkit-architecture.md`](docs/bkit-architecture.md) — the estimator protocol, the preprocessing transformers, and the histogram-based gradient booster still to come
 - **Decision logs:** `numba-suite/DECISIONS.md`, `btorch-suite/DECISIONS.md` and their siblings — every non-obvious choice, including the ones that turned out wrong and what replaced them
 - **Quick start:** [`QUICKSTART.md`](QUICKSTART.md)
 - **Samples:** [`samples/`](samples/) — three runnable apps

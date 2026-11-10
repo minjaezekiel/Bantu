@@ -1,15 +1,32 @@
 {
   "name": "bkit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "bantu": ">=1.4.0",
   "main": "base.b",
   "license": "MIT",
-  "description": "Classical machine learning for Bantu: scikit-learn's shape, with a histogram-based gradient-boosting implementation inside it rather than beside it. Phase K1 of twelve: the estimator protocol (fit/predict/get_params/set_params/clone, with fit_transform/score/_check_fitted provided), Pipeline with step__param addressing, and the table-driven protocol check every later estimator is measured against.",
-  "keywords": ["machine-learning", "scikit-learn", "estimator", "pipeline", "gbdt"],
+  "description": "Classical machine learning for Bantu: scikit-learn's shape, with a histogram-based gradient-boosting implementation inside it rather than beside it. Phases K1-K2 of twelve: the estimator protocol (fit/predict/transform/get_params/set_params/clone, with fit_transform/score/_check_fitted provided), Pipeline with step__param addressing and a deep clone, the table-driven protocol check every later estimator is measured against, and eleven preprocessing transformers -- four scalers sharing one transform, three encoders mapping through searchsorted, SimpleImputer, PolynomialFeatures, Normalizer and Binarizer.",
+  "keywords": [
+    "machine-learning",
+    "scikit-learn",
+    "estimator",
+    "pipeline",
+    "preprocessing",
+    "scaler",
+    "encoder",
+    "imputer",
+    "gbdt"
+  ],
   "dependencies": {
     "numba": "1.0.0"
   },
-  "files": ["base.b"],
+  "files": [
+    "base.b",
+    "preprocess.b"
+  ],
   "docs": "docs/bkit-architecture.md",
-  "tests": ["tests/bkit_base_test.b"]
+  "tests": [
+    "tests/bkit_base_test.b",
+    "tests/bkit_preprocess_test.b",
+    "tests/bkit_protocol_test.b"
+  ]
 }
