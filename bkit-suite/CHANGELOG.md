@@ -182,3 +182,97 @@ Eleven estimators over two base classes, 1,011 lines. Design:
   is **not** silenced — it goes to stderr instead, and says what the consequence is, because
   execution continues with no parent and the first symptom is "X.fit is not implemented" from a
   class that plainly implements `fit`.
+
+## Phase K3 — `selection.b`
+
+Four splitters, cross-validation and two parameter searches, 922 lines. Design:
+[`../docs/bkit-architecture.md`](../docs/bkit-architecture.md) §4; decisions K18–K24.
+
+- **[feature]** `train_test_split` (with a stratified option) and
+  `train_test_split_indices`; `KFold`, `StratifiedKFold`, `GroupKFold`,
+  `TimeSeriesSplit`; `cross_val_score`, `cross_validate`; `GridSearchCV`,
+  `RandomizedSearchCV`; plus `param_grid`, `as_splitter`, `take_rows` and `splitter_check`.
+- **[design]** **A splitter is not an estimator** (K20). `KFold` has nothing to fit and nothing to
+  predict, so forcing it through the estimator protocol would mean five of seven methods raising on
+  every splitter. They get their own three-method contract — `get_n_splits`, `split`, `partitions` —
+  and their own `splitter_check`, in `selection.b` so later phases inherit one definition of it.
+  `partitions()` is on the protocol rather than assumed by the checker because `TimeSeriesSplit`
+  deliberately never tests the first rows: a checker that assumed coverage would exempt it by name,
+  and the next splitter would be exempted by whoever added it.
+- **[design]** **Splitters return index arrays, never data** (K19). A 5-fold split of a 1M × 100
+  matrix copies nothing, and `cross_val_score` takes rows once per fold — but the deciding reason is
+  that **the invariants become checkable**. "No group appears in two folds" is a statement about
+  indices; given only `X_train` matrices you would have to search for rows, and `splitter_check`
+  could not exist in the form it does.
+- **[design]** **No `random_state` on any splitter** (K21). Reproducibility comes from seeding once
+  with `nd_seed`, the ecosystem's single RNG authority ([C4]). A per-splitter seed would have to
+  call `nd_seed` to take effect, clobbering the stream for everything downstream — a model drawing
+  its weights after a grid search would get a stream chosen by the splitter. The consequence is a
+  requirement that was needed anyway: **the searches materialise their splits once** and reuse them
+  for every candidate, because re-splitting per candidate with a shuffled splitter compares
+  candidates on different folds and makes the winner partly a draw of the RNG.
+- **[design]** **A permutation is `nd_argsort` of random keys** (K18) — two kernel calls instead of
+  `n` interpreter iterations with `n` RNG draws. The C-style `for` also stops silently at 100,000
+  iterations, so a hand-written Fisher–Yates would be *wrong* above that size without saying so.
+  Recorded with its caveat: `argsort` of distinct keys is uniform, and two equal `f64` keys break by
+  index — about a 1-in-10,000 chance of any collision at n = 1,000,000, perturbing one adjacent pair.
+- **[design]** **The fold-size rule is written down and stratification rotates it** (K22). The first
+  `n mod k` folds get one extra row, which is scikit-learn's rule; a different one silently changes
+  every score a user compares against a Python baseline. `StratifiedKFold` applies it per class and
+  **rotates the starting fold between classes** — without that, every class puts its extra in fold 0
+  and three classes make fold 0 three rows larger than the last. Each class is still within ±1
+  either way, so a test of class ratios alone passes; the *folds* are what go wrong.
+- **[design]** `train_test_split` returns a **named dict** (K23), not four positionals.
+  scikit-learn's `X_train, X_test, y_train, y_test` interleaves the two variables, and swapping two
+  gives a working program that trains on its test set. Bantu has no tuple unpacking at all, so the
+  positional form would read as `$r[2]`/`$r[3]`. The indices come back too, so a caller splitting a
+  third array the same way does not have to re-derive the split — which with a shuffled splitter
+  would give a *different* one.
+- **[bug fix]** **In `base.b`, found while designing this phase:** `set_params` accepted **any** key
+  and added it to `params_`. A grid over a mistyped key — `with_men` for `with_mean` — therefore ran
+  every candidate with identical settings, scored them identically, and reported a best
+  configuration it had never tried (K24). It now refuses a key `get_params()` does not hold and
+  names the ones it takes. Presence is tested with `keys()` rather than `== null`, because a
+  parameter may legitimately *hold* null — `OrdinalEncoder`'s `unknown_value` does.
+  `GridSearchCV` validates the whole grid before the first fit, so a typo costs a message instead of
+  minutes of fitting. Regression test in `tests/bkit_base_test.b`, grown to **53 assertions**,
+  including that a parameter whose value *is* null stays settable — the reason presence is tested
+  with `keys()` and not with `== null`.
+- **[test]** `tests/bkit_selection_test.b` — **117 assertions**, tiers 1–4. The gates: train and
+  test never overlap in any fold of any splitter; `cross_val_score` leaves the estimator it was
+  given unfitted and never shows it a row; the search's `best_score()` equals a hand-recomputed mean
+  over the same folds to 1e-15, **and so does every other candidate's**; every training index
+  precedes every test index in `TimeSeriesSplit`; each of four groups is tested in exactly one fold,
+  re-checked at 50 rows with 7 random groups. Stress: a 50,000-row shuffled 5-fold split in **13 ms**
+  with coverage and overlap verified across all 50,000 rows.
+- **[test]** `tests/bkit_protocol_test.b` grown to **39 assertions**: `GridSearchCV` and
+  `RandomizedSearchCV` join the estimator registry (they *are* estimators, `clone()` isolation
+  included), and the **splitter** contract is checked there too, so the package-wide tier 3 covers
+  both protocols and a reader asking "what conforms to what" has one file to open.
+- **[test]** **Fourteen mutations, and four of them initially passed** — which is the entire case for
+  running a battery rather than reading the test and nodding:
+  * *re-splitting per candidate* was unfalsifiable against an **unshuffled** splitter, since two
+    calls to `split()` return the same folds. The test now fits with `KFold(shuffle=true)` and
+    reproduces the folds by re-seeding.
+  * *sampling with replacement* in `RandomizedSearchCV` survived one lucky seed — drawing 4 of 5
+    distinct happens about 19% of the time. The check now runs ten seeds, where replacement would
+    be a 6-in-100-million coincidence.
+  * *removing the shuffle* from `train_test_split` passed every assertion about sizes, disjointness,
+    coverage and reproducibility, because all of those hold for an unshuffled split. The test now
+    asserts the number of **distinct** test sets across seeds.
+  * *removing the rare-class floor* from the stratified split passed, because at `test_size=0.5` a
+    2-member class already rounds to 1 and the floor never fired. The test now exercises 0.2 and 0.9,
+    the fractions where the floor and the cap actually do the work.
+- **[perf]** `_complement` and `splitter_check` were passing `nd_put` two **Bantu lists** built by
+  `nd_to_list`, where the kernel takes index arrays and a scalar directly: 29 ms against 1 ms for
+  100,000 indices, best of five on an idle machine. That path runs once per fold per candidate of a
+  grid search. The 50,000-row split went 17 ms → **13 ms**; the first reading after the change said
+  32 ms, which was the rest of the suite running beside it — the figure here is from an idle
+  machine, like every other number in this log.
+- **[bug fix]** **Two of this file's own assertions were wrong, not the code.** A guessed optimum
+  (`the best shift is 0`) held for a coarse grid and failed for a finer one — the true optimum on ten
+  rows is wherever the per-fold train means sit relative to the test means. It is now the **argmax of
+  a hand-recomputed table**, which is the property a search actually owes. And a 400-byte residue
+  after 200 splits was read as a leak; it is exactly one 5-fold split of ten rows, still referenced
+  by the loop variable. The test now runs 200 and 800 iterations and asserts the residue is **equal**,
+  then drops the reference and asserts it reaches zero — both stronger than "did not grow".

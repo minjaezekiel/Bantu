@@ -310,3 +310,138 @@ repeated categorical values rather than forty distinct floats, and a regressor
 needs a `y`. Sharing one matrix would have meant either skipping the estimators
 it did not suit — the ones most likely to break the contract — or giving them a
 fit that does not represent them.
+
+---
+
+### K18 — A permutation is `argsort` of random keys, not Fisher–Yates
+```bantu
+nd_argsort(nd_random_uniform([$n], 0.0, 1.0), null)
+```
+Two kernel calls. Fisher–Yates in Bantu is `n` interpreter iterations and `n`
+separate RNG draws, which for a million-row shuffle is the difference between
+milliseconds and minutes — and the C-style `for` silently stops at 100,000
+iterations, so the obvious implementation would also be *wrong* above that size
+without saying so.
+
+It delegates to the one RNG ([C4]) without touching it: `nd_random_uniform`
+draws from `nd_seed`'s stream, so the same seed gives the same permutation and
+nothing in `bkit` holds RNG state.
+
+**The honest caveat:** `argsort` of *distinct* keys is a uniform permutation.
+Two equal `f64` keys are broken by index. At n = 1,000,000 the chance of any
+collision at all is about 1 in 10,000, and a collision perturbs one adjacent
+pair — so the bias exists and is negligible, which is worth stating rather than
+implying that the method is exact.
+
+---
+
+### K19 — Splitters return index arrays, never data
+`split` yields `[train_idx, test_idx]` as `i64` arrays, not `X_train`/`X_test`.
+
+Two of the reasons are obvious — a 5-fold split of a 1M × 100 matrix copies
+nothing, and `cross_val_score` can take rows once per fold. The third is the one
+that decided it: **the invariants become checkable.** "No group appears in two
+folds" and "every index is tested exactly once" are statements about indices.
+Given only `X_train` matrices you would have to search for rows to verify
+either, and `splitter_check` could not exist in the form it does.
+
+---
+
+### K20 — A splitter is not an estimator, and gets its own protocol
+`KFold` has nothing to fit and nothing to predict. Putting it through the
+estimator protocol would mean `fit`, `predict`, `transform`, `score` and
+`clone` all raising on every splitter, and a `protocol_check` told to skip five
+of its seven assertions.
+
+So splitters have three methods — `get_n_splits()`, `split($X, $y, $groups)`,
+`partitions()` — and their own `splitter_check`, which lives in `selection.b`
+for the reason `protocol_check` lives in `base.b` ([K17]): one definition of the
+contract, inherited by whatever is added later.
+
+`partitions()` is on the protocol rather than assumed by the checker because the
+invariant genuinely differs. `KFold`, `StratifiedKFold` and `GroupKFold`
+partition the data exactly; `TimeSeriesSplit` does **not** — the earliest rows
+are never tested, which is the point of it. A checker that assumed coverage
+would have to exempt `TimeSeriesSplit` by name, and the next splitter added
+would be exempted by whoever added it.
+
+---
+
+### K21 — No `random_state` on a splitter, and the requirement that follows
+scikit-learn's splitters take a `random_state`. `bkit`'s do not. Reproducibility
+comes from seeding **once**, with `nd_seed`, which is already how `numba` and
+`btorch` work ([C4]).
+
+**Rejected:** a per-splitter seed. To take effect it would have to call
+`nd_seed`, which clobbers the global stream for everything downstream — a model
+drawing its initial weights after a grid search would get a stream chosen by the
+splitter. That is exactly the "each package seeds separately" failure C4 exists
+to prevent, and it would arrive as an irreproducible model rather than as an
+error.
+
+The consequence is not a limitation, it is a requirement that was needed anyway:
+**`cross_val_score` and the searches materialise their splits once and reuse
+them for every candidate.** Re-splitting per candidate with a shuffled splitter
+compares candidates on *different folds*, so the winner is partly a draw of the
+RNG. With the folds fixed, a difference in score is a difference in the
+parameters.
+
+That property is also why the test for it needs a *shuffled* splitter. With an
+unshuffled one it is unfalsifiable — two calls to `split()` return the same
+folds — and a mutation that re-split per candidate passed the first version of
+the test for exactly that reason.
+
+---
+
+### K22 — The fold-size rule is written down, and stratification rotates it
+With `n` rows and `k` folds, the first `n mod k` folds get `floor(n/k) + 1` rows
+and the rest get `floor(n/k)`. This is scikit-learn's rule, recorded because
+"balanced folds" has several reasonable definitions and a different one silently
+changes every cross-validated score a user compares against a Python baseline.
+
+`StratifiedKFold` applies the same rule **per class**, and **rotates the
+starting fold from one class to the next**. Without the rotation every class puts
+its extra sample in fold 0: with three classes each having one extra, fold 0 ends
+up three rows larger than the last. Each class is still balanced to ±1 either
+way — so a test of class ratios alone would pass — but the folds are not, and a
+fold 10% larger than its neighbour makes the per-fold scores incomparable.
+
+The rotation is one accumulator, `rot = (rot + m_c mod k) mod k`, and it is the
+difference between "stratified" and "stratified and balanced".
+
+---
+
+### K23 — `train_test_split` returns a named dict
+```bantu
+$s = sel.train_test_split($X, $y, 0.25, true, null);
+$s.X_train   $s.X_test   $s.y_train   $s.y_test   $s.train_index   $s.test_index
+```
+scikit-learn's `X_train, X_test, y_train, y_test = train_test_split(...)`
+interleaves the two variables rather than grouping them, and swapping two of
+them yields a working program that trains on its test set. Bantu has no tuple
+unpacking at all, so the positional form would have to be read as `$r[2]` and
+`$r[3]`, which is worse still. Named fields cost nothing and cannot be
+transposed.
+
+The indices come back too, because a caller who wants to split a third array
+the same way — sample weights, group labels — should not have to re-derive the
+split, and re-deriving it with a shuffled splitter would give a *different* one.
+
+---
+
+### K24 — A mistyped parameter is an error
+Found while designing K3, fixed in `base.b`: `set_params` accepted any key and
+added it to `params_`. So a grid over a mistyped key — `with_men` for
+`with_mean` — ran every candidate with identical settings, scored them
+identically, and reported a "best" configuration it had never tried. The whole
+protocol exists to prevent plausible wrong numbers, and this produced one.
+
+`set_params` now refuses a key `get_params()` does not already hold, and names
+the ones it takes. Presence is tested with `keys()` rather than `== null`,
+because a parameter may legitimately *hold* null — `OrdinalEncoder`'s
+`unknown_value` does — so a null read cannot tell "absent" from "set to null".
+
+`GridSearchCV` validates the whole grid against a clone of the estimator
+**before** the first fit, so a typo costs a message rather than a few minutes of
+fitting. For a `Pipeline` that validation has to go through the estimator
+anyway, since only the pipeline knows whether `reg__shift` names a real step.

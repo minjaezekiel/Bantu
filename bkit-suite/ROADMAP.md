@@ -119,10 +119,33 @@ the contract itself.
 
 | Item | Feature test | Status |
 |---|---|---|
-| `train_test_split` (stratified option) | **seeded via `nd_seed` only** ([C4]); same seed → identical split, twice | [ ] |
-| `KFold`, `StratifiedKFold`, `GroupKFold`, `TimeSeriesSplit` | folds partition exactly: every index once, no overlap; stratified preserves class ratios to ±1 | [ ] |
-| `cross_val_score`, `cross_validate` | **clones before every fit**; a test asserts the source estimator's coefficients are unchanged afterwards ([K2]) | [ ] |
-| `GridSearchCV`, `RandomizedSearchCV` | the reported best score equals a hand-run refit at those params | [ ] |
+| `train_test_split` (stratified option) | **seeded via `nd_seed` only** ([C4]); same seed → identical split, twice | [x] returns a named dict, not four positionals ([K23]); the rare-class floor and cap are exercised at the fractions where they fire |
+| `KFold`, `StratifiedKFold`, `GroupKFold`, `TimeSeriesSplit` | folds partition exactly: every index once, no overlap; stratified preserves class ratios to ±1 | [x] plus the rotation that keeps the **folds** balanced and not only the classes ([K22]), and `partitions()` on the protocol so `TimeSeriesSplit` is not an exemption ([K20]) |
+| `cross_val_score`, `cross_validate` | **clones before every fit**; a test asserts the source estimator's coefficients are unchanged afterwards ([K2]) | [x] the source is asserted unfitted *and* never to have seen a row |
+| `GridSearchCV`, `RandomizedSearchCV` | the reported best score equals a hand-run refit at those params | [x] to 1e-15, and so does **every** candidate's reported mean |
+
+**Gates, all green:** `tests/bkit_selection_test.b` 117 assertions (tiers 1–4),
+`tests/bkit_protocol_test.b` grown to 39 (both protocols). 50,000-row shuffled
+5-fold split in **13 ms**, with coverage and overlap verified across all 50,000
+rows.
+
+**Fourteen mutations, four of which initially passed.** That is the case for a
+battery rather than a careful read:
+* re-splitting per candidate was **unfalsifiable** against an unshuffled
+  splitter — two `split()` calls return the same folds — so the test now fits
+  with `KFold(shuffle=true)` and reproduces the folds by re-seeding;
+* sampling with replacement survived one lucky seed (4-of-5 distinct happens
+  19% of the time); the check now runs ten;
+* removing the shuffle from `train_test_split` passed everything about sizes,
+  disjointness, coverage and reproducibility, since all of it holds unshuffled;
+* removing the rare-class floor passed because at `test_size=0.5` a 2-member
+  class already rounds to 1 and the floor never fired.
+
+**Two of the test's own expectations were wrong, not the code.** A guessed
+optimum held for a coarse grid and failed for a finer one; it is now the argmax
+of a hand-recomputed table, which is the property a search actually owes. And a
+400-byte residue after 200 splits was read as a leak — it is exactly one
+5-fold split of ten rows, still referenced by the loop variable.
 
 ## Phase K4 — `metrics.b`
 
@@ -210,10 +233,10 @@ Datasets fetched and SHA-256 verified, **never committed** — the method
 
 ## Where to resume
 
-**K0, K1 and K2 are done; K3 (`selection.b`) is next.** `base.b` is 330 lines
-and `preprocess.b` is 956; `tests/bkit_base_test.b` is 46 assertions,
-`tests/bkit_preprocess_test.b` is 174 and `tests/bkit_protocol_test.b` is 32,
-all green. Read
+**K0–K3 are done; K4 (`metrics.b`) is next.** `base.b` is 330 lines,
+`preprocess.b` 1,011 and `selection.b` 922; `tests/bkit_base_test.b` is 53
+assertions, `tests/bkit_preprocess_test.b` 174, `tests/bkit_selection_test.b`
+117 and `tests/bkit_protocol_test.b` 39 — all green. Read
 [`../docs/bkit-architecture.md`](../docs/bkit-architecture.md) first, then
 [`DECISIONS.md`](DECISIONS.md).
 
@@ -221,7 +244,7 @@ Ecosystem **stage 2** (the engine field) landed first, as required, and
 `bkit/package.json` declares `"bantu": ">=1.4.0"` — verified against the floor
 its own sources imply with `bantu engine bkit`.
 
-What K3 inherits and should not re-invent:
+What K4 inherits and should not re-invent:
 
 * every estimator is `_Name` plus a same-named factory `def Name(...)`, because
   a `def Name()` shadows a `class Name`, and `new Name(...)` inside the factory
@@ -244,4 +267,15 @@ What K3 inherits and should not re-invent:
   needing kernels numba does not have ([K16]);
 * a throwing assertion must not abort a test file — use the `safe_ok` wrapper
   that `tests/bkit_preprocess_test.b` defines, or the first failure hides the
-  rest.
+  rest;
+* `selection.b` already has what K4 needs for its own tests: `KFold`,
+  `cross_val_score` and `take_rows`, plus `_permutation` for any sampling;
+* **`set_params` refuses an unknown key** now ([K24]), so a metric or scorer
+  exposing a parameter must declare it in `params_` at construction;
+* **`score()` raises on a constant target** — R² is 0/0 — so any test target
+  used with cross-validation should have distinct values, or a 2-row fold will
+  abort the file. This cost two debugging rounds in K3;
+* **mutation-test the suite, and expect some mutations to pass.** Four of
+  fourteen did in K3, every one of them because the assertion was true of the
+  broken code as well. A gate nobody has tried to break is a gate nobody has
+  tested.

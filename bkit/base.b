@@ -88,9 +88,26 @@ class Estimator {
     // Setting a parameter invalidates the fit. Leaving `fitted_` true would let
     // `predict` run with coefficients belonging to the OLD parameters, which is
     // a wrong answer rather than an error.
+    //
+    // AN UNKNOWN KEY IS REFUSED, and that is not pedantry (K24). It used to be
+    // accepted, which meant `set_params({"with_men": false})` added a
+    // parameter nobody reads: a grid search over a mistyped key then ran every
+    // candidate with identical settings and reported a best score for a
+    // configuration it never tried. A wrong number that looks plausible is the
+    // failure mode this whole protocol exists to prevent.
+    //
+    // Presence is tested with `keys()` and not with `== null`, because a
+    // parameter may legitimately HOLD null -- OrdinalEncoder's
+    // `unknown_value` does -- so a null read cannot distinguish "absent" from
+    // "set to null".
     def set_params($d) {
         if ($d == null) { return this; }
+        $known = this.params_.keys();
         for $k, $v in $d.items() {
+            if (!contains($known, $k)) {
+                throw this.name_ + ".set_params: there is no parameter '" + str($k)
+                      + "'. It takes " + str($known) + ".";
+            }
             this.params_[$k] = $v;
         }
         this.fitted_ = false;
@@ -225,6 +242,13 @@ class _Pipeline extends Estimator {
         return Pipeline($out);
     }
 
+    def _step_names() {
+        $out = [];
+        $i = 0;
+        while ($i < len(this.steps)) { append($out, this.steps[$i][0]); $i = $i + 1; }
+        return $out;
+    }
+
     def get_step($name) {
         $i = 0;
         while ($i < len(this.steps)) {
@@ -255,6 +279,13 @@ class _Pipeline extends Estimator {
         for $k, $v in $d.items() {
             $cut = indexOf($k, "__");
             if ($cut < 0) {
+                // Same refusal as the base class, for the same reason (K24).
+                if (!contains(this.params_.keys(), $k)) {
+                    throw "Pipeline.set_params: there is no pipeline parameter '"
+                          + str($k) + "'. A step's parameter is addressed as "
+                          + "\"<step>__<param>\"; this pipeline's steps are "
+                          + str(this._step_names()) + ".";
+                }
                 this.params_[$k] = $v;
             }
             if ($cut >= 0) {

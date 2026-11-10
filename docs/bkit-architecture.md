@@ -235,11 +235,134 @@ holding whatever the vector ended up as.
 
 ---
 
-## 4. Gradient boosting — the headline
+## 4. Model selection — splitting, and the one thing that must not leak
+
+### 4.1 A splitter is not an estimator [K20]
+
+`KFold` has nothing to fit and nothing to predict. Forcing it through the
+estimator protocol would mean `fit`, `predict`, `transform`, `score` and
+`clone` all raising on every splitter in the file, and a `protocol_check` that
+has to be told to skip five of its seven assertions.
+
+So splitters get their own three-method protocol, and their own check:
+
+```bantu
+def get_n_splits()                 // how many folds
+def split($X, $y, $groups)         // a list of [train_idx, test_idx]
+def partitions()                   // do the test folds cover 0..n-1 exactly?
+```
+
+`partitions()` exists because the invariant is not the same for all of them.
+`KFold`, `StratifiedKFold` and `GroupKFold` partition the data exactly — every
+index in exactly one test fold. `TimeSeriesSplit` does **not**: the earliest
+rows are never tested, which is the point of it. A single check that asserted
+exhaustiveness for everything would have to exempt `TimeSeriesSplit` by name,
+and the next splitter added would be exempted by whoever adds it.
+
+`splitter_check` lives in `selection.b` for the same reason `protocol_check`
+lives in `base.b` ([K17]): one definition of the contract, inherited by
+everything that comes later.
+
+### 4.2 Splitters return index arrays, not data [K19]
+
+`split` yields `[train_idx, test_idx]` as `i64` arrays, never `X_train`/`X_test`.
+
+Three things follow, and the third is the one that mattered:
+* a 5-fold split of a 1M × 100 matrix copies the data **zero** times instead of
+  five;
+* `cross_val_score` can hand the same indices to `nd_take` once per fold;
+* **the invariants become checkable.** "No group appears in two folds" and
+  "every index is tested exactly once" are statements about indices. Given only
+  `X_train` matrices you would have to search for rows.
+
+### 4.3 A permutation is `argsort` of random keys [K18]
+
+```bantu
+nd_argsort(nd_random_uniform([$n], 0.0, 1.0), null)
+```
+
+Two kernel calls. The alternative — Fisher–Yates in Bantu — is `n` interpreter
+iterations and `n` separate RNG draws, which for a 1M-row shuffle is the
+difference between milliseconds and minutes, and the interpreter's C-style
+`for` silently stops at 100,000 iterations anyway.
+
+It also delegates to the one RNG ([C4]) without touching it: `nd_random_uniform`
+draws from `nd_seed`'s stream, so the same seed gives the same permutation and
+nothing in `bkit` carries RNG state of its own.
+
+*The honest caveat:* `argsort` of **distinct** keys is a uniform permutation.
+Two equal f64 keys are broken by index, which is a negligible bias — at n = 1M
+the chance of any collision is about 1 in 10,000, and a collision perturbs one
+adjacent pair.
+
+### 4.4 No `random_state` on a splitter, and what that forces [K21]
+
+scikit-learn's splitters take a `random_state`. `bkit`'s do not: reproducibility
+comes from seeding **once**, at the top of the program, which is already how
+`numba` and `btorch` work ([C4]). A per-splitter seed would have to call
+`nd_seed` to take effect, and that clobbers the global stream for everything
+downstream — a model drawing its initial weights after a grid search would get a
+stream determined by the splitter's seed. That is precisely the
+"each package seeds separately" failure C4 exists to prevent.
+
+The consequence is not a limitation, it is a requirement that was needed anyway:
+**`cross_val_score` and `GridSearchCV` materialise their splits once and reuse
+them for every candidate.** Re-splitting per candidate with a shuffled splitter
+would compare candidates on *different folds*, so the winner would be partly a
+draw of the RNG. With the splits fixed, a difference in score is a difference in
+the parameters.
+
+### 4.5 The fold-size rule is stated, not implied [K22]
+
+With `n` rows and `k` folds, the first `n mod k` folds get `floor(n/k) + 1` rows
+and the rest get `floor(n/k)`. This is scikit-learn's rule and it is written
+down because "balanced folds" has several reasonable definitions and a different
+one silently changes every cross-validated score a user compares against a
+Python baseline.
+
+`StratifiedKFold` applies the same rule **per class**, and rotates the starting
+fold from one class to the next. Without the rotation every class puts its extra
+sample in fold 0, so with three classes each having one extra, fold 0 is three
+rows larger than the last — each class is still balanced to ±1, but the folds
+are not. The rotation is a one-line accumulator and it is the difference between
+"stratified" and "stratified and balanced".
+
+### 4.6 `train_test_split` returns a named dict, not four positionals
+
+```bantu
+$s = sel.train_test_split($X, $y, 0.25, true, null);
+$s.X_train    $s.X_test    $s.y_train    $s.y_test
+```
+
+scikit-learn's `X_train, X_test, y_train, y_test = train_test_split(...)` is
+famously easy to get wrong — the order interleaves the two variables rather than
+grouping them, and swapping two of them produces a working program that trains
+on the test set. In Bantu the call would have to be indexed as `$r[2]` and
+`$r[3]`, which is worse still. Named fields cost nothing and cannot be
+transposed.
+
+### 4.7 A mistyped parameter is an error [K24]
+
+Found while designing this phase, fixed in `base.b`: `set_params` accepted any
+key and added it to `params_`. So `GridSearchCV` over a grid with a mistyped
+key — `with_men` for `with_mean` — ran every candidate with identical settings,
+scored them identically, and reported a best configuration it had never tried.
+
+`set_params` now refuses a key `get_params()` does not already hold, and names
+the ones it takes. Presence is tested with `keys()` rather than `== null`,
+because a parameter may legitimately *hold* null: `OrdinalEncoder`'s
+`unknown_value` does, so a null read cannot tell "absent" from "set to null".
+
+`GridSearchCV` validates the whole grid against the estimator **before** the
+first fit, so a typo costs a message instead of a few minutes of fitting.
+
+---
+
+## 5. Gradient boosting — the headline
 
 Histogram-based, LightGBM-shaped. The design choices and why.
 
-### 4.1 The algorithm
+### 5.1 The algorithm
 
 1. **Bin once, up front.** Each feature is quantile-binned into at most 256
    bins. All later work reads bin indices, never raw values. This is what makes
@@ -256,7 +379,7 @@ Histogram-based, LightGBM-shaped. The design choices and why.
    `max_depth` as a separate guard.
 6. **Predict** by traversing the node array.
 
-### 4.2 The `tree_` native family
+### 5.2 The `tree_` native family
 
 Five kernels. The Bantu side runs the boosting loop, computes gradients and
 hessians (vectorised over `nd_*`), handles early stopping and feature
@@ -275,7 +398,7 @@ A Bantu function call costs **1.78 µs** (btorch B1). `tree_hist` on a
 what Bantu can do per element. These five are not an optimisation; without them
 there is no GBDT.
 
-### 4.3 The binned matrix is an opaque handle, not an `NdArray`
+### 5.3 The binned matrix is an opaque handle, not an `NdArray`
 
 **A real blocker, found while writing this.** The binned matrix wants to be
 `u8` — one byte per cell. numba's `DType` is `{F64, I64, BOOL}`: there is no
@@ -301,7 +424,7 @@ entirely from the dtype roadmap.
 quantization, the handle can migrate to an `NdArray` behind the same API. It is
 not a dead end, just not a dependency.
 
-### 4.4 Objectives
+### 5.4 Objectives
 
 Gradients and hessians are pure Bantu over `nd_*` — one vectorised call per
 boosting iteration.
@@ -320,7 +443,7 @@ deliberately.
 
 ---
 
-## 5. Data input: arrays, with arctic as an adapter
+## 6. Data input: arrays, with arctic as an adapter
 
 Resolves open question 4 in the ecosystem doc.
 
@@ -337,7 +460,7 @@ arrays would pay for a column store they do not use, and every algorithm would
 carry two code paths — the condition that B18 avoided in btorch by composing
 convolution out of im2col and matmul rather than writing a second path.
 
-### 5.1 Missing values in the GBDT
+### 6.1 Missing values in the GBDT
 
 `NaN` goes to a dedicated bin, and each split learns a default direction (the
 side with the higher gain) which is also used for unseen `NaN` at predict time.
@@ -346,7 +469,7 @@ first is both lossy and a different model.
 
 ---
 
-## 6. Persistence
+## 7. Persistence
 
 `.btsd` with `kind: "bkit.estimator"` ([C3]). One container, one SHA-256, one
 set of twelve load-failure messages — already written for btorch, not rewritten
@@ -364,7 +487,7 @@ memory.
 
 ---
 
-## 7. Gates
+## 8. Gates
 
 Six tiers, as every phase in this project. Gradcheck does not apply (no
 autograd here); its slot is taken by **differential testing against published
@@ -383,7 +506,7 @@ Tier 3 is new to this project and exists because a protocol with eleven
 implementers fragments silently. It enumerates the estimators and asserts the
 contract on each, so a new estimator that forgets `clone()` fails immediately.
 
-### 7.1 The accuracy gates
+### 8.1 The accuracy gates
 
 Public datasets, fetched and SHA-256 verified, never committed — the method
 btorch's `get_mnist.sh` established (B25).
@@ -402,7 +525,7 @@ measured from a reloaded `.btsd` model, not from memory.
 
 ---
 
-## 8. What is deliberately out
+## 9. What is deliberately out
 
 | item | why |
 |---|---|
@@ -415,7 +538,7 @@ measured from a reloaded `.btsd` model, not from memory.
 
 ---
 
-## 9. Open items
+## 10. Open items
 
 | # | item | settled by |
 |---|---|---|

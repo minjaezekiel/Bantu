@@ -39,7 +39,14 @@ All notable changes to the Bantu programming language are documented in this fil
   `_check_fitted` provided), `Pipeline` with `step__param` addressing and a deep `clone()`, and
   eleven preprocessing transformers — `StandardScaler`, `MinMaxScaler`, `RobustScaler`,
   `MaxAbsScaler`, `OrdinalEncoder`, `OneHotEncoder`, `LabelEncoder`, `SimpleImputer`,
-  `PolynomialFeatures`, `Normalizer`, `Binarizer`. A 100,000 × 20 `fit_transform` takes 75 ms.
+  `PolynomialFeatures`, `Normalizer`, `Binarizer` — and model selection: `train_test_split`,
+  `KFold`, `StratifiedKFold`, `GroupKFold`, `TimeSeriesSplit`, `cross_val_score`,
+  `cross_validate`, `GridSearchCV` and `RandomizedSearchCV`.
+
+  A 100,000 × 20 `fit_transform` takes 75 ms; a 50,000-row shuffled 5-fold split takes 13 ms.
+  Reproducibility comes from `nd_seed` alone — no estimator or splitter carries its own RNG state —
+  and splitters return index arrays rather than copies, so a 5-fold split of a large matrix copies
+  nothing and its invariants ("no group in two folds", "every row tested once") are checkable.
   Every estimator's conformance to the protocol is asserted in one table-driven test, because a
   protocol with eleven implementers fragments silently.
 

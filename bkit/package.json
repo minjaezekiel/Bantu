@@ -1,19 +1,19 @@
 {
   "name": "bkit",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "bantu": ">=1.4.0",
   "main": "base.b",
   "license": "MIT",
-  "description": "Classical machine learning for Bantu: scikit-learn's shape, with a histogram-based gradient-boosting implementation inside it rather than beside it. Phases K1-K2 of twelve: the estimator protocol (fit/predict/transform/get_params/set_params/clone, with fit_transform/score/_check_fitted provided), Pipeline with step__param addressing and a deep clone, the table-driven protocol check every later estimator is measured against, and eleven preprocessing transformers -- four scalers sharing one transform, three encoders mapping through searchsorted, SimpleImputer, PolynomialFeatures, Normalizer and Binarizer.",
+  "description": "Classical machine learning for Bantu: scikit-learn's shape, with a histogram-based gradient-boosting implementation inside it rather than beside it. Phases K1-K3 of twelve: the estimator protocol, Pipeline with step__param addressing and a deep clone, eleven preprocessing transformers (four scalers sharing one transform, three encoders mapping through searchsorted, SimpleImputer, PolynomialFeatures, Normalizer, Binarizer), and model selection -- train_test_split, KFold/StratifiedKFold/GroupKFold/TimeSeriesSplit, cross_val_score and GridSearchCV/RandomizedSearchCV. Reproducibility comes from nd_seed alone; splitters return index arrays and never copy data.",
   "keywords": [
     "machine-learning",
     "scikit-learn",
     "estimator",
     "pipeline",
     "preprocessing",
-    "scaler",
-    "encoder",
-    "imputer",
+    "cross-validation",
+    "grid-search",
+    "kfold",
     "gbdt"
   ],
   "dependencies": {
@@ -21,12 +21,14 @@
   },
   "files": [
     "base.b",
-    "preprocess.b"
+    "preprocess.b",
+    "selection.b"
   ],
   "docs": "docs/bkit-architecture.md",
   "tests": [
     "tests/bkit_base_test.b",
     "tests/bkit_preprocess_test.b",
+    "tests/bkit_selection_test.b",
     "tests/bkit_protocol_test.b"
   ]
 }

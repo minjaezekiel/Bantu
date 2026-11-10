@@ -30,6 +30,7 @@
 include "../numba/numba.b" as np;
 include "../bkit/base.b"       as base;
 include "../bkit/preprocess.b" as pre;
+include "../bkit/selection.b"  as sel;
 
 $R = {"pass": 0, "fail": 0};
 def ok($c, $n) {
@@ -46,10 +47,43 @@ print("");
 print("  bkit protocol conformance — every estimator in the package");
 print("  ════════════════════════════════════════");
 
+// A double, because `GridSearchCV` needs something SCORABLE to wrap and the
+// package has no real regressor until K5. A grid search over a transformer
+// cannot work at all -- there is no score to compare candidates by -- so this
+// is not a convenience, it is the only shape the entry can take today.
+class _ConstRegressor extends Estimator {
+    def init($bias) {
+        super();
+        this.name_ = "ConstRegressor";
+        this.task_ = "regressor";
+        $b = $bias;  if ($b == null) { $b = 0.0; }
+        this.params_ = {"bias": $b};
+        this.mu_ = 0.0;
+    }
+    def fit($X, $y) {
+        $ya = [0.0];
+        if ($y != null) { $ya = nd_to_list($y); }
+        this.mu_ = nd_get(nd_mean(nd($ya, "f64"), null, null), 0);
+        this.fitted_ = true;
+        return this;
+    }
+    def predict($X) {
+        this._check_fitted("ConstRegressor.predict");
+        $A = $X;
+        if (type($A) == "list") { $A = nd($A, "f64"); }
+        return nd_full([nd_shape($A)[0]], this.mu_ + this.params_.bias, "f64");
+    }
+    def clone() { return ConstRegressor(this.params_.bias); }
+}
+def ConstRegressor($bias) { return new _ConstRegressor($bias); }
+
 nd_seed(11);
 // Continuous: for the scalers and PolynomialFeatures.
 $Xc = nd_random_uniform([20, 3], 0.0 - 5.0, 5.0);
 $yc = nd_random_uniform([20], 0.0, 1.0);
+// Distinct by construction, so no cross-validation fold can have a constant
+// target -- base.b's score() rightly refuses an R2 of 0/0 for one.
+$yd = nd_astype(nd_arange(0, 20, null), "f64");
 // Categorical: small integers, repeated, so nd_unique finds real categories.
 $Xk = nd_astype(nd_random_int([20, 3], 0, 4), "f64");
 // One label column, for LabelEncoder.
@@ -81,7 +115,14 @@ $registry = [
     ["SimpleImputer(mode)", pre.SimpleImputer("most_frequent", null),   $Xk, $yc],
     ["SimpleImputer(const)", pre.SimpleImputer("constant", 0.0),        $Xc, $yc],
     ["PolynomialFeatures", pre.PolynomialFeatures(null, null, null),    $Xc, $yc],
-    ["PolynomialFeatures(int)", pre.PolynomialFeatures(2, true, false), $Xc, $yc]
+    ["PolynomialFeatures(int)", pre.PolynomialFeatures(2, true, false), $Xc, $yc],
+    // K3's two: they are Estimators, so the estimator contract applies to them
+    // exactly as to a scaler -- clone() isolation included, which for a search
+    // means a cloned search does not carry the winner it found.
+    ["GridSearchCV",       sel.GridSearchCV(ConstRegressor(0.0),
+                               {"bias": [0.0, 1.0]}, sel.KFold(4, false)), $Xc, $yd],
+    ["RandomizedSearchCV", sel.RandomizedSearchCV(ConstRegressor(0.0),
+                               {"bias": [0.0, 1.0, 2.0]}, 2, sel.KFold(4, false)), $Xc, $yd]
 ];
 
 print("");
@@ -94,7 +135,8 @@ while ($i < len($registry)) {
     else { ok(false, $nm + " violates the protocol: " + str($bad)); }
     $i = $i + 1;
 }
-eqs(len($registry), 23, "the registry names every estimator K2 added, in every mode");
+eqs(len($registry), 25,
+    "the registry names every estimator K2 and K3 added, in every mode");
 
 // ── the check can still fail ────────────────────────────────────────────────
 // A conformance suite that cannot fail proves nothing. `bkit_base_test.b` has
@@ -108,6 +150,33 @@ class _NoClone extends Estimator {
 def NoClone() { return new _NoClone(); }
 $neg = base.protocol_check(NoClone(), $Xc, $yc);
 ok(len($neg) > 0, "the same check still fails an estimator that forgot clone()");
+
+// ── the second protocol: splitters ──────────────────────────────────────────
+// `selection.b` adds a contract of its own, because a splitter has nothing to
+// fit and nothing to predict ([K20]). It is checked here as well as in
+// `bkit_selection_test.b` so that the package-wide tier 3 covers BOTH
+// protocols -- a reader asking "what conforms to what" has one file to open.
+print("");
+print("-- the splitter contract --");
+// Labels and groups built by construction rather than drawn: StratifiedKFold
+// needs every class to have at least as many members as there are folds, and
+// GroupKFold needs at least as many groups as folds. A random draw satisfies
+// both USUALLY, which is the kind of test that fails on somebody else's
+// machine. A repeating pattern satisfies them always.
+$yk = nd_astype(nd_mod(nd_arange(0, 20, null), 3, null), "f64");   // 7/7/6
+$gk = nd_astype(nd_floor_divide(nd_arange(0, 20, null), 4, null), "f64");  // 5 groups of 4
+$splitters = [["KFold",           sel.KFold(4, false)],
+              ["KFold(shuffle)",  sel.KFold(4, true)],
+              ["StratifiedKFold", sel.StratifiedKFold(3, true)],
+              ["GroupKFold",      sel.GroupKFold(3)],
+              ["TimeSeriesSplit", sel.TimeSeriesSplit(4)]];
+$i = 0;
+while ($i < len($splitters)) {
+    $bad = sel.splitter_check($splitters[$i][1], $Xc, $yk, $gk);
+    if (len($bad) == 0) { ok(true, $splitters[$i][0]); }
+    else { ok(false, $splitters[$i][0] + " violates the splitter contract: " + str($bad)); }
+    $i = $i + 1;
+}
 
 // ── every transformer composes in a Pipeline ────────────────────────────────
 // The protocol's purpose, not a separate feature: an estimator that satisfies

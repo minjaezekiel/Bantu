@@ -148,6 +148,41 @@ $ac.fit($X, null);
 eqs(nd_get($ac.transform(nd_zeros([1], "f64")), 0), 5.0, "the new parameter is used");
 eqs($ac.set_params(null), $ac, "set_params(null) is a no-op that still chains");
 
+// AN UNKNOWN KEY IS REFUSED (K24). It used to be accepted and added to
+// params_, so a grid search over a mistyped key ran every candidate with
+// identical settings and reported a best configuration it never tried -- a
+// plausible wrong number, which is the one failure this protocol exists to
+// prevent. Found while designing K3; this is its regression test.
+$typoMsg = "";
+try { $ac.set_params({"kk": 1.0}); } catch ($e) { $typoMsg = str($e); }
+ok($typoMsg != "", "set_params refuses a key get_params() does not hold");
+ok(indexOf($typoMsg, "no parameter 'kk'") >= 0, "  naming the key it rejected");
+ok(indexOf($typoMsg, "[k]") >= 0, "  and listing the ones it does take");
+eqs(len($ac.get_params()), 1, "and the refused key was NOT added");
+// a mix of one good and one bad key is still refused, so a grid cannot
+// half-apply
+$mixMsg = "";
+try { $ac.set_params({"k": 3.0, "nope": 1.0}); } catch ($e) { $mixMsg = str($e); }
+ok($mixMsg != "", "a dict with one unknown key among good ones is refused");
+
+// PRESENCE IS NOT A NULL TEST. A parameter may legitimately HOLD null --
+// OrdinalEncoder's unknown_value does -- so `== null` cannot distinguish
+// "absent" from "set to null", and using it would make every nullable
+// parameter unsettable.
+class _NullParam extends Estimator {
+    def init() { super(); this.name_ = "NullParam"; this.task_ = "transformer";
+                 this.params_ = {"opt": null}; }
+    def fit($X, $y) { this.fitted_ = true; return this; }
+    def transform($X) { return $X; }
+    def clone() { return NullParam(); }
+}
+def NullParam() { return new _NullParam(); }
+$np2 = NullParam();
+$nullOk = true;
+try { $np2.set_params({"opt": 7.0}); } catch ($e) { $nullOk = false; }
+ok($nullOk, "a parameter whose value is null is still settable");
+eqs($np2.get_params().opt, 7.0, "  and the new value took");
+
 // ── 4. clone isolation, which is the one that matters (K2) ──────────────────
 print("");
 print("-- clone --");
