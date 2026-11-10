@@ -895,3 +895,52 @@ threads reported), Apple Clang, `-O3 -ftree-vectorize` for `ndarray_native.cpp`.
 - **[test]** `bantu-src/compiler/tests/pairwise_partition_test.cpp` — 1813 size/chunk
   combinations, chunks from 1024 to 65536 elements, sizes on and around chunk boundaries with
   tails of 0, 1, 127, 128, 129 and 1000 elements. **1813/1813 bit-identical.**
+
+### D3c — reductions: the defect was the loop order
+
+- **[bug fix] [perf]** **A 27x loop-order asymmetry in axis reductions.**
+  `nd_sum($m, 0, null, null)` on a 2048x2048 f64 array took 66 ms where axis 1 took
+  2.4 ms — same 32 MB, same number of adds. The loops were nested one output at a time,
+  each walking a column with stride 2048, so every load was its own cache line and the
+  array was re-streamed once per output. Inverted to stream the input in memory order
+  with one accumulator per output, which is **bit-identical** because each output still
+  sees its elements in the same order. 20 reps, 2048x2048 f64:
+
+  | reduction | before | after | |
+  |---|---|---|---|
+  | `nd_sum` axis 0 | 1328 ms | 100 ms | **13.3x** |
+  | `nd_max` axis 0 | 1350 ms | 84 ms | **16.1x** |
+  | `nd_min` axis 0 | 1572 ms | 92 ms | **17.1x** |
+  | `nd_max` axis 1 | 130 ms | 71 ms | **1.83x** |
+
+  Also applies to `nd_mean`, `nd_prod`, `nd_any` and `nd_all`, for f64, f32, i64 and bool.
+- **[perf]** Two things took the sum path from 4.7x to 12.1x, both from the structure of
+  the accumulator rather than from tuning. **The carry depth is shared**: every
+  accumulator in a tile has been fed the same number of elements, so the binary counter's
+  carry depth at step `i` is the trailing-1-bit count of `i` for all of them, and hoisting
+  it out of the per-output loop removes an unpredictable branch per element. **Eight rows
+  at a time**: Pairwise's association for eight adds from an aligned count is exactly
+  `((r7+r6)+(r5+r4)) + ((r3+r2)+(r1+r0))`, so eight rows combine in registers and inject
+  at level 3 instead of touching the partials array eight times — without which the
+  level-0 writes alone double the memory traffic.
+- **[bug fix] [perf]** **`nd_max` over a CONTIGUOUS axis was slower than over a strided
+  one** once the strided path was blocked — the inversion that says a fast path is not
+  fast. Its NaN early `return` is a loop-carried control dependency, so nothing
+  vectorised: 5.2 GB/s against the summation loop's 12.4 next to it. Now eight independent
+  extremum accumulators (a NaN can never enter one — every comparison against NaN is
+  false) plus one branchless `x != x` flag, with a scalar rescan for the first NaN only
+  when the flag is set. 9.45 GB/s, and `min`/`max` being exact and order-independent means
+  splitting the accumulators cannot change a bit.
+- **[design]** **And then threading the reductions is not worth doing.** The fused sum runs
+  at 12.46 GB/s against the contiguous path's 12.4 — both at the bus, where D3b already
+  measured threading at 0.83x. What is left worth threads is the compute-bound
+  `nd_var`/`nd_std`, whose Welford pass does a division per element and runs at 0.92 GB/s.
+  A 27x loop-order defect was sitting underneath a plan to buy 6x with threads (N37).
+- **[test]** `tests/numba_reduce_axis_test.b` — 79 assertions, every one EXACT equality
+  against the old code path, which is still reachable because the inverted loops need at
+  least 8 outputs: a narrow column slice of the same array takes the old path while the
+  full array takes the new one. Same data, same order, two implementations. Covers sum,
+  mean, min, max, prod, any, all; f64/f32/i64/bool; 2048, 2047, 129, 128 and 13 rows
+  (whole groups of eight, a ragged tail, and no whole group at all); NaNs in the first,
+  middle and last row; inf and -inf; 3-D; strided views; a reversed axis (negative stride,
+  which the new path declines); keepdims; one row; one column; an empty axis.

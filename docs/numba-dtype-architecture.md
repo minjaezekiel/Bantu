@@ -447,7 +447,38 @@ everything that can is CHEAP -- so the property is asserted in C++, in
 `bantu-src/compiler/tests/parallel_test.cpp`, rather than left as a comment for
 bkit to discover.
 
-### 4.4f D3c: threaded reductions, with no change to anybody's sum
+### 4.4f D3c: the reduction fix was the loop order, not the core count
+
+Measuring before building, as 4.4e now requires, changed what D3c is.
+`nd_sum($m, 0, ...)` on a 2048×2048 f64 array took **66 ms while axis 1 took
+2.4 ms** — a 27× asymmetry for the same 32 MB and the same adds, because the
+loops were nested the wrong way: one output at a time, each walking a column
+with stride 2048. No number of threads fixes that; it divides it.
+
+Inverting the loops is bit-identical (same per-output element order, so the same
+`Pairwise` tree, the same running product, the same first NaN) and gives 13.3×
+on `sum`, 16.1× on `max` and 17.1× on `min`. The two tricks that take it from
+4.7× to 12.1× — the shared carry depth and the eight-rows-at-a-time injection
+at level 3 — are in N37, with the measurements.
+
+Finding that exposed a second one: with the strided path blocked, `nd_max` over
+a **contiguous** axis was slower than over a strided one, because its NaN early
+`return` is a loop-carried control dependency and nothing vectorised. Rewritten
+as eight independent accumulators plus a branchless `x != x` flag, with a
+rescan for the first NaN only when the flag is set: 1.83×, semantics untouched.
+
+**And then the threading is not worth doing.** The fused sum runs at 12.46 GB/s
+against the contiguous path's 12.4 — both at the bus, and 4.4e already measured
+what threading a bandwidth-bound loop does (`add`: 0.83×). What is left worth
+threading is the compute-bound reductions: `nd_var`/`nd_std`, where Welford's
+per-element division has the pass running at 0.92 GB/s.
+
+A 27× loop-order defect was sitting underneath a plan to buy 6× with threads.
+Measure the single-threaded kernel before deciding it needs cores.
+
+### 4.4g The partition that would have worked anyway
+
+
 
 The plan (N26) was to accept a one-time change to `nd_sum`'s last bits, on the
 grounds that `Pairwise`'s tree shape depends on the element count and so no

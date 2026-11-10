@@ -682,3 +682,62 @@ starts paying for itself even with transcendental work in it).
 The lesson is not about summation. It is that **"this is impossible, so we will
 change the user's answer" deserves a proof, not an argument** — and the proof
 is cheap compared to the apology.
+---
+
+### N37 — the reduction fix was the loop ORDER, not the core count
+
+D3c was planned as "thread the reductions". Measuring first, as N34 now
+requires, said something else: `nd_sum($m, 0, ...)` on a 2048×2048 f64 array
+took **66 ms while axis 1 took 2.4 ms** — a 27x asymmetry for the same 32 MB
+and the same number of adds. `nd_max` was worse: 67 ms against 6.5 ms.
+
+The cause is the loop nesting. One output at a time, each walking a column with
+stride 2048, so every load is its own cache line and the array is re-streamed
+once per output. No number of threads fixes that; it divides it.
+
+Inverting the loops — stream the input in memory order, one accumulator per
+output in a tile — is **bit-identical**, because each output still sees its
+elements in the same order, so `Pairwise` builds the same tree, a running
+product multiplies in the same order, and first-NaN-wins returns the same NaN.
+Two further things make it fast rather than merely better:
+
+* **The carry depth is shared.** Every accumulator in a tile has been fed the
+  same number of elements, so the binary counter's carry depth at step `i` is
+  the same for all of them — the count of trailing 1 bits of `i`. Hoisted out
+  of the per-output loop, it stops being an unpredictable branch per element.
+* **Eight rows at a time.** Pairwise's association for eight adds from an
+  aligned count is exactly `((r7+r6)+(r5+r4)) + ((r3+r2)+(r1+r0))`, so eight
+  rows combine in registers and inject at level 3 instead of touching the
+  partials array eight times. Without this the level-0 writes alone double the
+  memory traffic — 4.7x instead of 12.1x.
+
+Measured, 2048×2048 f64, 20 reps:
+
+| reduction | before | after | |
+|---|---|---|---|
+| `nd_sum` axis 0 | 1328 ms | 100 ms | **13.3x** |
+| `nd_max` axis 0 | 1350 ms | 84 ms | **16.1x** |
+| `nd_min` axis 0 | 1572 ms | 92 ms | **17.1x** |
+| `nd_max` axis 1 (contiguous) | 130 ms | 71 ms | **1.83x** |
+
+The last row is a separate fix found by the first. Once the strided path was
+blocked, `nd_max` over a *contiguous* axis was SLOWER than over a strided one —
+the kind of inversion that says the fast path is not fast. The reason was the
+NaN early `return` inside the loop: correct, and a loop-carried control
+dependency, so nothing vectorised. Split in two instead, with the semantics
+untouched: eight independent extremum accumulators (a NaN can never enter one,
+since every comparison against NaN is false) plus one branchless `x != x` flag,
+and a scalar rescan for the first NaN only when the flag is set. `min`/`max` are
+exact and order-independent, so splitting the accumulators cannot change a bit.
+
+**And then threading the reductions is not worth doing.** The fused sum runs at
+12.46 GB/s against the contiguous path's 12.4 — both at the memory bus. N34
+already measured what that means: `add` is 0.83x on six threads at n=1M. So the
+reductions that remain worth threading are the *compute-bound* ones —
+`nd_var`/`nd_std`, where Welford does a division per element and the pass runs
+at 0.92 GB/s — and not `sum`, `max`, `min`, `any` or `all`.
+
+That is the whole lesson. A 27x loop-order defect was sitting under a plan to
+buy 6x with threads, and the plan would have shipped 6x on top of a 27x
+mistake and called it a win. **Measure the single-threaded kernel before
+deciding it needs cores.**

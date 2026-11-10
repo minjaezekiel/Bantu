@@ -377,7 +377,7 @@ accumulator per output element is disjoint-write parallelism.
 |---|---|---|
 | `nd_matmul` | **yes** | each thread owns distinct output rows, so per-`(i,j)` summation order is untouched and bit-identity is trivial |
 | element-wise ufuncs | **only the compute-bound ones** | no cross-element dependency, so correctness is free — but `add` is 0.83x on six threads at n=1M because one core already saturates the bus, so only the transcendentals are threaded (N34) |
-| reductions | above the chunk size | **aligned** chunks injected at level `m`; bit-identical to the sequential answer, not merely self-consistent (N36) |
+| reductions | **no** — and that is a measurement, not an omission | the defect was the loop ORDER: axis-0 reductions were 27x slower than axis-1 for the same data. Inverted, bit-identically, they run at the memory bus (12.46 GB/s), where N34 measured threading at 0.83x. Only `nd_var`/`nd_std` (0.92 GB/s, Welford's per-element division) is compute-bound enough to want cores (N37). The aligned-chunk partition that *would* have kept the bits exact is still recorded in N36 and tested, for when a reduction is compute-bound enough to need it |
 | `nd_im2col` | not yet | disjoint output rows, so it is safe; but it is data movement, and N34's measurements say memory-bound kernels gain nothing. To be measured rather than assumed either way |
 | **`nd_col2im`** | **no** | it *accumulates* into overlapping destinations — a data race and order-dependent. Left sequential until a per-thread-accumulator design is measured |
 | sort, scans | no | sequential by nature |
