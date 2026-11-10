@@ -330,15 +330,110 @@ inline const Family* familyFor(const std::string& builtin) {
     return nullptr;
 }
 
+// ── the syntax floor ────────────────────────────────────────────────────────
+// A package's floor is not only about builtins. The GRAMMAR has grown too, and
+// a pure-Bantu package using a construct an older parser rejects is in exactly
+// the same position as one calling a builtin that does not exist -- except
+// worse, because it fails at parse time with a message about a brace.
+//
+// The features below are evidence, not recollection. The v1.3.2 interpreter
+// builds from git in about a minute, so it can be used as an ORACLE: feed it a
+// snippet and see whether it parses. Of the 60 source files in this
+// repository's eleven packages, **twelve** are rejected by the 1.3.2 parser --
+// in arctic, pillow, btorch and lugha -- which is what makes this worth
+// detecting rather than noting.
+//
+// tests/engine_syntax_oracle.sh rebuilds that binary and checks this table
+// against it file by file: every file the oracle rejects must be flagged here,
+// and every file it accepts must not be. A feature missing from this table
+// shows up there as a file the oracle rejects and the scanner passes.
+struct SyntaxFeature {
+    const char* name;
+    const char* floor;
+    const char* why;
+};
+
+inline const std::vector<SyntaxFeature>& syntaxFeatures() {
+    static const std::vector<SyntaxFeature> f = {
+        { "else-if",             "1.4.0",
+          "`else if` as a chain; 1.3.2 needed `else { if ... }`" },
+        { "qualified-extends",   "1.4.0",
+          "`extends mod.Class`; 1.3.2 stopped at the dot" },
+        { "qualified-implements","1.4.0",
+          "`implements mod.Iface`; 1.3.2 stopped at the dot" },
+        { "exponent-in-brackets","1.4.0",
+          "a float like 1.0e300 inside ( ) or [ ]; 1.3.2 took the exponent for "
+          "an identifier there, though it accepted the same literal in a plain "
+          "assignment" },
+    };
+    return f;
+}
+
+// The index of the last non-blank character before i, or npos. Comments count
+// as blank, so `= /* why */ {` is still a value position.
+inline size_t start_of_prev_nonblank(const std::string& t, size_t i) {
+    if (i == 0) return std::string::npos;
+    size_t j = i;
+    while (j > 0) {
+        j--;
+        const char c = t[j];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+        // Walking backwards out of a comment is not worth the machinery; a
+        // brace preceded by a comment is treated by its last code character.
+        return j;
+    }
+    return std::string::npos;
+}
+
+inline bool identChar(char c);
+
+// Is the character before i part of a name? `$x1e5` and `v2e3` are names, not
+// number literals, and must not be read as exponents.
+inline bool start_of_prev_nonblank_is_ident(const std::string& t, size_t i) {
+    if (i == 0) return false;
+    const char p = t[i - 1];
+    return identChar(p) || p == '$' || p == '.';
+}
+
+// Skip whitespace and comments forward from i. Shared by the detectors, which
+// all need "the next thing that is not blank".
+inline size_t skipBlank(const std::string& t, size_t i) {
+    const size_t n = t.size();
+    for (;;) {
+        while (i < n && (t[i] == ' ' || t[i] == '\t' || t[i] == '\r' || t[i] == '\n')) i++;
+        if (i + 1 < n && t[i] == '/' && t[i + 1] == '/') {
+            while (i < n && t[i] != '\n') i++;
+            continue;
+        }
+        if (i + 1 < n && t[i] == '/' && t[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < n && !(t[i] == '*' && t[i + 1] == '/')) i++;
+            i = (i + 1 < n) ? i + 2 : n;
+            continue;
+        }
+        return i;
+    }
+}
+
 // The floor a piece of Bantu source implies: the highest floor among the native
 // builtins it calls. Names are matched as whole identifiers, so a variable
 // called `$nd_thing` or the word "nd_sum" inside a comment or string cannot
 // raise a package's floor.
 struct SourceFloor {
-    SemVer      floor;                      // 0.0.0 when nothing native is used
-    std::string reason;                     // the builtin that set it
+    SemVer      floor;                      // 0.0.0 when nothing is used
+    std::string reason;                     // what set it: a builtin or a feature
     std::vector<std::string> builtins;      // every native builtin seen, sorted
+    std::vector<std::string> syntax;        // every post-baseline feature seen
 };
+
+// Raise the floor, keeping what caused it. Both scans funnel through here so
+// the reported reason is always the thing that actually set the maximum.
+inline void raiseFloor(SourceFloor& out, const SemVer& v, const std::string& why) {
+    if (!out.floor.ok || compareSemVer(v, out.floor) > 0) {
+        out.floor  = v;
+        out.reason = why;
+    }
+}
 
 inline bool identChar(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -394,13 +489,140 @@ inline void scanSourceFloor(const std::string& text, SourceFloor& out) {
         if (std::find(out.builtins.begin(), out.builtins.end(), word) == out.builtins.end()) {
             out.builtins.push_back(word);
         }
-        const SemVer fv = parseSemVer(f->floor);
-        if (!out.floor.ok || compareSemVer(fv, out.floor) > 0) {
-            out.floor  = fv;
-            out.reason = word;
-        }
+        raiseFloor(out, parseSemVer(f->floor), word);
     }
     std::sort(out.builtins.begin(), out.builtins.end());
+}
+
+// ── the grammar scan ────────────────────────────────────────────────────────
+// Same skipping rules as the builtin scan: a construct inside a comment or a
+// string is not code. Each detector is written to the narrowest signature that
+// separates the new form from the old one -- `else if` must not fire on
+// `else { if ... }`, which 1.3.2 parses perfectly well.
+inline void scanSyntaxFloor(const std::string& text, SourceFloor& out) {
+    const size_t n = text.size();
+    auto note = [&out](const char* feature) {
+        for (const SyntaxFeature& f : syntaxFeatures()) {
+            if (std::string(f.name) != feature) continue;
+            if (std::find(out.syntax.begin(), out.syntax.end(), feature) ==
+                out.syntax.end()) {
+                out.syntax.push_back(feature);
+            }
+            raiseFloor(out, parseSemVer(f.floor), std::string("syntax: ") + feature);
+            return;
+        }
+    };
+
+    size_t i = 0;
+    size_t depth = 0;                      // open ( and [ , and dict-literal {
+    std::vector<bool> braceIsExpr;         // per open brace: dict, or block?
+    while (i < n) {
+        const char c = text[i];
+        if (c == '/' && i + 1 < n && text[i + 1] == '/') {
+            while (i < n && text[i] != '\n') i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < n && text[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < n && !(text[i] == '*' && text[i + 1] == '/')) i++;
+            i = (i + 1 < n) ? i + 2 : n;
+            continue;
+        }
+        if (c == '"' || c == '\'') {
+            const char q = c;
+            i++;
+            while (i < n) {
+                if (text[i] == '\\') { i += 2; continue; }
+                if (text[i] == q) { i++; break; }
+                i++;
+            }
+            continue;
+        }
+        // Bracket depth, for the exponent rule below. `(` and `[` always open
+        // an expression; `{` only does so in a value position (after = , : ( [),
+        // because everywhere else it opens a BLOCK -- and 1.3.2 parses
+        // `def g() { return 1.0e300; }` perfectly well.
+        if (c == '(' || c == '[') { depth++; i++; continue; }
+        if (c == ')' || c == ']') { if (depth > 0) depth--; i++; continue; }
+        if (c == '{') {
+            size_t k = start_of_prev_nonblank(text, i);
+            const char prev = (k == std::string::npos) ? '\0' : text[k];
+            if (prev == '=' || prev == ',' || prev == ':' || prev == '(' || prev == '[') {
+                depth++; braceIsExpr.push_back(true);
+            } else {
+                braceIsExpr.push_back(false);
+            }
+            i++;
+            continue;
+        }
+        if (c == '}') {
+            if (!braceIsExpr.empty()) {
+                if (braceIsExpr.back() && depth > 0) depth--;
+                braceIsExpr.pop_back();
+            }
+            i++;
+            continue;
+        }
+
+        // A number literal with an exponent. The leading character must not be
+        // part of a name, so `$x1e5` and `name2e3` are not literals.
+        if (c >= '0' && c <= '9' &&
+            !(start_of_prev_nonblank_is_ident(text, i))) {
+            size_t j = i;
+            while (j < n && ((text[j] >= '0' && text[j] <= '9') || text[j] == '.')) j++;
+            if (j < n && (text[j] == 'e' || text[j] == 'E')) {
+                size_t k = j + 1;
+                if (k < n && (text[k] == '+' || text[k] == '-')) k++;
+                if (k < n && text[k] >= '0' && text[k] <= '9') {
+                    if (depth > 0) note("exponent-in-brackets");
+                    while (k < n && text[k] >= '0' && text[k] <= '9') k++;
+                    i = k;
+                    continue;
+                }
+            }
+            i = j;
+            continue;
+        }
+
+        if (!identChar(c)) { i++; continue; }
+        const size_t start = i;
+        while (i < n && identChar(text[i])) i++;
+        if (start > 0 && (identChar(text[start - 1]) ||
+                          text[start - 1] == '$' || text[start - 1] == '.')) {
+            continue;                       // part of a longer name, or a member
+        }
+        const std::string word = text.substr(start, i - start);
+
+        if (word == "else") {
+            // `else if` only. `else { if (...) }` is the old spelling and parses
+            // everywhere, so the brace has to be checked for.
+            const size_t j = skipBlank(text, i);
+            if (j + 1 < n && text.compare(j, 2, "if") == 0 &&
+                (j + 2 >= n || !identChar(text[j + 2]))) {
+                note("else-if");
+            }
+            continue;
+        }
+        if (word == "extends" || word == "implements") {
+            // A dotted parent name, i.e. a dot before the class body opens.
+            size_t j = skipBlank(text, i);
+            const size_t nameStart = j;
+            while (j < n && (identChar(text[j]) || text[j] == '.')) j++;
+            const std::string parent = text.substr(nameStart, j - nameStart);
+            if (parent.find('.') != std::string::npos) {
+                note(word == "extends" ? "qualified-extends" : "qualified-implements");
+            }
+            continue;
+        }
+    }
+    std::sort(out.syntax.begin(), out.syntax.end());
+}
+
+// Everything a source file implies: the builtins it calls and the grammar it
+// uses, whichever is higher.
+inline void scanSource(const std::string& text, SourceFloor& out) {
+    scanSourceFloor(text, out);
+    scanSyntaxFloor(text, out);
 }
 
 }  // namespace bantu_engine

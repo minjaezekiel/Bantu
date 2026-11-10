@@ -355,13 +355,61 @@ and what is running. A declaration *lower* than the implication is a failure,
 not a warning, because that is the case that installs on a binary which cannot
 run it.
 
-Two things the scan deliberately does not do. It skips comments and string
-literals, so `// nd_fft( is next` cannot raise a package's floor (a false
-positive is still wrong, and it would be reported to the author as a fact about
-their code). And it says nothing about *syntax*: a pure-Bantu package using a
-language feature added after 1.3.2 gets no floor from this, because the floor is
-derived from the builtin surface. `random` declares nothing for exactly that
-reason, and that is a known limit rather than a claim of safety.
+The scan skips comments and string literals, so `// nd_fft( is next` cannot
+raise a package's floor: a false positive is still wrong, and it would be
+reported to the author as a fact about their code.
+
+It also covers **syntax**, which it did not at first — and the first version of
+this section recorded that as a known limit. It was not an acceptable one. The
+grammar has grown too, and a pure-Bantu package using a construct an older
+parser rejects is in the same position as one calling a builtin that does not
+exist, except it fails at parse time with a message about a brace. E25 has the
+features, how they were found, and the oracle that keeps the list honest.
+
+### E25 — the syntax floor, found by asking the old binary
+
+The builtin floor was the easy half. The grammar has grown too, and
+`bantu engine` said nothing about it — so a pure-Bantu package using a
+post-1.3.2 construct would declare no floor at all and fail at parse time on an
+older binary, with a message about a brace.
+
+Enumerating grammar changes from the parser diff was the obvious approach and
+the wrong one. **v1.3.2 is 22 source files and builds in about a minute**, so it
+can be asked instead: feed it a snippet, see whether it parses. That turned a
+reading exercise into a measurement, and the measurement found four features:
+
+| feature | what v1.3.2 does |
+|---|---|
+| `else if` chains | rejects; it needed `else { if ... }` |
+| `extends mod.Class` | stops at the dot |
+| `implements mod.Iface` | stops at the dot |
+| an exponent literal inside `( )` or `[ ]` | takes `e300` for an identifier |
+
+The fourth one is why the oracle earns its keep. With the first three
+implemented, the detector agreed with the oracle on **59 of 60** source files in
+this repository — and the one disagreement was `btorch.b`, where v1.3.2 reports
+`Expected ')' after arguments (got: 'e300')` on `pad(..., 0.0 - 1.0e300)`. No
+amount of reading the keyword tables would have found that: **no keywords were
+added since 1.3.2 at all** (seven were de-reserved), so a keyword diff says the
+grammar never changed.
+
+The exponent rule also has a genuine edge, and it is the kind that a guess gets
+wrong in both directions: v1.3.2 **accepts** `$z = 1.0e300;` and `return
+1.0e300;`, and **rejects** `f(1.0e300)`, `(1.0e300)`, `[1.0e300]` and
+`if (1.0e300 > 1)`. So the detector tracks bracket depth and counts `{` as a
+bracket only in a value position — because a block brace is not a bracket, and
+flagging `def g() { return 1.0e300; }` would be a false positive.
+
+Of the 60 files in the eleven packages here, **12 are rejected by the 1.3.2
+parser** (arctic, pillow, btorch, lugha). The limitation this replaces was not
+theoretical; it was simply invisible, because those packages' *builtin* floors
+were already 1.4.0 and so the right answer came out for the wrong reason.
+
+`tests/engine_syntax_oracle.sh` rebuilds the oracle and re-derives every
+verdict: 60 files plus 14 constructs, and it skips cleanly with a message when
+git or a compiler is unavailable rather than passing silently. A feature missing
+from the table shows up there as a file the oracle rejects and the detector
+passes, which is exactly how the fourth one surfaced.
 
 ### E24 — the table is checked against the BINARY, not against the sources
 
@@ -492,6 +540,7 @@ insensitive to f32 vs f64 and are the commercially valuable item.** If
 | **L2** | `bantu install` refuses, with the required version and the current build id, before writing any file | a too-old binary produces one clear message, not a runtime `Undefined variable` |
 | **L3** | backfill every existing manifest with the floor it actually needs | `bantu doctor` reports each package's floor against the running build |
 | **L4** | a native-family → minimum-version table, so `nd_fft` maps to a stated floor | adding a kernel without updating the table fails a test |
+| **L5** | the **syntax** floor as well as the builtin one, checked against the v1.3.2 parser itself | every file that parser rejects is flagged, and every file it accepts is not (E25) |
 
 Deliberately before stage 3: `bkit` ships a new native family (`tree_`), and it
 is the first package that would hit this trap in the wild.

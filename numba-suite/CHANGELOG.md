@@ -981,3 +981,31 @@ threads reported), Apple Clang, `-O3 -ftree-vectorize` for `ndarray_native.cpp`.
   copy — two implementations with the same per-output visit order, which is what makes
   even `argmax`'s index comparable. Plus the early exit asserted not to change an answer
   settled only at the final element, and every length 1..20 for the unrolled count loop.
+
+### Stage 2 follow-up — the engine field learned about grammar
+
+- **[feature]** A package's floor now comes from the **syntax** it uses as well as the builtins it
+  calls. Without that, a pure-Bantu package using a post-1.3.2 construct declared no floor at all
+  and failed at parse time on an older binary, with a message about a brace.
+- **[design]** The features were found by **asking the v1.3.2 interpreter**, not by reading the
+  parser diff. It is 22 source files and builds in about a minute, so it can be used as an oracle:
+  feed it a snippet, see whether it parses. Four features turned up — `else if` chains,
+  `extends mod.Class`, `implements mod.Iface`, and an exponent literal inside `( )` or `[ ]`.
+
+  The fourth is why the oracle earns its keep. With the first three implemented the detector agreed
+  with the oracle on **59 of 60** source files here, and the one disagreement was `btorch.b`, where
+  v1.3.2 reports `Expected ')' after arguments (got: 'e300')` on `pad(..., 0.0 - 1.0e300)`. A
+  keyword diff would never have found it: **no keywords were added since 1.3.2 at all** — seven were
+  de-reserved — so by that measure the grammar never changed.
+- **[design]** The exponent rule has a real edge in both directions: v1.3.2 **accepts**
+  `$z = 1.0e300;` and `return 1.0e300;`, and **rejects** `f(1.0e300)`, `(1.0e300)`, `[1.0e300]` and
+  `if (1.0e300 > 1)`. So the detector tracks bracket depth and counts `{` as a bracket only in a
+  value position — a block brace is not a bracket, and flagging `def g() { return 1.0e300; }` would
+  be a false positive reported to an author as a fact about their code.
+- **[test]** `tests/engine_syntax_oracle.sh` — 74 assertions: it rebuilds the v1.3.2 interpreter
+  from git and compares its verdict with the detector's for all 60 package source files (it rejects
+  **12** of them, in arctic, pillow, btorch and lugha) plus 14 constructs including every near
+  miss. It skips cleanly with a message when git or a compiler is unavailable, rather than passing
+  silently. A feature missing from the table shows up there as a file the oracle rejects and the
+  detector passes.
+- **[test]** `bantu-src/compiler/tests/engine_req_test.cpp` grown to 82 assertions.

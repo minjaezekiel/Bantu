@@ -1079,7 +1079,14 @@ int cmdEngine(int argc, char* argv[]) {
                 std::cout << " ";
             std::cout << f.provides << "\n";
         }
-        std::cout << "\n  bantu engine <dir>  computes the floor a package needs.\n\n";
+        std::cout << "\n  Grammar that an older parser rejects:\n\n";
+        for (const bantu_engine::SyntaxFeature& f : bantu_engine::syntaxFeatures()) {
+            std::cout << "      " << f.floor << "  " << f.name;
+            for (size_t i = std::string(f.name).size(); i < 22; i++) std::cout << " ";
+            std::cout << f.why << "\n";
+        }
+        std::cout << "\n  bantu engine <dir>  computes the floor a package needs,\n";
+        std::cout << "                      from the builtins it calls AND the grammar it uses.\n\n";
         return 0;
     }
 
@@ -1097,8 +1104,18 @@ int cmdEngine(int argc, char* argv[]) {
     std::cout << "\n  " << (m.name.empty() ? dir : m.name) << "\n";
     std::cout << "  ══════════════════════════════\n\n";
     std::cout << "  native builtins called:  " << sf.builtins.size() << "\n";
+    std::cout << "  post-baseline syntax:    " << sf.syntax.size();
+    if (!sf.syntax.empty()) {
+        std::cout << "   (";
+        for (size_t i = 0; i < sf.syntax.size(); i++) {
+            std::cout << (i ? ", " : "") << sf.syntax[i];
+        }
+        std::cout << ")";
+    }
+    std::cout << "\n";
     if (!sf.floor.ok) {
-        std::cout << "  floor implied:           none (no native builtins)\n";
+        std::cout << "  floor implied:           none (no native builtins, "
+                     "no post-baseline syntax)\n";
     } else {
         std::cout << "  floor implied:           " << bantu_engine::semVerString(sf.floor)
                   << "   (by " << sf.reason << ")\n";

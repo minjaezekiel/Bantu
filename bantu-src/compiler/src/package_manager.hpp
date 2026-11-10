@@ -1428,7 +1428,7 @@ inline bantu_engine::SourceFloor sourceFloorOfDir(const std::string& dir) {
     std::vector<std::string> files = listFilesIn(dir);
     for (const std::string& f : files) {
         if (f.size() < 3 || f.compare(f.size() - 2, 2, ".b") != 0) continue;
-        bantu_engine::scanSourceFloor(readFile(join(dir, f)), sf);
+        bantu_engine::scanSource(readFile(join(dir, f)), sf);
     }
     return sf;
 }

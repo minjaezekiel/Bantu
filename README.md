@@ -1,14 +1,114 @@
 # Bantu
 
-**Bantu Programming Language v1.3.0 — Stable Release**
+**Bantu Programming Language v1.4.0 — in development.** The last published
+release is **v1.3.2** (2026-09-06); everything in the v1.4.0 section below is in
+this source tree and not yet in a downloadable binary. The distinction matters
+in practice: v1.3.2 contains **none** of the native array, imaging, columnar or
+crypto builtins, so the packages in this repository cannot run on it. `bantu
+engine` says so precisely, and `bantu install` refuses rather than failing
+later — see [What's New in v1.4.0](#whats-new-in-v140).
 
 A high-level, dynamically-typed programming language implemented as a tree-walking interpreter in C++17. The entire toolchain — interpreter, linter, package manager, HTTP server, WebRTC engine, SQLite/PostgreSQL drivers, FFI, project scaffolding, VSCode extension, and cross-platform desktop installer generator — ships as a single static binary with zero runtime dependencies.
 
 ```bash
-bantu --version     # → Bantu v1.3.0
+bantu --version     # → Bantu v1.4.0
 bantu init myapp
 cd myapp && bantu run
 ```
+
+## What's New in v1.4.0
+
+Two things, and the second is why the first needs saying out loud: a
+**scientific-computing stack written in Bantu**, and a **manifest that can
+finally state which interpreter a package needs**.
+
+### The libraries
+
+Every one of these is written in Bantu, on native primitives in the binary.
+None can run on v1.3.2, which has no `nd_*` builtins at all.
+
+| package | what it is |
+|---|---|
+| [`numba`](numba/) | NumPy-class arrays: n-dimensional, strided, zero-copy views, broadcasting, ~55 element-wise functions, reductions over any axis with pairwise summation, sorting, fancy indexing, and linear algebra written from scratch (matmul, solve, inv, det, Cholesky, QR, least squares, eigh, SVD) |
+| [`btorch`](btorch/) | PyTorch-shaped deep learning: reverse-mode autograd over a define-by-run tape, 40+ differentiable ops with every gradient checked against central differences, `nn.Module`, Conv1d/2d, BatchNorm, LayerNorm, Embedding, SGD/Adam/AdamW/RMSprop/Adagrad, LR schedulers, DataLoader, checkpoints with a SHA-256. Trains MNIST to **98.16%** with an MLP and **98.98%** with a CNN |
+| [`pillow`](pillow/) | Imaging in the shape of Python's Pillow: all 20 modes, the six resampling filters, PNG/BMP/TGA/PPM. Fidelity is **differential** — checked against Pillow 13, not against its documentation |
+| [`arctic`](arctic/) | Columnar frames: CSV, Feather, Parquet and SQLite readers and writers, group-by, joins |
+| [`bplot`](bplot/) | Plotting on a raster backend written from scratch, straight to PNG |
+| [`hash`](hash/) · [`crypto`](crypto/) · [`uuid`](uuid/) | SHA-1/2, HMAC, AES-GCM, Ed25519, X25519, P-256, Argon2, PBKDF2, scrypt, base64/32/hex, and UUIDs v1/v3/v4/v5/v7 |
+| [`orm`](orm/) · [`lugha`](lugha/) · [`random`](random/) | A Django-style ORM, natural-language helpers, and distributions |
+
+### Deterministic threading
+
+`nd_set_threads(n)`, **opt-in, default 1**. The whole value rests on one
+property: the answer does not depend on how many threads computed it — not
+"agrees to a tolerance", **bit-identical**. Floating-point addition is not
+associative, so chunk *boundaries* come from the data's shape alone and never
+from the thread count, and each chunk writes output no other chunk touches.
+Asserted with exact equality at 1, 2, 3, 4, 8 and 16 threads.
+
+Measured on a 10-core machine:
+
+| | 1 thread | threaded | |
+|---|---|---|---|
+| `nd_matmul`, 1024³ f64 | 5.95 GFLOP/s | 30.25 GFLOP/s | **5.09×** |
+| `nd_exp`, 1M elements | 48 ms | 10 ms | **4.8×** |
+| `nd_log`, 1M elements | 116 ms | 21 ms | **5.5×** |
+| MNIST MLP epoch | 18.3 s | 11.7 s | 1.56× (matmul is ~35–40% of it) |
+
+Only the ops with work to share are threaded. `nd_add` is **0.83×** on six
+threads at a million elements — one core already saturates the memory bus — so
+the cheap element-wise ops stay sequential. An op that got *slower* when you
+turned threading on would make `nd_set_threads` something to be afraid of.
+
+### Reductions that were nested the wrong way round
+
+Found by measuring before threading: `nd_sum($m, 0, …)` on a 2048×2048 array
+took **66 ms where axis 1 took 2.4 ms** — a 27× asymmetry for the same data and
+the same number of adds, because the loops walked one strided column per
+output. Inverting them is **bit-identical** (each output still sees its
+elements in the same order) and gives:
+
+| axis-0 reduction, 2048×2048 f64 | before | after | |
+|---|---|---|---|
+| `nd_sum` | 1328 ms | 100 ms | **13.3×** |
+| `nd_max` / `nd_min` | 1350 / 1572 ms | 84 / 92 ms | **16×** |
+| `nd_var` / `nd_std` | 1571 / 1674 ms | 122 / 121 ms | **13×** |
+| `nd_argmax` / `nd_ptp` | 1578 / 1544 ms | 129 / 103 ms | **12–15×** |
+
+`nd_count_nonzero` over a 4M-element bool array went 412 → 35 ms separately,
+and `nd_max` over a *contiguous* axis 130 → 71 ms once its NaN early-`return`
+stopped blocking vectorisation.
+
+### `"bantu"`: the version a package needs
+
+A Bantu package does not only depend on other packages — it depends on the
+**interpreter**, because its libraries are written on native builtins. Nothing
+in a manifest could say so, and the failure mode was the worst kind: the
+package installed happily, and then a program using it died on `Undefined
+variable: nd_zeros`.
+
+```json
+{ "name": "btorch", "version": "1.0.0", "bantu": ">=1.4.0" }
+```
+
+```bash
+bantu engine              # what this binary provides, and the floor table
+bantu engine ./btorch     # the floor that package needs, from its own sources
+bantu engine --check-table
+```
+
+- `install` and `add` **refuse before writing anything**, naming the
+  requirement, the running version and the build id.
+- The floor is **computed, not remembered**: `bantu engine <dir>` scans a
+  package's sources for the native builtins it calls *and* the grammar it uses,
+  and a declaration lower than that is a failure. The grammar half is checked
+  against the real v1.3.2 parser, built from git — which is how a fourth
+  feature nobody remembered turned up: that parser rejects `1.0e300` inside a
+  call, while accepting it in a plain assignment.
+- `>=`, `>`, `^`, `~`, a bare version (a floor, not a pin) and `*` are
+  understood. Compound ranges, `||`, upper bounds and prerelease metadata are
+  refused **by name** — a range nobody can parse must not quietly become "any
+  version", because that is the same silence the field replaced.
 
 ## What's New in v1.3.0
 
@@ -121,7 +221,7 @@ bantu setup --seed
 
 # verify (open a NEW terminal if PATH was just changed)
 bantu --version
-# → Bantu v1.3.0
+# → Bantu v1.4.0
 ```
 
 Prefer a graphical install on macOS? Download `Bantu-<ver>-macos-<arch>.pkg`
@@ -148,7 +248,7 @@ Open a **new** Command Prompt (so PATH reloads) and verify:
 
 ```bat
 bantu --version
-:: → Bantu v1.3.0
+:: → Bantu v1.4.0
 ```
 
 To uninstall later: run `uninstall.bat` from the original zip folder,
@@ -156,7 +256,7 @@ or use *Add/Remove Programs* in Windows Settings.
 
 ### One-time setup (macOS) — build from source
 
-The v1.3.0 release ships pre-built binaries for **Linux x86-64**, **macOS**, and
+The v1.3.2 release ships pre-built binaries for **Linux x86-64**, **macOS**, and
 **Windows x64** only. There is no pre-built macOS binary in the release
 (yet) — on macOS, build `bantu` from source. It's a single C++17 file
 that compiles in ~30 seconds with the Xcode command-line tools.
@@ -181,7 +281,7 @@ sudo chmod +x /usr/local/bin/bantu
 
 # 5. Open a NEW terminal, then verify
 bantu --version
-# → Bantu v1.3.0
+# → Bantu v1.4.0
 ```
 
 **Optional — real PostgreSQL/MySQL/WebRTC drivers:**
@@ -479,7 +579,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release \
 make -j$(nproc)
 
 sudo cp bantu /usr/local/bin/
-bantu --version    # → Bantu v1.3.0
+bantu --version    # → Bantu v1.4.0
 ```
 
 ## Repository Layout
@@ -493,6 +593,10 @@ Bantu/
 │   │   ├── parser.hpp       # Recursive-descent parser
 │   │   ├── evaluator.hpp    # Tree-walking evaluator (3.4k lines, includes sua.* framework)
 │   │   ├── module_resolver.hpp  # [v1.2.2] include path resolution
+│   │   ├── ndarray_*.hpp    # [v1.4.0] the nd_* array kernels (numba's native half)
+│   │   ├── parallel.hpp     # [v1.4.0] the deterministic thread pool
+│   │   ├── engine_req.hpp   # [v1.4.0] the "bantu" engine field and floor tables
+│   │   ├── bantu_version.hpp # [v1.4.0] the one place the version number lives
 │   │   └── ...
 │   └── CMakeLists.txt       # Build config (with -DBANTU_POSTGRES/MYSQL/WEBRTC flags)
 ├── drivers/                 # [v1.2.2] Optional real-driver glue
@@ -514,10 +618,18 @@ Bantu/
 │   └── pg-dashboard/        # PostgreSQL analytics dashboard
 ├── docs/
 │   └── Bantu-Programming-Language-v1.2.2.pdf  # 36-page official guide (Dracula theme)
+├── numba/                   # [v1.4.0] NumPy-class arrays, in Bantu
+├── btorch/                  # [v1.4.0] PyTorch-shaped deep learning, in Bantu
+├── pillow/                  # [v1.4.0] imaging, differential-checked against Pillow 13
+├── arctic/                  # [v1.4.0] columnar frames (CSV/Feather/Parquet/SQLite)
+├── bplot/                   # [v1.4.0] plotting on a from-scratch raster backend
+├── hash/ crypto/ uuid/      # [v1.4.0] SHA-2, HMAC, AES-GCM, Ed25519, P-256, UUIDs
+├── orm/ lugha/ random/      # [v1.4.0] ORM, language helpers, distributions
+├── tests/                   # 80+ Bantu suites, run by tests/*.sh and bantu run
 ├── windows/                 # Windows .bat helpers (start, stop, reset-db)
 ├── public/                  # Sua default static files
 ├── README.md                # This file
-├── CHANGELOG.md             # v1.0.0 → v1.1.0 → v1.2.0 → v1.2.2 → v1.3.0
+├── CHANGELOG.md             # v1.0.0 → … → v1.3.2 → v1.4.0 (unreleased)
 ├── LICENSE                  # MIT
 └── QUICKSTART.md
 ```
@@ -525,6 +637,10 @@ Bantu/
 ## Documentation
 
 - **Official guide:** [`docs/Bantu-Programming-Language-v1.2.2.pdf`](docs/Bantu-Programming-Language-v1.2.2.pdf) — 36 pages, Dracula-themed, covers every feature including `bantu installer`
+- **The ecosystem plan:** [`docs/ecosystem-architecture.md`](docs/ecosystem-architecture.md) — what belongs in a package and what belongs in the binary, the dependency DAG, and every decision with the reason it was made
+- **Array internals:** [`docs/numba-architecture.md`](docs/numba-architecture.md) and [`docs/numba-dtype-architecture.md`](docs/numba-dtype-architecture.md) — the three-tier kernel loop, dtypes, the thread pool's determinism contract
+- **Library docs:** [`docs/numba.md`](docs/numba.md) · [`docs/btorch.md`](docs/btorch.md) · [`docs/pillow.md`](docs/pillow.md) · [`docs/arctic.md`](docs/arctic.md) · [`docs/bplot.md`](docs/bplot.md)
+- **Decision logs:** `numba-suite/DECISIONS.md`, `btorch-suite/DECISIONS.md` and their siblings — every non-obvious choice, including the ones that turned out wrong and what replaced them
 - **Quick start:** [`QUICKSTART.md`](QUICKSTART.md)
 - **Samples:** [`samples/`](samples/) — three runnable apps
 - **VSCode extension:** [`vscode-extension/README.md`](vscode-extension/README.md)
@@ -546,4 +662,4 @@ Bantu was created by **Assey Silivestir Peter**. The language is named after the
 
 ---
 
-*v1.3.0 stable release · July 2026*
+*v1.3.2 is the last published release (September 2026). v1.4.0 is in development in this tree.*

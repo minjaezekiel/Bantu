@@ -9,6 +9,78 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] Deterministic threading for the array kernels — `nd_set_threads(n)`, opt-in, default 1.**
+  The whole value rests on one property: the answer does not depend on how many threads computed it.
+  Not "agrees to a tolerance" — **bit-identical**, asserted with exact equality at 1, 2, 3, 4, 8 and
+  16 threads. Floating-point addition is not associative, so chunk *boundaries* are a function of
+  the data's shape alone and never of the thread count, and each chunk writes output no other chunk
+  touches. Also `nd_get_threads()` and `nd_hardware_threads()`; `nd_set_threads(0)` adopts the
+  hardware count.
+
+  Measured, 10-core machine: **`nd_matmul` 1024³ f64 5.95 → 30.25 GFLOP/s (5.09×)**; `nd_exp` at 1M
+  elements 4.8×, `nd_log` 5.5×, `nd_power` 5.1×, `nd_tanh` 4.5×; the MNIST MLP epoch 18.3 → 11.7 s
+  (1.56×, because matmul is only ~35–40% of it).
+
+  **Only the ops with work to share are threaded.** `nd_add` is 0.83× on six threads at a million
+  elements — one core already saturates the memory bus, so the handshake is pure cost — and `sqrt`
+  and `divide` win only inside a band whose edges are one machine's cache sizes. The cost class is
+  declared next to each functor and defaults to CHEAP, so a new ufunc is sequential until somebody
+  measures it: the failure mode of forgetting the tag is "no speed-up", never "slower".
+
+  A caller that finds the pool busy **runs the region itself** rather than blocking, which is what
+  makes this safe under `sua` (every connection's handler is its own thread). Nesting does the same,
+  so a threaded kernel calling another cannot deadlock or oversubscribe.
+- **[feature] `bantu engine`** — what this binary provides, the native-family floor table, and the
+  grammar an older parser rejects. `bantu engine <dir>` computes the floor a package needs from its
+  own sources; `--check-table` asserts every builtin has a stated floor.
+
+### Fixed
+
+- **[bug fix] The thread pool returned while a worker was still inside the caller's body** — a
+  use-after-free, plus the next region claiming chunk indices while a straggler ran the previous
+  one's body. A worker started with `seen = 0`, so a worker created *during* a region consumed the
+  generation of the region that had already finished and decremented the completion counter for the
+  region being set up. **Found by ThreadSanitizer on the integrated interpreter in under two
+  minutes**; the determinism suite was green throughout, because it compares answers and the
+  answers were right. The standalone pool stress test was clean too — it warmed the pool before
+  measuring, so it never created a worker inside a region under test.
+- **[bug fix] [perf] Axis reductions were nested the wrong way round: a 27× asymmetry.**
+  `nd_sum($m, 0, null, null)` on a 2048×2048 f64 array took 66 ms where axis 1 took 2.4 ms — same
+  data, same number of adds — because the loops walked one strided column per output, so every load
+  was its own cache line and the array was re-streamed once per output. Inverted to stream the
+  input in memory order with one accumulator per output, which is **bit-identical** because each
+  output still sees its elements in the same order. 2048×2048 f64, axis 0, 20 reps:
+
+  | | before | after | |
+  |---|---|---|---|
+  | `nd_sum` | 1328 ms | 100 ms | **13.3×** |
+  | `nd_max` | 1350 ms | 84 ms | **16.1×** |
+  | `nd_min` | 1572 ms | 92 ms | **17.1×** |
+  | `nd_var` | 1571 ms | 122 ms | **12.9×** |
+  | `nd_std` | 1674 ms | 121 ms | **13.8×** |
+  | `nd_argmax` | 1578 ms | 129 ms | **12.2×** |
+  | `nd_ptp` | 1544 ms | 103 ms | **15.0×** |
+  | `nd_count_nonzero` | 1357 ms | 99 ms | **13.7×** |
+
+  Also `nd_mean`, `nd_prod`, `nd_any` and `nd_all`, for f64, f32, i64 and bool. **The plan had been
+  to thread the reductions**; measuring first found the loop order instead, and after the fix the
+  sum runs at the memory bus (12.46 GB/s), where threading measures 0.83×.
+- **[bug fix] [perf] `nd_max` over a contiguous axis was slower than over a strided one** once the
+  strided path was blocked — the inversion that says a fast path is not fast. Its NaN early
+  `return` is a loop-carried control dependency, so nothing vectorised: 5.2 GB/s beside a summation
+  loop doing 12.4. Now eight independent extremum accumulators (a NaN can never enter one — every
+  comparison against NaN is false) plus one branchless `x != x` flag, with a scalar rescan for the
+  first NaN only when the flag is set. 130 → 71 ms, and the first-NaN-wins rule is untouched.
+- **[bug fix] [perf] `any`, `all`, `count_nonzero` and `argmin`/`argmax` over a contiguous run were
+  paying a dtype switch and a lambda call per element.** `nd_count_nonzero` over a 4M-element bool
+  array 412 → 35 ms (11.8×). `any`/`all` now also stop at the first element that settles the
+  answer, which the old path did not: 2.2× in the worst case where the answer is only known at the
+  last element, and effectively instant on data that decides early.
+- **[bug fix] `nd_std` nearly shipped without the reduction fix.** `nd_var` got the hook at its
+  call site; `nd_std`, registered separately against the same Welford helper, did not, and measured
+  1674 ms while `nd_var` had gone to 122. An optimisation applied at the call site instead of in the
+  shared helper gets applied to *some* of the callers.
+
 - **[feature] `package.json` gains a `"bantu"` engine field, and the version number moves again.**
   A Bantu package does not only depend on other packages — it depends on the *interpreter*, because
   its libraries are written on native builtins: `numba` on `nd_*`, `pillow` on `bp_*`, `arctic` on
