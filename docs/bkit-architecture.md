@@ -358,11 +358,138 @@ first fit, so a typo costs a message instead of a few minutes of fitting.
 
 ---
 
-## 5. Gradient boosting — the headline
+## 5. Metrics — one confusion matrix, and where the zeros are
+
+### 5.1 `metrics.b` depends on nothing but numba
+
+Not even on `base.b`. Nothing in the file is an estimator: they are pure
+functions of two arrays, so the estimator protocol has nothing to say about
+them and tier 3 does not apply.
+
+Keeping it dependency-free is the same decision as [K7] for `base.b` and for the
+same reason: a user who wants `f1_score` should not import scalers, splitters
+and a gradient booster to get it. It also means `base.b`'s `score()` does **not**
+delegate here — it keeps its two inlined formulas, because the dependency would
+have to run the other way and `base.b` is the file everything else depends on.
+
+### 5.2 Every classification metric is a view of one confusion matrix [K26]
+
+`precision_recall_fscore_support` computes the matrix once and reads everything
+off it:
+
+```
+tp = diag(cm)        fp = colsum(cm) − diag       fn = rowsum(cm) − diag
+support = rowsum(cm)
+```
+
+`precision_score`, `recall_score`, `f1_score` and `classification_report` all
+call it rather than recomputing. So the **zero-division rule lives in one
+place**, and a class that never appears cannot be handled one way by `precision`
+and another way by `f1`.
+
+The matrix itself is built without a loop over samples: encode both label
+arrays to codes `0..k−1`, form `true_code · k + pred_code`, and
+`nd_bincount(..., k·k)` reshaped to `(k, k)`. Three kernel calls for any number
+of rows.
+
+### 5.3 A zero-support class scores 0, and the test proves it [K27]
+
+A class present in `y_true` but never predicted has `tp + fp = 0`, so precision
+is `0/0`. A class never present but sometimes predicted has `tp + fn = 0`, so
+recall is. `f1` is `0/0` whenever `precision + recall = 0`.
+
+All three yield **0**, which is scikit-learn's `zero_division=0` default. The
+alternative — `NaN` — propagates into the macro average and turns one absent
+class into a `NaN` for the whole model, which is the silent-wrong-answer shape
+this package exists to avoid. An error was the other option and is too strict:
+a class missing from one cross-validation fold is normal.
+
+The test includes a 3-class case with a class that is in `y_true` and never
+predicted, **and** a class predicted but never true, and asserts the macro
+average is a finite number computed from the zeros rather than around them.
+
+### 5.4 The curves emit one point per *distinct* threshold [K28]
+
+This is what "handling ties" means, and it is not a detail. With scores
+`[0.8, 0.8, 0.8]` and labels `[1, 0, 1]`, a curve that advanced one sample at a
+time would trace a staircase through points that no threshold can actually
+produce — and the area under that staircase depends on the order the equal
+scores happened to arrive in. The AUC would change when the input was shuffled.
+
+So after sorting by score descending and taking cumulative true and false
+positives, a point is emitted only at the **end of each run of equal scores**:
+the run boundaries are `nd_nonzero(nd_diff(sorted_scores) != 0)` plus the last
+index — the same construction the mode uses in [K16].
+
+`roc_auc_score` is then the **trapezoid** over `(fpr, tpr)`.
+`average_precision_score` is deliberately **not**: it is the step sum
+`Σ (R_n − R_{n−1}) · P_n`. Those two give different numbers on the same curve,
+scikit-learn uses exactly this pair, and a test asserts both against a hand case
+so neither drifts into the other's rule.
+
+### 5.5 `log_loss` is clipped, so a confident mistake is finite
+
+`log(0)` is `−∞`. One prediction of `0.0` for a sample whose label is 1 would
+make the loss of an entire 10,000-row evaluation `inf`, which says nothing about
+the model beyond "at least one prediction was certain and wrong". Probabilities
+are clipped to `[eps, 1 − eps]` with `eps = 1e-15` by default, so that sample
+contributes about 34.5 and the rest of the number survives.
+
+### 5.6 `r2_score` raises on a constant target [K30]
+
+`R² = 1 − SSE/SST`, and a constant target has `SST = 0`. scikit-learn returns
+`0.0` with a warning (or `1.0` if the predictions are exactly right).
+
+`bkit` raises, for consistency with `base.b`'s `score()`, which already did so
+before this file existed ([K1]'s test asserts it). A model cannot be scored on a
+constant target by R² — the metric's denominator is the thing it normalises
+against — and returning `0.0` makes a meaningless comparison look like a bad
+one. `mean_squared_error` is the metric for that case and the error message
+says so.
+
+`mean_absolute_percentage_error` is the mirror image and is handled the other
+way: a zero in `y_true` makes one term infinite, and the denominator is clamped
+to `eps` rather than raising, because a single zero among thousands of nonzero
+targets is a data point and not a reason to refuse the whole metric. The
+clamping is documented at the function, since it means the result is bounded
+rather than exact there.
+
+### 5.7 `classification_report` returns a dict; the text is a separate function [K29]
+
+A metric whose only output is a formatted string can only be tested by matching
+that string, and then every change to the column widths breaks the test. So
+`classification_report` returns the numbers — one entry per class plus
+`accuracy`, `macro avg` and `weighted avg`, which is scikit-learn's
+`output_dict=True` shape — and `classification_report_text` formats them.
+
+The numbers are asserted numerically; the formatter is asserted only to mention
+every class and to produce the right number of lines.
+
+### 5.8 `ds.accuracy` moves, but btorch keeps its implementation [K25]
+
+[C5] and [E14] say the metric moves to `bkit.metrics` with a **delegating**
+alias left in `btorch`. The move happens; the delegation does not, and the
+reason is [E2]'s own argument.
+
+`btorch` is **1.0.0 and gated on MNIST accuracy**. `bkit` is `0.3.0` and changes
+every phase. Delegating would make the stable package depend on the churning
+one, so a `bkit` release could break a `btorch` install — "blast radius becomes
+release cadence", which is why these are separate packages at all.
+
+So `bkit.metrics.accuracy_score($y_true, $y_pred)` is the home, and
+`btorch.datasets.accuracy($logits, $labels)` keeps its eight lines, marked
+deprecated in the docstring and the CHANGELOG. The two are *not* the same
+function — btorch's takes logits and argmaxes them — so a **differential test**
+asserts they agree on the same inputs. That test, not the delegation, is what
+stops them drifting.
+
+---
+
+## 6. Gradient boosting — the headline
 
 Histogram-based, LightGBM-shaped. The design choices and why.
 
-### 5.1 The algorithm
+### 6.1 The algorithm
 
 1. **Bin once, up front.** Each feature is quantile-binned into at most 256
    bins. All later work reads bin indices, never raw values. This is what makes
@@ -379,7 +506,7 @@ Histogram-based, LightGBM-shaped. The design choices and why.
    `max_depth` as a separate guard.
 6. **Predict** by traversing the node array.
 
-### 5.2 The `tree_` native family
+### 6.2 The `tree_` native family
 
 Five kernels. The Bantu side runs the boosting loop, computes gradients and
 hessians (vectorised over `nd_*`), handles early stopping and feature
@@ -398,7 +525,7 @@ A Bantu function call costs **1.78 µs** (btorch B1). `tree_hist` on a
 what Bantu can do per element. These five are not an optimisation; without them
 there is no GBDT.
 
-### 5.3 The binned matrix is an opaque handle, not an `NdArray`
+### 6.3 The binned matrix is an opaque handle, not an `NdArray`
 
 **A real blocker, found while writing this.** The binned matrix wants to be
 `u8` — one byte per cell. numba's `DType` is `{F64, I64, BOOL}`: there is no
@@ -424,7 +551,7 @@ entirely from the dtype roadmap.
 quantization, the handle can migrate to an `NdArray` behind the same API. It is
 not a dead end, just not a dependency.
 
-### 5.4 Objectives
+### 6.4 Objectives
 
 Gradients and hessians are pure Bantu over `nd_*` — one vectorised call per
 boosting iteration.
@@ -443,7 +570,7 @@ deliberately.
 
 ---
 
-## 6. Data input: arrays, with arctic as an adapter
+## 7. Data input: arrays, with arctic as an adapter
 
 Resolves open question 4 in the ecosystem doc.
 
@@ -460,7 +587,7 @@ arrays would pay for a column store they do not use, and every algorithm would
 carry two code paths — the condition that B18 avoided in btorch by composing
 convolution out of im2col and matmul rather than writing a second path.
 
-### 6.1 Missing values in the GBDT
+### 7.1 Missing values in the GBDT
 
 `NaN` goes to a dedicated bin, and each split learns a default direction (the
 side with the higher gain) which is also used for unseen `NaN` at predict time.
@@ -469,7 +596,7 @@ first is both lossy and a different model.
 
 ---
 
-## 7. Persistence
+## 8. Persistence
 
 `.btsd` with `kind: "bkit.estimator"` ([C3]). One container, one SHA-256, one
 set of twelve load-failure messages — already written for btorch, not rewritten
@@ -487,7 +614,7 @@ memory.
 
 ---
 
-## 8. Gates
+## 9. Gates
 
 Six tiers, as every phase in this project. Gradcheck does not apply (no
 autograd here); its slot is taken by **differential testing against published
@@ -506,7 +633,7 @@ Tier 3 is new to this project and exists because a protocol with eleven
 implementers fragments silently. It enumerates the estimators and asserts the
 contract on each, so a new estimator that forgets `clone()` fails immediately.
 
-### 8.1 The accuracy gates
+### 9.1 The accuracy gates
 
 Public datasets, fetched and SHA-256 verified, never committed — the method
 btorch's `get_mnist.sh` established (B25).
@@ -525,7 +652,7 @@ measured from a reloaded `.btsd` model, not from memory.
 
 ---
 
-## 9. What is deliberately out
+## 10. What is deliberately out
 
 | item | why |
 |---|---|
@@ -538,7 +665,7 @@ measured from a reloaded `.btsd` model, not from memory.
 
 ---
 
-## 10. Open items
+## 11. Open items
 
 | # | item | settled by |
 |---|---|---|

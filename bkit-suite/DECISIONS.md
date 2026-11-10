@@ -445,3 +445,141 @@ because a parameter may legitimately *hold* null — `OrdinalEncoder`'s
 **before** the first fit, so a typo costs a message rather than a few minutes of
 fitting. For a `Pipeline` that validation has to go through the estimator
 anyway, since only the pipeline knows whether `reg__shift` names a real step.
+
+---
+
+### K25 — `ds.accuracy` moves to `bkit.metrics`, but btorch keeps its implementation
+[C5] and [E14] say the metric moves with a **delegating alias** left in
+`btorch`. The move happens; the delegation does not.
+
+The reason is [E2]'s own argument, applied to itself. `btorch` is **1.0.0 and
+gated on MNIST accuracy**; `bkit` is `0.3.0` and changes every phase.
+Delegating would make the stable package depend on the churning one, so a
+`bkit` release could break a `btorch` install — *"blast radius becomes release
+cadence"*, which is the reason these are separate packages at all. A conditional
+dependency (delegate if `bkit` is installed) was the third option and is worse:
+two code paths for one metric, which is exactly what [B18] avoided in btorch by
+composing convolution out of `im2col` and `matmul` rather than writing a second
+path.
+
+So `bkit.metrics.accuracy_score($y_true, $y_pred)` is the home, and
+`btorch.datasets.accuracy($logits, $labels)` keeps its eight lines, marked
+deprecated in the source and the CHANGELOG. They are not the same function —
+btorch's takes logits and argmaxes them — so a **differential test** in
+`tests/bkit_metrics_test.b` asserts they agree on the same inputs, over a hand
+case and over 200 random rows. That test, not the delegation, is what stops them
+drifting.
+
+**Also rejected:** having `base.b`'s `score()` delegate to `metrics.b`. The
+dependency would run the wrong way — `base.b` is the file everything else
+depends on, and [K7] keeps it free of everything.
+
+---
+
+### K26 — Every classification metric is a view of one confusion matrix
+`precision_recall_fscore_support` builds the matrix once and reads everything
+off it: `tp` is the diagonal, `fp` the column sum minus it, `fn` the row sum
+minus it, `support` the row sum. `precision_score`, `recall_score`, `f1_score`
+and `classification_report` all call that function rather than recomputing.
+
+The payoff is not the arithmetic saved, it is that **the zero-division rule
+lives in one place** ([K27]). With four independent implementations, a class
+that never appears could be handled one way by `precision` and another by `f1`,
+and the macro average would disagree with the per-class array it was supposedly
+averaging.
+
+The matrix itself is built without a loop over samples: encode both label
+arrays to codes, form `true_code · k + pred_code`, and `nd_bincount(..., k·k)`
+reshaped to `(k, k)`. Three kernel calls for any number of rows — 200,000 rows
+over 10 classes in 49 ms.
+
+**The orientation is part of the contract:** rows are true, columns predicted.
+Transposing it silently swaps precision and recall, so the test asserts cell
+`[0][1]` is "true 0, predicted 1" rather than only checking the row sums.
+
+---
+
+### K27 — A zero-support class scores 0, not `NaN`
+A class present in `y_true` but never predicted has `tp + fp = 0`, so precision
+is `0/0`. A class never present but sometimes predicted has `tp + fn = 0`, so
+recall is. `f1` is `0/0` whenever `precision + recall = 0`.
+
+All three yield **0**, which is scikit-learn's `zero_division=0` default.
+
+**Rejected: `NaN`.** It propagates into the macro average, so one absent class
+turns the whole model's score into `NaN` — and `NaN` is a perfectly good `f64`
+that nothing downstream objects to. That is the exact silent-wrong-answer shape
+this package is built against.
+
+**Rejected: raising.** Too strict. A class missing from one cross-validation
+fold is normal, and a metric that refused to score such a fold would make
+`cross_val_score` fail on ordinary data.
+
+The test covers both directions — a class in `y_true` and never predicted, and
+a class predicted but never true — and asserts the macro average is a finite
+number computed *from* the zeros rather than around them.
+
+---
+
+### K28 — The curves emit one point per *distinct* threshold, and AP is not a trapezoid
+**Tie handling.** With scores `[0.8, 0.8, 0.8]` and labels `[1, 0, 1]`, a curve
+that advanced one sample at a time would trace a staircase through points no
+threshold can actually produce — and the area under that staircase depends on
+the order the equal scores happened to arrive in. **The AUC would change when
+the input was shuffled.** So a point is emitted only at the end of each run of
+equal scores, found with `nd_nonzero(nd_diff(sorted) != 0)` plus the last index
+— the same construction the mode uses in [K16]. A test asserts the AUC is
+unchanged when two tied samples swap places, which is the property the handling
+actually buys.
+
+**Two different rules on purpose.** `roc_auc_score` is the **trapezoid** over
+`(fpr, tpr)`. `average_precision_score` is the **step sum**
+`Σ (R_n − R_{n−1}) · P_n`. These give different numbers on the same data —
+0.625 and 0.583 on the test's hand case — and scikit-learn uses exactly this
+pair. The trapezoid is optimistic on a curve that steps *down*, which a PR
+curve does, which is why AP does not use it. The test asserts both values and
+asserts they differ, so neither can drift into the other's rule unnoticed.
+
+The ROC AUC is cross-checked against the **Mann–Whitney statistic** — counting
+the four positive/negative pairs by hand, a tie counting ½ — because that is a
+completely different route to the same number and so cannot share a bug with
+the curve code.
+
+---
+
+### K29 — `classification_report` returns a dict; the text is a separate function
+A metric whose only output is a formatted string can only be tested by matching
+that string, and then every change to a column width is a test failure — which
+trains whoever hits it to update the expected string rather than to check the
+numbers.
+
+So `classification_report` returns the numbers, in scikit-learn's
+`output_dict=True` shape (one entry per class plus `accuracy`, `macro avg` and
+`weighted avg`), and `classification_report_text` formats them. The numbers are
+asserted numerically; the formatter is asserted only to mention every class, to
+format to three decimals, and to produce the right number of lines.
+
+The formatter rounds explicitly rather than using `str()`, because `str()` gives
+six significant digits — the first of the three rules carried from btorch.
+
+---
+
+### K30 — `r2_score` raises on a constant target; MAPE clamps instead
+`R² = 1 − SSE/SST`, and a constant target has `SST = 0`: the metric's own
+denominator is gone. scikit-learn returns `0.0` with a warning.
+
+`bkit` **raises**, for two reasons. One, `base.b`'s `score()` already did so
+before this file existed ([K1]'s test asserts it), and one package should not
+disagree with itself about the same formula. Two, `0.0` makes a *meaningless*
+comparison look like a *bad* one — a reader sees a number and concludes the
+model is useless, when in fact R² had nothing to measure. The error names
+`mean_squared_error` as the metric for that case.
+
+`mean_absolute_percentage_error` is the mirror image and is handled the other
+way round: a zero in `y_true` makes one term infinite, and the denominator is
+**clamped** to `eps` rather than raising. The asymmetry is deliberate — a
+constant target breaks R² for *every* sample, while a single zero among
+thousands of nonzero targets breaks one term of a mean. Refusing the whole
+metric for that would be out of proportion. The consequence is that the result
+is bounded rather than exact at a zero target, which is stated at the function
+because a bounded-but-wrong number is only safe if the reader knows.

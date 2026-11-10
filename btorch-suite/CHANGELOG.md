@@ -1025,3 +1025,20 @@ bound for streaming 40 MB, so little is available without fusing the gather
 into the matmul. The rest is a real GEMM blocking problem for extreme aspect
 ratios — `K = 25, N = 6` leaves an inner loop too short to vectorise — which
 wants a packed micro-kernel, with its own gate. `f32` (B6) remains deferred.
+
+### Deprecation — `datasets.accuracy` moves to `bkit.metrics`
+
+- **[docs]** `ds.accuracy($logits, $labels)` is **deprecated** in favour of
+  `bkit.metrics.accuracy_score($y_true, $y_pred)`, which is the ecosystem's one metrics home
+  ([C5]/[E14]). It still works; nothing that runs today stops running.
+- **[design]** **It is not delegated**, and the reason is [E2]'s own argument applied to this
+  package. btorch is **1.0.0 and gated on MNIST accuracy**; `bkit` is `0.x` and changes every
+  phase. Delegating would make the stable package depend on the churning one, so a `bkit` release
+  could break a `btorch` install — *"blast radius becomes release cadence"*, which is why these are
+  separate packages at all. A conditional dependency was the third option and is worse: two code
+  paths for one metric.
+- **[test]** The two are not even the same function — this one takes **logits** and argmaxes them,
+  `accuracy_score` takes labels on both sides — so what stops them drifting is a **differential
+  test** rather than a shared implementation. `tests/bkit_metrics_test.b` asserts they return
+  identical numbers on a hand case and on 200 random rows of 10 classes, and that btorch's still
+  refuses a label-count mismatch.

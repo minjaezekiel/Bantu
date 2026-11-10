@@ -276,3 +276,78 @@ Four splitters, cross-validation and two parameter searches, 922 lines. Design:
   after 200 splits was read as a leak; it is exactly one 5-fold split of ten rows, still referenced
   by the loop variable. The test now runs 200 and 800 iterations and asserts the residue is **equal**,
   then drops the reference and asserts it reaches zero — both stronger than "did not grow".
+
+## Phase K4 — `metrics.b`
+
+Classification, probability, regression and ranking metrics, 701 lines. Design:
+[`../docs/bkit-architecture.md`](../docs/bkit-architecture.md) §5; decisions K25–K30.
+
+- **[feature]** classification: `confusion_matrix`, `accuracy_score`,
+  `precision_recall_fscore_support`, `precision_score`, `recall_score`, `f1_score` (per class,
+  `micro`, `macro`, `weighted`), `classification_report`, `classification_report_text`, `labels_of`.
+- **[feature]** probability: `roc_curve`, `roc_auc_score`, `precision_recall_curve`,
+  `average_precision_score`, `log_loss` (binary and multiclass), `brier_score_loss`.
+- **[feature]** regression: `mean_squared_error`, `root_mean_squared_error`,
+  `mean_absolute_error`, `r2_score`, `explained_variance_score`,
+  `mean_absolute_percentage_error`.
+- **[feature]** ranking: `ndcg_score` (with `k`), `mrr_score`, both over a single query or a batch.
+- **[design]** **`metrics.b` depends on nothing but numba** — not even on `base.b`. Nothing here is
+  an estimator, so the protocol has nothing to say about them and tier 3 does not apply. Same
+  decision as [K7] and for the same reason: a user who wants `f1_score` should not import scalers,
+  splitters and a gradient booster to get it. The corollary is that `base.b`'s `score()` does **not**
+  delegate here — the dependency would run the wrong way.
+- **[design]** **Every classification metric is a view of one confusion matrix** (K26). The payoff
+  is not arithmetic saved, it is that the zero-division rule lives in **one place**: with four
+  independent implementations a never-predicted class could be handled one way by `precision` and
+  another by `f1`, and the macro average would disagree with the array it was averaging. The matrix
+  is built with no loop over samples — encode, `true·k + pred`, `nd_bincount`, reshape — three
+  kernel calls for any number of rows. **The orientation is contractual**: rows true, columns
+  predicted, and the test asserts cell `[0][1]` rather than only the row sums, because transposing
+  it silently swaps precision and recall.
+- **[design]** **A zero-support class scores 0, not `NaN`** (K27). `NaN` propagates into the macro
+  average, so one absent class would turn the whole model's score into `NaN` — and `NaN` is a
+  perfectly good `f64` that nothing downstream objects to. Raising was the other option and is too
+  strict: a class missing from one cross-validation fold is ordinary.
+- **[design]** **The curves emit one point per *distinct* threshold** (K28). That is what tie
+  handling means, and the property it buys is stated and tested: with scores `[0.8, 0.8, …]` a curve
+  advancing one sample at a time traces a staircase through points no threshold can produce, and its
+  area depends on the order the equal scores arrived in — **the AUC would change when the input was
+  shuffled**. A test asserts the AUC is identical when two tied samples swap places.
+- **[design]** **`roc_auc_score` is the trapezoid; `average_precision_score` is the step sum**
+  (K28). Different numbers on the same data — 0.625 and 0.583 on the hand case — and scikit-learn
+  uses exactly this pair. The trapezoid is optimistic on a curve that steps *down*, which a PR curve
+  does. The test asserts both and asserts they differ, so neither can drift into the other's rule.
+- **[design]** **`r2_score` raises on a constant target; MAPE clamps instead** (K30). The asymmetry
+  is deliberate: a constant target breaks R² for *every* sample, while one zero among thousands of
+  targets breaks one term of a mean. `base.b`'s `score()` already raised before this file existed,
+  and one package should not disagree with itself about the same formula.
+- **[design]** **`classification_report` returns a dict; the text is a separate function** (K29). A
+  metric whose only output is a formatted string can only be tested by matching that string, and
+  then a column-width change is a test failure — which trains whoever hits it to update the expected
+  string rather than check the numbers.
+- **[feature]** **C5 resolved: the metric moved, the delegation did not** (K25).
+  `bkit.metrics.accuracy_score` is the home. `btorch.datasets.accuracy` keeps its implementation,
+  marked deprecated, because btorch is **1.0.0 and gated on MNIST accuracy** while bkit is 0.x and
+  changes every phase — delegating would let a bkit release break a btorch install, which is [E2]'s
+  own blast-radius argument. They are not even the same function (btorch's takes logits), so a
+  **differential test** asserts they agree on a hand case and on 200 random rows of 10 classes.
+  That test, not a shared implementation, is what stops them drifting.
+- **[test]** `tests/bkit_metrics_test.b` — **123 assertions**, tiers 1, 2 and 4. **Every reference
+  value is derived independently of the implementation:** the 3-class confusion matrix written out
+  cell by cell; the tie-handled AUC cross-checked against the **Mann–Whitney statistic** over the
+  four positive/negative pairs with a tie counting ½, which is a wholly different route to 0.625;
+  `r2_score` and `explained_variance_score` against scikit-learn's own documented example
+  (0.9486081… and 0.9571734…); `log_loss` on a clipped certainty against −ln(1e-15); NDCG against a
+  term-by-term DCG/IDCG computation. Stress: 200,000 rows over 10 classes in **49 ms**, with
+  `trace/n` asserted equal to `accuracy_score` so the bincount encoding is verified at a size no
+  hand case reaches, and 200,000 **tied** scores asserted to collapse to one threshold.
+- **[test]** **Sixteen mutations, all sixteen caught** — a transposed matrix, `NaN` for zero
+  division, precision and recall swapped, support from the column sum, a support-weighted "macro",
+  a curve ignoring ties, each area rule swapped for the other, an unclipped `log_loss`, `r2`
+  returning 0 on a constant target, a perturbed `r2` denominator, an unclamped MAPE, a linear NDCG
+  gain, a shifted NDCG discount, a 0-based MRR rank, and a length mismatch left to broadcast.
+- **[bug fix]** **Two of this file's own expected values were wrong, not the code.** The NDCG
+  reference was remembered as 0.9481156 — which is the published figure for those relevances under
+  the **linear** gain convention, a different metric with the same name; the exponential gain
+  scikit-learn defaults to gives 0.9488107, confirmed term by term. And a line count said 6 where
+  eight lines have seven separators.

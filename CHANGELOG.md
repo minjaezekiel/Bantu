@@ -39,9 +39,15 @@ All notable changes to the Bantu programming language are documented in this fil
   `_check_fitted` provided), `Pipeline` with `step__param` addressing and a deep `clone()`, and
   eleven preprocessing transformers — `StandardScaler`, `MinMaxScaler`, `RobustScaler`,
   `MaxAbsScaler`, `OrdinalEncoder`, `OneHotEncoder`, `LabelEncoder`, `SimpleImputer`,
-  `PolynomialFeatures`, `Normalizer`, `Binarizer` — and model selection: `train_test_split`,
+  `PolynomialFeatures`, `Normalizer`, `Binarizer`; model selection: `train_test_split`,
   `KFold`, `StratifiedKFold`, `GroupKFold`, `TimeSeriesSplit`, `cross_val_score`,
-  `cross_validate`, `GridSearchCV` and `RandomizedSearchCV`.
+  `cross_validate`, `GridSearchCV` and `RandomizedSearchCV`; and metrics: the classification set
+  from one confusion matrix (`accuracy`, `precision`, `recall`, `f1` per class and
+  micro/macro/weighted, `classification_report`), tie-handled `roc_curve`/`roc_auc_score`/
+  `precision_recall_curve`/`average_precision_score`, a clipped `log_loss` and `brier_score_loss`,
+  the regression set (`MSE`, `RMSE`, `MAE`, `R²`, `MAPE`, explained variance), and `ndcg_score`
+  and `mrr_score`. `metrics.b` depends on nothing but numba, so a user who wants `f1_score` does
+  not import a gradient booster to get it.
 
   A 100,000 × 20 `fit_transform` takes 75 ms; a 50,000-row shuffled 5-fold split takes 13 ms.
   Reproducibility comes from `nd_seed` alone — no estimator or splitter carries its own RNG state —
@@ -49,6 +55,14 @@ All notable changes to the Bantu programming language are documented in this fil
   nothing and its invariants ("no group in two folds", "every row tested once") are checkable.
   Every estimator's conformance to the protocol is asserted in one table-driven test, because a
   protocol with eleven implementers fragments silently.
+
+### Deprecated
+
+- **[patch] `btorch.datasets.accuracy` is deprecated** in favour of
+  `bkit.metrics.accuracy_score`. It still works and is **not** delegated: btorch is 1.0.0 and
+  gated on MNIST accuracy, bkit is 0.x and changes every phase, so delegating would let a bkit
+  release break a btorch install. A differential test asserts the two agree on the same inputs —
+  that, rather than a shared implementation, is what keeps them from drifting.
 
 ### Fixed
 

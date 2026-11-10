@@ -1,10 +1,10 @@
 {
   "name": "bkit",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "bantu": ">=1.4.0",
   "main": "base.b",
   "license": "MIT",
-  "description": "Classical machine learning for Bantu: scikit-learn's shape, with a histogram-based gradient-boosting implementation inside it rather than beside it. Phases K1-K3 of twelve: the estimator protocol, Pipeline with step__param addressing and a deep clone, eleven preprocessing transformers (four scalers sharing one transform, three encoders mapping through searchsorted, SimpleImputer, PolynomialFeatures, Normalizer, Binarizer), and model selection -- train_test_split, KFold/StratifiedKFold/GroupKFold/TimeSeriesSplit, cross_val_score and GridSearchCV/RandomizedSearchCV. Reproducibility comes from nd_seed alone; splitters return index arrays and never copy data.",
+  "description": "Classical machine learning for Bantu: scikit-learn's shape, with a histogram-based gradient-boosting implementation inside it rather than beside it. Phases K1-K4 of twelve: the estimator protocol, Pipeline with step__param addressing, eleven preprocessing transformers, model selection (train_test_split, four splitters, cross_val_score, GridSearchCV/RandomizedSearchCV), and metrics -- classification from one confusion matrix, tie-handled ROC and PR curves, clipped log_loss, the regression set, NDCG and MRR. metrics.b depends on nothing but numba. Reproducibility comes from nd_seed alone; splitters return index arrays and never copy data.",
   "keywords": [
     "machine-learning",
     "scikit-learn",
@@ -13,7 +13,9 @@
     "preprocessing",
     "cross-validation",
     "grid-search",
-    "kfold",
+    "metrics",
+    "roc-auc",
+    "f1-score",
     "gbdt"
   ],
   "dependencies": {
@@ -22,13 +24,15 @@
   "files": [
     "base.b",
     "preprocess.b",
-    "selection.b"
+    "selection.b",
+    "metrics.b"
   ],
   "docs": "docs/bkit-architecture.md",
   "tests": [
     "tests/bkit_base_test.b",
     "tests/bkit_preprocess_test.b",
     "tests/bkit_selection_test.b",
+    "tests/bkit_metrics_test.b",
     "tests/bkit_protocol_test.b"
   ]
 }

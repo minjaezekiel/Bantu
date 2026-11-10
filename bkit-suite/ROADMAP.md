@@ -151,12 +151,31 @@ of a hand-recomputed table, which is the property a search actually owes. And a
 
 | Item | Feature test | Status |
 |---|---|---|
-| classification: accuracy, precision, recall, F1 (micro/macro/weighted), confusion matrix, `classification_report` | against hand-computed 3-class cases; zero-support class does not divide by zero | [ ] |
-| `roc_auc_score`, `roc_curve`, `precision_recall_curve`, `average_precision` | ties in score handled by the trapezoid rule, asserted against a hand case | [ ] |
-| `log_loss`, `brier_score` | clipped at `eps`, so a confident wrong prediction is finite, not `inf` | [ ] |
-| regression: MSE, RMSE, MAE, R², MAPE, explained variance | R² on a constant target is defined (or raises) rather than `0/0` | [ ] |
-| ranking: NDCG, MRR | — | [ ] |
-| **move `ds.accuracy` here**, alias left in btorch ([C5], [E14]) | the btorch alias still works and warns once | [ ] |
+| classification: accuracy, precision, recall, F1 (micro/macro/weighted), confusion matrix, `classification_report` | against hand-computed 3-class cases; zero-support class does not divide by zero | [x] all of them views of **one** confusion matrix ([K26]), so the zero rule lives in one place ([K27]); the matrix orientation is asserted cell by cell, because transposing it silently swaps precision and recall |
+| `roc_auc_score`, `roc_curve`, `precision_recall_curve`, `average_precision` | ties in score handled by the trapezoid rule, asserted against a hand case | [x] and the AUC is asserted **unchanged when two tied samples swap places**, which is the property tie handling actually buys. AP is the **step sum**, not the trapezoid — a different number on the same curve, asserted to differ ([K28]) |
+| `log_loss`, `brier_score` | clipped at `eps`, so a confident wrong prediction is finite, not `inf` | [x] `−ln(1e-15) = 34.5`, and a larger `eps` asserted to clip harder; binary and multiclass |
+| regression: MSE, RMSE, MAE, R², MAPE, explained variance | R² on a constant target is defined (or raises) rather than `0/0` | [x] R² **raises**, matching `base.b`'s `score()`; MAPE **clamps** instead, and the asymmetry is argued ([K30]) |
+| ranking: NDCG, MRR | — | [x] single query or batch, with `k` |
+| **move `ds.accuracy` here**, alias left in btorch ([C5], [E14]) | the btorch alias still works and warns once | [x] **deviated, with the reason recorded** ([K25]): the metric moved, the *delegation* did not. btorch is 1.0.0 and gated on MNIST accuracy; bkit is 0.x. A **differential test** keeps the two from drifting |
+
+**Gates, all green:** `tests/bkit_metrics_test.b` 123 assertions. 200,000 rows
+over 10 classes in **49 ms**, with `trace/n` asserted equal to `accuracy_score`
+so the bincount encoding is checked at a size no hand case reaches.
+
+**Every reference value is derived independently of the implementation** — the
+3-class matrix written out cell by cell, the tie-handled AUC cross-checked
+against the **Mann–Whitney statistic** (a wholly different route to 0.625), R²
+and explained variance against scikit-learn's documented example, `log_loss`
+against −ln(1e-15), NDCG term by term from DCG and IDCG.
+
+**Sixteen mutations, all sixteen caught** — no gaps this time, which is what the
+earlier phases' gaps taught the test to assert: the *property* (order-invariance
+of the AUC) rather than only the value.
+
+**Two of the test's own expected values were wrong, not the code.** The NDCG
+reference was remembered as 0.9481156, which is that example's published figure
+under the **linear** gain convention — a different metric with the same name.
+The exponential gain scikit-learn defaults to gives 0.9488107.
 
 ## Phase K5 — `linear.b`
 
@@ -233,10 +252,11 @@ Datasets fetched and SHA-256 verified, **never committed** — the method
 
 ## Where to resume
 
-**K0–K3 are done; K4 (`metrics.b`) is next.** `base.b` is 330 lines,
-`preprocess.b` 1,011 and `selection.b` 922; `tests/bkit_base_test.b` is 53
-assertions, `tests/bkit_preprocess_test.b` 174, `tests/bkit_selection_test.b`
-117 and `tests/bkit_protocol_test.b` 39 — all green. Read
+**K0–K4 are done; K5 (`linear.b`) is next.** `base.b` is 391 lines,
+`preprocess.b` 1,011, `selection.b` 926 and `metrics.b` 701;
+`tests/bkit_base_test.b` is 53 assertions, `tests/bkit_preprocess_test.b` 174,
+`tests/bkit_selection_test.b` 117, `tests/bkit_metrics_test.b` 123 and
+`tests/bkit_protocol_test.b` 39 — all green. Read
 [`../docs/bkit-architecture.md`](../docs/bkit-architecture.md) first, then
 [`DECISIONS.md`](DECISIONS.md).
 
@@ -244,7 +264,7 @@ Ecosystem **stage 2** (the engine field) landed first, as required, and
 `bkit/package.json` declares `"bantu": ">=1.4.0"` — verified against the floor
 its own sources imply with `bantu engine bkit`.
 
-What K4 inherits and should not re-invent:
+What K5 inherits and should not re-invent:
 
 * every estimator is `_Name` plus a same-named factory `def Name(...)`, because
   a `def Name()` shadows a `class Name`, and `new Name(...)` inside the factory
@@ -276,6 +296,14 @@ What K4 inherits and should not re-invent:
   used with cross-validation should have distinct values, or a 2-row fold will
   abort the file. This cost two debugging rounds in K3;
 * **mutation-test the suite, and expect some mutations to pass.** Four of
-  fourteen did in K3, every one of them because the assertion was true of the
-  broken code as well. A gate nobody has tried to break is a gate nobody has
-  tested.
+  fourteen did in K3; none of sixteen did in K4, because K3's gaps taught the
+  tests to assert the *property* (the AUC is unchanged when tied samples swap)
+  and not only the value. A gate nobody has tried to break is a gate nobody has
+  tested;
+* `metrics.b` is where every score belongs — K5's `LinearRegression.score`
+  should be R² *via `base.b`'s existing formula*, not a third copy, and any new
+  metric goes in `metrics.b` rather than beside the model that wanted it ([C5]);
+* **derive every expected value independently** of the code under test. K4's
+  two wrong expectations were both remembered rather than computed, and one of
+  them (NDCG 0.9481156) is a real published number — for a *different* gain
+  convention.

@@ -198,6 +198,23 @@ def as_images($flat) {
 // argmax over the class axis, compared with the labels. Kept here rather than
 // written out at every call site, because an off-by-one in the axis gives a
 // plausible-looking 10% and nothing else to go on.
+//
+// DEPRECATED, and the metric's home is now `bkit.metrics.accuracy_score`
+// (ecosystem C5/E14). It is NOT removed and NOT delegated, and the reason is
+// E2's own argument: btorch is 1.0.0 and gated on MNIST accuracy, while bkit
+// is 0.x and changes every phase. Delegating would make the stable package
+// depend on the churning one, so a bkit release could break a btorch install
+// -- "blast radius becomes release cadence", which is why they are separate
+// packages at all.
+//
+// The two are not even the same function: this one takes LOGITS and argmaxes
+// them, while accuracy_score takes labels on both sides. So what stops them
+// drifting is a differential test -- tests/bkit_metrics_test.b asserts they
+// agree on the same inputs -- rather than a shared implementation.
+//
+// New code should prefer:
+//     include "bkit/metrics.b" as mt;
+//     mt.accuracy_score($labels, nd_argmax($logits.data, 1, null));
 def accuracy($logits, $labels) {
     _need();
     $pred = nd_argmax($logits.data, 1, null);
