@@ -590,8 +590,10 @@ Shell suites: `btorch_stress.sh` 10/10, `numba_stress.sh` 26/0, `gc_stress.sh` 1
 
 Under ASan, **timing** assertions fail because the sanitizer runs 4-8× slower.
 Set `BANTU_SKIP_PERF=1` for sanitizer runs: `numba_fastpath_test` honours it and
-reports those three assertions as skipped. `numba_linalg_test`'s pre-existing
-4 GFLOP/s gate has the same property and does not.
+reports those three assertions as skipped. `numba_linalg_test`'s 4 GFLOP/s gate
+**now honours it too** (fixed during ecosystem stage 1) — it used to fail on
+every sanitizer run and be explained away each time. Verified both ways: skipped
+under ASan (68/68 green), and still firing on a normal build at 6.60 GFLOP/s.
 
 ---
 

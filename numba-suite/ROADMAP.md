@@ -331,3 +331,26 @@ because the packed GEMM's benefit depends on how much of the matmul is already
 parallel.
 
 Each item is independently shippable and independently revertible.
+
+### Tier 6 — ASan + UBSan, stage 1
+
+Built separately in the scratchpad (`-fsanitize=address,undefined
+-fno-sanitize-recover=undefined -fno-omit-frame-pointer`); the production
+`build-mac.sh` is not touched, as in previous phases.
+
+**Clean.** 22 of 22 suites green, no `AddressSanitizer` report and no UBSan
+runtime error anywhere — across the new f32 storage paths, the five templated
+ufunc arms, `extremeFast<T>`, `sumContigT<T>` and the weak-scalar dtype
+computation.
+
+This tier mattered more than usual here. f32 writes **4-byte** elements through
+code that assumed 8 bytes in ~44 places, and a wrong `itemsize` is not a crash:
+it reads half of one value and half of the next. Tests compare numbers and
+would not necessarily see it; ASan does.
+
+Fixed while here: `numba_linalg_test`'s 4 GFLOP/s throughput gate now honours
+`BANTU_SKIP_PERF=1`, like `numba_fastpath_test`'s budgets already did. It used
+to fail on every sanitizer run — a throughput gate measures the machine as much
+as the code, and under ASan the interpreter is 4-8x slower — and was explained
+away each time instead. Verified both ways: skipped under ASan (68/68 green),
+still firing on a normal build at **6.60 GFLOP/s**.

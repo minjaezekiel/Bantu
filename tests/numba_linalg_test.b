@@ -289,7 +289,16 @@ $mm = nd_matmul(nd_random_normal([1000, 1000], 0, 1, 24), nd_random_normal([1000
 $mmMs = clock() - $t0;
 $gflops = (2.0 * 1000 * 1000 * 1000) / ($mmMs / 1000.0) / 1000000000.0;
 print("        1000x1000 matmul: " + str($mmMs) + "ms = " + str($gflops) + " GFLOP/s");
-ok($gflops >= 4.0, "GATE: 1000-cubed matmul reaches at least 4 GFLOP/s");
+// A throughput gate measures the MACHINE as much as the code, and under
+// ASan+UBSan the interpreter runs 4-8x slower, so this assertion failed on
+// every sanitizer run and had to be explained away each time. It now honours
+// BANTU_SKIP_PERF=1 the same way numba_fastpath_test's budgets do: reported as
+// skipped, never quietly loosened to a number that would prove nothing.
+if (env("BANTU_SKIP_PERF") == "1") {
+    print("  skip  GATE: 1000-cubed matmul >= 4 GFLOP/s  (BANTU_SKIP_PERF=1)");
+} else {
+    ok($gflops >= 4.0, "GATE: 1000-cubed matmul reaches at least 4 GFLOP/s");
+}
 eq(str(nd_shape($mm)), "[1000, 1000]", "with the right shape");
 
 print("");
