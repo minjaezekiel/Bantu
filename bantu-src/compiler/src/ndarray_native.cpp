@@ -10,6 +10,7 @@
  */
 
 #include "ndarray_native.hpp"
+#include "parallel.hpp"
 #include <fstream>
 #include <cstring>      // memcpy, for the nd_frombytes/nd_tobytes float paths
 #include "ndarray_api.hpp"
@@ -231,6 +232,44 @@ void registerBuiltins(const DefineFn& rawDefine) {
     // Read BANTU_ND_MAX_BYTES once, here, before any script line runs and so
     // before sua has spawned a connection thread.
     initLimits();
+
+    // ── threading (D3) ───────────────────────────────────────────────────────
+    // Default 1, i.e. opt-in. A library whose numeric results changed when it
+    // was installed on a machine with more cores would be a support nightmare;
+    // because a fixed partition makes every thread count give the SAME bits
+    // (DECISIONS N25), opting in is a performance decision and never a
+    // correctness one, and nd_set_threads(1) is always an exact reproduction
+    // path.
+    //
+    // Process-global rather than thread_local, unlike the PRNG (N18/N32): a
+    // shared PRNG lets one sua request reshape another's results, a shared
+    // thread count cannot.
+    define("nd_set_threads", [](std::vector<Value> a) -> Value {
+        if (a.empty() || a[0].isNull()) {
+            throw std::runtime_error("nd_set_threads(n): n is the thread count, "
+                                     "or 0 for as many as the hardware reports");
+        }
+        if (!a[0].isNumber()) {
+            throw std::runtime_error("nd_set_threads: expected a number (got " +
+                                     a[0].toString() + ")");
+        }
+        const double d = a[0].numberVal;
+        if (std::isnan(d) || std::isinf(d) || d < 0 || d != std::floor(d)) {
+            throw std::runtime_error("nd_set_threads: expected a non-negative whole "
+                                     "number, got " + std::to_string(d));
+        }
+        if (d > 4096) {
+            throw std::runtime_error("nd_set_threads: " + std::to_string((long long)d) +
+                                     " threads is past any plausible machine; the cap is 256");
+        }
+        return Value((double)setThreads((size_t)d));
+    });
+    define("nd_get_threads", [](std::vector<Value>) -> Value {
+        return Value((double)getThreads());
+    });
+    define("nd_hardware_threads", [](std::vector<Value>) -> Value {
+        return Value((double)hardwareThreads());
+    });
 
     // ── the allocation ceiling ───────────────────────────────────────────────
     define("nd_max_bytes", [](std::vector<Value> a) -> Value {

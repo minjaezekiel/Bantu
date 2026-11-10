@@ -489,3 +489,81 @@ making.
 Pinned, not left to chance: `tests/numba_f32_test.b` asserts all four current
 return dtypes by name, with a comment saying these are the assertions to change
 when D4 lands.
+
+---
+
+### N32 — threading is OPT-IN, and the thread count is a PROCESS-WIDE setting
+
+`nd_set_threads(n)` with a default of **1**. Nothing in numba uses more than one
+thread until a program asks for it.
+
+Two reasons the default is not "as many as the hardware reports":
+
+* **sua.** A server runs each connection's handler on its own detached thread
+  (N18). If every handler silently claimed every core, eight concurrent
+  requests would oversubscribe the machine by 8x and each would be *slower*
+  than single-threaded. The process-wide knob lets the operator decide once,
+  at start-up, with knowledge the library does not have.
+* **Reproducibility is a promise, so it must not be a surprise.** It is kept at
+  any thread count (N25), but a user who never asked for threads should not
+  have to take that on trust.
+
+The count is stored in one atomic, read once per region, and is *not*
+thread-local. A thread-local count was considered and rejected: a Bantu program
+that set threads at start-up and then served requests on handler threads would
+find the setting silently gone, because those threads never ran the line that
+set it. One process, one answer to "how wide is this machine allowed to go".
+
+`nd_set_threads(0)` means "as many as the hardware reports", and
+`nd_hardware_threads()` reports that number without adopting it.
+
+### N33 — the pool's completion counter is a memory-safety invariant, not bookkeeping
+
+`parallelFor(nChunks, body)` wraps the caller's body in a `std::function` that
+lives on **the caller's stack**, and the pool holds only a pointer to it. So
+`run()` returning while any worker is still inside the body is not an untidiness
+— it is a use-after-free, plus a second region claiming chunk indices while a
+straggler is still executing the previous one's body.
+
+Everything therefore rests on one invariant: **`active_` counts exactly the
+workers a region asked to take chunks, and each of those reports back exactly
+once.** Off by one in one direction is a hang; off by one in the other is the
+use-after-free.
+
+It was off by one. A worker thread started with `seen = 0`, so a worker created
+during region *G* found `generation_ != seen` true the instant it started,
+consumed the generation of the region that had **already finished**
+(`body_ == nullptr`, so it ran nothing), and decremented `active_` for the
+region that was at that moment being set up. One phantom decrement: the counter
+reached zero while a real worker was still inside the body, and `run()`
+returned.
+
+Nothing in the results showed it. The determinism suite was 57/57 green, the
+1024³ matmul was bit-identical at 1, 2, 4, 6, 8 and 12 threads, and the MNIST
+losses matched byte for byte. The window is a few microseconds wide and only
+opens on the *first* region after a worker is created, so the straggler almost
+always finished before the caller's frame was reused.
+
+**ThreadSanitizer on the integrated interpreter found it in under two minutes**,
+as a write by a worker to a matmul output racing a later main-thread read of the
+same buffer. The standalone pool stress test — 12 concurrent callers, 60
+regions, every thread count from 1 to 16 — had not, because it warmed the pool
+before measuring and therefore never created a worker inside a region under
+test.
+
+The fix is to hand each new worker the generation current **at its birth**, so
+its first wake-up is for the next region — the one whose `active_` counts it.
+Two further rules fell out of writing the invariant down:
+
+* only the workers that will *take* chunks are counted
+  (`active_ = min(limit_, workers_.size())`), and only those report back. A
+  region asking for 2 threads from a pool that once ran 16 wide no longer wakes
+  fifteen threads to have fourteen of them immediately decrement a counter.
+* the sequential fallbacks — pool busy, nested region, one chunk, one thread —
+  never touch the counter at all.
+
+Two things to keep from this. **A sanitizer gate on the integrated build is not
+the same test as a sanitizer gate on the component**: the component test was
+clean and wrong. And **a determinism suite cannot find a lifetime bug** — it
+compares answers, and the answers were right. They are different tiers for
+different defects, which is why §7's six tiers are six and not five.

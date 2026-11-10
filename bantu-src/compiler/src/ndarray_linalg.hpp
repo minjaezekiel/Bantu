@@ -16,6 +16,7 @@
  */
 
 #include "ndarray_reduce.hpp"
+#include "parallel.hpp"
 
 namespace numba {
 
@@ -113,8 +114,38 @@ inline void gemmContigT(const T* NB_RESTRICT A, const T* NB_RESTRICT B,
                         double* NB_RESTRICT C, size_t M, size_t K, size_t N) {
     const size_t BS = 64;                       // 64x64 f64 tiles: 32 KB, L1-resident
     for (size_t i = 0; i < M * N; i++) C[i] = 0.0;
-    for (size_t ii = 0; ii < M; ii += BS) {
-        const size_t iMax = std::min(ii + BS, M);
+
+    // Parallel over i-BLOCKS (D3). Block b writes only rows [b*BS, ...) of C,
+    // so the blocks are disjoint and no two threads touch the same output --
+    // the first of parallelFor's two accepted forms. And within a block the
+    // k loop is untouched, so for every (i,j) the summation order is still
+    // monotonic in k, which is the argument B29 made for the fast paths being
+    // bit-identical. The result therefore does not move when the thread count
+    // does, and does not move from the pre-D3 answer either.
+    //
+    // The block COUNT is ceil(M/BS) -- a function of the shape alone, never of
+    // the thread count (parallel.hpp contract point 1).
+    // Rows per PARALLEL chunk, which is deliberately finer than the 64-row
+    // cache tile. With BS-sized chunks a batch-128 matmul yields only two
+    // chunks and so caps at two threads -- and batch-128 is exactly the shape a
+    // neural network issues on its forward pass. Measured on [128,784]x[784,256]
+    // before this: 256 ms -> 130 ms at two threads, then flat at four and six.
+    //
+    // Chunk size cannot affect the ANSWER here: each chunk writes only its own
+    // rows of C, and the kk/jj tiling and the k order inside are untouched. So
+    // this is purely a scheduling choice, and it stays a function of M alone so
+    // that the partition still does not depend on the thread count.
+    const size_t rowsPerChunk = (M >= 2 * BS) ? std::max<size_t>(8, M / 48) : BS;
+    const size_t nIBlocks = (M + rowsPerChunk - 1) / rowsPerChunk;
+    // Below this much work the region costs more than it saves. LeNet's second
+    // convolution is K=25, N=6: a few chunks of almost nothing.
+    const size_t work = M * K * N;
+    const bool   par  = (work >= (size_t(1) << 20)) && nIBlocks > 1;
+
+    const auto block = [&](size_t b) {
+        const size_t ii   = b * rowsPerChunk;
+        if (ii >= M) return;
+        const size_t iMax = std::min(ii + rowsPerChunk, M);
         for (size_t kk = 0; kk < K; kk += BS) {
             const size_t kMax = std::min(kk + BS, K);
             for (size_t jj = 0; jj < N; jj += BS) {
@@ -130,7 +161,10 @@ inline void gemmContigT(const T* NB_RESTRICT A, const T* NB_RESTRICT B,
                 }
             }
         }
-    }
+    };
+
+    if (par) parallelFor(nIBlocks, block);
+    else for (size_t b = 0; b < nIBlocks; b++) block(b);
 }
 
 // C[M,N] = A[M,K] . B[K,N] where A is stored TRANSPOSED: its buffer holds a
@@ -152,16 +186,37 @@ template <class T>
 inline void gemmTransAT(const T* NB_RESTRICT At, const T* NB_RESTRICT B,
                         double* NB_RESTRICT C, size_t M, size_t K, size_t N) {
     for (size_t i = 0; i < M * N; i++) C[i] = 0.0;
-    for (size_t k = 0; k < K; k++) {
-        const T* NB_RESTRICT ak = At + k * M;           // M values, contiguous
-        const T* NB_RESTRICT bk = B  + k * N;           // N values, contiguous
-        for (size_t i = 0; i < M; i++) {
-            const double a = (double)ak[i];
-            if (a == 0.0) continue;
-            double* NB_RESTRICT cp = C + i * N;
-            for (size_t j = 0; j < N; j++) cp[j] += a * (double)bk[j];
+
+    // Parallel over i-blocks, same reasoning as gemmContigT: disjoint output
+    // rows, and k still ascends monotonically for every (i,j) so the answer is
+    // unchanged. Note the k loop moves INSIDE the block here. That is not a
+    // reordering of any sum -- for a fixed (i,j) the k sequence is identical --
+    // it only changes which rows of At and B a thread streams, and each thread
+    // now streams a contiguous slice of both.
+    // Same finer chunking as gemmContigT, same reasoning.
+    const size_t IB = (M >= 128) ? std::max<size_t>(8, M / 48) : 64;
+    const size_t nIBlocks = (M + IB - 1) / IB;
+    const size_t work = M * K * N;
+    const bool   par  = (work >= (size_t(1) << 20)) && nIBlocks > 1;
+
+    const auto block = [&](size_t b) {
+        const size_t ii   = b * IB;
+        if (ii >= M) return;
+        const size_t iMax = std::min(ii + IB, M);
+        for (size_t k = 0; k < K; k++) {
+            const T* NB_RESTRICT ak = At + k * M;       // M values, contiguous
+            const T* NB_RESTRICT bk = B  + k * N;       // N values, contiguous
+            for (size_t i = ii; i < iMax; i++) {
+                const double a = (double)ak[i];
+                if (a == 0.0) continue;
+                double* NB_RESTRICT cp = C + i * N;
+                for (size_t j = 0; j < N; j++) cp[j] += a * (double)bk[j];
+            }
         }
-    }
+    };
+
+    if (par) parallelFor(nIBlocks, block);
+    else for (size_t b = 0; b < nIBlocks; b++) block(b);
 }
 
 // The f64 entry points, behaviour and summation order unchanged.

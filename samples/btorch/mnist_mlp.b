@@ -29,6 +29,12 @@ if ($envEpochs != "") { $EPOCHS = num($envEpochs); }
 // a separate f32 sample would not be. Unset means f64, exactly as before.
 $DT = env("BTORCH_DTYPE");
 if ($DT == "") { $DT = "f64"; }
+
+// BTORCH_THREADS=n turns on numba's thread pool (D3). Default is 1, i.e. off:
+// a fixed partition means every thread count gives bit-identical results, so
+// this is a performance switch and never a correctness one.
+$envThreads = env("BTORCH_THREADS");
+if ($envThreads != "") { nd_set_threads(num($envThreads)); }
 if ($DT != "f32" && $DT != "f64") {
     print("  BTORCH_DTYPE must be f32 or f64 (got '" + $DT + "')");
     exit(1);
@@ -60,6 +66,8 @@ if ($DT == "f32") {
 }
 print("  dtype:     " + $DT + " (parameters " + $net.dtype()
     + ", inputs " + nd_dtype($m.train_x) + ")");
+print("  threads:   " + str(nd_get_threads()) + " of " + str(nd_hardware_threads())
+    + " hardware");
 $liveMB = nd_live_bytes() / 1048576.0;
 print("  live arrays after load: " + str($liveMB) + " MB");
 

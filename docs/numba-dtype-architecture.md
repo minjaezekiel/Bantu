@@ -316,12 +316,115 @@ change, and `nd_set_threads(1)` is always an exact reproduction path.
 A pool is created once, lazily, and lives for the interpreter's life. No pool
 is created at `n == 1`.
 
+### 4.4a Concurrency: the pool meets sua's threading model
+
+The design question the plan did not cover, and the one N18 guarantees will
+bite. sua accepts a connection and runs its Bantu handler on a **detached
+`std::thread`** (`server.hpp:863`), so every numba global is touched
+concurrently. That is why the allocation counters are `std::atomic` and the PRNG
+is `thread_local`. A thread pool is the first *large* piece of process-global
+mutable state numba would own, and two sua requests can enter `nd_matmul` at
+the same instant.
+
+Three ways to handle that:
+
+| option | consequence |
+|---|---|
+| a global pool behind a mutex | the second request **blocks** until the first finishes its parallel region — one slow matmul stalls an unrelated HTTP request |
+| a pool per thread | N threads x M workers; a 50-connection server would spawn hundreds of workers |
+| **a global pool, and a caller that finds it busy runs sequentially** | **chosen** |
+
+The third option is only available *because* of the fixed partition ([E15]),
+and that is worth stating plainly: **the result of a parallel region does not
+depend on how many threads executed it.** So falling back to sequential
+execution when the pool is already in use is not a behaviour change at all — it
+is the same answer, computed on one thread. A work-stealing design could not do
+this; it would have to choose between blocking and non-determinism.
+
+So:
+
+- one pool, created lazily on the first parallel region with `threads > 1`, and
+  living for the interpreter's life;
+- a single `std::atomic_flag` claims it. Claimed → you parallelise. Already
+  claimed → you run the identical loop sequentially and return;
+- a `thread_local` "already inside a parallel region" flag makes nested
+  parallel calls run sequentially too, so a threaded kernel calling another
+  threaded kernel cannot deadlock or oversubscribe.
+
+**`nd_set_threads(n)` is process-global and atomic, not `thread_local`.** This
+departs from N18's PRNG precedent on purpose: N18 made the PRNG thread-local
+because a shared stream means one request *silently reshapes another's
+results*. A shared thread count cannot do that — every thread count produces
+identical output — so the objection does not apply, and a global is far more
+useful (set it once at startup rather than in every handler). The reasoning is
+recorded as N32 so the inconsistency with N18 is deliberate and visible rather
+than looking like an oversight.
+
+### 4.4b What the pool must be, for stage 3's sake
+
+[E21] makes `bkit` depend on this phase: `tree_hist` is O(samples x features)
+per node and partitions cleanly over samples, so it wants the same machinery.
+Therefore the pool is a **general primitive over chunk indices**:
+
+```cpp
+// Runs body(0..nChunks-1). Chunk i always computes the same thing regardless of
+// which worker runs it or how many workers there are.
+void parallelFor(size_t nChunks, const std::function<void(size_t)>& body);
+```
+
+and *not* something welded into the `nd_*` kernels. A pool only `nd_*` can call
+would strand `tree_` and `tok_` back on one core, which is the whole reason D3
+precedes `bkit`.
+
+The one invariant the caller owes: **chunk `i` must write only to storage no
+other chunk writes to**, or produce a per-chunk partial that the caller combines
+in ascending index order. That is what makes the fixed partition deterministic,
+and it is why `nd_col2im` is excluded (§4.3) — it accumulates into overlapping
+destinations and satisfies neither form.
+
+### 4.4c No per-call allocation
+
+Invariant 5 of §7, and the phase-9 lesson: `nditer` heap-allocating three
+vectors per call cost ~450,000 allocations in one pooling layer and made
+`nd_max` 85x slower than it needed to be. A pool that allocates a task vector
+per parallel region reintroduces exactly that defect one level up, on a hotter
+path.
+
+So the task descriptor is a fixed struct reused across regions, worker threads
+are created once, and `parallelFor` on the sequential path (`threads == 1`,
+pool busy, or `nChunks == 1`) does **no allocation and takes no lock** — it is a
+plain loop, which is what the overwhelming majority of calls will do given the
+default of 1.
+
+### 4.4d The completion counter is a lifetime invariant
+
+`parallelFor` wraps the caller's body in a `std::function` that lives on **the
+caller's stack**; the pool holds a pointer to it. So "has every worker
+finished?" is not bookkeeping, it is the difference between a correct program
+and a use-after-free. The invariant is one sentence: *`active_` counts exactly
+the workers a region asked to take chunks, and each of those reports back
+exactly once.*
+
+Implementation found it off by one. A worker started with `seen = 0`, so a
+worker created *during* a region immediately consumed the generation of the
+region that had already finished and decremented `active_` for the region being
+set up — one phantom decrement, so the caller stopped waiting while a real
+worker was still inside the body. ThreadSanitizer on the **integrated
+interpreter** reported it as a worker's write to a matmul output racing a later
+main-thread read of that buffer; the determinism suite was 57/57 green
+throughout, because the answers were right. N33 records the fix and the two
+lessons: a sanitizer gate on the component is not a gate on the integrated
+build, and a determinism suite cannot find a lifetime bug.
+
 ### 4.5 D3 gate
 
 - **`tests/numba_threading_test.b`: every threaded kernel produces bit-identical
   output at 1, 2, 4, 8 and 16 threads.** Asserted with exact equality, not
   `allclose` — the same method that proved the three phase-9 fast paths safe.
-- TSan clean (new tier, in addition to ASan + UBSan).
+- TSan clean **on the integrated interpreter**, not only on a standalone pool
+  harness (new tier, in addition to ASan + UBSan). The distinction is not
+  pedantry: the standalone harness passed while the pool had a lifetime bug,
+  and the integrated build found it in under two minutes (N33).
 - `nd_live_bytes` returns to its pre-call value after a threaded op: no
   per-call pool allocation, no leak across 20,000 calls.
 - Scaling measured and recorded honestly: a kernel that does not scale is
