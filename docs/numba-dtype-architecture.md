@@ -476,7 +476,16 @@ per-element division has the pass running at 0.92 GB/s.
 A 27× loop-order defect was sitting underneath a plan to buy 6× with threads.
 Measure the single-threaded kernel before deciding it needs cores.
 
-### 4.4g The partition that would have worked anyway
+The inversion generalises to the reductions that keep more than one number per
+output — Welford's mean and m2, argmin/argmax's extremum and index, ptp's low
+and high — for 12.2x to 15.0x (N38). Two things worth keeping from that:
+`nd_std` was measured still at 1674 ms while `nd_var` had gone to 122, because
+the hook went in at `nd_var`'s call site rather than in the shared Welford
+helper; and a separate defect underneath it all, the contiguous `any`, `all`,
+`count_nonzero` and `argmin`/`argmax` loops paying a dtype switch per element,
+worth 11.8x on `nd_count_nonzero` over a bool array (N39).
+
+### 4.4h The partition that would have worked anyway
 
 
 

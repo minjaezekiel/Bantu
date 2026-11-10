@@ -944,3 +944,40 @@ threads reported), Apple Clang, `-O3 -ftree-vectorize` for `ndarray_native.cpp`.
   (whole groups of eight, a ragged tail, and no whole group at all); NaNs in the first,
   middle and last row; inf and -inf; 3-D; strided views; a reversed axis (negative stride,
   which the new path declines); keepdims; one row; one column; an empty axis.
+
+### D3c, continued — the same defect in the reductions that carry more state
+
+- **[bug fix] [perf]** `nd_var`, `nd_std`, `nd_argmin`, `nd_argmax`, `nd_ptp` and
+  `nd_count_nonzero` had the identical loop-order defect. 2048x2048 f64, axis 0, 20 reps:
+
+  | | before | after | |
+  |---|---|---|---|
+  | `nd_var` | 1571 ms | 122 ms | **12.9x** |
+  | `nd_std` | 1674 ms | 121 ms | **13.8x** |
+  | `nd_argmax` | 1578 ms | 129 ms | **12.2x** |
+  | `nd_ptp` | 1544 ms | 103 ms | **15.0x** |
+  | `nd_count_nonzero` | 1357 ms | 99 ms | **13.7x** |
+
+  Welford needs two doubles per output, argmin/argmax two, ptp two. The count is not
+  per-output state — every accumulator in a tile has been fed the same number of elements,
+  so Welford's `n` is the loop index plus one, which is the same observation the sum path's
+  shared carry depth rests on. Bit-identical for the same reason as N37.
+- **[bug fix]** **`nd_std` nearly shipped without the fix.** `nd_var` got the hook;
+  `nd_std`, registered separately against the same Welford helper, did not, and measured
+  1674 ms while `nd_var` had gone to 122. Caught by measuring every op rather than the one
+  that was changed, and fixed by making both call one shared `welfordFused`. An
+  optimisation applied at the call site instead of the shared helper gets applied to some
+  of the callers (N38).
+- **[perf]** The contiguous inner loops for `any`, `all`, `count_nonzero` and
+  `argmin`/`argmax` were paying a dtype switch and a lambda call **per element**. Written
+  over `T`: `nd_count_nonzero` on a 4M bool array 412 -> 35 ms (**11.8x**), `nd_argmax`
+  175 -> 125 ms. `any`/`all` also now stop at the first element that settles the answer,
+  which the old path did not: 484 -> 1 ms on random data, and **2.2x** in the worst case
+  where the answer is only known at the last element. Both figures are recorded, because
+  the first one is the early exit and not the loop (N39).
+- **[test]** `tests/numba_reduce_axis_test.b` grown to 125 assertions: the multi-state
+  reductions against the old path for f64/f32/i64, `ddof`, argmax ties and NaN indices,
+  3-D, strided views; and the contiguous loops against the *blocked* path by transposing a
+  copy — two implementations with the same per-output visit order, which is what makes
+  even `argmax`'s index comparable. Plus the early exit asserted not to change an answer
+  settled only at the final element, and every length 1..20 for the unrolled count loop.

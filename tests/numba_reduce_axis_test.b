@@ -175,6 +175,108 @@ $rev = nd_slice(nd_random_uniform([100, 40], -1.0, 1.0), [[99, 0 - 1, 0 - 1], nu
 same(nd_slice(nd_sum($rev, 0, null, null), [[0, 7, 1]]),
      nd_sum(nd_slice($rev, [null, [0, 7, 1]]), 0, null, null), "a reversed axis still agrees");
 
+// ── 4b. the accumulators that carry more than one number ────────────────────
+// var and std (Welford's mean and m2), argmin/argmax (the extremum and its
+// index), ptp (the low and the high) and count_nonzero went down the same
+// inverted loops. Welford's count is not per-output state -- every accumulator
+// in a tile has been fed the same number of elements -- which is the same
+// observation the sum path's shared carry depth rests on.
+print("");
+print("-- var, std, argmin, argmax, ptp, count_nonzero --");
+$dts2 = ["f64", "f32", "i64"];
+$dj = 0;
+while ($dj < len($dts2)) {
+    $dt = $dts2[$dj];
+    $m   = nd_astype(nd_multiply(nd_random_uniform([300, 97], -1.0, 1.0), 100.0, null), $dt);
+    $nar = nd_slice($m, [null, [0, 7, 1]]);
+    same(nd_slice(nd_var($m, 0, null, null), [[0, 7, 1]]), nd_var($nar, 0, null, null), "var " + $dt);
+    same(nd_slice(nd_var($m, 0, null, 1.0), [[0, 7, 1]]), nd_var($nar, 0, null, 1.0), "var ddof=1 " + $dt);
+    same(nd_slice(nd_std($m, 0, null, null), [[0, 7, 1]]), nd_std($nar, 0, null, null), "std " + $dt);
+    same(nd_slice(nd_argmax($m, 0, null), [[0, 7, 1]]), nd_argmax($nar, 0, null), "argmax " + $dt);
+    same(nd_slice(nd_argmin($m, 0, null), [[0, 7, 1]]), nd_argmin($nar, 0, null), "argmin " + $dt);
+    same(nd_slice(nd_ptp($m, 0, null), [[0, 7, 1]]), nd_ptp($nar, 0, null), "ptp " + $dt);
+    same(nd_slice(nd_count_nonzero($m, 0, null), [[0, 7, 1]]),
+         nd_count_nonzero($nar, 0, null), "count_nonzero " + $dt);
+    ok(nd_dtype(nd_argmax($m, 0, null)) == "i64", "argmax is i64 " + $dt);
+    $dj = $dj + 1;
+}
+// The two rules argmax must keep: a tie goes to the LOWEST index, and a NaN
+// wins while keeping its own index -- even over a larger value further on.
+$ti = nd_full([30, 20], 5.0, "f64");
+nd_set($ti, [7, 1], 9.0);
+nd_set($ti, [19, 1], 9.0);
+nd_set($ti, [11, 2], $nan);
+nd_set($ti, [3, 3], $nan);
+nd_set($ti, [25, 3], 100.0);
+same(nd_slice(nd_argmax($ti, 0, null), [[0, 7, 1]]),
+     nd_argmax(nd_slice($ti, [null, [0, 7, 1]]), 0, null), "argmax ties and NaNs vs the old path");
+ok(nd_get(nd_argmax($ti, 0, null), 1) == 7, "a tie goes to the lowest index");
+ok(nd_get(nd_argmax($ti, 0, null), 2) == 11, "a NaN takes the index where it sits");
+ok(nd_get(nd_argmax($ti, 0, null), 3) == 3, "a NaN beats a later maximum");
+$c2 = nd_random_uniform([9, 11, 37], -1.0, 1.0);
+same(nd_slice(nd_var($c2, 1, null, null), [null, [0, 4, 1]]),
+     nd_var(nd_slice($c2, [null, null, [0, 4, 1]]), 1, null, null), "3-D var axis 1");
+same(nd_slice(nd_argmax($c2, 0, null), [null, [0, 4, 1]]),
+     nd_argmax(nd_slice($c2, [null, null, [0, 4, 1]]), 0, null), "3-D argmax axis 0");
+$v2 = nd_slice(nd_random_uniform([300, 300], -1.0, 1.0), [[3, 290, 4], [1, 290, 3]]);
+same(nd_slice(nd_var($v2, 0, null, null), [[0, 7, 1]]),
+     nd_var(nd_slice($v2, [null, [0, 7, 1]]), 0, null, null), "a strided view's var");
+
+// ── 4c. the contiguous inner loops, written over the stored type ─────────────
+// any, all, count_nonzero and argmin/argmax over a contiguous run used to go
+// through a dtype switch and a lambda call per element. Now they are plain
+// loops over T -- and any/all stop at the first element that settles the
+// answer, which the old path did not.
+//
+// There is no narrow-slice trick here, because the contiguous path is chosen
+// by the axis rather than by the width. The reference is the OTHER new path:
+// reducing axis 1 of an array must equal reducing axis 0 of its transposed
+// copy, which goes through the blocked driver instead. Two implementations,
+// same visit order per output -- including for argmax, whose index depends on
+// that order.
+print("");
+print("-- the contiguous any/all/count/argmax loops --");
+$q  = nd_random_uniform([97, 300], -1.0, 1.0);
+$qt = nd_copy(nd_transpose($q, null), null);
+same(nd_argmax($q, 1, null), nd_argmax($qt, 0, null), "contiguous argmax == blocked argmax");
+same(nd_argmin($q, 1, null), nd_argmin($qt, 0, null), "contiguous argmin == blocked argmin");
+same(nd_count_nonzero($q, 1, null), nd_count_nonzero($qt, 0, null), "contiguous count_nonzero");
+$qb  = nd_greater($q, 0.3, null);
+$qbt = nd_copy(nd_transpose($qb, null), null);
+same(nd_any($qb, 1, null), nd_any($qbt, 0, null), "contiguous any == blocked any");
+same(nd_all($qb, 1, null), nd_all($qbt, 0, null), "contiguous all == blocked all");
+// the early exit must not change an answer that is only settled at the end
+$af = nd_zeros([40, 500], "bool");
+$at = nd_greater(nd_ones([40, 500], "f64"), 0.0, null);
+ok(nd_get(nd_any($af, 1, null), 0) == false, "any on all-false is false (nothing to exit on)");
+ok(nd_get(nd_all($at, 1, null), 0) == true, "all on all-true is true");
+nd_set($af, [0, 499], true);
+ok(nd_get(nd_any($af, 1, null), 0) == true, "any finds a true in the LAST element");
+nd_set($at, [0, 499], false);
+ok(nd_get(nd_all($at, 1, null), 0) == false, "all finds a false in the LAST element");
+// argmax with the NaN in each position, over a contiguous axis
+$an = nd_full([5, 64], 1.0, "f64");
+nd_set($an, [0, 0], $nan);
+nd_set($an, [1, 63], $nan);
+nd_set($an, [2, 31], $nan);
+nd_set($an, [3, 7], 9.0);
+ok(nd_get(nd_argmax($an, 1, null), 0) == 0, "contiguous argmax: NaN at index 0");
+ok(nd_get(nd_argmax($an, 1, null), 1) == 63, "contiguous argmax: NaN at the end");
+ok(nd_get(nd_argmax($an, 1, null), 2) == 31, "contiguous argmax: NaN in the middle");
+ok(nd_get(nd_argmax($an, 1, null), 3) == 7, "contiguous argmax: no NaN, the max wins");
+ok(nd_get(nd_argmax($an, 1, null), 4) == 0, "contiguous argmax: all equal -> index 0");
+// every length 1..20, so the tail of the unrolled count loop is covered
+$ci = 1;
+$cok = 1;
+while ($ci <= 20) {
+    $row = nd_greater(nd_random_uniform([1, $ci], -1.0, 1.0), 0.0, null);
+    $n1 = nd_get(nd_count_nonzero($row, 1, null), 0);
+    $n2 = nd_get(nd_count_nonzero($row, null, null), 0);
+    if ($n1 != $n2) { $cok = 0; }
+    $ci = $ci + 1;
+}
+ok($cok == 1, "count_nonzero agrees with the flat count for every length 1..20");
+
 // ── 5. reducing everything, and the degenerate shapes ───────────────────────
 print("");
 print("-- whole-array and degenerate shapes --");

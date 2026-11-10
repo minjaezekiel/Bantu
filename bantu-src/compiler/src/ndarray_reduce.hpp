@@ -265,6 +265,55 @@ inline double extremeContig(const T* NB_RESTRICT q, size_t n, bool wantMax) {
     return (double)best;
 }
 
+// ── the other contiguous inner loops, over the stored type ───────────────────
+// any, all, count_nonzero and argmin/argmax over a contiguous run went through
+// innerSweep + getAsDouble: a dtype switch and a lambda call PER ELEMENT. On a
+// 4M-element bool array `nd_any` spent 4.7 ns per byte compared, which is
+// almost entirely that overhead -- and `nd_all(nd_equal(a, b))` is the shape of
+// nearly every assertion in this project's test suites.
+//
+// Written over T they are plain loops. `any`/`all` also stop at the first
+// element that settles the answer, which the generic path did not do: for a
+// predicate that is already decided, continuing to read memory is pure waste
+// and the answer cannot change.
+template <class T>
+inline bool anyContig(const T* NB_RESTRICT q, size_t n) {
+    for (size_t i = 0; i < n; i++) if (q[i] != T(0)) return true;
+    return false;
+}
+template <class T>
+inline bool allContig(const T* NB_RESTRICT q, size_t n) {
+    for (size_t i = 0; i < n; i++) if (q[i] == T(0)) return false;
+    return true;
+}
+template <class T>
+inline double countNzContig(const T* NB_RESTRICT q, size_t n) {
+    size_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        c0 += (q[i + 0] != T(0)); c1 += (q[i + 1] != T(0));
+        c2 += (q[i + 2] != T(0)); c3 += (q[i + 3] != T(0));
+    }
+    for (; i < n; i++) c0 += (q[i] != T(0));
+    return (double)(c0 + c1 + c2 + c3);
+}
+
+// argmin/argmax keep the documented rules exactly: the first NaN wins and keeps
+// its own index, and a tie goes to the LOWEST index (hence the strict > / <).
+template <class T>
+inline double argExtremeContig(const T* NB_RESTRICT q, size_t n, bool wantMax) {
+    if (n == 0) return 0.0;
+    T best = q[0];
+    size_t bestIdx = 0;
+    if (best != best) return 0.0;                 // NaN at 0: it wins, index 0
+    for (size_t i = 1; i < n; i++) {
+        const T x = q[i];
+        if (x != x) return (double)i;              // first NaN wins, with its index
+        if (wantMax ? (x > best) : (x < best)) { best = x; bestIdx = i; }
+    }
+    return (double)bestIdx;
+}
+
 template <class T>
 inline auto extremeFast(const NdArray& A, const ReducePlan& p, bool wantMax) {
     static_assert(std::is_floating_point<T>::value,
@@ -467,6 +516,91 @@ inline ArrayPtr runReduceOuterSimple(const NdArray& a, const ReducePlan& p, DTyp
             default:
                 reduceOuterSimple<uint8_t>(static_cast<const uint8_t*>(a.buf->data),
                                            base, W, S, n, tmp.data(), initFromFirst, initVal, upd);
+                break;
+        }
+        for (size_t t = 0; t < W; t++) setFromDouble(*out, k + t, tmp[t]);
+        k += W;
+    };
+
+    if (p.outerShape.size() == 1) {
+        run(a.offset);
+    } else {
+        std::vector<size_t>    oshape(p.outerShape.begin(), p.outerShape.end() - 1);
+        std::vector<ptrdiff_t> ostride(p.outerStrides.begin(), p.outerStrides.end() - 1);
+        nditer(oshape, { ostride }, { a.offset }, [&](const size_t* o) { run(o[0]); });
+    }
+    return out;
+}
+
+// ── and for the accumulators that carry MORE THAN ONE number ─────────────────
+// var and std (Welford's mean and m2), argmin and argmax (the extremum and its
+// index), ptp (the low and the high) all keep K doubles per output. Same loop
+// inversion, same bit-identity argument -- the per-output element order is
+// unchanged, so Welford's sequence of divisions is the same sequence and an
+// index tie is broken by the same element.
+//
+// The count is NOT per-output state: every accumulator in a tile has been fed
+// the same number of elements, so Welford's n is the loop index plus one. That
+// is the same observation the sum path's shared carry depth rests on.
+//
+// AoS rather than SoA here: K is 2, these reductions are compute-bound (Welford
+// divides per element), and the layout that keeps one output's state in one
+// cache line matters more than vectorising across outputs.
+inline std::vector<double>& reduceScratch3() {
+    static thread_local std::vector<double> v;
+    return v;
+}
+
+template <class T, size_t K, class Init, class Upd, class Fin>
+inline void reduceOuterMulti(const T* data, size_t base, size_t W, size_t S, size_t n,
+                             double* out, Init init, Upd upd, Fin fin) {
+    const size_t tile = (W < kOuterTile) ? W : kOuterTile;
+    std::vector<double>& sc = reduceScratch3();
+    if (sc.size() < tile * K) sc.resize(tile * K);
+    double* const st = sc.data();
+
+    for (size_t j0 = 0; j0 < W; j0 += tile) {
+        const size_t w = (j0 + tile <= W) ? tile : W - j0;
+        const T* const col = data + base + j0;
+        for (size_t t = 0; t < w; t++) init(st + t * K, (double)col[t]);
+        for (size_t i = 1; i < n; i++) {
+            const T* row = col + i * S;
+            for (size_t t = 0; t < w; t++) upd(st + t * K, (double)row[t], i);
+        }
+        for (size_t t = 0; t < w; t++) out[j0 + t] = fin(st + t * K, n);
+    }
+}
+
+template <size_t K, class Init, class Upd, class Fin>
+inline ArrayPtr runReduceOuterMulti(const NdArray& a, const ReducePlan& p, DType rdt,
+                                    const char* what, Init init, Upd upd, Fin fin) {
+    ArrayPtr out = makeArray(p.resultShape, rdt, what);
+    if (out->size() == 0) return out;
+
+    const size_t last = p.outerShape.size() - 1;
+    const size_t W    = p.outerShape[last];
+    const size_t S    = (size_t)p.innerStrides[0];
+    const size_t n    = p.innerCount;
+
+    std::vector<double> tmp(W);
+    size_t k = 0;
+    auto run = [&](size_t base) {
+        switch (a.dtype) {
+            case DType::F64:
+                reduceOuterMulti<double, K>(static_cast<const double*>(a.buf->data),
+                                            base, W, S, n, tmp.data(), init, upd, fin);
+                break;
+            case DType::F32:
+                reduceOuterMulti<float, K>(static_cast<const float*>(a.buf->data),
+                                           base, W, S, n, tmp.data(), init, upd, fin);
+                break;
+            case DType::I64:
+                reduceOuterMulti<int64_t, K>(static_cast<const int64_t*>(a.buf->data),
+                                             base, W, S, n, tmp.data(), init, upd, fin);
+                break;
+            default:
+                reduceOuterMulti<uint8_t, K>(static_cast<const uint8_t*>(a.buf->data),
+                                             base, W, S, n, tmp.data(), init, upd, fin);
                 break;
         }
         for (size_t t = 0; t < W; t++) setFromDouble(*out, k + t, tmp[t]);

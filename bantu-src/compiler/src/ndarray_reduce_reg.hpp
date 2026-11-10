@@ -42,6 +42,18 @@ inline void requireNonEmptySlice(const ReducePlan& p, const char* what) {
     }
 }
 
+// One place to turn (dtype, contiguous run) into a raw-pointer call, so the
+// four arms are written once per OP rather than once per op per dtype.
+template <class R, class Fn>
+inline R contigDispatch(const NdArray& a, size_t base, size_t n, Fn fn) {
+    switch (a.dtype) {
+        case DType::F64: return fn(static_cast<const double*>(a.buf->data) + base, n);
+        case DType::F32: return fn(static_cast<const float*>(a.buf->data) + base, n);
+        case DType::I64: return fn(static_cast<const int64_t*>(a.buf->data) + base, n);
+        default:         return fn(static_cast<const uint8_t*>(a.buf->data) + base, n);
+    }
+}
+
 inline void registerReductions(const DefineFn& define) {
 
     // ── sum / mean, on the pairwise accumulator (docs §4.9) ──────────────────
@@ -109,6 +121,23 @@ inline void registerReductions(const DefineFn& define) {
     });
 
     // ── var / std, Welford one-pass (docs §4.9) ──────────────────────────────
+    auto welfordFused = [](const NdArray& A, const ReducePlan& P, const char* what,
+                           double ddof, bool root) {
+        return runReduceOuterMulti<2>(A, P, floatResultDType(A.dtype), what,
+            [](double* st, double x) { st[0] = x; st[1] = 0.0; },
+            [](double* st, double x, size_t i) {
+                const double d = x - st[0];
+                st[0] += d / (double)(i + 1);
+                st[1] += d * (x - st[0]);
+            },
+            [ddof, root](const double* st, size_t n) {
+                const double denom = (double)n - ddof;
+                if (denom <= 0.0) return std::numeric_limits<double>::quiet_NaN();
+                const double v = st[1] / denom;
+                return root ? std::sqrt(v) : v;
+            });
+    };
+
     auto welford = [](const NdArray& a, const ReducePlan& p, size_t base, double ddof) -> double {
         double mean = 0.0, m2 = 0.0;
         size_t n = 0;
@@ -124,17 +153,27 @@ inline void registerReductions(const DefineFn& define) {
         return m2 / denom;
     };
 
-    define("nd_var", [welford](std::vector<Value> args) -> Value {
+    define("nd_var", [welford, welfordFused](std::vector<Value> args) -> Value {
         RedArgs r = redArgs(args, "nd_var");
         const double ddof = (args.size() > 3 && !args[3].isNull()) ? args[3].numberVal : 0.0;
         const NdArray& A = *r.a; const ReducePlan& P = r.plan;
+        if (outerSimpleApplies(A, P)) {
+            return wrap(welfordFused(A, P, "nd_var", ddof, false));
+        }
         return wrap(runReduce(A, P, floatResultDType(A.dtype), "nd_var",
             [&](size_t base) { return welford(A, P, base, ddof); }));
     });
-    define("nd_std", [welford](std::vector<Value> args) -> Value {
+    define("nd_std", [welford, welfordFused](std::vector<Value> args) -> Value {
         RedArgs r = redArgs(args, "nd_std");
         const double ddof = (args.size() > 3 && !args[3].isNull()) ? args[3].numberVal : 0.0;
         const NdArray& A = *r.a; const ReducePlan& P = r.plan;
+        // The same fused path as nd_var, with the square root in the
+        // finaliser. Sharing it is not tidiness: nd_var got the fast path
+        // first and nd_std did not, and the measurement showed nd_std alone
+        // still at 1674 ms while nd_var had gone to 118.
+        if (outerSimpleApplies(A, P)) {
+            return wrap(welfordFused(A, P, "nd_std", ddof, true));
+        }
         return wrap(runReduce(A, P, floatResultDType(A.dtype), "nd_std",
             [&](size_t base) { return std::sqrt(welford(A, P, base, ddof)); }));
     });
@@ -194,6 +233,15 @@ inline void registerReductions(const DefineFn& define) {
         requireNonEmptySlice(r.plan, "nd_ptp");
         const DType rdt = r.a->dtype == DType::BOOL ? DType::I64 : r.a->dtype;
         const NdArray& A = *r.a; const ReducePlan& P = r.plan;
+        if (outerSimpleApplies(A, P)) {
+            return wrap(runReduceOuterMulti<2>(A, P, rdt, "nd_ptp",
+                [](double* st, double x) { st[0] = x; st[1] = x; },
+                [](double* st, double x, size_t) {
+                    if (x < st[0]) st[0] = x;
+                    if (x > st[1]) st[1] = x;
+                },
+                [](const double* st, size_t) { return st[1] - st[0]; }));
+        }
         return wrap(runReduce(A, P, rdt, "nd_ptp", [&](size_t base) {
             bool first = true; double lo = 0.0, hi = 0.0;
             innerSweep(P, base, [&](size_t o) {
@@ -212,6 +260,24 @@ inline void registerReductions(const DefineFn& define) {
             RedArgs r = redArgs(args, what);
             requireNonEmptySlice(r.plan, what);
             const NdArray& A = *r.a; const ReducePlan& P = r.plan;
+            if (innerIsContig(P) && A.buf && A.buf->data) {
+                return wrap(runReduce(A, P, DType::I64, what, [&](size_t base) {
+                    return contigDispatch<double>(A, base, P.innerCount,
+                        [wantMax](auto* q, size_t n) {
+                            return argExtremeContig(q, n, wantMax);
+                        });
+                }));
+            }
+            if (outerSimpleApplies(A, P)) {
+                return wrap(runReduceOuterMulti<2>(A, P, DType::I64, what,
+                    [](double* st, double x) { st[0] = x; st[1] = 0.0; },
+                    [wantMax](double* st, double x, size_t i) {
+                        if (std::isnan(st[0])) return;          // NaN wins, keeps its index
+                        if (std::isnan(x)) { st[0] = x; st[1] = (double)i; return; }
+                        if (wantMax ? (x > st[0]) : (x < st[0])) { st[0] = x; st[1] = (double)i; }
+                    },
+                    [](const double* st, size_t) { return st[1]; }));
+            }
             return wrap(runReduce(A, P, DType::I64, what, [&](size_t base) {
                 size_t idx = 0, bestIdx = 0, i = 0;
                 bool first = true; double best = 0.0;
@@ -238,6 +304,12 @@ inline void registerReductions(const DefineFn& define) {
             return wrap(runReduceOuterSimple(A, P, DType::BOOL, "nd_any", false, 0.0,
                 [](double& acc, double x) { if (x != 0.0) acc = 1.0; }));
         }
+        if (innerIsContig(P) && A.buf && A.buf->data) {
+            return wrap(runReduce(A, P, DType::BOOL, "nd_any", [&](size_t base) {
+                return contigDispatch<double>(A, base, P.innerCount,
+                    [](auto* q, size_t n) { return anyContig(q, n) ? 1.0 : 0.0; });
+            }));
+        }
         return wrap(runReduce(A, P, DType::BOOL, "nd_any", [&](size_t base) {
             bool found = false;                       // identity: empty -> false
             innerSweep(P, base, [&](size_t o) { if (getAsDouble(A, o) != 0.0) found = true; });
@@ -251,6 +323,12 @@ inline void registerReductions(const DefineFn& define) {
             return wrap(runReduceOuterSimple(A, P, DType::BOOL, "nd_all", false, 1.0,
                 [](double& acc, double x) { if (x == 0.0) acc = 0.0; }));
         }
+        if (innerIsContig(P) && A.buf && A.buf->data) {
+            return wrap(runReduce(A, P, DType::BOOL, "nd_all", [&](size_t base) {
+                return contigDispatch<double>(A, base, P.innerCount,
+                    [](auto* q, size_t n) { return allContig(q, n) ? 1.0 : 0.0; });
+            }));
+        }
         return wrap(runReduce(A, P, DType::BOOL, "nd_all", [&](size_t base) {
             bool all = true;                          // identity: empty -> true
             innerSweep(P, base, [&](size_t o) { if (getAsDouble(A, o) == 0.0) all = false; });
@@ -260,6 +338,16 @@ inline void registerReductions(const DefineFn& define) {
     define("nd_count_nonzero", [](std::vector<Value> args) -> Value {
         RedArgs r = redArgs(args, "nd_count_nonzero");
         const NdArray& A = *r.a; const ReducePlan& P = r.plan;
+        if (outerSimpleApplies(A, P)) {
+            return wrap(runReduceOuterSimple(A, P, DType::I64, "nd_count_nonzero", false, 0.0,
+                [](double& acc, double x) { if (x != 0.0) acc += 1.0; }));
+        }
+        if (innerIsContig(P) && A.buf && A.buf->data) {
+            return wrap(runReduce(A, P, DType::I64, "nd_count_nonzero", [&](size_t base) {
+                return contigDispatch<double>(A, base, P.innerCount,
+                    [](auto* q, size_t n) { return countNzContig(q, n); });
+            }));
+        }
         return wrap(runReduce(A, P, DType::I64, "nd_count_nonzero", [&](size_t base) {
             double n = 0;
             innerSweep(P, base, [&](size_t o) { if (getAsDouble(A, o) != 0.0) n += 1; });

@@ -741,3 +741,64 @@ That is the whole lesson. A 27x loop-order defect was sitting under a plan to
 buy 6x with threads, and the plan would have shipped 6x on top of a 27x
 mistake and called it a win. **Measure the single-threaded kernel before
 deciding it needs cores.**
+
+---
+
+### N38 — the loop inversion generalises, and one op nearly got left behind
+
+N37 fixed `sum`, `mean`, `min`, `max`, `prod`, `any` and `all`. The reductions
+that carry **more than one number per output** had the identical defect:
+
+| axis-0, 2048×2048 f64, 20 reps | before | after | |
+|---|---|---|---|
+| `nd_var` | 1571 ms | 122 ms | **12.9x** |
+| `nd_std` | 1674 ms | 121 ms | **13.8x** |
+| `nd_argmax` | 1578 ms | 129 ms | **12.2x** |
+| `nd_ptp` | 1544 ms | 103 ms | **15.0x** |
+| `nd_count_nonzero` | 1357 ms | 99 ms | **13.7x** |
+
+Welford needs two doubles (mean and m2), argmin/argmax two (the extremum and
+its index), ptp two (the low and the high). The count is *not* per-output
+state: every accumulator in a tile has been fed the same number of elements, so
+Welford's `n` is the loop index plus one — the same observation the sum path's
+shared carry depth rests on. Layout is AoS rather than SoA here, because K is 2
+and these are compute-bound (Welford divides per element), so keeping one
+output's state in one cache line beats vectorising across outputs.
+
+**`nd_std` was measured at 1674 ms while `nd_var` had gone to 122.** `nd_var`
+got the hook and `nd_std`, registered separately with the same Welford helper,
+did not. It was caught by measuring every op rather than the one that was
+changed, and fixed by making both call one shared `welfordFused` — so the next
+reduction to want it cannot get half of it. **An optimisation applied at the
+call site instead of the shared helper gets applied to some of the callers.**
+
+### N39 — the contiguous inner loops were paying a dtype switch per element
+
+Separately from the loop order: `any`, `all`, `count_nonzero` and
+`argmin`/`argmax` over a *contiguous* run went through `innerSweep` plus
+`getAsDouble` — a dtype switch and a lambda call per element. On a 4M-element
+bool array `nd_any` spent 4.7 ns per byte compared, almost all of it overhead,
+and `nd_all(nd_equal(a, b))` is the shape of nearly every assertion in this
+project's suites.
+
+Written as plain loops over `T` (2048×2048, axis 1, 20 reps):
+
+| | before | after | |
+|---|---|---|---|
+| `nd_any` on bool, random data | 484 ms | 1 ms | early exit |
+| `nd_any` on bool, answer in the last element | 114 ms | 52 ms | **2.2x** |
+| `nd_all` on bool, answer in the last element | 66 ms | 45 ms | 1.5x |
+| `nd_count_nonzero` on bool | 412 ms | 35 ms | **11.8x** |
+| `nd_argmax` on f64 | 175 ms | 125 ms | 1.4x |
+
+Both numbers are given for `any` deliberately. The 484 ms → 1 ms is the **early
+exit**: `any`/`all` now stop at the first element that settles the answer, which
+the old path did not, and for a predicate that is already decided, continuing
+to read memory is waste that cannot change the result. The honest worst-case
+figure is 2.2x, and the old path's 484 ms on random data against 114 ms on
+all-false was branch misprediction, not work.
+
+`argmin`/`argmax` keep both documented rules exactly: the first NaN wins and
+keeps its own index, and a tie goes to the lowest index (hence the strict
+`>` / `<`). Asserted for a NaN at index 0, in the middle, and in the last
+position, plus the all-equal case.
