@@ -43,7 +43,7 @@ the first package that would hit the trap in the wild.
 ## Phase K0 — Tracking docs
 - [x] `docs/bkit-architecture.md`
 - [x] `bkit-suite/ROADMAP.md`, `DECISIONS.md`
-- [ ] `bkit-suite/CHANGELOG.md` (created when K1 starts)
+- [x] `bkit-suite/CHANGELOG.md`
 
 ## Phase K1 — `base.b`, the estimator protocol
 
@@ -52,10 +52,19 @@ Deliberately tiny and deliberately first: `btext` depends on this file alone
 
 | Item | How | Feature test | Stress test | Status |
 |---|---|---|---|---|
-| `Estimator` base | `fit`/`predict`/`get_params`/`set_params`/`clone`, plus `fit_transform`/`score`/`_check_fitted` provided in terms of `this` | each method present; calling an unimplemented one raises **by name** | — | [ ] |
-| `clone()` per estimator | no reflective constructor in Bantu, so each writes its own ([K3]) | a cloned estimator is unfitted and shares no array with its source | 1,000 clones leak 0 bytes | [ ] |
-| `Pipeline` | a list of `(name, estimator)`; `fit` chains `fit_transform`, `predict` chains `transform` | a 3-stage pipeline equals the hand-written composition exactly | 50-stage pipeline | [ ] |
-| **protocol test harness** | table-driven over a registry of every estimator | tier 3's mechanism, written here so later phases inherit it | — | [ ] |
+| `Estimator` base | `fit`/`predict`/`get_params`/`set_params`/`clone`, plus `fit_transform`/`score`/`_check_fitted` provided in terms of `this` | each method present; calling an unimplemented one raises **by name** | — | [x] |
+| `clone()` per estimator | no reflective constructor in Bantu, so each writes its own ([K3]) | a cloned estimator is unfitted and shares no array with its source | 1,000 clones leak 0 bytes | [x] |
+| `Pipeline` | a list of `(name, estimator)`; `fit` chains `fit_transform`, `predict` chains `transform` | a 3-stage pipeline equals the hand-written composition exactly | 50-stage pipeline | [x] feature + exactness; the 50-stage stress belongs with K6's `ColumnTransformer` |
+| **protocol test harness** | table-driven over a registry of every estimator | tier 3's mechanism, written here so later phases inherit it | — | [x] in `base.b`, so every phase inherits one definition of the contract |
+
+**K1 found a language bug, fixed in the interpreter.** A class from an included
+file could be **inherited from but not instantiated**: `extends` resolves a
+parent against the global class registry, while `new X()` resolved it against
+the scope — and a class declaration binds its name where it appears, which for
+an included file is that file's own environment. So `class Ridge extends
+Estimator` worked and `new Estimator()` said `Undefined variable`. A name after
+`new` now resolves against the registry too, gated on the keyword so the
+factory pattern is untouched. Regression: `tests/lang_class_include_test.b`.
 
 ## Phase K2 — `preprocess.b`
 
@@ -162,8 +171,23 @@ Datasets fetched and SHA-256 verified, **never committed** — the method
 
 ## Where to resume
 
-**K0 is done; K1 is next.** Nothing is built. Read
+**K0 and K1 are done; K2 (`preprocess.b`) is next.** `base.b` is 330 lines and
+`tests/bkit_base_test.b` is 46 assertions, all green. Read
 [`../docs/bkit-architecture.md`](../docs/bkit-architecture.md) first, then
 [`DECISIONS.md`](DECISIONS.md).
 
-Blocked on: ecosystem **stage 2** (the engine field) landing first.
+Ecosystem **stage 2** (the engine field) landed first, as required, and
+`bkit/package.json` declares `"bantu": ">=1.4.0"` — verified against the floor
+its own sources imply with `bantu engine bkit`.
+
+What K2 inherits from K1 and should not re-invent:
+
+* every estimator is `_Name` plus a same-named factory `def Name(...)`, because
+  a `def Name()` shadows a `class Name`, and `new Name(...)` inside the factory
+  then re-enters the factory until the call-depth guard fires;
+* a field and a method cannot share a name (one namespace), hence `fitted_`,
+  `params_`, `name_`, `task_`;
+* `append($list, $v)` **mutates and returns the new LENGTH** — `$l = append($l, $v)`
+  replaces the list with a number;
+* every new estimator joins the registry in `tests/bkit_base_test.b`'s protocol
+  section, which is tier 3 for the whole package.

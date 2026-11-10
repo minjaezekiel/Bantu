@@ -767,7 +767,13 @@ private:
             auto className = expect(BantuTokenType::IDENTIFIER, "Expected class name after 'new'");
             // The CallNode in parseCall will handle the (args) part
             // We return a VariableNode for the class name, and parseCall wraps it
-            return std::make_shared<VariableNode>(className.value, nLine, nCol);
+            auto cn = std::make_shared<VariableNode>(className.value, nLine, nCol);
+            // Remember that the keyword was there. The evaluator resolves a
+            // name written after `new` against the class registry as well as
+            // the scope, which is what makes `new X()` work wherever
+            // `extends X` does.
+            cn->fromNew = true;
+            return cn;
         }
 
         // super() call for parent constructor

@@ -36,6 +36,23 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Fixed
 
+- **[bug fix] A class from an included file could be inherited from but not instantiated.**
+  `extends` resolves a parent name against the global class registry; `new X()` resolved it against
+  the **scope**, and a class declaration binds its name in the environment where the declaration
+  appears — which for an included file is that file's own. So this worked:
+
+  ```bantu
+  include "bkit/base.b" as base;
+  class Ridge extends Estimator { ... }     // fine
+  $e = new Estimator();                     // Undefined variable: Estimator
+  ```
+
+  A class visible enough to inherit from, and not visible enough to build. A name written after
+  `new` now resolves against the class registry as well as the scope. **Gated on the keyword**, so a
+  bare `X()` still resolves through the scope alone and the factory pattern — `def Linear()`
+  shadowing `class Linear`, which every package uses — behaves exactly as before. Found while
+  writing `bkit`'s estimator protocol, where a user is expected to do both.
+
 - **[bug fix] The thread pool returned while a worker was still inside the caller's body** — a
   use-after-free, plus the next region claiming chunk indices while a straggler ran the previous
   one's body. A worker started with `seen = 0`, so a worker created *during* a region consumed the

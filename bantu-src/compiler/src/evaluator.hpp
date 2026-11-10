@@ -5776,6 +5776,35 @@ private:
                     return instantiateClass(val.classDefVal, args);
                 }
             }
+            // A name written after `new` is a class name, so it resolves
+            // against the class registry too -- not only against the scope.
+            //
+            // `extends` has always resolved there, which is why a class from
+            // an included file could be INHERITED FROM but not INSTANTIATED:
+            //
+            //     include "bkit/base.b" as base;
+            //     class Ridge extends Estimator { ... }   // worked
+            //     $e = new Estimator();                   // Undefined variable
+            //
+            // A class declaration binds its name in the environment where it
+            // appears, and an included file has its own, so the includer's
+            // scope never saw it. One rule for both now: if `extends X` can
+            // find it, `new X()` can build it.
+            //
+            // Gated on the keyword deliberately. A bare `X()` with no `new`
+            // keeps resolving through the scope alone, so the factory-function
+            // pattern -- `def Linear()` shadowing `class Linear` -- behaves
+            // exactly as it did.
+            if (varNode->fromNew) {
+                auto cit = classRegistry_.find(varNode->name);
+                if (cit != classRegistry_.end() && cit->second) {
+                    std::vector<Value> args;
+                    for (auto& arg : n->args) {
+                        args.push_back(evalNode(arg));
+                    }
+                    return instantiateClass(cit->second, args);
+                }
+            }
         }
 
         // Check for 'new' keyword as outer expression

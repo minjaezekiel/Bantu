@@ -170,6 +170,13 @@ struct DictNode : ASTNodeK<NodeKind::Dict> {
 // ─── Variables ───
 struct VariableNode : ASTNodeK<NodeKind::Variable> {
     std::string name;
+    // `new ClassName(...)` parses to this same node -- the keyword carries no
+    // other information -- and the evaluator needs to know, because a name
+    // written after `new` is a CLASS name and must be resolved as one even
+    // when nothing of that name is bound in the current scope. Without this,
+    // a class from an included file could be inherited from but not
+    // instantiated. Default false, so every other VariableNode is unchanged.
+    bool fromNew = false;
     VariableNode(const std::string& n, int l, int c) : ASTNodeK(l, c), name(n) {}
 };
 
