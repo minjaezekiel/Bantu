@@ -806,3 +806,92 @@ failed:
   its own 10,000,000-element operands.
 - **[test]** `tests/run_doc_examples.sh` covers `docs/numba.md` in both CI test jobs, so the gate is
   enforced from here on.
+
+---
+
+## Ecosystem stage 1, D3 — deterministic threading
+
+Machine for every number below: macOS, 10 performance cores (12 hardware
+threads reported), Apple Clang, `-O3 -ftree-vectorize` for `ndarray_native.cpp`.
+
+### D3a — the pool, and threaded matmul
+
+- **[feature]** `bantu-src/compiler/src/parallel.hpp` — `parallelFor(nChunks, body)`, a
+  reusable primitive rather than something welded into `nd_*`, because `bkit`'s histogram
+  builder and `btext`'s tokenizer need it next. Workers are created once and never
+  retired; the sequential path (one thread, pool busy, nested region, one chunk) takes no
+  lock and allocates nothing.
+- **[feature]** `nd_set_threads(n)` / `nd_get_threads()` / `nd_hardware_threads()`.
+  **Default 1: threading is opt-in** (N32). `nd_set_threads(0)` adopts the hardware count.
+  The count is one process-wide atomic, not thread-local — a program that set it at
+  start-up and then served requests on sua handler threads would otherwise find the
+  setting silently gone.
+- **[perf]** `nd_matmul`, both kernels, threaded over row blocks:
+  **1024³ 5.95 → 30.25 GFLOP/s (5.09x)** at 8 threads; `fwd1 128x784x256` 145 → 32 ms
+  (4.5x); `bwd1 784x128x256` 112 → 28 ms (4.0x); the MNIST MLP epoch 18.3 → 11.7 s
+  (1.56x — Amdahl, matmul is ~35-40% of an epoch).
+- **[perf]** Row chunking finer than the 64-row register block: `M = 128` gave only two
+  blocks and so only 1.22x. Safe because chunk size cannot affect a disjoint-output
+  answer, and it took `fwd1` from 260 to 63 ms.
+- **[test]** `tests/numba_threading_test.b` — 57 assertions, **exact equality** against the
+  single-threaded answer over four shapes (including `257x193x65`, whose last block is one
+  row) on both gemm paths, at 1/2/3/4/8/16 threads, f64 and f32.
+- **[bug fix]** **The pool returned while a worker was still inside the caller's body** — a
+  use-after-free, plus the next region claiming chunks while a straggler ran the previous
+  one's. A worker started with `seen = 0`, so a worker created *during* a region consumed
+  the generation of the region that had already finished and decremented the completion
+  counter for the region being set up. Fixed by giving each worker the generation current
+  at its birth; `active_` now counts only the workers that will take chunks, and only those
+  report back. **Found by ThreadSanitizer on the integrated interpreter in under two
+  minutes.** The determinism suite was green throughout — it compares answers, and the
+  answers were right. The standalone pool harness was also clean, because it warmed the
+  pool before measuring and so never created a worker inside a region under test (N33).
+- **[test]** `tests/numba_pool_tsan_test.b` — the sanitizer-sized sibling: shapes just past
+  the parallel threshold, region *count* rather than region size, 30 ms uninstrumented.
+
+### D3b — threaded element-wise ufuncs
+
+- **[perf]** Only the compute-bound ops, measured rather than assumed (N34):
+  **`exp` 4.83x, `log` 5.51x, `power` 5.06x, `tanh` 4.53x at n=1M**, 1.7-3.9x at 131k,
+  1.25-2.8x at the 16384-element threshold.
+- **[design]** **`add` is 0.83x on six threads at n=1M** (0.91x at 4M, 0.88x at 16M) — one
+  core already saturates the memory bus and the region handshake is pure cost. So the cheap
+  ops are left sequential: an op that got *slower* when a user turned threading on would
+  make `nd_set_threads` a thing to be afraid of. `sqrt` and `divide` win only inside a
+  131k-262k band whose edges are this machine's cache sizes, and a rule that holds on one
+  machine is not a rule.
+- **[design]** Cost is declared at the registration site as a trailing `Cost::HEAVY`, next
+  to the functor, defaulting to `Cost::CHEAP` — so a new ufunc is sequential until somebody
+  measures it. The failure mode of forgetting the tag is "no speed-up", never "slower" and
+  never "wrong".
+- **[perf]** The sequential path is unchanged: measured paired and alternating against the
+  previous build over add/multiply/less/negative/sqrt at n = 1k, 64k and 1M, all within
+  noise. `__restrict` is re-asserted on locals inside each chunk body, because passing the
+  pointers through a lambda capture would otherwise drop the no-alias promise and with it
+  the vectorisation that is the whole point of tier 0.
+- **[feature]** A parallel body that throws is caught per chunk, and the exception from the
+  **lowest chunk index** is rethrown on the caller's thread after the pool is released
+  (N35). By index rather than by arrival, so the error message does not depend on the
+  thread count; the pool is released first, so a failure cannot leave every later region in
+  the process running single-threaded.
+- **[test]** `tests/numba_elemwise_threads_test.b` — 376 assertions: 22 threaded ops × 3
+  shapes × 5 thread counts exact, the cheap ops asserted unchanged, f32, below-threshold and
+  empty, tier-1 scalar and tier-2 strided paths, `out=` destinations, inf/NaN/subnormals
+  placed deliberately on chunk boundaries, identical error messages at 1 and 6 threads, and
+  no live-byte growth over 500 threaded regions.
+- **[test]** `bantu-src/compiler/tests/parallel_test.cpp` — the properties no Bantu program
+  can reach: a throwing body, which exception wins, nesting, twelve concurrent callers ×
+  60 regions, and the pool still working after an error. Green, and green under TSan.
+
+### D3c — found while planning it
+
+- **[design]** **N26 was wrong, and nothing has to change.** It claimed no partition could
+  reproduce `Pairwise`'s single-threaded sum, and planned a one-time re-baseline of
+  `nd_sum`'s last bits on that basis. Because the tree's shape is a function of the element
+  count, an *aligned* partition reproduces it exactly: a chunk of `128 * 2^m` elements summed
+  from an empty counter is bit-for-bit the double the global tree holds at level `m`, and
+  injecting the chunk sums at level `m` in ascending order rebuilds the global state. So
+  `nd_sum` and `nd_mean` will keep every bit they have today, at every thread count (N36).
+- **[test]** `bantu-src/compiler/tests/pairwise_partition_test.cpp` — 1813 size/chunk
+  combinations, chunks from 1024 to 65536 elements, sizes on and around chunk boundaries with
+  tails of 0, 1, 127, 128, 129 and 1000 elements. **1813/1813 bit-identical.**

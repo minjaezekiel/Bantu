@@ -41,6 +41,15 @@
 //  direction is either a hang or a use-after-free, so the two rules are
 //  written out where they are implemented (see ensureWorkers).
 //
+//  ERRORS: a body may throw -- nd_left_shift raises on a shift count outside
+//  0..63, element-wise, so the throw comes from inside the loop. An exception
+//  escaping a worker thread is std::terminate, i.e. a crash where the
+//  single-threaded path raises a catchable Bantu error. So every chunk runs
+//  under a catch, the first exception BY CHUNK INDEX is kept (not by arrival,
+//  so the error MESSAGE is reproducible too), the remaining chunks are
+//  abandoned, and the caller rethrows it on its own thread. A threaded kernel
+//  therefore fails exactly as the sequential one does, with the same message.
+//
 //  ALLOCATION: the sequential path -- threads == 1, pool busy, nested call, or
 //  one chunk -- takes no lock and allocates nothing. It is a plain loop. Given
 //  the default of 1 thread that is what almost every call does. Phase 9 found
@@ -51,6 +60,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <exception>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -129,6 +139,9 @@ public:
             // pool has already created leaves the surplus parked without
             // touching the counter at all.
             active_  = std::min(limit_, workers_.size());
+            err_      = nullptr;
+            errChunk_ = 0;
+            abort_.store(false, std::memory_order_relaxed);
             generation_++;
         }
         cvWork_.notify_all();
@@ -141,8 +154,16 @@ public:
             body_ = nullptr;
         }
 
+        // The pool is released BEFORE the rethrow: an error in a body must not
+        // leave the pool permanently claimed, or every later region in the
+        // process would silently run single-threaded.
+        std::exception_ptr err = nullptr;
+        { std::lock_guard<std::mutex> lk(m_); err = err_; err_ = nullptr; }
+
         inRegionFlag() = false;
         busy_.clear(std::memory_order_release);
+
+        if (err) std::rethrow_exception(err);
         return true;
     }
 
@@ -166,10 +187,25 @@ private:
     // chunk BOUNDARIES and the caller's combine order, not from who runs what.
     void drain(const std::function<void(size_t)>& body, size_t nChunks) {
         for (;;) {
+            if (abort_.load(std::memory_order_relaxed)) return;
             const size_t i = next_.fetch_add(1, std::memory_order_relaxed);
             if (i >= nChunks) return;
-            body(i);
+            try {
+                body(i);
+            } catch (...) {
+                recordError(i, std::current_exception());
+                return;
+            }
         }
+    }
+
+    // Kept by lowest chunk index rather than by arrival: the sequential loop
+    // fails on the first offending ELEMENT, which lives in the lowest offending
+    // chunk, so this is the error the single-threaded run would have raised.
+    void recordError(size_t chunk, std::exception_ptr e) {
+        std::lock_guard<std::mutex> lk(m_);
+        if (!err_ || chunk < errChunk_) { err_ = e; errChunk_ = chunk; }
+        abort_.store(true, std::memory_order_relaxed);
     }
 
     // Workers are created once and never retired. A later region that wants
@@ -235,6 +271,9 @@ private:
     size_t                                   nChunks_    = 0;
     size_t                                   limit_      = 0;
     size_t                                   active_     = 0;
+    std::exception_ptr                       err_        = nullptr;
+    size_t                                   errChunk_   = 0;
+    std::atomic<bool>                        abort_{false};
     std::atomic<size_t>                      next_{0};
     std::atomic_flag                         busy_ = ATOMIC_FLAG_INIT;
 };

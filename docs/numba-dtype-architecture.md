@@ -416,6 +416,66 @@ throughout, because the answers were right. N33 records the fix and the two
 lessons: a sanitizer gate on the component is not a gate on the integrated
 build, and a determinism suite cannot find a lifetime bug.
 
+### 4.4e D3b: which element-wise ops get threads
+
+Measured, not assumed. An element-wise loop either saturates the memory bus or
+saturates the ALU, and only the second has anything left for a second core:
+`exp` goes 1.74x at 16k elements and 4.83x at 1M, while `add` is 0.83x at 1M
+and 0.88x at 16M -- *slower*, because one core already saturates the bus and
+the region handshake is pure cost. `sqrt` and `divide` win only inside a
+131k-262k band whose edges are this machine's cache sizes.
+
+So the transcendentals are threaded and nothing else is. The cost is declared
+at the registration site as a trailing `Cost::HEAVY`, defaulting to CHEAP, so
+a new ufunc is sequential until measured -- the failure mode of forgetting the
+tag is "no speed-up", never "slower" and never "wrong". The threshold is 16384
+elements in fixed 4096-element chunks (32 KB, L1-resident); fixed, because a
+boundary that moved with the thread count is what §4.4's contract forbids. The
+numbers and the reasoning are N34.
+
+Two things this does not do. It does not speed up the MNIST MLP much -- relu
+activations, a 1280-element softmax, and an epoch dominated by matmul and cheap
+optimizer arithmetic. And it does not touch tier 2 (strided and broadcast
+inputs), which walks a shared index and would need its own partitioning; that
+is where a bias-add lives, and it is left for later measurement rather than
+guessed at.
+
+The error path came with it (N35): a body that throws is caught per chunk, the
+**lowest-indexed** exception is rethrown on the caller's thread, the rest are
+abandoned, and the pool is released first. No threaded kernel throws today --
+everything that can is CHEAP -- so the property is asserted in C++, in
+`bantu-src/compiler/tests/parallel_test.cpp`, rather than left as a comment for
+bkit to discover.
+
+### 4.4f D3c: threaded reductions, with no change to anybody's sum
+
+The plan (N26) was to accept a one-time change to `nd_sum`'s last bits, on the
+grounds that `Pairwise`'s tree shape depends on the element count and so no
+partition could reproduce it. That was wrong, and the premise is what makes it
+wrong: *because* the shape is a function of the count, after a multiple of
+`2^m` adds level `m` holds the sum of the last `2^m` values associated as a
+perfect subtree, with every level below it empty.
+
+So:
+
+* a chunk of exactly `2^m` blocks, summed independently from an empty counter,
+  **is** the double the global tree would hold at level `m`;
+* injecting the chunk sums back at level `m` in ascending order — one
+  `addLevel(m, v)` mirroring `add` with the counter shifted — rebuilds the
+  global state exactly;
+* the remainder, always under one chunk, is added sequentially and cannot carry
+  into level `m`.
+
+`bantu-src/compiler/tests/pairwise_partition_test.cpp` checks 1813 size/chunk
+combinations and all 1813 are bit-identical. N36 records it. Axis reductions
+need none of this: one accumulator per output element is disjoint-write
+parallelism, and `nd_argmin`/`nd_argmax` keep lowest-index ties by combining in
+ascending order.
+
+The constraint this accepts is alignment: chunks are `128 * 2^m` elements and
+only whole chunks are parallel. That is not a compromise on the answer, which
+is the point.
+
 ### 4.5 D3 gate
 
 - **`tests/numba_threading_test.b`: every threaded kernel produces bit-identical
@@ -427,6 +487,13 @@ build, and a determinism suite cannot find a lifetime bug.
   and the integrated build found it in under two minutes (N33).
 - `nd_live_bytes` returns to its pre-call value after a threaded op: no
   per-call pool allocation, no leak across 20,000 calls.
+- The sequential path measured against the previous build, paired and
+  alternating: wrapping a tier-0 loop in a chunk lambda must cost nothing, and
+  the `__restrict` promise must survive the capture (it is re-asserted on
+  locals inside each chunk body, which is what keeps the vectorisation).
+- `bantu-src/compiler/tests/parallel_test.cpp` green, including under TSan: the
+  properties no Bantu program can reach -- a throwing body, which exception
+  wins, the pool surviving an error.
 - Scaling measured and recorded honestly: a kernel that does not scale is
   reported as not scaling, not quietly left in.
 - The full suite green at `nd_set_threads(0)` as well as the default 1.

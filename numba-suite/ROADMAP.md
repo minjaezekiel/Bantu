@@ -245,7 +245,7 @@ changes no stride arithmetic anywhere.**
 | **D4a ✅ f32 GEMM** (half of D4, pulled forward — E20) | `gemmContigT<T>`/`gemmTransAT<T>` over the input type with the accumulator kept `double`; `gemmReadyIn`/`gemmTransposedIn` take the dtype; `nd_matmul` and `nd_dot` return f32 only when BOTH operands are f32 | `nd_matmul(f32,f32)` is f32, `(f32,f64)` widens, `(f64,f64)` unchanged; the transposed-A path carries f32 too | **f64 bit-identical** (`numba_fastpath_test` exact, green); at K=1024 the f32 answer sits at **5.93e-08** against the f64 one, i.e. f32 *storage* resolution, which is the f64 accumulator doing its job | [x] |
 | **D2c ✅ btorch f32 plumbing** | `bt.set_default_dtype`/`get_default_dtype`, an optional trailing dtype on 9 constructors, `Module.to/float/double/dtype`, f32 in `.btsd`, and **13 hard-coded `"f64"` sites inside backward closures, masks, the backward seed, `one_hot` and the optimizer's state slots** | `tests/btorch_f32_test.b` **36/36** | **the MNIST MLP gate re-run in f32** — see the D2c results below | [x] |
 | **D2b `f32` arithmetic** — the ~55 ufunc functors become generic (`[](auto x, auto y)`) so f32 work happens at f32 width | mechanical; f64 deduces `double` and stays bit-identical | f32 element-wise measurably faster than f64, not merely smaller | — | [ ] |
-| **D3 deterministic threading** | a pool with a **fixed partition computed from shape and thread count-independently**, `nd_set_threads(n)`, default **1** (opt-in) | **bit-identical output at 1, 2, 4, 8, 16 threads**, asserted with exact equality | TSan (new tier) + ASan + UBSan; `nd_live_bytes` returns to its pre-call value; 20,000 threaded calls leak 0 bytes; **no per-call heap allocation** | [ ] |
+| **D3 deterministic threading** | a pool whose chunk **boundaries** come from shape alone (assignment stays dynamic — it cannot affect the answer), `nd_set_threads(n)`, default **1** (opt-in) | **bit-identical output at 1, 2, 3, 4, 8, 16 threads**, asserted with exact equality | TSan **on the integrated interpreter**, not only a component harness (it was the difference between clean-and-wrong and finding the bug — N33) + ASan + UBSan; `nd_live_bytes` does not grow; **no per-call heap allocation** | D3a ✅ matmul (5.09x), D3b ✅ element-wise (`exp` 4.83x), D3c reductions next |
 | **D4 packed GEMM + f32 GEMM** for skinny shapes (`K=25, N=6`); also makes matmul preserve f32 (**f32 in, f64 accumulator, f32 out** — N31), which is what unblocks D2c | register-blocked `A`/`B` panels, a measured `4×4` or `8×4` micro-kernel, shape-gated | `numba_fastpath_test.b` unchanged and passing | no regression at the large square shapes already at 7.8 GFLOP/s | [ ] |
 | **D5 FFT** (for `bsci`, ecosystem stage 6) | radix-4 for powers of two, mixed-radix for small prime factors, **Bluestein for arbitrary lengths**; `nd_rfft`/`nd_irfft` for real input | `ifft(fft(x)) == x` to 1e-12; **Parseval**; `rfft` agrees with `fft` on the first `N/2+1` bins | 10M-point transform; **every length works** — no silent zero-padding | [ ] |
 
@@ -341,32 +341,44 @@ what N29 predicts: the arithmetic still happens in `double`, so f32 changes
 bytes moved and not operations issued. Anyone wanting f32 to be *faster* wants
 D2b.
 
-### The `Pairwise` problem — why D3 is not a scheduling exercise
+### The `Pairwise` problem — solved without changing anyone's answer
 
 `Pairwise` (`ndarray_reduce.hpp:21`) is a binary-counter tree: after `n`
 elements, set bit `k` of `n` holds the sum of exactly `2^k` values. **Its tree
 shape is a function of `n` alone.** Split 1M elements as 2×500k and each thread
-builds a tree over 500k; adding the two partials is a *different summation
-order* and therefore a different answer in the last bits.
+builds a tree over 500k; adding the two partials is a different summation order
+and so a different answer in the last bits.
 
-There is no partitioning that reproduces the single-threaded answer. Chosen:
-**fixed chunks of `kReduceChunk` elements regardless of thread count, chunk
-totals combined by a second `Pairwise` in ascending chunk index, used at all
-thread counts including 1.** One thread and sixteen then agree bit for bit.
+This section used to end "there is no partitioning that reproduces the
+single-threaded answer", and plan for a one-time re-baseline of `nd_sum`. **That
+was wrong** (N26, superseded by N36), and the premise is exactly what makes it
+wrong: *because* the shape is a function of `n`, after a multiple of `2^m` adds
+level `m` holds the sum of the last `2^m` values associated as a perfect
+subtree, and every level below it is empty.
 
-The cost, stated plainly: **`nd_sum`/`nd_mean` change in their last bits,
-once** — a deliberate, documented, announced re-baseline. Accuracy is not
-harmed (still a tree, error still `log n`), and the existing 10M-to-2e-16 gate
-must be re-verified. Below `kReduceChunk` nothing changes at all.
+So the partition that works is an **aligned** one:
+
+* chunks of exactly `128 * 2^m` elements (128 is the block loop's stride);
+* each chunk summed independently from an empty counter — which produces
+  bit-for-bit the double the global tree would hold at level `m`;
+* chunk sums injected back at level `m` in ascending chunk order, via an
+  `addLevel(m, v)` that mirrors `add` with the counter shifted;
+* the remainder — under one chunk, including the sub-128 tail — added
+  sequentially, where its carries cannot reach level `m`.
+
+`bantu-src/compiler/tests/pairwise_partition_test.cpp` checks 1813 size/chunk
+combinations: **all 1813 bit-identical.** `nd_sum` and `nd_mean` keep every bit
+they have today, at every thread count. Axis reductions need none of it — one
+accumulator per output element is disjoint-write parallelism.
 
 ### What is *not* threaded in D3, and why
 
 | kernel | threaded | reason |
 |---|---|---|
 | `nd_matmul` | **yes** | each thread owns distinct output rows, so per-`(i,j)` summation order is untouched and bit-identity is trivial |
-| element-wise ufuncs | yes | no cross-element dependency |
-| reductions | above `kReduceChunk` | fixed chunks, combined by index |
-| `nd_im2col` | yes | disjoint output rows |
+| element-wise ufuncs | **only the compute-bound ones** | no cross-element dependency, so correctness is free — but `add` is 0.83x on six threads at n=1M because one core already saturates the bus, so only the transcendentals are threaded (N34) |
+| reductions | above the chunk size | **aligned** chunks injected at level `m`; bit-identical to the sequential answer, not merely self-consistent (N36) |
+| `nd_im2col` | not yet | disjoint output rows, so it is safe; but it is data movement, and N34's measurements say memory-bound kernels gain nothing. To be measured rather than assumed either way |
 | **`nd_col2im`** | **no** | it *accumulates* into overlapping destinations — a data race and order-dependent. Left sequential until a per-thread-accumulator design is measured |
 | sort, scans | no | sequential by nature |
 | **`nd_random_*`** | **no** | `nd_seed` is thread-local; parallel generation needs a per-partition seeding decision that would break [C4] |

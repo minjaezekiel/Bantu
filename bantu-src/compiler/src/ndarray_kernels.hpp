@@ -20,6 +20,7 @@
  */
 
 #include "ndarray_native.hpp"
+#include "parallel.hpp"
 
 namespace numba {
 
@@ -226,32 +227,120 @@ inline void nditer(const std::vector<size_t>& shape,
     #define NB_RESTRICT
 #endif
 
+// ── threading the element-wise loops (D3b) ───────────────────────────────────
+// Element i of a tier-0/1 loop reads only input element i and writes only
+// output element i, so chunking by index satisfies the determinism contract
+// without any care at all: the boundaries come from n alone, the writes are
+// disjoint, and there is no combine step to order. Unlike the reductions
+// (D3c), nothing about the ANSWER changes here -- which is why this is the
+// increment that needed measurement rather than argument.
+//
+// The chunk size is fixed, not derived from the thread count, because a
+// boundary that moved with the thread count is exactly what the contract
+// forbids. kElemMin is the point below which a region costs more than it
+// saves; both constants are measured, see docs/numba-dtype-architecture.md.
+// WHICH ops get threads is a measured property of the op, not of the array.
+// An element-wise loop either saturates the memory bus or saturates the ALU,
+// and only the second kind has anything left for a second core:
+//
+//   1 thread -> 6 threads, f64, this machine (10 cores, measured 2026-11-10)
+//     exp    n=16384  1.78x   n=131072  3.30x   n=262144  3.51x   n=1M  2.98x
+//     tanh                    n=131072  2.90x                     n=1M  5.00x
+//     power                                     n=262144  4.55x
+//     sqrt   n=16384  0.64x   n=131072  1.74x   n=262144  1.94x   n=1M  1.29x
+//     divide n=16384  0.57x   n=131072  1.22x   n=262144  1.50x   n=1M  1.00x
+//     abs                     n=131072  0.92x   n=262144  1.10x   n=1M  1.08x
+//     add    n=1M 0.83x   n=4M 0.91x   n=16M 0.88x
+//
+// So the transcendentals are threaded and nothing else is. `add` is SLOWER on
+// six threads at every size large enough to matter -- one core already
+// saturates the bus, and the region handshake is pure cost. sqrt and divide
+// win, but only inside a band (131k-262k) whose edges are this machine's cache
+// sizes; a rule that only holds on one machine is not a rule, and an op that
+// got slower when a user turned threading on would be worse than an op that
+// stayed the same speed.
+//
+// Cost is declared at the registration site, next to the functor, because that
+// is the only place the answer is knowable. The default is CHEAP: a new ufunc
+// is not threaded until someone measures it.
+enum class Cost { CHEAP, HEAVY };
+
+// Fixed, because a boundary that moved with the thread count is exactly what
+// the determinism contract forbids. 4096 doubles is 32 KB, so a chunk is
+// L1-resident; the minimum is where a region first pays for itself (1.78x).
+inline constexpr size_t kElemChunk = 4096;
+inline constexpr size_t kElemMin   = 16384;
+
+template <class Body>
+inline void elemwiseFor(size_t n, Cost cost, Body&& body) {   // body(lo, hi)
+    if (cost == Cost::CHEAP || n < kElemMin ||
+        getThreads() <= 1 || inRegionFlag()) {
+        body(size_t(0), n);                             // the overwhelming case
+        return;
+    }
+    const size_t chunks = chunkCount(n, kElemChunk);
+    if (chunks <= 1) { body(size_t(0), n); return; }
+    parallelFor(chunks, [&](size_t c) {
+        const size_t lo = c * kElemChunk;
+        body(lo, std::min(n, lo + kElemChunk));
+    });
+}
+
+// Each loop re-asserts NB_RESTRICT on locals inside the chunk body. Passing the
+// pointers through a lambda capture would otherwise drop the no-alias promise
+// the signature makes, and with it the vectorisation that is the whole point of
+// tier 0 -- a 30% loss on the SEQUENTIAL path, which is most calls.
 template <class T, class Op>
 inline void tier0(const T* NB_RESTRICT a, const T* NB_RESTRICT b,
-                  T* NB_RESTRICT o, size_t n, Op op) {
-    for (size_t i = 0; i < n; i++) o[i] = op(a[i], b[i]);
+                  T* NB_RESTRICT o, size_t n, Cost cost, Op op) {
+    elemwiseFor(n, cost, [=](size_t lo, size_t hi) {
+        const T* NB_RESTRICT ap = a;
+        const T* NB_RESTRICT bp = b;
+        T* NB_RESTRICT        op2 = o;
+        for (size_t i = lo; i < hi; i++) op2[i] = op(ap[i], bp[i]);
+    });
 }
 
 template <class T, class R, class Op>
 inline void tier0cmp(const T* NB_RESTRICT a, const T* NB_RESTRICT b,
-                     R* NB_RESTRICT o, size_t n, Op op) {
-    for (size_t i = 0; i < n; i++) o[i] = op(a[i], b[i]) ? 1 : 0;
+                     R* NB_RESTRICT o, size_t n, Cost cost, Op op) {
+    elemwiseFor(n, cost, [=](size_t lo, size_t hi) {
+        const T* NB_RESTRICT ap = a;
+        const T* NB_RESTRICT bp = b;
+        R* NB_RESTRICT        op2 = o;
+        for (size_t i = lo; i < hi; i++) op2[i] = op(ap[i], bp[i]) ? 1 : 0;
+    });
 }
 
 // Tier 1: one side is a single value, splatted. Worth its own loop because the
 // scalar stays in a register instead of being re-read through a stride-0 walk.
 template <class T, class Op>
-inline void tier1(const T* NB_RESTRICT a, T s, T* NB_RESTRICT o, size_t n, Op op) {
-    for (size_t i = 0; i < n; i++) o[i] = op(a[i], s);
+inline void tier1(const T* NB_RESTRICT a, T s, T* NB_RESTRICT o, size_t n,
+                  Cost cost, Op op) {
+    elemwiseFor(n, cost, [=](size_t lo, size_t hi) {
+        const T* NB_RESTRICT ap = a;
+        T* NB_RESTRICT        op2 = o;
+        for (size_t i = lo; i < hi; i++) op2[i] = op(ap[i], s);
+    });
 }
 template <class T, class Op>
-inline void tier1r(T s, const T* NB_RESTRICT b, T* NB_RESTRICT o, size_t n, Op op) {
-    for (size_t i = 0; i < n; i++) o[i] = op(s, b[i]);
+inline void tier1r(T s, const T* NB_RESTRICT b, T* NB_RESTRICT o, size_t n,
+                   Cost cost, Op op) {
+    elemwiseFor(n, cost, [=](size_t lo, size_t hi) {
+        const T* NB_RESTRICT bp = b;
+        T* NB_RESTRICT        op2 = o;
+        for (size_t i = lo; i < hi; i++) op2[i] = op(s, bp[i]);
+    });
 }
 
 template <class T, class Op>
-inline void tier0u(const T* NB_RESTRICT a, T* NB_RESTRICT o, size_t n, Op op) {
-    for (size_t i = 0; i < n; i++) o[i] = op(a[i]);
+inline void tier0u(const T* NB_RESTRICT a, T* NB_RESTRICT o, size_t n,
+                   Cost cost, Op op) {
+    elemwiseFor(n, cost, [=](size_t lo, size_t hi) {
+        const T* NB_RESTRICT ap = a;
+        T* NB_RESTRICT        op2 = o;
+        for (size_t i = lo; i < hi; i++) op2[i] = op(ap[i]);
+    });
 }
 
 }   // namespace numba

@@ -423,7 +423,7 @@ D1–D4. Full design in
 |---|---|---|
 | **D1** | dtype templating pass — `load<T>`/`store<T>`, `itemsize`, `promote`, a dispatch macro replacing the hand-written `if (cdt == F64)` pairs | **every existing test bit-identical**; no new dtype yet |
 | **D2** | `f32` dtype end to end — construction, ufuncs, reductions, linalg, sort, manip, I/O, `nd_astype` | f32 within 1e-6 of the f64 answer; f64 paths bit-identical; memory halves |
-| **D3** | deterministic threading — fixed partition, `nd_set_threads(n)` | **bit-identical across 1/2/4/8/16 threads**; ASan+TSan clean |
+| **D3** | deterministic threading — fixed partition, `nd_set_threads(n)` | **bit-identical across 1/2/4/8/16 threads**; ASan+TSan clean, TSan on the *integrated* build and not only a component harness (N33) |
 | **D4** | packed GEMM micro-kernel for skinny shapes (`K=25, N=6`) | the three conv matmuls faster; `numba_fastpath_test.b` still exact |
 
 Why first: it multiplies every stage below. f32 halves memory and doubles SIMD
@@ -529,7 +529,7 @@ Recorded rather than guessed, with the measurement that would settle each.
 
 ## Where to resume
 
-**Stage 1: D1 and D2a are done. D2b is next, then D3, D4.**
+**Stage 1: D1, D2a, D2c, D4's f32 half and D3a/D3b are done. D3c is next, then stage 2 and `bkit`.**
 
 | item | state |
 |---|---|
@@ -537,7 +537,9 @@ Recorded rather than guessed, with the measurement that would settle each.
 | **D2a** f32 in numba | ✅ done — `tests/numba_f32_test.b` 78/78; stores in 4 bytes, **computes in double** (N29) |
 | **D4 f32 GEMM** (half of D4, pulled forward — E20) | ✅ done — `nd_matmul`/`nd_dot` preserve f32 with an **f64 accumulator**; measured 5.93e-08 at K=1024 |
 | **D2c** btorch f32 plumbing | ✅ done — `set_default_dtype`, optional dtype on 9 constructors, `Module.to/float/double/dtype`, f32 `.btsd`; `tests/btorch_f32_test.b` 36/36. **MNIST MLP in f32: 97.99% against f64's 98.16%, on exactly half the memory (210.8 MB vs 421.0 MB)** |
-| **D3** deterministic threading | **next** — the largest multiplier, and `bkit` wants it too (E21). Must ship the pool as a *reusable primitive* |
+| **D3a** threaded matmul | ✅ done — `parallel.hpp` as a reusable primitive, `nd_set_threads`; **1024³ matmul 5.95 → 30.25 GFLOP/s (5.09x)**, fwd1 4.5x, bwd1 4.0x, MNIST epoch 1.56x; bit-identical at 1/2/3/4/8/16 threads, `tests/numba_threading_test.b` 57/57. TSan on the **integrated** interpreter found a lifetime bug the determinism suite could not see (N33) |
+| **D3b** threaded element-wise ufuncs | ✅ done — only the compute-bound ops, measured: **`exp` 4.83x, `log` 5.51x, `power` 5.06x at n=1M**, while `add` is 0.83x threaded and so is left sequential (N34). `tests/numba_elemwise_threads_test.b` 376/376; the pool now rethrows a body's exception by lowest chunk index (N35) |
+| **D3c** threaded reductions | **next** — and it needs **no re-baseline**: N26 claimed no partition could reproduce the sequential sum, and that was wrong. Aligned `128*2^m` chunks whose sums are injected back at level `m` rebuild the binary-counter tree exactly, so `nd_sum` keeps every bit it has today at every thread count (N36, proof in `bantu-src/compiler/tests/pairwise_partition_test.cpp`, 1813/1813) |
 | **stage 2 + stage 3 (`bkit`)** | after D3, moved earlier than originally planned (E21) |
 | **D4** packed GEMM (skinny shapes) | deferred — helps convolution only |
 | **D2b** generic ufunc functors | deferred — helps f32 element-wise only; its benefit was gated behind D4 (E20) |

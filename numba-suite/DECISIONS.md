@@ -322,28 +322,23 @@ the GC and the evaluator, a far larger change for the same arithmetic benefit.
 
 ---
 
-### N26 — `nd_sum`'s last bits change once, deliberately, and it is announced
-A consequence of N25 that deserves its own entry because it is a user-visible
-change to a shipped function.
+### N26 — ~~`nd_sum`'s last bits change once~~ — WRONG, and nothing has to change
+**Superseded by N36.** Kept in full because the mistake is instructive: the
+plan was prepared to make a user-visible change to a shipped function, and the
+justification sounded airtight.
 
-`Pairwise` is a binary-counter tree whose shape is a function of the element
-count alone (`ndarray_reduce.hpp:21`), so **no partitioning of a threaded
-reduction reproduces the single-threaded answer.** The chosen scheme — fixed
-chunks combined by ascending index, used at *all* thread counts including one —
-is self-consistent and reproducible, but differs from today's answer in the
-last bits.
+> ~~`Pairwise` is a binary-counter tree whose shape is a function of the element
+> count alone (`ndarray_reduce.hpp:21`), so **no partitioning of a threaded
+> reduction reproduces the single-threaded answer.** The chosen scheme — fixed
+> chunks combined by ascending index, used at *all* thread counts including one
+> — is self-consistent and reproducible, but differs from today's answer in the
+> last bits.~~
 
-Alternatives were: partition by thread count (not reproducible at all —
-disqualified), or keep reductions sequential forever (reproducible, but
-forfeits the largest available win on the most common operation).
-
-Accuracy is unharmed: it is still a tree, so error still grows as `log n`, and
-the existing 10M-values-to-2e-16 gate must be re-verified before D3 ships.
-Below `kReduceChunk` the current path is untouched, so small arrays keep their
-exact current bits.
-
-Any test asserting an exact f64 sum is re-baselined with it, and the change is
-called out in the CHANGELOG and the release notes rather than discovered.
+The premise is true and the conclusion does not follow. The tree's shape being
+a function of the element count is exactly what makes an *aligned* partition
+reproduce it: see N36. A plan that is ready to change a shipped answer should
+be made to prove the change is necessary, not merely plausible — the proof is
+80 lines and it came out the other way.
 
 ---
 
@@ -567,3 +562,123 @@ the same test as a sanitizer gate on the component**: the component test was
 clean and wrong. And **a determinism suite cannot find a lifetime bug** — it
 compares answers, and the answers were right. They are different tiers for
 different defects, which is why §7's six tiers are six and not five.
+
+---
+
+### N34 — only the compute-bound element-wise ops get threads
+
+An element-wise loop either saturates the memory bus or saturates the ALU, and
+only the second kind has anything left over for a second core. Measured on this
+machine (10 cores, f64, 1 thread -> 6 threads, alternating order, 2026-11-10):
+
+| op | n=16k | n=131k | n=262k | n=1M | n=4M | n=16M |
+|---|---|---|---|---|---|---|
+| `exp` | 1.74x | 3.12x | 3.51x | 4.83x | | |
+| `log` | 2.12x | 3.15x | | 5.51x | | |
+| `tanh` | 1.25x | 3.11x | 2.90x | 4.53x | | |
+| `power` | 2.81x | 3.90x | 4.55x | 5.06x | | |
+| `sqrt` | 0.64x | 1.74x | 1.94x | 1.29x | | |
+| `divide` | 0.57x | 1.22x | 1.50x | 1.00x | | |
+| `abs` | | 0.92x | 1.10x | 1.08x | | |
+| `add` | | | | 0.83x | 0.91x | 0.88x |
+
+So the transcendentals are threaded and **nothing else is**. Three readings
+behind that:
+
+* **`add` is SLOWER on six threads at every size large enough to matter.** One
+  core already saturates the bus; the region handshake is pure cost. An op that
+  got *slower* when a user turned threading on would be worse than an op that
+  stayed the same speed, because it would make `nd_set_threads` a thing to be
+  afraid of.
+* **`sqrt` and `divide` win, but only inside a band.** 131k-262k elements is
+  where the arrays no longer fit in one core's L2 but the bus is not yet the
+  limit — and the band's edges are *this machine's cache sizes*. A rule that
+  holds on one machine is not a rule.
+* **The threshold is 16384 elements**, which is where a threaded region first
+  pays for itself (1.74x on `exp`), with a fixed 4096-element chunk — 32 KB of
+  f64, so a chunk is L1-resident. Fixed, because a boundary that moved with the
+  thread count is exactly what N25 forbids.
+
+Cost is declared at the registration site, next to the functor, as a trailing
+`Cost::HEAVY`; the default is `Cost::CHEAP`, so **a new ufunc is sequential
+until somebody measures it**. That ordering is deliberate: the failure mode of
+forgetting the tag is "no speed-up", not "slower than before" and not "wrong".
+
+What this does NOT do is speed up the MNIST MLP much. Its activations are
+`relu`, its softmax `exp` is 1280 elements, and its real cost is matmul (D3a)
+and the optimizer's cheap arithmetic. The ops this increment makes 3-5x faster
+are the ones a *scientific* workload is made of — `nd_exp` over a grid, `log`
+in a likelihood, `power` in a kernel — plus `tanh`/`sigmoid` networks, where
+the activation is above the threshold.
+
+### N35 — a parallel body that throws
+
+`nd_left_shift` raises on a shift count outside 0..63, element-wise, so the
+throw comes from inside the loop. An exception escaping a worker thread is
+`std::terminate`: a crash, where the sequential path raises a catchable Bantu
+error. So the pool catches per chunk, keeps the exception from the **lowest
+chunk index** and rethrows it on the caller's thread after releasing the pool.
+
+Three details, each the answer to a way of getting it wrong:
+
+* **By index, not by arrival.** The sequential loop fails on the first
+  offending *element*, which is in the lowest offending chunk, so this is the
+  error the single-threaded run would have raised — and the message a user sees
+  does not depend on which thread got there first.
+* **Remaining chunks are abandoned** (an atomic flag checked before each claim),
+  matching the sequential path, which also stops at the first failure.
+* **The pool is released before the rethrow.** A failure that left the pool
+  claimed would make every later region in the process run single-threaded —
+  a performance bug invisible to any test of the answers.
+
+Today no threaded kernel throws: everything that can is in the CHEAP class and
+runs sequentially. The property is still implemented and still tested, because
+the next threaded kernel to be written (bkit's histogram builder, ecosystem
+stage 3) will be the first to need it, and `bantu-src/compiler/tests/parallel_test.cpp`
+asserts it directly in C++ — the error path, the lowest-index rule, nesting,
+twelve concurrent callers, and the pool still working afterwards. Properties
+that no Bantu program can reach yet get a C++ test rather than a comment.
+
+
+---
+
+### N36 — a threaded reduction is bit-identical to the sequential one, and N26 was wrong
+
+`Pairwise` is a binary counter: after a multiple of `2^m` adds, level `m` holds
+the sum of the last `2^m` values **associated as a perfect subtree**, and every
+level below `m` is empty, because reaching level `m` takes `2^m` adds.
+
+Three consequences, which together are the whole design:
+
+1. A chunk of exactly `2^m` blocks, summed independently with the same
+   algorithm from an empty counter, produces *exactly* the double the global
+   tree would hold at level `m` for that range. Same association, same rounding,
+   same bits.
+2. Injecting those chunk values back at level `m` in ascending chunk order
+   rebuilds the global tree's state exactly — one `addLevel(m, v)` that mirrors
+   `add` with the counter shifted by `m`.
+3. The remainder — always fewer than one chunk, including the sub-128 element
+   tail — is then added sequentially, and its carries cannot reach level `m`.
+
+So the answer does not change. Not "changes only in the last bits", not
+"changes once, announced": **it is the same double**, at every thread count,
+for every size. `bantu-src/compiler/tests/pairwise_partition_test.cpp` checks
+1813 size/chunk combinations — chunks from 1024 to 65536 elements, sizes landing
+on, just before and just after chunk boundaries, with tails of 0, 1, 127, 128,
+129 and 1000 elements — and all 1813 agree bit for bit.
+
+Axis reductions are easier still and need none of this: each output element has
+its own accumulator, so threading over OUTPUT elements is disjoint-write
+parallelism with no combine step at all. `nd_min`/`nd_max` are exact, and
+`nd_argmin`/`nd_argmax` keep lowest-index tie-breaking by combining chunk
+results in ascending order.
+
+What this costs is the alignment constraint: the chunk must be `128 * 2^m`
+elements (the 128 is the existing block loop's stride), and only *whole* chunks
+go to the pool. At `m = 9` that is 65536 elements per chunk, which is the right
+order of magnitude for a region anyway (N34 found 16384 is where a region
+starts paying for itself even with transcendental work in it).
+
+The lesson is not about summation. It is that **"this is impossible, so we will
+change the user's answer" deserves a proof, not an argument** — and the proof
+is cheap compared to the apology.

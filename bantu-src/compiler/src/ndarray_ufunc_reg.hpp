@@ -32,9 +32,14 @@ inline void registerUfuncs(const DefineFn& define) {
     // cannot inline and cannot vectorize. Measured at 11 GB/s against 16 GB/s
     // for the identical loop with the operation's own type. Generic lambdas
     // keep each op distinct, so each gets its own inlined, vectorized loop.
-    auto bin = [&define](const char* name, Kind k, auto fd, auto fi) {
+    // The trailing Cost says whether this op has enough work per element to
+    // repay a parallel region; it defaults to CHEAP, i.e. not threaded, so a
+    // new ufunc is sequential until somebody measures it (see Cost in
+    // ndarray_kernels.hpp for the measurements behind the ones marked HEAVY).
+    auto bin = [&define](const char* name, Kind k, auto fd, auto fi,
+                         Cost cost = Cost::CHEAP) {
         std::string n = name;
-        define(name, [n, k, fd, fi](std::vector<Value> a) -> Value {
+        define(name, [n, k, fd, fi, cost](std::vector<Value> a) -> Value {
             if (a.size() < 2) {
                 throw std::runtime_error(n + "(a, b, out?) needs two operands");
             }
@@ -44,7 +49,7 @@ inline void registerUfuncs(const DefineFn& define) {
             // here, and toArrayValue has already erased the number/array
             // distinction the rule depends on (N28).
             weakenScalars(a[0], av, a[1], bv);
-            return applyBinary(n.c_str(), k, av, bv, outOf(a, 2), fd, fi);
+            return applyBinary(n.c_str(), k, av, bv, outOf(a, 2), fd, fi, cost);
         });
     };
 
@@ -60,11 +65,11 @@ inline void registerUfuncs(const DefineFn& define) {
     bin("nd_floor_divide", Kind::ARITH, fdiv, idiv);
     bin("nd_mod",      Kind::ARITH, fmod_py, imod);
     bin("nd_power",    Kind::REAL,  [](double x, double y) { return std::pow(x, y); },
-                                    [](int64_t, int64_t) -> int64_t { return 0; });
+                                    [](int64_t, int64_t) -> int64_t { return 0; }, Cost::HEAVY);
     bin("nd_atan2",    Kind::REAL,  [](double x, double y) { return std::atan2(x, y); },
-                                    [](int64_t, int64_t) -> int64_t { return 0; });
+                                    [](int64_t, int64_t) -> int64_t { return 0; }, Cost::HEAVY);
     bin("nd_hypot",    Kind::REAL,  [](double x, double y) { return std::hypot(x, y); },
-                                    [](int64_t, int64_t) -> int64_t { return 0; });
+                                    [](int64_t, int64_t) -> int64_t { return 0; }, Cost::HEAVY);
     bin("nd_copysign", Kind::REAL,  [](double x, double y) { return std::copysign(x, y); },
                                     [](int64_t, int64_t) -> int64_t { return 0; });
     // NaN propagates, matching NumPy's minimum/maximum (not fmin/fmax).
@@ -123,12 +128,13 @@ inline void registerUfuncs(const DefineFn& define) {
                                        [](int64_t x, int64_t y) { return (int64_t)((x != 0) != (y != 0)); });
 
     // ── unary ────────────────────────────────────────────────────────────────
-    auto un = [&define](const char* name, Kind k, auto fd, auto fi) {
+    auto un = [&define](const char* name, Kind k, auto fd, auto fi,
+                        Cost cost = Cost::CHEAP) {
         std::string n = name;
-        define(name, [n, k, fd, fi](std::vector<Value> a) -> Value {
+        define(name, [n, k, fd, fi, cost](std::vector<Value> a) -> Value {
             if (a.empty()) throw std::runtime_error(n + "(a, out?) needs an operand");
             const Value av = toArrayValue(a[0], n.c_str());
-            return applyUnary(n.c_str(), k, av, outOf(a, 1), fd, fi);
+            return applyUnary(n.c_str(), k, av, outOf(a, 1), fd, fi, cost);
         });
     };
 
@@ -145,29 +151,29 @@ inline void registerUfuncs(const DefineFn& define) {
     un("nd_bitwise_not", Kind::BITWISE, [](double) { return 0.0; },
                                         [](int64_t x) { return ~x; });
 
-    auto real1 = [&un](const char* name, auto fd) {
-        un(name, Kind::REAL, fd, [](int64_t) -> int64_t { return 0; });
+    auto real1 = [&un](const char* name, auto fd, Cost cost = Cost::CHEAP) {
+        un(name, Kind::REAL, fd, [](int64_t) -> int64_t { return 0; }, cost);
     };
     real1("nd_sqrt",   [](double x) { return std::sqrt(x); });
-    real1("nd_cbrt",   [](double x) { return std::cbrt(x); });
-    real1("nd_exp",    [](double x) { return std::exp(x); });
-    real1("nd_expm1",  [](double x) { return std::expm1(x); });
-    real1("nd_log",    [](double x) { return std::log(x); });
-    real1("nd_log1p",  [](double x) { return std::log1p(x); });
-    real1("nd_log2",   [](double x) { return std::log2(x); });
-    real1("nd_log10",  [](double x) { return std::log10(x); });
-    real1("nd_sin",    [](double x) { return std::sin(x); });
-    real1("nd_cos",    [](double x) { return std::cos(x); });
-    real1("nd_tan",    [](double x) { return std::tan(x); });
-    real1("nd_asin",   [](double x) { return std::asin(x); });
-    real1("nd_acos",   [](double x) { return std::acos(x); });
-    real1("nd_atan",   [](double x) { return std::atan(x); });
-    real1("nd_sinh",   [](double x) { return std::sinh(x); });
-    real1("nd_cosh",   [](double x) { return std::cosh(x); });
-    real1("nd_tanh",   [](double x) { return std::tanh(x); });
-    real1("nd_asinh",  [](double x) { return std::asinh(x); });
-    real1("nd_acosh",  [](double x) { return std::acosh(x); });
-    real1("nd_atanh",  [](double x) { return std::atanh(x); });
+    real1("nd_cbrt",   [](double x) { return std::cbrt(x); }, Cost::HEAVY);
+    real1("nd_exp",    [](double x) { return std::exp(x); }, Cost::HEAVY);
+    real1("nd_expm1",  [](double x) { return std::expm1(x); }, Cost::HEAVY);
+    real1("nd_log",    [](double x) { return std::log(x); }, Cost::HEAVY);
+    real1("nd_log1p",  [](double x) { return std::log1p(x); }, Cost::HEAVY);
+    real1("nd_log2",   [](double x) { return std::log2(x); }, Cost::HEAVY);
+    real1("nd_log10",  [](double x) { return std::log10(x); }, Cost::HEAVY);
+    real1("nd_sin",    [](double x) { return std::sin(x); }, Cost::HEAVY);
+    real1("nd_cos",    [](double x) { return std::cos(x); }, Cost::HEAVY);
+    real1("nd_tan",    [](double x) { return std::tan(x); }, Cost::HEAVY);
+    real1("nd_asin",   [](double x) { return std::asin(x); }, Cost::HEAVY);
+    real1("nd_acos",   [](double x) { return std::acos(x); }, Cost::HEAVY);
+    real1("nd_atan",   [](double x) { return std::atan(x); }, Cost::HEAVY);
+    real1("nd_sinh",   [](double x) { return std::sinh(x); }, Cost::HEAVY);
+    real1("nd_cosh",   [](double x) { return std::cosh(x); }, Cost::HEAVY);
+    real1("nd_tanh",   [](double x) { return std::tanh(x); }, Cost::HEAVY);
+    real1("nd_asinh",  [](double x) { return std::asinh(x); }, Cost::HEAVY);
+    real1("nd_acosh",  [](double x) { return std::acosh(x); }, Cost::HEAVY);
+    real1("nd_atanh",  [](double x) { return std::atanh(x); }, Cost::HEAVY);
     real1("nd_floor",  [](double x) { return std::floor(x); });
     real1("nd_ceil",   [](double x) { return std::ceil(x); });
     real1("nd_trunc",  [](double x) { return std::trunc(x); });

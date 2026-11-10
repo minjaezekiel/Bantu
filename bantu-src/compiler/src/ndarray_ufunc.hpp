@@ -215,17 +215,17 @@ inline ArrayPtr asIntegerOperand(const ArrayPtr& a, const char* what) {
 
 template <class T, class Op>
 inline void binTier0(const NdArray& a, const NdArray& b, NdArray& out,
-                     size_t n, bool boolOut, Op op) {
+                     size_t n, bool boolOut, Cost cost, Op op) {
     const T* ap = a.ptr<T>();
     const T* bp = b.ptr<T>();
-    if (boolOut) tier0cmp(ap, bp, out.ptr<uint8_t>(), n,
+    if (boolOut) tier0cmp(ap, bp, out.ptr<uint8_t>(), n, cost,
                           [&](T x, T y) { return op(x, y) != T(0); });
-    else         tier0(ap, bp, out.ptr<T>(), n, op);
+    else         tier0(ap, bp, out.ptr<T>(), n, cost, op);
 }
 
 template <class T, class Op>
 inline void binTier1(const NdArray& arr, const NdArray& scl, NdArray& out,
-                     size_t n, bool boolOut, bool scalarRight, Op op) {
+                     size_t n, bool boolOut, bool scalarRight, Cost cost, Op op) {
     const T* p = arr.ptr<T>();
     const T  s = load<T>(scl, scl.offset);
     if (boolOut) {
@@ -234,8 +234,8 @@ inline void binTier1(const NdArray& arr, const NdArray& scl, NdArray& out,
         else             for (size_t i = 0; i < n; i++) o[i] = op(s, p[i]) != T(0) ? 1 : 0;
     } else {
         T* o = out.ptr<T>();
-        if (scalarRight) tier1(p, s, o, n, op);
-        else             tier1r(s, p, o, n, op);
+        if (scalarRight) tier1(p, s, o, n, cost, op);
+        else             tier1r(s, p, o, n, cost, op);
     }
 }
 
@@ -255,11 +255,12 @@ inline void binTier2(const NdArray& A, const NdArray& B, NdArray& O,
 }
 
 template <class T, class Op>
-inline void unTier0(const NdArray& a, NdArray& out, size_t n, bool boolOut, Op op) {
+inline void unTier0(const NdArray& a, NdArray& out, size_t n, bool boolOut,
+                    Cost cost, Op op) {
     const T* ap = a.ptr<T>();
-    if (boolOut) tier0cmp(ap, ap, out.ptr<uint8_t>(), n,
+    if (boolOut) tier0cmp(ap, ap, out.ptr<uint8_t>(), n, cost,
                           [&](T x, T) { return op(x) != T(0); });
-    else         tier0u(ap, out.ptr<T>(), n, op);
+    else         tier0u(ap, out.ptr<T>(), n, cost, op);
 }
 
 template <class T, class Op>
@@ -278,7 +279,7 @@ template <class FD, class FI>
 
 inline Value applyBinary(const char* what, Kind kind,
                          const Value& av, const Value& bv, const Value* outArg,
-                         FD fd, FI fi) {
+                         FD fd, FI fi, Cost cost = Cost::CHEAP) {
     ArrayPtr a = asArray(av), b = asArray(bv);
     if (kind == Kind::BITWISE) {
         a = asIntegerOperand(a, what);
@@ -308,13 +309,13 @@ inline Value applyBinary(const char* what, Kind kind,
                       a->dtype == cdt && b->dtype == cdt && out->dtype == rdt;
     if (flat) {
         const bool boolOut0 = (rdt == DType::BOOL);
-        if      (cdt == DType::F64) binTier0<double >(*a, *b, *out, n, boolOut0, fd);
-        else if (cdt == DType::F32) binTier0<float  >(*a, *b, *out, n, boolOut0, fd);
-        else if (cdt == DType::I64) binTier0<int64_t>(*a, *b, *out, n, boolOut0, fi);
+        if      (cdt == DType::F64) binTier0<double >(*a, *b, *out, n, boolOut0, cost, fd);
+        else if (cdt == DType::F32) binTier0<float  >(*a, *b, *out, n, boolOut0, cost, fd);
+        else if (cdt == DType::I64) binTier0<int64_t>(*a, *b, *out, n, boolOut0, cost, fi);
         else {   // BOOL compute: logic ops only, functor called on widened ints
             const uint8_t* ap = a->ptr<uint8_t>();
             const uint8_t* bp = b->ptr<uint8_t>();
-            tier0cmp(ap, bp, out->ptr<uint8_t>(), n,
+            tier0cmp(ap, bp, out->ptr<uint8_t>(), n, cost,
                      [&](uint8_t x, uint8_t y) { return fi(x ? 1 : 0, y ? 1 : 0) != 0; });
         }
         if (plan.finalOut) copyInto(*out, *plan.finalOut, what);
@@ -365,10 +366,10 @@ inline Value applyBinary(const char* what, Kind kind,
             const NdArray& scl = scalarRight ? *b : *a;
             const bool boolOut1 = (rdt == DType::BOOL);
             if      (cdt == DType::F64)
-                 binTier1<double >(arr, scl, *out, n, boolOut1, scalarRight, fd);
+                 binTier1<double >(arr, scl, *out, n, boolOut1, scalarRight, cost, fd);
             else if (cdt == DType::F32)
-                 binTier1<float  >(arr, scl, *out, n, boolOut1, scalarRight, fd);
-            else binTier1<int64_t>(arr, scl, *out, n, boolOut1, scalarRight, fi);
+                 binTier1<float  >(arr, scl, *out, n, boolOut1, scalarRight, cost, fd);
+            else binTier1<int64_t>(arr, scl, *out, n, boolOut1, scalarRight, cost, fi);
             if (plan.finalOut) copyInto(*out, *plan.finalOut, what);
             return wrap(plan.finalOut ? plan.finalOut : out);
         }
@@ -401,7 +402,8 @@ inline Value applyBinary(const char* what, Kind kind,
 // ── unary application ────────────────────────────────────────────────────────
 template <class FD, class FI>
 inline Value applyUnary(const char* what, Kind kind,
-                        const Value& av, const Value* outArg, FD fd, FI fi) {
+                        const Value& av, const Value* outArg, FD fd, FI fi,
+                        Cost cost = Cost::CHEAP) {
     ArrayPtr a = asArray(av);
     if (kind == Kind::BITWISE) a = asIntegerOperand(a, what);
     const std::vector<size_t> shape = a->shape;
@@ -422,12 +424,12 @@ inline Value applyUnary(const char* what, Kind kind,
                       a->dtype == cdt && out->dtype == rdt;
     if (flat) {
         const bool boolOutU = (rdt == DType::BOOL);
-        if      (cdt == DType::F64) unTier0<double >(*a, *out, n, boolOutU, fd);
-        else if (cdt == DType::F32) unTier0<float  >(*a, *out, n, boolOutU, fd);
-        else if (cdt == DType::I64) unTier0<int64_t>(*a, *out, n, boolOutU, fi);
+        if      (cdt == DType::F64) unTier0<double >(*a, *out, n, boolOutU, cost, fd);
+        else if (cdt == DType::F32) unTier0<float  >(*a, *out, n, boolOutU, cost, fd);
+        else if (cdt == DType::I64) unTier0<int64_t>(*a, *out, n, boolOutU, cost, fi);
         else {   // BOOL compute: functor called on widened ints
             const uint8_t* ap = a->ptr<uint8_t>();
-            tier0cmp(ap, ap, out->ptr<uint8_t>(), n,
+            tier0cmp(ap, ap, out->ptr<uint8_t>(), n, cost,
                      [&](uint8_t x, uint8_t) { return fi(x ? 1 : 0) != 0; });
         }
         if (plan.finalOut) copyInto(*out, *plan.finalOut, what);
