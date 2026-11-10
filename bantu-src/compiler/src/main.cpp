@@ -56,7 +56,10 @@
     #include <unistd.h>
 #endif
 
-const std::string BANTU_VERSION = "1.3.2";
+#include "bantu_version.hpp"
+// One definition, in bantu_version.hpp, so the package manager and the CLI
+// cannot disagree about what is running.
+const std::string BANTU_VERSION = BANTU_VERSION_STR;
 
 // ─── Build identity ──────────────────────────────────────────────────────
 // The version string alone cannot tell two binaries apart, and for a long time
@@ -681,6 +684,10 @@ int cmdInit(const std::string& projectName) {
         "  \"template\": \"cli\",\n"
         "  \"language\": \"bantu\",\n"
         "  \"bantuVersion\": \"" + BANTU_VERSION + "\",\n"
+        // What CREATED the project, then what it NEEDS. A new project needs
+        // the binary that made it, which is the only floor anyone can state
+        // honestly at `bantu init` time.
+        "  \"bantu\": \">=" + BANTU_VERSION + "\",\n"
         "  \"dependencies\": {}\n"
         "}\n";
 
@@ -971,6 +978,172 @@ int cmdUninstall() {
     return 0;
 }
 
+// ─── bantu engine ────────────────────────────────────────────────────────
+// Which binary does a package need, and which one is this?
+//
+// Stage 2 of the ecosystem plan. The field is `"bantu": ">=1.4.0"` in a
+// package.json, and the number in it should be DERIVED rather than
+// remembered -- so this command computes it from the native builtins a
+// package's sources actually call.
+int cmdEngine(int argc, char* argv[]) {
+    std::string arg = (argc > 2) ? argv[2] : "";
+
+    if (arg == "--help" || arg == "-h") {
+        std::cout << "\n  Usage: bantu engine                 what this binary provides\n";
+        std::cout << "         bantu engine <dir>           the floor that package needs\n";
+        std::cout << "         bantu engine --check-table   every builtin has a floor\n\n";
+        return 0;
+    }
+
+    // --check-table: ask the RUNNING binary what it registers, and assert that
+    // everything absent from the last release's baseline is covered by the
+    // floor table. This is what makes adding a kernel without updating the
+    // table a test failure rather than a surprise for a user.
+    if (arg == "--check-table" || arg == "--builtins") {
+        Evaluator ev;
+        std::vector<std::string> names = ev.builtinNames();
+        if (arg == "--builtins") {
+            for (const std::string& n : names) std::cout << n << "\n";
+            return 0;
+        }
+        // The baseline ships beside the tests; look for it relative to cwd.
+        std::vector<std::string> baselinePaths = {
+            "bantu-src/compiler/tests/builtins_v1.3.2.txt",
+            "tests/builtins_v1.3.2.txt",
+            "../tests/builtins_v1.3.2.txt"
+        };
+        std::set<std::string> baseline;
+        std::string used;
+        for (const std::string& bp : baselinePaths) {
+            std::ifstream in(bp);
+            if (!in) continue;
+            used = bp;
+            std::string line;
+            while (std::getline(in, line)) {
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+                if (line.empty() || line[0] == '#') continue;
+                baseline.insert(line);
+            }
+            break;
+        }
+        if (baseline.empty()) {
+            std::cerr << "  [ERROR] Could not read builtins_v1.3.2.txt (the released "
+                         "baseline).\n          Run this from the repository root.\n";
+            return 1;
+        }
+        std::cout << "\n  Engine floor table\n  ════════════════════\n\n";
+        std::cout << "  running:   " << BANTU_VERSION << "  (build "
+                  << BANTU_BUILD_ID_STR << ")\n";
+        std::cout << "  baseline:  " << used << "  (" << baseline.size()
+                  << " builtins in v1.3.2)\n";
+        std::cout << "  registered now: " << names.size() << "\n\n";
+        std::vector<std::string> uncovered;
+        int covered = 0;
+        for (const std::string& n : names) {
+            if (baseline.count(n)) continue;              // shipped in 1.3.2
+            if (bantu_engine::familyFor(n)) { covered++; continue; }
+            uncovered.push_back(n);
+        }
+        std::cout << "  new since v1.3.2: " << (covered + (int)uncovered.size())
+                  << ", of which " << covered << " have a stated floor\n";
+        if (uncovered.empty()) {
+            std::cout << "\n  [OK] Every builtin is either in the released baseline or "
+                         "has a floor.\n\n";
+            return 0;
+        }
+        std::cout << "\n  [FAIL] " << uncovered.size()
+                  << " builtin(s) have no entry in the floor table:\n\n";
+        for (const std::string& n : uncovered) std::cout << "      " << n << "\n";
+        std::cout << "\n  A builtin with no floor cannot be depended on safely: a package\n";
+        std::cout << "  calling it has no version it can require. Add it to families() in\n";
+        std::cout << "  src/engine_req.hpp with the release that first provides it.\n\n";
+        return 1;
+    }
+
+    // No argument: report this binary and the table it carries.
+    if (arg.empty()) {
+        const bantu_engine::SemVer me = bantu_engine::parseSemVer(BANTU_VERSION_STR);
+        std::cout << "\n  bantu engine\n  ══════════════\n\n";
+        std::cout << "  version:  " << BANTU_VERSION << "\n";
+        std::cout << "  build:    " << BANTU_BUILD_ID_STR << "  ("
+                  << BANTU_BUILD_DATE_STR << ")\n";
+        std::cout << "  semver:   " << bantu_engine::semVerString(me) << "\n\n";
+        std::cout << "  A package declares what it needs as:\n";
+        std::cout << "      \"bantu\": \">=" << BANTU_VERSION << "\"\n\n";
+        std::cout << "  Native families and the release that first provides them:\n\n";
+        std::string lastFloor;
+        for (const bantu_engine::Family& f : bantu_engine::families()) {
+            std::cout << "      " << f.floor << "  " << f.prefix
+                      << (f.exact ? "" : "*");
+            for (size_t i = std::string(f.prefix).size() + (f.exact ? 0 : 1); i < 22; i++)
+                std::cout << " ";
+            std::cout << f.provides << "\n";
+        }
+        std::cout << "\n  bantu engine <dir>  computes the floor a package needs.\n\n";
+        return 0;
+    }
+
+    // A directory: compute the floor from the sources, and compare with what
+    // the manifest declares.
+    std::string dir = arg;
+    if (!bantu_pkg::isDir(dir)) {
+        std::cerr << "  [ERROR] Not a directory: " << dir << "\n";
+        return 1;
+    }
+    bantu_engine::SourceFloor sf = bantu_pkg::sourceFloorOfDir(dir);
+    bantu_pkg::Manifest m = bantu_pkg::readManifest(bantu_pkg::join(dir, "package.json"));
+    const bantu_engine::SemVer me = bantu_engine::parseSemVer(BANTU_VERSION_STR);
+
+    std::cout << "\n  " << (m.name.empty() ? dir : m.name) << "\n";
+    std::cout << "  ══════════════════════════════\n\n";
+    std::cout << "  native builtins called:  " << sf.builtins.size() << "\n";
+    if (!sf.floor.ok) {
+        std::cout << "  floor implied:           none (no native builtins)\n";
+    } else {
+        std::cout << "  floor implied:           " << bantu_engine::semVerString(sf.floor)
+                  << "   (by " << sf.reason << ")\n";
+    }
+    if (m.engine.empty()) {
+        std::cout << "  floor declared:          (none)\n";
+    } else {
+        const bantu_engine::VersionReq req = bantu_engine::parseVersionReq(m.engine);
+        std::cout << "  floor declared:          \"" << m.engine << "\"  -> "
+                  << bantu_engine::describeReq(req) << "\n";
+        if (!req.ok) {
+            std::cout << "\n  [FAIL] That requirement cannot be read, so nothing can "
+                         "check it.\n\n";
+            return 1;
+        }
+        if (sf.floor.ok && !bantu_engine::satisfies(req, sf.floor)) {
+            std::cout << "\n  [FAIL] The declaration is LOWER than the sources need.\n";
+            std::cout << "         " << sf.reason << " needs "
+                      << bantu_engine::semVerString(sf.floor)
+                      << ", so an older binary would install this package and then\n";
+            std::cout << "         fail inside it. Declare \"bantu\": \">="
+                      << bantu_engine::semVerString(sf.floor) << "\".\n\n";
+            return 1;
+        }
+        if (!bantu_engine::satisfies(req, me)) {
+            std::cout << "\n  [WARN] This binary (" << BANTU_VERSION
+                      << ") does not satisfy the declaration.\n\n";
+            return 1;
+        }
+    }
+    std::cout << "  running:                 " << BANTU_VERSION << "\n";
+    if (!sf.builtins.empty()) {
+        std::cout << "\n  calls:  ";
+        size_t col = 0;
+        for (const std::string& b : sf.builtins) {
+            if (col > 60) { std::cout << "\n          "; col = 0; }
+            std::cout << b << " ";
+            col += b.size() + 1;
+        }
+        std::cout << "\n";
+    }
+    std::cout << "\n  [OK]\n\n";
+    return 0;
+}
+
 int cmdDoctor() {
     return bantu_pkg::runDoctor(BANTU_BUILD_ID_STR);
 }
@@ -992,7 +1165,7 @@ int cmdAdd(int argc, char* argv[]) {
         return 1;
     }
     std::cout << "\n";
-    bool any = false;
+    int named = 0, added = 0;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--help" || a == "-h") {
@@ -1000,11 +1173,24 @@ int cmdAdd(int argc, char* argv[]) {
             return 0;
         }
         if (!a.empty() && a[0] == '-') continue;
+        named++;
         std::cout << "  ── Adding " << a << " ──\n";
-        if (bantu_pkg::addDependency(a)) any = true;
+        if (bantu_pkg::addDependency(a)) added++;
     }
-    if (!any) {
+    // Two different failures, and reporting one as the other is how a clear
+    // message gets buried: an engine refusal used to print "No package name
+    // provided" underneath it, which contradicts the command the user typed.
+    if (named == 0) {
         std::cerr << "  [ERROR] No package name provided.\n";
+        return 1;
+    }
+    if (added == 0) {
+        std::cerr << "  [ERROR] Nothing was installed. The reason is above.\n";
+        return 1;
+    }
+    if (added < named) {
+        std::cerr << "  [WARN] " << (named - added) << " of " << named
+                  << " packages were not installed. See above.\n";
         return 1;
     }
     return 0;
@@ -2793,6 +2979,10 @@ int cmdBench() {
 // ─── Main ─────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
+    // The package manager quotes the running build in its refusals, and a
+    // build id of "unknown" there means this line did not run.
+    bantu_pkg::selfBuildIdCell() = BANTU_BUILD_ID_STR;
+
     std::signal(SIGINT, [](int) {
         std::cout << "\n  [Interrupted] Type 'exit' to quit\n";
     });
@@ -2929,6 +3119,7 @@ int main(int argc, char* argv[]) {
     if (command == "setup")  return cmdSetup(argc, argv);
     if (command == "uninstall" || command == "unlink") return cmdUninstall();
     if (command == "doctor") return cmdDoctor();
+    if (command == "engine") return cmdEngine(argc, argv);
 
     // ─── bantu install / add / remove / update / list / search / publish ─
     if (command == "install" || command == "i")  return cmdInstall();

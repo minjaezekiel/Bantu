@@ -9,6 +9,46 @@ All notable changes to the Bantu programming language are documented in this fil
 
 ### Added
 
+- **[feature] `package.json` gains a `"bantu"` engine field, and the version number moves again.**
+  A Bantu package does not only depend on other packages — it depends on the *interpreter*, because
+  its libraries are written on native builtins: `numba` on `nd_*`, `pillow` on `bp_*`, `arctic` on
+  `col_*`. Nothing in a manifest could say so, and the failure mode was the worst kind: the package
+  installs happily and then a program using it dies on `Undefined variable: nd_zeros`, with nothing
+  pointing at the binary.
+
+  **The problem was not in the future tense.** The last release is **v1.3.2 (2026-09-06)**, and
+  `git ls-tree` at that tag lists 22 files in `compiler/src` — no `ndarray_native.cpp`, no
+  `raster_native.cpp`, no `dataframe_native.hpp`. It registered **49 builtins** (`abs`, `ceil`,
+  `len`, `open`, `read`, `str`, `sua` and the like); `sort`, `PI` and `mkdir` did not exist. Of the
+  456 builtins registered today, **409 arrived after that release**. Every package in the registry —
+  `hash`, `crypto`, `uuid`, `numba`, `arctic`, `pillow`, `btorch`, `bplot`, `orm`, `lugha` —
+  required a binary that had never been released.
+
+  So the in-development version is now **1.4.0**, defined in one place (`src/bantu_version.hpp`)
+  with the rule written next to it: *a new native family or builtin bumps the minor*. A floor table
+  is worthless if every floor it can honestly state names a version that does not exist.
+
+  - `"bantu": ">=1.4.0"` is parsed, and `>=`, `>`, `^`, `~`, a bare version (a floor, not a pin)
+    and `*` are understood. Compound ranges, `||` alternatives, upper bounds and prerelease
+    metadata are **refused by name**, quoting the token that lost — a range nobody can parse must
+    not quietly become "any version", because that is the same silence the field replaced.
+  - `bantu install` / `bantu add` **refuse before writing anything**, naming the requirement, the
+    running version and the build id. Nothing lands in `bantu_modules/`.
+  - **`bantu engine`** reports what this binary provides and the family→floor table.
+    **`bantu engine <dir>`** computes the floor a package needs *from the native builtins its
+    sources actually call* and compares it with what the manifest declares — so the number is
+    derived rather than remembered, and a declaration lower than the implication is a failure.
+    **`bantu engine --check-table`** asserts every registered builtin is either in the released
+    baseline or has a stated floor.
+  - All 11 packages in this repository backfilled. `random` declares nothing, because it calls no
+    native builtin at all.
+- **[bug fix]** `bantu add` in a directory without a manifest wrote `"bantuVersion": "1.1.0"` — a
+  literal three releases stale — into the manifest it created. It now writes the running version,
+  and an engine floor to match.
+- **[bug fix]** An install refused for any reason printed `[ERROR] No package name provided.`
+  underneath the real explanation, contradicting the command the user had just typed. "No name
+  given" and "nothing installed" are now different messages.
+
 - **[feature] `pillow` — imaging for Bantu, in the shape of Python's Pillow.** Phases P0–P4 of
   nine. The Image object (`open new convert copy crop paste split merge point histogram getbbox
   getextrema getcolors blend composite alpha_composite tobytes save`), all 20 Pillow modes, the

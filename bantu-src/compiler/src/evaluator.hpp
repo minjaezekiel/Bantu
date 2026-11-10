@@ -3017,6 +3017,30 @@ public:
         filePathStack_.push_back(path);
     }
 
+    // Every builtin this binary registers, by name, sorted.
+    //
+    // `bantu engine --check-table` asks the RUNNING BINARY what it provides,
+    // rather than grepping the sources for registration calls. The two can
+    // disagree -- a name registered through a helper the grep does not know
+    // about is invisible to it -- and the one that matters to a package author
+    // is what the binary actually has.
+    std::vector<std::string> builtinNames() const {
+        std::vector<std::string> out;
+        if (!globalEnv_) return out;
+        for (const auto& kv : globalEnv_->variables) {
+            const Value& v = kv.second;
+            if (v.type == Value::NATIVE_FN || v.type == Value::NUMBER ||
+                v.type == Value::NATIVE_HANDLE || v.type == Value::OBJECT) {
+                // Constants (PI, INF) and module objects (sua, http, db) are
+                // part of the surface a package can depend on, exactly like a
+                // function is, so they are listed too.
+                out.push_back(kv.first);
+            }
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+
 private:
     std::shared_ptr<Environment> env_;
     std::shared_ptr<Environment> globalEnv_;

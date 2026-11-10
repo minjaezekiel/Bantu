@@ -37,6 +37,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <algorithm>
 #include <vector>
 #include <map>
 #include <set>
@@ -66,6 +67,9 @@
     #define PATH_SEP "/"
     #define PATH_SEP_CH '/'
 #endif
+
+#include "bantu_version.hpp"
+#include "engine_req.hpp"
 
 namespace bantu_pkg {
 
@@ -133,6 +137,41 @@ inline bool copyFile(const std::string& src, const std::string& dst) {
 }
 
 // Copy a directory recursively. Returns number of files copied.
+// Names (not paths) of the regular files directly inside a directory.
+// Used by the engine floor scan, which wants a package's own .b files and not
+// its subdirectories' -- a package's native surface is in the files it ships,
+// and recursing would pull in bantu_modules/ copies of its dependencies.
+inline std::vector<std::string> listFilesIn(const std::string& dir) {
+    std::vector<std::string> out;
+    if (!isDir(dir)) return out;
+#ifdef _WIN32
+    std::string pattern = dir + "\\*";
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return out;
+    do {
+        std::string name = fd.cFileName;
+        if (name == "." || name == "..") continue;
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) out.push_back(name);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR* d = opendir(dir.c_str());
+    if (!d) return out;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != nullptr) {
+        std::string name = ent->d_name;
+        if (name == "." || name == "..") continue;
+        struct stat st;
+        if (stat(join(dir, name).c_str(), &st) != 0) continue;
+        if (!S_ISDIR(st.st_mode)) out.push_back(name);
+    }
+    closedir(d);
+#endif
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 inline int copyDir(const std::string& src, const std::string& dst) {
     if (!isDir(src)) return 0;
     makeDirs(dst);
@@ -677,10 +716,16 @@ struct Manifest {
     std::string version;
     std::string entry;
     std::string language;
-    std::string bantuVersion;
+    std::string bantuVersion;  // informational: what CREATED the project
+    std::string engine;        // REQUIRED of the binary: "bantu": ">=1.4.0"
     std::string templateType;  // "cli" or "web"
     std::vector<Dependency> dependencies;
 };
+
+// `bantuVersion` and `engine` are different things and the distinction matters.
+// bantuVersion records which binary scaffolded the project, which is history.
+// engine states which binary can RUN this package, which is a contract -- and
+// the only one of the two that an installer can check.
 
 // Tiny JSON-ish reader for the subset we care about in bantu.json.
 // We don't ship a JSON library, so we do regex-style scanning.
@@ -746,6 +791,7 @@ inline Manifest readManifest(const std::string& path) {
     m.entry         = extractJsonField(content, "entry");
     m.language      = extractJsonField(content, "language");
     m.bantuVersion  = extractJsonField(content, "bantuVersion");
+    m.engine        = extractJsonField(content, "bantu");
     m.templateType  = extractJsonField(content, "template");
     m.dependencies  = extractDeps(content);
     return m;
@@ -761,6 +807,8 @@ inline bool writeManifest(const std::string& path, const Manifest& m) {
         s << "  \"template\": \""     << m.templateType << "\",\n";
     s << "  \"language\": \""    << m.language << "\",\n";
     s << "  \"bantuVersion\": \"" << m.bantuVersion << "\",\n";
+    if (!m.engine.empty())
+        s << "  \"bantu\": \"" << m.engine << "\",\n";
     if (m.dependencies.empty()) {
         s << "  \"dependencies\": {}\n";
     } else {
@@ -775,6 +823,63 @@ inline bool writeManifest(const std::string& path, const Manifest& m) {
     }
     s << "}\n";
     return writeFile(path, s.str());
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  The engine requirement (ecosystem stage 2)
+// ════════════════════════════════════════════════════════════════════
+
+// Defined further down with the rest of the path helpers; the engine gate runs
+// before them in the file but after them in the call graph.
+inline std::string getModulesDir();
+
+// The running build's identity, set once by main(). A wrong answer here only
+// weakens a message; "unknown" is what a binary predating the build-id
+// mechanism reports, and that is itself informative.
+inline std::string& selfBuildIdCell() {
+    static std::string s = "unknown";
+    return s;
+}
+
+// Can the running binary run this package? Prints the reason if not.
+//
+// Called BEFORE anything is copied. The whole point is that a too-old binary
+// produces one clear message instead of a successful install followed by
+// `Undefined variable: nd_zeros` from inside a library, which is what every
+// package in the registry would do on a 1.3.2 binary today.
+inline bool engineAllows(const std::string& pkgName, const std::string& pkgDir) {
+    const Manifest m = readManifest(join(pkgDir, "package.json"));
+    if (m.engine.empty()) return true;            // declares nothing, checks nothing
+
+    const bantu_engine::VersionReq req = bantu_engine::parseVersionReq(m.engine);
+    const bantu_engine::SemVer     me  = bantu_engine::parseSemVer(BANTU_VERSION_STR);
+
+    // A requirement nobody can parse is an ERROR, not "any version". Treating
+    // it as "any" would restore exactly the silence the field was added to end.
+    if (!req.ok) {
+        std::cerr << "\n  [ERROR] " << pkgName << " declares a \"bantu\" requirement "
+                  << "this binary cannot read.\n";
+        std::cerr << "          declared:  \"" << m.engine << "\"\n";
+        std::cerr << "          problem:   " << req.error << "\n";
+        std::cerr << "          Nothing was installed. Fix the package's "
+                  << "package.json, or install it from a source you trust.\n\n";
+        return false;
+    }
+    if (bantu_engine::satisfies(req, me)) return true;
+
+    std::cerr << "\n  [ERROR] " << pkgName << " needs a newer bantu.\n";
+    std::cerr << "          requires:  " << bantu_engine::describeReq(req)
+              << "   (\"bantu\": \"" << m.engine << "\")\n";
+    std::cerr << "          running:   " << BANTU_VERSION_STR
+              << "   (build " << selfBuildIdCell() << ")\n";
+    std::cerr << "          Nothing was written to " << getModulesDir() << ".\n";
+    std::cerr << "\n          This is the check that replaces a runtime "
+              << "\"Undefined variable\" from\n";
+    std::cerr << "          inside the library: " << pkgName << " calls native "
+              << "builtins your binary\n          does not have.\n";
+    std::cerr << "\n          Upgrade:  cd bantu-src/compiler && ./build-mac.sh --install\n";
+    std::cerr << "          Check:    bantu engine\n\n";
+    return false;
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -913,6 +1018,11 @@ inline bool installPackageInto(const std::string& pkgName, std::string version,
         return false;
     }
 
+    // ── the engine gate (stage 2, L2) ─────────────────────────────────────
+    // Before the destination is touched, let alone written: a refusal must
+    // leave the project exactly as it was.
+    if (!engineAllows(pkgName, src)) return false;
+
     std::string dst = getModuleDir(pkgName);
     if (isDir(dst)) {
         std::cout << "  [INFO] Reinstalling " << pkgName << " (overwriting)...\n";
@@ -994,7 +1104,11 @@ inline bool addDependency(const std::string& spec) {
         m.version = "1.0.0";
         m.entry = "main.b";
         m.language = "bantu";
-        m.bantuVersion = "1.1.0";
+        // Was the literal "1.1.0" -- a version this binary stopped being
+        // three releases ago, written into every manifest auto-created by
+        // `bantu add` in a directory without one.
+        m.bantuVersion = BANTU_VERSION_STR;
+        m.engine       = std::string(">=") + BANTU_VERSION_STR;
     }
 
     // Replace if exists, else append.
@@ -1304,6 +1418,38 @@ inline bool publishPackage(const std::string& publishDir, const std::string& asN
 //  Doctor — diagnose install + registry state
 // ════════════════════════════════════════════════════════════════════
 
+// ── reporting a manifest's engine requirement ───────────────────────────────
+// Three numbers matter and the doctor prints all three: what the manifest
+// DECLARES, what the sources IMPLY, and what is RUNNING. A declaration that is
+// lower than the implication is the dangerous case -- it installs on a binary
+// that cannot run it -- so it is called out rather than listed.
+inline bantu_engine::SourceFloor sourceFloorOfDir(const std::string& dir) {
+    bantu_engine::SourceFloor sf;
+    std::vector<std::string> files = listFilesIn(dir);
+    for (const std::string& f : files) {
+        if (f.size() < 3 || f.compare(f.size() - 2, 2, ".b") != 0) continue;
+        bantu_engine::scanSourceFloor(readFile(join(dir, f)), sf);
+    }
+    return sf;
+}
+
+inline void reportEngineLine(const Manifest& m, const std::string& indent) {
+    const bantu_engine::SemVer me = bantu_engine::parseSemVer(BANTU_VERSION_STR);
+    if (m.engine.empty()) {
+        std::cout << indent << "bantu engine:   (not declared)\n";
+        return;
+    }
+    const bantu_engine::VersionReq req = bantu_engine::parseVersionReq(m.engine);
+    if (!req.ok) {
+        std::cout << indent << "bantu engine:   \"" << m.engine
+                  << "\"  [ UNREADABLE ] " << req.error << "\n";
+        return;
+    }
+    std::cout << indent << "bantu engine:   " << bantu_engine::describeReq(req)
+              << "  (running " << BANTU_VERSION_STR << ")  "
+              << (bantu_engine::satisfies(req, me) ? "[ OK ]" : "[ TOO OLD ]") << "\n";
+}
+
 inline int runDoctor(const std::string& selfBuildId = "unknown") {
     int issues = 0;
     std::cout << "\n  Bantu install diagnostics\n";
@@ -1409,6 +1555,7 @@ inline int runDoctor(const std::string& selfBuildId = "unknown") {
         std::cout << "      version:        " << m.version << "\n";
         std::cout << "      entry:          " << m.entry << "\n";
         std::cout << "      dependencies:   " << m.dependencies.size() << "\n";
+        reportEngineLine(m, "      ");
     } else {
         std::cout << "  [7] Project manifest:     (none in cwd)\n";
     }

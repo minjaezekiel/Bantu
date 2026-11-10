@@ -1,0 +1,67 @@
+# The builtins registered by the last RELEASED binary, v1.3.2 (2026-09-06,
+# commit 7f4b2aa). Generated from git, not from memory:
+#
+#   git archive 7f4b2aa bantu-src/compiler/src | tar -x -C <tmp>
+#   <extract every name passed to define/reg/bin/un/real1/pred/env_->define>
+#
+# This file is the baseline for tests/engine_floor_table_test.sh, which asserts
+# that every builtin registered TODAY and absent from this list is covered by
+# the native-family floor table in src/engine_req.hpp. That is what makes
+# "adding a kernel without updating the table fails a test" true rather than
+# aspirational.
+#
+# It is also the evidence behind the floor of 1.4.0 for every native family:
+# 1.3.2 registered 49 builtins and not one of them is an nd_*, col_* or bp_*.
+# Nothing was removed since, so this list is a prefix of today's surface.
+#
+# Append to this file ONLY when a new version is released, alongside a new
+# baseline for that version.
+abs
+appendfile
+ceil
+chr
+clock
+close
+contains
+cos
+db
+entries
+env
+fetch
+floor
+func
+http
+indexOf
+json
+keys
+len
+loadlib
+log
+max
+min
+num
+open
+pow
+random
+range
+read
+readfile
+readline
+readlines
+replace
+round
+self
+sin
+sleep
+split
+sqrt
+str
+sua
+substr
+tan
+this
+trim
+type
+values
+write
+writefile

@@ -1,6 +1,7 @@
 {
   "name": "btorch",
   "version": "1.0.0",
+  "bantu": ">=1.4.0",
   "main": "btorch.b",
   "license": "MIT",
   "description": "PyTorch-shaped deep learning for Bantu, in pure Bantu on numba's native array atoms. Tensors with reverse-mode autograd over a define-by-run tape: 40+ differentiable operations, every gradient checked against central differences, broadcast gradients summed back over stretched axes. nn.Module with a deduplicated parameter tree — Linear, Conv1d/Conv2d, MaxPool2d/AvgPool2d, Dropout, LayerNorm, BatchNorm1d/2d, Embedding, Sequential, and the stable softmax family (cross_entropy on logits of 1000 is finite, not NaN). SGD/Adam/AdamW/RMSprop/Adagrad with StepLR, ExponentialLR and CosineAnnealingLR. DataLoader with reproducible seeded shuffling. Checkpoints in a binary format with a SHA-256, round-tripping bit-identically. Convolution is im2col composed with matmul, so there is no hand-derived convolution gradient anywhere. Trains MNIST: 98.16% with an MLP, LeNet-5 for the CNN.",

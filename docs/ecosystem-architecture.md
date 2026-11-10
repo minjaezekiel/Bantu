@@ -328,6 +328,54 @@ the manifest cannot say so. The failure mode is the stale-binary bug already
 fixed once (B21), arriving through the registry and reported as
 `Undefined variable: nd_fft`.
 
+### E22 — the version number had stopped moving, and that is what broke the manifest
+
+E17 predicted the engine field would be needed "the moment `btorch` 1.1 needs
+`nd_fft`". Checking before writing the parser showed the deadline had passed
+long ago: **v1.3.2 (2026-09-06) is the last release, and it contains no native
+builtins at all.** 409 of today's 456 registered builtins postdate it. Nine
+packages in the registry require a binary nobody can download.
+
+The cause is not the manifest format. It is that the version number stopped
+being part of the work: five libraries' worth of native surface landed under
+one unchanged version string, which is also why the stale-install bug (B21) was
+invisible enough to need a build id.
+
+So the rule is written where the number is defined, in `src/bantu_version.hpp`:
+**a new native family or builtin bumps the minor.** A floor table cannot name a
+version that does not exist, and a package author cannot declare a floor that
+has never shipped.
+
+### E23 — a floor is computed from the code, not remembered by the author
+
+`bantu engine <dir>` scans a package's `.b` files for native builtin calls, maps
+each to its family's floor, and reports the maximum — and `bantu doctor` prints
+three numbers per package: what the sources imply, what the manifest declares,
+and what is running. A declaration *lower* than the implication is a failure,
+not a warning, because that is the case that installs on a binary which cannot
+run it.
+
+Two things the scan deliberately does not do. It skips comments and string
+literals, so `// nd_fft( is next` cannot raise a package's floor (a false
+positive is still wrong, and it would be reported to the author as a fact about
+their code). And it says nothing about *syntax*: a pure-Bantu package using a
+language feature added after 1.3.2 gets no floor from this, because the floor is
+derived from the builtin surface. `random` declares nothing for exactly that
+reason, and that is a known limit rather than a claim of safety.
+
+### E24 — the table is checked against the BINARY, not against the sources
+
+`bantu engine --check-table` asks the running interpreter which builtins it
+registers and asserts each is either in the last release's baseline
+(`tests/builtins_v1.3.2.txt`, taken from git) or covered by the floor table.
+
+This was going to be a source grep over registration calls, and the grep was
+written first. It missed **26 builtins** — `exp`, `log2`, `sinh`, `tanh`,
+`cbrt`, `isnan`, `degrees` and the rest of the scalar math family — because
+they are registered through a helper the pattern did not know about. The binary
+knew. A gate that reads the sources is a gate on the sources; a gate that asks
+the binary is a gate on what users get.
+
 ### E20 — stage 1 is resequenced: value-ordered, not completion-ordered
 **The original order inside stage 1 was wrong, and re-deriving it from
 dependencies rather than from tidiness is what showed it.**
@@ -407,7 +455,7 @@ regression cannot hide.
 | stage | what | where | design doc |
 |---|---|---|---|
 | **1** | dtype templating → f32 → **f32 GEMM** → deterministic threading → (packed GEMM, generic functors deferred — E20) | binary + `numba` | [`numba-dtype-architecture.md`](numba-dtype-architecture.md) |
-| **2** | the engine field + dependency check | binary (package manager) | §7.2 below |
+| **2** | the engine field + dependency check | binary (package manager) | ✅ done — §7.2 below |
 | **3** | `bkit` with GBDT | new package | [`bkit-architecture.md`](bkit-architecture.md) |
 | **4** | `bonnx` import | new package | [`bonnx-architecture.md`](bonnx-architecture.md) |
 | **5** | `btext` + btorch phase 8 | new package + `btorch` | [`btext-architecture.md`](btext-architecture.md) |
@@ -439,6 +487,7 @@ insensitive to f32 vs f64 and are the commercially valuable item.** If
 
 | phase | item | gate |
 |---|---|---|
+| **L0** | the version number moves when a native family lands | one place defines it; the floor table cannot name a version that does not exist |
 | **L1** | `"bantu": ">=1.4.0"` parsed from `package.json` into `Manifest` | malformed ranges rejected by name |
 | **L2** | `bantu install` refuses, with the required version and the current build id, before writing any file | a too-old binary produces one clear message, not a runtime `Undefined variable` |
 | **L3** | backfill every existing manifest with the floor it actually needs | `bantu doctor` reports each package's floor against the running build |
@@ -446,6 +495,64 @@ insensitive to f32 vs f64 and are the commercially valuable item.** If
 
 Deliberately before stage 3: `bkit` ships a new native family (`tree_`), and it
 is the first package that would hit this trap in the wild.
+
+#### L0, which the evidence forced
+
+E17 said "the moment `btorch` 1.1 needs `nd_fft`, it depends on a binary
+version and the manifest cannot say so". Checking the version history before
+writing the parser showed the problem is not in the future tense.
+
+The released versions are 1.1.0 (2026-06-17) through **1.3.2 (2026-09-06)**,
+and 1.3.2 is still what `BANTU_VERSION` reports. The native sources tell the
+rest:
+
+| native family | first commit | in 1.3.2? |
+|---|---|---|
+| `crypto_*`, `sha256_*` | 2026-08-28 | **no** |
+| `col_*` (dataframe) | 2026-09-06 | **no** |
+| `nd_*` (ndarray) | 2026-09-13 | **no** |
+| `raster_*` (imaging) | 2026-09-16 | **no** |
+| `nd_set_threads` | 2026-11-10 | **no** |
+
+`git ls-tree` at the 1.3.2 tag lists 22 files in `compiler/src`, and none of
+them is `ndarray_native.cpp`, `raster_native.cpp`, `dataframe_native.hpp` or
+`crypto_native.hpp`. **No released binary contains a single `nd_*` builtin.**
+
+So every package in the registry today — `hash`, `crypto`, `uuid`, `random`,
+`numba`, `arctic`, `pillow`, `btorch`, `bplot` — requires a binary that has
+never been released. A user who installs `numba` with the 1.3.2 they downloaded
+gets `Undefined variable: nd_zeros`, which is E17's failure mode arriving
+already, for nine packages, rather than later for one.
+
+That makes the version bump part of the work rather than a release chore: a
+floor table is worthless if every floor it can honestly state is a version that
+does not exist. **1.4.0** is the first release with the native families, so it
+is the floor for all of them, and the engine field's first job is to say so.
+
+#### What the range syntax accepts, and what it refuses
+
+`>=1.4.0`, `^1.4.0` (same major, at least this), `~1.4.0` (same major and
+minor), `>1.4.0`, a bare `1.4.0` (treated as `>=`, because an engine
+requirement of *exactly* one build is almost never what a package author
+means), and `*` or absent for "any".
+
+Refused **by name**, with the unsupported token quoted back: compound ranges
+(`>=1.2 <2.0`), alternatives (`1.2 || 1.3`), upper bounds (`<2.0.0`),
+prerelease and build metadata. An upper bound is the interesting refusal: "this
+package does not work on newer Bantu" is a real thing to want to say, but
+nobody can know it at publish time, and a field that encodes a guess about the
+future would make every future release look broken. A package that genuinely
+breaks on a later binary is a bug report, not a manifest entry.
+
+#### Where the floor comes from
+
+Not from the author's memory. `bantu engine <dir>` scans a package's `.b` files
+for native builtin calls, maps each to its family's floor, and reports the
+maximum — so the backfill in L3 is computed from what the code actually calls,
+and an author who adds an `nd_fft` call is told the floor moved. The same
+computation backs `bantu doctor`, which compares three numbers per package: the
+floor its sources imply, the floor its manifest declares, and the version
+running.
 
 ### 7.3 Stage 3 — `bkit` (where the paying work is)
 
@@ -540,7 +647,8 @@ Recorded rather than guessed, with the measurement that would settle each.
 | **D3a** threaded matmul | ✅ done — `parallel.hpp` as a reusable primitive, `nd_set_threads`; **1024³ matmul 5.95 → 30.25 GFLOP/s (5.09x)**, fwd1 4.5x, bwd1 4.0x, MNIST epoch 1.56x; bit-identical at 1/2/3/4/8/16 threads, `tests/numba_threading_test.b` 57/57. TSan on the **integrated** interpreter found a lifetime bug the determinism suite could not see (N33) |
 | **D3b** threaded element-wise ufuncs | ✅ done — only the compute-bound ops, measured: **`exp` 4.83x, `log` 5.51x, `power` 5.06x at n=1M**, while `add` is 0.83x threaded and so is left sequential (N34). `tests/numba_elemwise_threads_test.b` 376/376; the pool now rethrows a body's exception by lowest chunk index (N35) |
 | **D3c** reductions | ✅ mostly done, and it turned out not to be about threads at all. Measuring first found a **27x loop-order defect**: `nd_sum` axis 0 took 66 ms where axis 1 took 2.4 ms. Inverting the loops is bit-identical and gives **sum 13.3x, max 16.1x, min 17.1x**, plus 1.83x on the contiguous `max` whose NaN early-return blocked vectorisation (N37). After that the fused sum is at the memory bus (12.46 GB/s), so threading it would buy nothing — only the compute-bound `nd_var`/`nd_std` (0.92 GB/s, a division per element) is still worth threads. `tests/numba_reduce_axis_test.b` 79/79 |
-| **stage 2 + stage 3 (`bkit`)** | after D3, moved earlier than originally planned (E21) |
+| **stage 2** the engine field | ✅ done — `"bantu": ">=1.4.0"` parsed and enforced before any file is written; `bantu engine` computes a package's floor from the builtins its sources call; the floor table checked against the running binary, not the sources (E22–E24). The finding that forced it: **v1.3.2 contains no native builtins at all**, so all 11 packages required a binary that had never been released |
+| **stage 3 (`bkit`)** | **next** — moved earlier than originally planned (E21) |
 | **D4** packed GEMM (skinny shapes) | deferred — helps convolution only |
 | **D2b** generic ufunc functors | deferred — helps f32 element-wise only; its benefit was gated behind D4 (E20) |
 

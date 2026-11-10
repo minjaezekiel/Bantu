@@ -549,6 +549,7 @@ inline std::string bantu_json(const std::string& name, const std::string& versio
   "template": "web",
   "language": "bantu",
   "bantuVersion": "%%VER%%",
+  "bantu": ">=%%VER%%",
   "dependencies": {}
 }
 )JSON";
@@ -903,6 +904,7 @@ inline std::string pwa_bantu_json(const std::string& name, const std::string& ve
   "template": "pwa",
   "language": "bantu",
   "bantuVersion": "%%VER%%",
+  "bantu": ">=%%VER%%",
   "dependencies": {}
 }
 )JSON";
