@@ -6339,9 +6339,27 @@ private:
             auto it = classRegistry_.find(n->parentClass);
             if (it != classRegistry_.end()) {
                 classDef->parentClass = it->second;
-                std::cout << "  [class] " << n->name << " extends " << n->parentClass << "\n";
+                // Informational, and so honours --quiet exactly as the
+                // "[class] Defined:" line below does. It did not, which made
+                // --quiet useless for any program built on a class hierarchy:
+                // `bantu run -q` on a script that includes bkit printed
+                // thirteen of these, to STDOUT, where a handler's real output
+                // goes. A library's internals are not its caller's data.
+                if (!quietMode_)
+                    std::cout << "  [class] " << n->name << " extends "
+                              << n->parentClass << "\n";
             } else {
-                std::cout << "  [class] WARNING: parent class '" << n->parentClass << "' not found for " << n->name << "\n";
+                // NOT suppressed by --quiet, and on stderr rather than stdout:
+                // this one is a defect in the program being run, and the
+                // consequence is silent. Execution continues with no parent,
+                // so instances are missing every inherited method and the
+                // first symptom is "X.fit is not implemented" from a class
+                // that plainly implements fit.
+                std::cerr << "  [class] WARNING: parent class '" << n->parentClass
+                          << "' not found for " << n->name
+                          << " -- its instances will NOT have the inherited "
+                             "methods or fields. Is the parent's file included "
+                             "before this one?\n";
             }
         }
 
