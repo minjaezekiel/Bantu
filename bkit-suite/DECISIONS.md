@@ -583,3 +583,204 @@ thousands of nonzero targets breaks one term of a mean. Refusing the whole
 metric for that would be out of proportion. The consequence is that the result
 is bounded rather than exact at a zero target, which is stated at the function
 because a bounded-but-wrong number is only safe if the reader knows.
+
+---
+
+### K31 — The Gram matrix is never formed, and the measurement is the argument
+The roadmap asked for *"normal equations via numba's `lstsq`; `solve` for
+well-conditioned"*. The second half is wrong.
+
+A degree-9 polynomial design on 60 points — an ordinary fit, not a contrived
+one:
+
+| | value |
+|---|---|
+| condition number of `X` | 2.6 × 10⁶ |
+| condition number of `XᵀX` | **6.9 × 10¹²** |
+| max coefficient error, `lstsq` | 1.2 × 10⁻⁹ |
+| max coefficient error, normal equations | **2.8 × 10⁻³** |
+
+Forming `XᵀX` **squares the condition number**, and the normal equations came
+out *a million times* less accurate — a 0.3% error in coefficients, with
+nothing in the output to show it. Against that, `lstsq` cost 41 ms versus 7 ms
+on a 5000 × 60 problem, once per fit, and on a well-conditioned problem the two
+agree to 2.4 × 10⁻¹⁶.
+
+**Rejected: making it conditional.** "Use `solve` when well-conditioned"
+requires knowing the condition number, which costs an SVD — more than the
+`lstsq` it was avoiding. And the caller cannot be asked to know: the whole
+hazard is that an ill-conditioned design looks exactly like a well-conditioned
+one until the answers are wrong.
+
+The test re-derives this rather than trusting it: it asserts both that `lstsq`
+stays under 1e-6 **and** that the Gram route exceeds 1e-4 on the same data, so
+the decision is checked on every run instead of remembered.
+
+---
+
+### K32 — `Ridge` is least squares on an augmented system
+Ridge's closed form, `(XᵀX + αI)b = Xᵀy`, needs the matrix [K31] just rejected.
+It is not needed:
+
+```
+minimise ‖Xb − y‖² + α‖Pb‖²   ==   minimise ‖ [    X     ] b − [ y ] ‖²
+                                              [ √α · P   ]     [ 0 ]
+```
+
+Stack `√α` rows under the design and zeros under the target, then `lstsq`.
+Three things fall out:
+
+* the Gram matrix is never formed, so Ridge inherits [K31]'s accuracy;
+* `P` selects the penalised columns, so **the intercept is excluded by
+  construction** rather than by remembering to exclude it;
+* it explains what the penalty does numerically — the added rows raise the
+  smallest singular value to at least `√α`, so a rank-deficient design becomes
+  full rank. Ridge is *better* conditioned than the fit it regularises, which
+  is why a closed form is safe here and not in [K31].
+
+The test checks it against the textbook `(XᵀX + αP)` solve on a small
+well-conditioned matrix, where that form is trustworthy — two independent
+routes to the same coefficients, agreeing to 1e-9.
+
+---
+
+### K33 — The iteration cap is audible, on stderr, and does not raise
+Coordinate descent that stops at `max_iter` without converging returns
+coefficients that are **wrong**, not approximate — and every number computed
+from them afterwards is wrong too, with nothing in the output to say so.
+
+So: `converged_` and `n_iter_` are on the estimator and asserted by a test, and
+hitting the cap prints a warning to **stderr** via `eprint`. Stderr, not
+stdout, because a library's diagnostic that a pipeline's output can swallow is
+a diagnostic nobody reads — the same argument that fixed `--quiet` for the
+`[class]` lines.
+
+**Rejected: raising.** Hitting `max_iter` on hard data is normal. A user who
+wants more iterations should get a warning and a number, not an exception in
+the middle of a cross-validation that then reports nothing at all.
+
+**Rejected: silence plus a flag.** The flag is right and insufficient: nobody
+checks a flag they do not know exists. The warning is what makes the flag
+discoverable.
+
+The warning names what to change — raise `max_iter`, loosen `tol`, or scale `X`
+— because coordinate descent converges far faster on columns of comparable
+magnitude, and "scale your features" is the actual fix nine times in ten.
+
+---
+
+### K34 — `LogisticRegression`: binary IRLS, multiclass one-vs-rest
+Binary uses **IRLS** — Newton on the log-likelihood — where each step is a
+weighted ridge solved by [K32]'s augmented `lstsq`. Five to ten iterations on
+ordinary data, quadratic convergence, no learning rate to tune.
+
+Multiclass is **one-vs-rest**: `k` binary fits, prediction by the largest
+decision value. Multinomial softmax needs a general optimiser (L-BFGS) because
+its Hessian is a `k·p × k·p` block matrix — a phase of its own, not a line of
+this file.
+
+**What one-vs-rest actually costs**, since "it is worse" is usually said
+without saying how: for **prediction** it is not worse — `argmax` over `k`
+independent fits and `argmax` of a softmax fit agree on the great majority of
+points. What it costs is **calibration**: the `k` sigmoids do not sum to 1, so
+`predict_proba` normalises them, and that normalisation is an approximation
+rather than a model. scikit-learn's `liblinear` solver does exactly this and
+documents it the same way. The test asserts the normalised rows sum to 1 so the
+approximation is visible in the suite rather than implied by the docs.
+
+**The L2 penalty is not optional.** On separable data the unpenalised
+likelihood is maximised by coefficients of infinite magnitude, so IRLS diverges
+with its weights `p(1−p)` going to zero. `C` (inverse strength, as in
+scikit-learn) bounds `b`, and `p` is clipped away from 0 and 1 so the weights
+cannot underflow to exactly zero. A test drives it at `C = 1e6` — the weakest
+penalty the model allows — on perfectly separable data and asserts the
+coefficients stay finite.
+
+---
+
+### K35 — `SGD*` is mini-batch, and that is a different optimiser
+"One pass per epoch, `nd_*`-vectorised" and "stochastic gradient descent" are
+in tension: true per-sample SGD is `n` interpreter iterations an epoch, and the
+interpreter costs about a microsecond a step — a 100,000-row epoch is a tenth
+of a second of pure overhead before any arithmetic.
+
+So these are **mini-batch** gradient descent, default batch 256, where each
+step is one `matmul`. The batch is a declared parameter, not a hidden one.
+
+This is an honest difference from scikit-learn's `SGDClassifier`, which really
+does take one sample at a time: **the optimisation path differs, so the
+coefficients differ**, though both minimise the same objective. What is asserted
+instead is the property that matters — on a well-conditioned problem
+`SGDRegressor` must approach `LinearRegression`'s closed-form coefficients, and
+it does, to 8.8 × 10⁻⁹. An optimiser is correct when it finds the answer the
+closed form already knows; reproducing another library's trajectory would be a
+weaker claim and an unmaintainable test.
+
+**The regressor centres `X` and `y`** and recovers the intercept afterwards,
+like `ElasticNet`. Writing the test for "the intercept is not penalised" found
+why it has to: learning the intercept by descent starts it at 0 and makes it
+travel the whole way to `mean(y)`, while the step size decays as
+`1/(1 + η₀·α·t)` — so a strong penalty throttles exactly the parameter with
+furthest to go. Measured on a target centred at 50 with `α = 5`: the intercept
+reached 37.1 after 600 epochs and was still climbing. Centring removes the
+problem instead of tuning around it.
+
+**The classifier does not centre**, because centring a 0/1 label would change
+the logistic loss into a different objective. Its intercept is learned, which
+is fine — on the logit scale it is O(1). It is still excluded from the penalty,
+and the test for that had to assert the **intercept** rather than accuracy:
+with 90/10 classes, penalising the intercept pulls it from −0.75 toward −0.15
+and *raises* accuracy from 90.3% to 96.7%, because the model then predicts the
+minority class at roughly its true rate instead of never. A metric can improve
+while the mechanism is wrong.
+
+---
+
+### K36 — The SGD step size is not coupled to the penalty
+The first schedule was `η₀ / (1 + η₀·α·t)`. It is broken at **both** ends, and
+both were measured rather than reasoned about:
+
+* **Strong penalty, collapsed step.** At `α = 2` on a 90/10 classification the
+  intercept read −0.754 after 400 epochs, −0.938 after 4,000 and −1.046 after
+  20,000 — still moving, never reporting convergence — against the **−2.069**
+  that IRLS gives for the same objective. The optimiser was not converging
+  slowly; it was being governed by the one parameter that has nothing to do
+  with step length. Centring `X` and `y` ([K35]) hid this for the *regressor's
+  intercept* by computing it in closed form, but the coefficients and the whole
+  of `SGDClassifier` were still throttled.
+* **No penalty, no annealing.** At `α = 0` the schedule never decays, so there
+  is no annealing precisely where gradient noise most needs it.
+
+`learning_rate` is now explicit, and the default depends only on `t`:
+`"invscaling"` = `η₀ / (1 + t)^power_t` with `power_t = 0.25`, `"constant"` =
+`η₀`, `"optimal"` = `1/(α·(t + t₀))` with `t₀ = 1/(α·η₀)` so that `η(0) = η₀`
+under all three. The same `α = 2` fit reaches −2.031 in 400 epochs under the
+default.
+
+`"optimal"` is the old rule, **kept rather than deleted**: it is the correct
+schedule for a strongly convex objective — the strong convexity constant *is*
+`α` — and it is scikit-learn's name for it. It now has to be asked for, and
+requires `α > 0`.
+
+**Why `invscaling` rather than `constant`**, which taste cannot settle:
+
+| | noiseless target | noisy target (σ = 0.5) |
+|---|---|---|
+| `constant` | 8.4 × 10⁻⁹ at 175 epochs | 7.8 × 10⁻³ |
+| `invscaling` | 6.1 × 10⁻⁴ at 400, **9.7 × 10⁻¹¹** at 2,000 | **2.1 × 10⁻³** |
+
+A decaying step is *slower early* on a clean problem and **not capped** — given
+the epochs it converges further than a constant one. On a noisy problem it is
+nearly four times closer, because the decay is what lets the iterate settle
+rather than bounce around the optimum. Real targets are noisy.
+
+**Not claimed:** the usual robustness argument for decay. Neither schedule
+diverged at `η₀ = 5` on this problem, so that reason was tested and did not
+hold; the noisy-target result is the one doing the work.
+
+**A test-design note worth keeping.** The first assertion that `power_t` is
+applied passed even with the value hardcoded, because the two fits drew
+different mini-batch shuffles from the global RNG — it was measuring RNG
+variation, not the parameter. The comparison now re-seeds before each fit, and
+a companion assertion checks that the same seed and schedule give bit-identical
+coefficients, which is what makes the comparison mean anything.

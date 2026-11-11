@@ -46,8 +46,15 @@ All notable changes to the Bantu programming language are documented in this fil
   micro/macro/weighted, `classification_report`), tie-handled `roc_curve`/`roc_auc_score`/
   `precision_recall_curve`/`average_precision_score`, a clipped `log_loss` and `brier_score_loss`,
   the regression set (`MSE`, `RMSE`, `MAE`, `R²`, `MAPE`, explained variance), and `ndcg_score`
-  and `mrr_score`. `metrics.b` depends on nothing but numba, so a user who wants `f1_score` does
-  not import a gradient booster to get it.
+  and `mrr_score`; and linear models: `LinearRegression`, `Ridge`, `Lasso`, `ElasticNet`,
+  `LogisticRegression` (binary IRLS, multiclass one-vs-rest) and mini-batch `SGDRegressor`/
+  `SGDClassifier`.
+
+  `metrics.b` depends on nothing but numba, so a user who wants `f1_score` does not import a
+  gradient booster to get it. **No linear model forms `XᵀX`**: the Gram matrix squares the
+  condition number, and on a degree-9 polynomial design the normal equations came out a million
+  times less accurate than `lstsq` on the design matrix — 2.8e-3 of coefficient error against
+  1.2e-9 — for 34 ms saved once per fit. A 20,000 × 20 least-squares fit takes 31 ms.
 
   A 100,000 × 20 `fit_transform` takes 75 ms; a 50,000-row shuffled 5-fold split takes 13 ms.
   Reproducibility comes from `nd_seed` alone — no estimator or splitter carries its own RNG state —

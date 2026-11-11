@@ -181,11 +181,53 @@ The exponential gain scikit-learn defaults to gives 0.9488107.
 
 | Item | How | Status |
 |---|---|---|
-| `LinearRegression` | normal equations via numba's `lstsq`; `solve` for well-conditioned | [ ] |
-| `Ridge` | closed form with the penalty on the Gram matrix | [ ] |
-| `Lasso`, `ElasticNet` | coordinate descent with a convergence tolerance **and an iteration cap that warns when hit** | [ ] |
-| `LogisticRegression` | IRLS or L-BFGS; multinomial via softmax | [ ] |
-| `SGDClassifier`/`SGDRegressor` | one pass per epoch, `nd_*`-vectorised | [ ] |
+| `LinearRegression` | ~~normal equations via numba's `lstsq`; `solve` for well-conditioned~~ **`lstsq` always** | [x] **the "`solve` for well-conditioned" half was wrong and is now measured, not argued** ([K31]): `XᵀX` squares the condition number, and on a degree-9 polynomial design the normal equations came out a **million times** less accurate — 2.8e-3 against 1.2e-9 — for 34 ms saved once per fit |
+| `Ridge` | ~~closed form with the penalty on the Gram matrix~~ **augmented least squares** | [x] same reason ([K32]): `√α` rows stacked under the design give the identical solution, never form the Gram matrix, and exclude the intercept **by construction** |
+| `Lasso`, `ElasticNet` | coordinate descent with a convergence tolerance **and an iteration cap that warns when hit** | [x] the warning goes to **stderr**, because one a pipeline's stdout can swallow is one nobody reads; it does not raise, since hitting the cap on hard data is normal ([K33]) |
+| `LogisticRegression` | IRLS or L-BFGS; multinomial via softmax | [x] **binary IRLS, multiclass one-vs-rest** ([K34]). Softmax needs a general optimiser — its Hessian is `k·p × k·p` — which is a phase of its own. What OvR costs is *calibration*, not accuracy, and the test makes the approximation visible |
+| `SGDClassifier`/`SGDRegressor` | one pass per epoch, `nd_*`-vectorised | [x] **mini-batch**, which is what those two phrases together can mean ([K35]). Asserted by the property that matters: it reaches `LinearRegression`'s closed form to 9.7e-11. `learning_rate` is explicit and its default is **not** coupled to `alpha` ([K36]) |
+
+**Gates, all green:** `tests/bkit_linear_test.b` 135 assertions,
+`tests/bkit_protocol_test.b` grown to 49. 20,000 × 20: LinearRegression 31 ms,
+Ridge 30 ms, Lasso 28 ms, LogisticRegression 356 ms in 11 IRLS iterations.
+
+**A real bug, and the language behaviour that hid it.** `Lasso` was applying
+**no L1 penalty at all** and reporting a clean convergence: `_Lasso.init`
+replaced `params_` without `l1_ratio`, so `fit` read `null` — and in Bantu
+`alpha * null` is **0**, silently. It ran as pure L2 and produced *zero*
+sparsity where `ElasticNet(α, 1.0)` zeroed 8 of 10 coefficients. Fixed twice
+over: the ratio now comes through an overridable `_rho()`, **and** `alpha` and
+`l1_ratio` are type-checked, so the whole class of "missing key meets
+null-as-zero arithmetic" raises with a message.
+
+**Twenty-three mutations, four of which initially passed**, every one a
+property asserted in shape but not in substance:
+* a **hard** threshold kept the sparsity and lost the shrinkage — the test now
+  compares against least squares on the support Lasso *selected*;
+* returning `mean(y)` as `ElasticNet`'s intercept passed, because nothing
+  checked the intercept against a known value;
+* penalising SGD's intercept passed, and asserting it needed the **mechanism,
+  not a metric**: with 90/10 classes the bug *raises* accuracy from 90.3% to
+  96.7%;
+* hardcoding `power_t` passed, because the two fits compared drew **different
+  mini-batch shuffles** from the global RNG — the assertion was measuring RNG
+  variation. It re-seeds before each fit now.
+
+**Writing a test found a design weakness, and then a second, deeper one.**
+First: `SGDRegressor` learned its intercept by descent from 0 while the step
+decayed as `1/(1 + η₀·α·t)`, so a strong penalty throttled exactly the
+parameter with furthest to go — at `α = 5` on a target centred at 50 it reached
+**37.1** after 600 epochs, still climbing. Centring `X` and `y` fixed that
+intercept.
+
+But centring only *moved* the problem: the schedule itself was wrong ([K36]).
+At `α = 2` the classifier's intercept read −0.754 at 400 epochs, −0.938 at
+4,000 and **−1.046 at 20,000**, still moving, against IRLS's **−2.069**. The
+step size is now a function of `t` alone unless `"optimal"` is asked for, and
+the same fit reaches **−2.031 in 400 epochs**. Choosing between `"invscaling"`
+and `"constant"` was settled by measurement: identical on clean data given the
+epochs, but invscaling is **nearly four times closer on a noisy target**, and
+real targets are noisy.
 
 ## Phase K6 — `Pipeline` + `ColumnTransformer`
 `ColumnTransformer` is the only part of `bkit` that touches `arctic`
@@ -252,11 +294,12 @@ Datasets fetched and SHA-256 verified, **never committed** — the method
 
 ## Where to resume
 
-**K0–K4 are done; K5 (`linear.b`) is next.** `base.b` is 391 lines,
-`preprocess.b` 1,011, `selection.b` 926 and `metrics.b` 701;
-`tests/bkit_base_test.b` is 53 assertions, `tests/bkit_preprocess_test.b` 174,
-`tests/bkit_selection_test.b` 117, `tests/bkit_metrics_test.b` 123 and
-`tests/bkit_protocol_test.b` 39 — all green. Read
+**K0–K5 are done; K6 (`Pipeline` + `ColumnTransformer`) is next.** `base.b` is
+391 lines, `preprocess.b` 1,011, `selection.b` 926, `metrics.b` 701 and
+`linear.b` 798; `tests/bkit_base_test.b` is 53 assertions,
+`tests/bkit_preprocess_test.b` 174, `tests/bkit_selection_test.b` 117,
+`tests/bkit_metrics_test.b` 123, `tests/bkit_linear_test.b` 127 and
+`tests/bkit_protocol_test.b` 49 — all green. Read
 [`../docs/bkit-architecture.md`](../docs/bkit-architecture.md) first, then
 [`DECISIONS.md`](DECISIONS.md).
 
@@ -264,7 +307,7 @@ Ecosystem **stage 2** (the engine field) landed first, as required, and
 `bkit/package.json` declares `"bantu": ">=1.4.0"` — verified against the floor
 its own sources imply with `bantu engine bkit`.
 
-What K5 inherits and should not re-invent:
+What K6 inherits and should not re-invent:
 
 * every estimator is `_Name` plus a same-named factory `def Name(...)`, because
   a `def Name()` shadows a `class Name`, and `new Name(...)` inside the factory
@@ -306,4 +349,17 @@ What K5 inherits and should not re-invent:
 * **derive every expected value independently** of the code under test. K4's
   two wrong expectations were both remembered rather than computed, and one of
   them (NDCG 0.9481156) is a real published number — for a *different* gain
-  convention.
+  convention;
+* **`number * null` is `0` in Bantu, silently**, and `null == 0` is *false*, so
+  you cannot detect it afterwards either. This cost K5 a real bug in `Lasso`
+  (see above). Any value read from a dict and used in arithmetic should be
+  type-checked at the boundary — `linear.b` does this for `alpha` and
+  `l1_ratio`;
+* `linear.b`'s `_ridge_solve` and `_weighted_ridge_solve` are the reusable
+  numerical core: penalised least squares with an unpenalised prefix, and its
+  weighted form. K7's trees do not need them, but any further linear model
+  does;
+* **a metric can improve while the mechanism is wrong.** K5's hardest
+  assertion to get right was "SGD does not penalise its intercept", because the
+  bug *raises* accuracy on imbalanced data. Assert the coefficient the bug
+  would move, not a score downstream of it.

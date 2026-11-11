@@ -1,10 +1,10 @@
 {
   "name": "bkit",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "bantu": ">=1.4.0",
   "main": "base.b",
   "license": "MIT",
-  "description": "Classical machine learning for Bantu: scikit-learn's shape, with a histogram-based gradient-boosting implementation inside it rather than beside it. Phases K1-K4 of twelve: the estimator protocol, Pipeline with step__param addressing, eleven preprocessing transformers, model selection (train_test_split, four splitters, cross_val_score, GridSearchCV/RandomizedSearchCV), and metrics -- classification from one confusion matrix, tie-handled ROC and PR curves, clipped log_loss, the regression set, NDCG and MRR. metrics.b depends on nothing but numba. Reproducibility comes from nd_seed alone; splitters return index arrays and never copy data.",
+  "description": "Classical machine learning for Bantu: scikit-learn's shape, with a histogram-based gradient-boosting implementation inside it rather than beside it. Phases K1-K5 of twelve: the estimator protocol, Pipeline with step__param addressing, eleven preprocessing transformers, model selection, metrics, and linear models -- LinearRegression, Ridge, Lasso, ElasticNet, LogisticRegression (binary IRLS, multiclass one-vs-rest) and mini-batch SGD. No model forms X'X: the Gram matrix squares the condition number, so every fit goes through lstsq on the design matrix.",
   "keywords": [
     "machine-learning",
     "scikit-learn",
@@ -14,8 +14,10 @@
     "cross-validation",
     "grid-search",
     "metrics",
-    "roc-auc",
-    "f1-score",
+    "linear-regression",
+    "ridge",
+    "lasso",
+    "logistic-regression",
     "gbdt"
   ],
   "dependencies": {
@@ -25,7 +27,8 @@
     "base.b",
     "preprocess.b",
     "selection.b",
-    "metrics.b"
+    "metrics.b",
+    "linear.b"
   ],
   "docs": "docs/bkit-architecture.md",
   "tests": [
@@ -33,6 +36,7 @@
     "tests/bkit_preprocess_test.b",
     "tests/bkit_selection_test.b",
     "tests/bkit_metrics_test.b",
+    "tests/bkit_linear_test.b",
     "tests/bkit_protocol_test.b"
   ]
 }

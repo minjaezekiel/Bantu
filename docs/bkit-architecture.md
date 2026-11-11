@@ -485,11 +485,205 @@ stops them drifting.
 
 ---
 
-## 6. Gradient boosting — the headline
+## 6. Linear models — and the Gram matrix we do not form
+
+### 6.1 Never form `XᵀX`, measured rather than argued [K31]
+
+The roadmap said *"normal equations via numba's `lstsq`; `solve` for
+well-conditioned"*. The second half is wrong, and the measurement is the
+argument.
+
+A degree-9 polynomial design on 60 points — an ordinary, unremarkable fit:
+
+| | value |
+|---|---|
+| condition number of `X` | 3.6 × 10⁶ |
+| condition number of `XᵀX` | **1.3 × 10¹³** |
+| max coefficient error, `lstsq` | 1.2 × 10⁻⁹ |
+| max coefficient error, normal equations | **2.8 × 10⁻³** |
+
+Forming the Gram matrix **squares the condition number**, so the normal
+equations came out **2.4 million times less accurate** — a 0.3% error in
+coefficients the caller has no way to notice. Their cost: `lstsq` took 41 ms on
+a 5000 × 60 problem against 7 ms for the Gram route, and on a *well*-conditioned
+problem the two agree to 2.4 × 10⁻¹⁶.
+
+So: 34 ms, on a fit that happens once, against a silent three-digit error. Every
+fit in this file goes through `nd_lstsq` on the design matrix.
+
+The deeper reason not to make it conditional is that **the caller cannot know
+which regime they are in**. "Use `solve` when well-conditioned" requires
+computing the condition number to decide — which costs an SVD, more than the
+`lstsq` it was trying to avoid.
+
+### 6.2 `Ridge` is least squares on an augmented system [K32]
+
+Ridge has a closed form, `(XᵀX + αI)b = Xᵀy`, and that form requires the Gram
+matrix §6.1 just rejected. It is not needed:
+
+```
+minimise ‖Xb − y‖² + α‖b‖²   ==   minimise ‖ [  X        ] b − [ y ] ‖²
+                                            [ √α · P     ]     [ 0 ]
+```
+
+Stack `√α` rows under the design matrix and zeros under the target, and `lstsq`
+solves the penalised problem directly. Two things fall out for free:
+
+* the Gram matrix is never formed, so Ridge inherits §6.1's accuracy;
+* `P` selects the penalised columns, so **the intercept is excluded by
+  construction** rather than by remembering to exclude it (§6.3).
+
+It also explains what the penalty does numerically: the added rows raise the
+smallest singular value to at least `√α`, so a rank-deficient design becomes
+full rank. Ridge is better conditioned than the fit it regularises, which is
+why the closed form is *safe* here and not elsewhere.
+
+### 6.3 The intercept is a column of ones, and is never penalised
+
+Every model fits `[1 | X]` and reports `coef_` and `intercept_` separately.
+
+Penalising the intercept is the classic silent error: it shrinks predictions
+toward **zero** instead of toward the **mean**, so a model of a quantity
+centred on 1000 is dragged to 0 and reports a terrible fit that looks like
+underfitting rather than a bug. `Ridge` excludes it through `P` above;
+`ElasticNet` excludes it by centring `X` and `y`, fitting without an intercept,
+and recovering `intercept_ = ȳ − x̄ · b`; `LogisticRegression` excludes it in the
+same `P`.
+
+### 6.4 Coordinate descent, and a cap that is *heard* [K33]
+
+`Lasso` and `ElasticNet` have no closed form — the L1 term is not
+differentiable at zero — so they use cyclic coordinate descent with soft
+thresholding, minimising
+
+```
+(1/2n)‖y − Xb‖² + α·ρ·‖b‖₁ + ½·α·(1−ρ)·‖b‖²
+```
+
+(`ρ` is `l1_ratio`; `ρ = 1` is Lasso.) Each coordinate has a closed-form
+update, and the residual is maintained incrementally so a sweep is `p` kernel
+calls rather than `p` matrix products.
+
+**The iteration cap must be audible.** A coordinate descent that stops at
+`max_iter` without converging returns coefficients that are simply *wrong* — not
+approximate, wrong — and every downstream number computed from them is wrong
+too, with nothing in the output to say so. So:
+
+* `converged_` and `n_iter_` are on the estimator and a test asserts them;
+* hitting the cap prints a warning **to stderr** (`eprint`), once per fit, so it
+  cannot be lost in a pipeline's stdout;
+* the warning names the tolerance reached and what to change.
+
+It does **not** raise. Hitting `max_iter` on hard data is normal and a user who
+wants more iterations should get a warning and a number, not an exception in the
+middle of a cross-validation.
+
+### 6.5 `LogisticRegression`: binary IRLS, multiclass one-vs-rest [K34]
+
+Binary uses **IRLS** — Newton's method on the log-likelihood — where each step
+is a weighted ridge solved by §6.2's augmented `lstsq`. It converges in five to
+ten iterations on ordinary data, quadratically, with no learning rate to tune.
+
+Multiclass is **one-vs-rest**: `k` binary fits, prediction by the largest
+decision value. The alternative, multinomial softmax, needs a general optimiser
+(L-BFGS) because its Hessian is a `k·p × k·p` block matrix — and writing one is
+a phase of its own, not a line of this file.
+
+What that costs is worth stating precisely, because "one-vs-rest is worse" is
+usually said without saying how: for **prediction** it is not worse — `argmax`
+of `k` independent fits and `argmax` of a softmax fit agree on the great
+majority of points. What it costs is **calibration**: the `k` sigmoids do not
+sum to 1, so `predict_proba` normalises them, and that normalisation is an
+approximation rather than a model. scikit-learn's `liblinear` solver does
+exactly this and documents it the same way.
+
+The L2 penalty is not optional here. On separable data the unpenalised
+likelihood is maximised by coefficients of infinite magnitude, so IRLS diverges
+with weights going to zero. `C` (inverse regularisation strength, as in
+scikit-learn) keeps `b` bounded, and probabilities are clipped away from 0 and 1
+so the IRLS weights `p(1−p)` cannot underflow to exactly zero.
+
+### 6.6 `SGD*` is mini-batch, and that is a different optimiser [K35]
+
+"One pass per epoch, `nd_*`-vectorised" and "stochastic gradient descent" are in
+tension: true per-sample SGD is `n` interpreter iterations per epoch, and the
+interpreter costs about a microsecond a step — so a 100,000-row epoch is a tenth
+of a second of pure interpreter overhead before any arithmetic.
+
+So these are **mini-batch** gradient descent, default batch 256, where each step
+is one `matmul`. The batch is a declared parameter and not a hidden one.
+
+This is an honest difference from scikit-learn's `SGDClassifier`, which really
+does take one sample at a time: **the optimisation path differs, so the
+coefficients differ**, even though both minimise the same objective. What is
+asserted instead is the property that matters — on a well-conditioned problem,
+`SGDRegressor` must approach `LinearRegression`'s closed-form coefficients. An
+optimiser is correct when it finds the answer the closed form already knows, and
+that is a far stronger test than reproducing another library's trajectory.
+
+### 6.7 The step size is not coupled to the penalty [K36]
+
+The first schedule was `η₀ / (1 + η₀·α·t)`, and it is broken at **both** ends:
+
+* with a strong penalty the denominator grows fast and the step collapses. At
+  `α = 2` on a 90/10 classification the intercept read **−0.754** after 400
+  epochs, **−0.938** after 4,000 and **−1.046** after 20,000 — still moving,
+  never reporting convergence — against the **−2.069** that IRLS gives for the
+  same objective. The optimiser was not converging slowly; it was being
+  governed by the one parameter that has nothing to do with step length.
+* with `α = 0` it never decays at all, so there is no annealing exactly where
+  gradient noise most needs it.
+
+Centring `X` and `y` (§6.6) hid this for the regressor's *intercept*, by
+computing it in closed form instead of descending to it. The coefficients, and
+the whole of `SGDClassifier`, were still throttled.
+
+`learning_rate` is now an explicit choice and the default depends only on `t`:
+
+| | |
+|---|---|
+| `"invscaling"` (default) | `η₀ / (1 + t)^power_t`, `power_t = 0.25` |
+| `"constant"` | `η₀` |
+| `"optimal"` | `1 / (α·(t + t₀))`, `t₀ = 1/(α·η₀)` |
+
+Under the default, the same `α = 2` fit reaches **−2.031** in 400 epochs.
+
+`"optimal"` is the old rule, kept rather than deleted because it is the right
+schedule for a strongly convex objective — the strong convexity constant *is*
+`α` — and it is scikit-learn's name for it. It now has to be asked for, and
+requires `α > 0`, since with `α = 0` there is no constant for it to use.
+
+**Why `invscaling` and not `constant`** — the choice measurement had to settle
+rather than taste:
+
+| | noiseless target | noisy target (σ = 0.5) |
+|---|---|---|
+| `constant` | 8.4 × 10⁻⁹ at 175 epochs | 7.8 × 10⁻³ |
+| `invscaling` | 6.1 × 10⁻⁴ at 400 epochs, **9.7 × 10⁻¹¹** at 2,000 | **2.1 × 10⁻³** |
+
+A decaying step is *slower early* on a clean problem and **not capped** — given
+the epochs it converges further than a constant one. On a noisy problem it is
+nearly four times closer, because the decay is what lets the iterate settle
+instead of bouncing around the optimum. Real targets are noisy, so that is the
+default. Neither schedule diverged at `η₀ = 5`, so the usual robustness
+argument for decay was tested, did not hold here, and is not claimed.
+
+### 6.8 These are the first real estimators, so the protocol test drops its doubles
+
+K1 through K4 had no classifier or regressor, so `bkit_protocol_test.b` wrapped
+`GridSearchCV` around a hand-written `ConstRegressor` to have something
+scorable. From K5 the registry carries `LinearRegression`, `Ridge`,
+`ElasticNet`, `Lasso`, `LogisticRegression` and both `SGD*` estimators, and the
+searches are exercised over a real model whose right answer is known in closed
+form.
+
+---
+
+## 7. Gradient boosting — the headline
 
 Histogram-based, LightGBM-shaped. The design choices and why.
 
-### 6.1 The algorithm
+### 7.1 The algorithm
 
 1. **Bin once, up front.** Each feature is quantile-binned into at most 256
    bins. All later work reads bin indices, never raw values. This is what makes
@@ -506,7 +700,7 @@ Histogram-based, LightGBM-shaped. The design choices and why.
    `max_depth` as a separate guard.
 6. **Predict** by traversing the node array.
 
-### 6.2 The `tree_` native family
+### 7.2 The `tree_` native family
 
 Five kernels. The Bantu side runs the boosting loop, computes gradients and
 hessians (vectorised over `nd_*`), handles early stopping and feature
@@ -525,7 +719,7 @@ A Bantu function call costs **1.78 µs** (btorch B1). `tree_hist` on a
 what Bantu can do per element. These five are not an optimisation; without them
 there is no GBDT.
 
-### 6.3 The binned matrix is an opaque handle, not an `NdArray`
+### 7.3 The binned matrix is an opaque handle, not an `NdArray`
 
 **A real blocker, found while writing this.** The binned matrix wants to be
 `u8` — one byte per cell. numba's `DType` is `{F64, I64, BOOL}`: there is no
@@ -551,7 +745,7 @@ entirely from the dtype roadmap.
 quantization, the handle can migrate to an `NdArray` behind the same API. It is
 not a dead end, just not a dependency.
 
-### 6.4 Objectives
+### 7.4 Objectives
 
 Gradients and hessians are pure Bantu over `nd_*` — one vectorised call per
 boosting iteration.
@@ -570,7 +764,7 @@ deliberately.
 
 ---
 
-## 7. Data input: arrays, with arctic as an adapter
+## 8. Data input: arrays, with arctic as an adapter
 
 Resolves open question 4 in the ecosystem doc.
 
@@ -587,7 +781,7 @@ arrays would pay for a column store they do not use, and every algorithm would
 carry two code paths — the condition that B18 avoided in btorch by composing
 convolution out of im2col and matmul rather than writing a second path.
 
-### 7.1 Missing values in the GBDT
+### 8.1 Missing values in the GBDT
 
 `NaN` goes to a dedicated bin, and each split learns a default direction (the
 side with the higher gain) which is also used for unseen `NaN` at predict time.
@@ -596,7 +790,7 @@ first is both lossy and a different model.
 
 ---
 
-## 8. Persistence
+## 9. Persistence
 
 `.btsd` with `kind: "bkit.estimator"` ([C3]). One container, one SHA-256, one
 set of twelve load-failure messages — already written for btorch, not rewritten
@@ -614,7 +808,7 @@ memory.
 
 ---
 
-## 9. Gates
+## 10. Gates
 
 Six tiers, as every phase in this project. Gradcheck does not apply (no
 autograd here); its slot is taken by **differential testing against published
@@ -633,7 +827,7 @@ Tier 3 is new to this project and exists because a protocol with eleven
 implementers fragments silently. It enumerates the estimators and asserts the
 contract on each, so a new estimator that forgets `clone()` fails immediately.
 
-### 9.1 The accuracy gates
+### 10.1 The accuracy gates
 
 Public datasets, fetched and SHA-256 verified, never committed — the method
 btorch's `get_mnist.sh` established (B25).
@@ -652,7 +846,7 @@ measured from a reloaded `.btsd` model, not from memory.
 
 ---
 
-## 10. What is deliberately out
+## 11. What is deliberately out
 
 | item | why |
 |---|---|
@@ -665,7 +859,7 @@ measured from a reloaded `.btsd` model, not from memory.
 
 ---
 
-## 11. Open items
+## 12. Open items
 
 | # | item | settled by |
 |---|---|---|

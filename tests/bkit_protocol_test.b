@@ -31,6 +31,7 @@ include "../numba/numba.b" as np;
 include "../bkit/base.b"       as base;
 include "../bkit/preprocess.b" as pre;
 include "../bkit/selection.b"  as sel;
+include "../bkit/linear.b"     as lin;
 
 $R = {"pass": 0, "fail": 0};
 def ok($c, $n) {
@@ -47,10 +48,12 @@ print("");
 print("  bkit protocol conformance — every estimator in the package");
 print("  ════════════════════════════════════════");
 
-// A double, because `GridSearchCV` needs something SCORABLE to wrap and the
-// package has no real regressor until K5. A grid search over a transformer
-// cannot work at all -- there is no score to compare candidates by -- so this
-// is not a convenience, it is the only shape the entry can take today.
+// K5 brought real regressors and classifiers, so the searches below are
+// exercised over `lin.Ridge` rather than over a double. This one is kept for a
+// different job: it is the simplest possible conforming estimator, so if it
+// ever fails the protocol check the fault is in the check or in `base.b` and
+// not in a model's arithmetic. A suite of only complex subjects cannot tell
+// those apart.
 class _ConstRegressor extends Estimator {
     def init($bias) {
         super();
@@ -84,6 +87,10 @@ $yc = nd_random_uniform([20], 0.0, 1.0);
 // Distinct by construction, so no cross-validation fold can have a constant
 // target -- base.b's score() rightly refuses an R2 of 0/0 for one.
 $yd = nd_astype(nd_arange(0, 20, null), "f64");
+// A binary and a 3-class label vector, built rather than drawn so every class
+// has enough members for the classifiers and for a 4-fold split.
+$yb = nd_astype(nd_mod(nd_arange(0, 20, null), 2, null), "f64");
+$y3 = nd_astype(nd_mod(nd_arange(0, 20, null), 3, null), "f64");
 // Categorical: small integers, repeated, so nd_unique finds real categories.
 $Xk = nd_astype(nd_random_int([20, 3], 0, 4), "f64");
 // One label column, for LabelEncoder.
@@ -122,11 +129,28 @@ $registry = [
     ["GridSearchCV",       sel.GridSearchCV(ConstRegressor(0.0),
                                {"bias": [0.0, 1.0]}, sel.KFold(4, false)), $Xc, $yd],
     ["RandomizedSearchCV", sel.RandomizedSearchCV(ConstRegressor(0.0),
-                               {"bias": [0.0, 1.0, 2.0]}, 2, sel.KFold(4, false)), $Xc, $yd]
+                               {"bias": [0.0, 1.0, 2.0]}, 2, sel.KFold(4, false)), $Xc, $yd],
+    // K5's models -- the first entries with a right answer of their own
+    ["LinearRegression",   lin.LinearRegression(null),                $Xc, $yd],
+    ["LinearRegression(0)", lin.LinearRegression(false),              $Xc, $yd],
+    ["Ridge",              lin.Ridge(1.0, null),                      $Xc, $yd],
+    ["ElasticNet",         lin.ElasticNet(0.1, 0.5, null, null, null), $Xc, $yd],
+    ["Lasso",              lin.Lasso(0.1, null, null, null),           $Xc, $yd],
+    ["SGDRegressor",       lin.SGDRegressor(null, null, 30, null, null, null), $Xc, $yd],
+    ["LogisticRegression", lin.LogisticRegression(null, null, 30, null), $Xc, $yb],
+    ["LogisticRegression(3)", lin.LogisticRegression(null, null, 30, null), $Xc, $y3],
+    ["SGDClassifier",      lin.SGDClassifier(null, null, 30, null, null, null), $Xc, $yb],
+    // and a search over a REAL model, where the winner is knowable
+    ["GridSearchCV(Ridge)", sel.GridSearchCV(lin.Ridge(1.0, null),
+                               {"alpha": [0.01, 1.0]}, sel.KFold(4, false)), $Xc, $yd]
 ];
 
 print("");
 print("-- the contract, estimator by estimator --");
+// EXPECTED on stderr: the two SGD entries are given 30 epochs deliberately, to
+// keep this file fast, and they warn that the coefficients had not settled.
+// That is the K33 mechanism working, not a failure -- and it goes to stderr
+// precisely so it cannot be mistaken for this test's own output.
 $i = 0;
 while ($i < len($registry)) {
     $nm  = $registry[$i][0];
@@ -135,8 +159,8 @@ while ($i < len($registry)) {
     else { ok(false, $nm + " violates the protocol: " + str($bad)); }
     $i = $i + 1;
 }
-eqs(len($registry), 25,
-    "the registry names every estimator K2 and K3 added, in every mode");
+eqs(len($registry), 35,
+    "the registry names every estimator K2-K5 added, in every mode");
 
 // ── the check can still fail ────────────────────────────────────────────────
 // A conformance suite that cannot fail proves nothing. `bkit_base_test.b` has

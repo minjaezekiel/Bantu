@@ -351,3 +351,102 @@ Classification, probability, regression and ranking metrics, 701 lines. Design:
   the **linear** gain convention, a different metric with the same name; the exponential gain
   scikit-learn defaults to gives 0.9488107, confirmed term by term. And a line count said 6 where
   eight lines have seven separators.
+
+## Phase K5 — `linear.b`
+
+Seven estimators, 798 lines. Design:
+[`../docs/bkit-architecture.md`](../docs/bkit-architecture.md) §6; decisions K31–K35.
+
+- **[feature]** `LinearRegression`, `Ridge`, `ElasticNet`, `Lasso`, `LogisticRegression`
+  (binary and multiclass), `SGDRegressor`, `SGDClassifier`. Each reports `coef_`, `intercept_`,
+  `n_iter_` and `converged_`; the classifiers add `decision_function` and `predict_proba`.
+- **[design]** **The Gram matrix is never formed, and the measurement is the argument** (K31). The
+  roadmap asked for "`solve` for well-conditioned"; on a degree-9 polynomial design over 60 points
+  the condition number of `X` is 2.6 × 10⁶ and of `XᵀX` is **6.9 × 10¹²**, and the normal equations
+  came out **a million times** less accurate — 2.8 × 10⁻³ against 1.2 × 10⁻⁹, a 0.3% coefficient
+  error with nothing in the output to show it. `lstsq` cost 41 ms against 7 ms on a 5000 × 60
+  problem, once per fit. Not made conditional either: deciding "is this well-conditioned" needs the
+  condition number, which costs an SVD — more than the `lstsq` it was avoiding.
+- **[design]** **`Ridge` is least squares on an augmented system** (K32): stack `√α` rows under the
+  design and zeros under the target. The Gram matrix is never formed, **the intercept is excluded by
+  construction** rather than by remembering to, and it explains what the penalty does numerically —
+  the added rows raise the smallest singular value to at least `√α`, so Ridge is *better*
+  conditioned than the fit it regularises, which is why a closed form is safe here and not in K31.
+- **[design]** **The iteration cap is audible, on stderr, and does not raise** (K33). Coordinate
+  descent that stops at `max_iter` returns coefficients that are *wrong*, not approximate. So
+  `converged_`/`n_iter_` are on the estimator **and** the cap warns through `eprint` — stderr, not
+  stdout, because a diagnostic a pipeline's output can swallow is one nobody reads. Raising was
+  rejected: hitting `max_iter` on hard data is normal, and an exception mid-cross-validation reports
+  nothing at all. A flag alone was rejected too — nobody checks a flag they do not know exists.
+- **[design]** **`LogisticRegression` is binary IRLS with multiclass one-vs-rest** (K34), and what
+  OvR costs is stated precisely: not *accuracy* — `argmax` over `k` fits agrees with a softmax fit
+  on the great majority of points — but **calibration**, since the `k` sigmoids do not sum to 1 and
+  `predict_proba` normalises them. The L2 penalty is not optional: on separable data the unpenalised
+  likelihood is maximised at infinite coefficients, so a test drives `C = 1e6` on perfectly
+  separable clouds and asserts the coefficients stay finite.
+- **[design]** **`SGD*` is mini-batch, and that is a different optimiser from scikit-learn's**
+  (K35). True per-sample SGD is `n` interpreter iterations an epoch at ~1 µs a step. The honest
+  consequence is stated — the optimisation path differs, so the coefficients differ — and what is
+  asserted instead is the property that matters: `SGDRegressor` reaches `LinearRegression`'s
+  closed-form coefficients to **8.8 × 10⁻⁹**. An optimiser is correct when it finds what the closed
+  form already knows.
+- **[bug fix]** **`Lasso` was applying no L1 penalty at all, and reporting a clean convergence.**
+  `_Lasso.init` replaced `params_` with a dict that omitted `l1_ratio`, so `fit` read **null** — and
+  in Bantu `alpha * null` is **0**, silently. Lasso therefore ran as pure L2 and produced **zero**
+  sparsity where `ElasticNet(α, 1.0)` zeroed 8 of 10 coefficients. Fixed by reading the ratio
+  through an overridable `_rho()`, **and** by validating that `alpha` and `l1_ratio` are numbers, so
+  the whole class of "missing key plus null-as-zero arithmetic" becomes an error with a message
+  instead of a plausible wrong answer. The test pins the equivalence `Lasso ≡ ElasticNet(α, 1)` to
+  1e-14 so it cannot come back.
+- **[perf]** **`SGDRegressor` now centres `X` and `y`** and recovers the intercept afterwards, like
+  `ElasticNet`. Writing the "intercept is not penalised" test found why it must: learning the
+  intercept by descent starts it at 0 and makes it travel to `mean(y)`, while the step decays as
+  `1/(1 + η₀·α·t)` — a strong penalty throttles exactly the parameter with furthest to go. Measured
+  at `α = 5` on a target centred at 50, the intercept reached **37.1** after 600 epochs and was
+  still climbing; centred, it lands at 49.979 against a mean of 49.978.
+- **[bug fix]** **The SGD step size was coupled to the penalty, and it throttled convergence**
+  (K36). The schedule was `η₀ / (1 + η₀·α·t)`, which is broken at *both* ends. At `α = 2` on a
+  90/10 classification the intercept read −0.754 after 400 epochs, **−0.938 after 4,000 and −1.046
+  after 20,000** — still moving, never reporting convergence — against the **−2.069** that IRLS
+  gives for the same objective. The optimiser was not slow; it was governed by the one parameter
+  that has nothing to do with step length. At `α = 0` it never decayed at all. Centring `X` and `y`
+  hid this for the regressor's *intercept* by computing it in closed form, but the coefficients and
+  the whole of `SGDClassifier` were still throttled.
+
+  `learning_rate` is now explicit — `"invscaling"` (default, `η₀/(1+t)^power_t`), `"constant"`,
+  `"optimal"` — and the default depends only on `t`. The same `α = 2` fit reaches **−2.031 in 400
+  epochs**. `"optimal"` is the old rule, kept rather than deleted because it is correct for a
+  strongly convex objective and is scikit-learn's name for it; it now requires `α > 0`.
+- **[design]** **`invscaling` over `constant` was settled by measurement, not taste.** Noiseless
+  target: constant 8.4e-9 at 175 epochs, invscaling 6.1e-4 at 400 but **9.7e-11 at 2,000** — slower
+  early, *not* capped. Noisy target (σ = 0.5): constant 7.8e-3, invscaling **2.1e-3**, nearly four
+  times closer, because the decay is what lets the iterate settle instead of bouncing around the
+  optimum. Real targets are noisy. The usual robustness argument for decay was also tested and
+  **does not hold here** — neither schedule diverged at `η₀ = 5` — so it is not claimed.
+- **[test]** `tests/bkit_linear_test.b` — **135 assertions**, tiers 1–4. Differential against closed
+  forms throughout: exact coefficient recovery on noiseless data, Ridge's augmented form against the
+  textbook `(XᵀX + αP)` solve to 1e-9, and the K31 gate asserting **both** that `lstsq` stays under
+  1e-6 *and* that the Gram route exceeds 1e-4 on the same data, so the decision is re-derived on
+  every run. Plus a cross-module check that `base.b`'s `score()` and `metrics.b`'s `r2_score` — two
+  independent implementations, since `base.b` deliberately does not delegate — agree to 1e-14.
+  Stress: 20,000 × 20 in 31 ms (LinearRegression), 30 ms (Ridge), 28 ms (Lasso) and 356 ms
+  (LogisticRegression, 11 IRLS iterations).
+- **[test]** **Twenty-three mutations, four of which initially passed** — and all three were properties
+  asserted in *shape* but not in *substance*:
+  * a **hard** threshold instead of a soft one kept the sparsity and lost the shrinkage, so every
+    assertion passed. The test now compares the surviving coefficients against least squares **on
+    the support Lasso selected** — L1 shrinks, it does not merely select.
+  * `ElasticNet` returning `mean(y)` as the intercept instead of `mean(y) − x̄·b` passed, because
+    nothing asserted the intercept against a known value. It now checks a target shifted by 100.
+  * penalising SGD's intercept passed, because `maxabs(coef)` says nothing about it. Asserting it
+    needed the **mechanism, not a metric**: with 90/10 classes the bug *raises* accuracy from 90.3%
+    to 96.7%, since the model then predicts the minority class at roughly its true rate instead of
+    never.
+  * hardcoding `power_t` passed, because the two fits being compared drew **different mini-batch
+    shuffles** from the global RNG — the assertion was measuring RNG variation, not the parameter.
+    It now re-seeds before each fit, with a companion assertion that the same seed and schedule
+    give bit-identical coefficients, which is what makes the comparison mean anything.
+- **[test]** `tests/bkit_protocol_test.b` grown to **49 assertions**: the registry carries the seven
+  real estimators and a `GridSearchCV` over `Ridge`, so the contract is checked against models with
+  a right answer of their own. The `ConstRegressor` double stays, with a new job — as the simplest
+  conforming estimator, it tells a fault in the *check* apart from a fault in a model's arithmetic.
