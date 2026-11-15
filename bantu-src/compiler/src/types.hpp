@@ -507,6 +507,7 @@ public:
             { "ct_",       "crypto (constant time)" },
             { "webpush_",  "Web Push"               },
             { "gc_",       "the collector"          },
+            { "tree_",     "bkit (decision trees)"  },
         };
         std::string msg = "Undefined variable: " + name;
         for (const auto& fam : kNativeFamilies) {

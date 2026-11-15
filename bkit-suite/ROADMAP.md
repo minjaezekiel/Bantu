@@ -229,24 +229,64 @@ and `"constant"` was settled by measurement: identical on clean data given the
 epochs, but invscaling is **nearly four times closer on a noisy target**, and
 real targets are noisy.
 
-## Phase K6 — `Pipeline` + `ColumnTransformer`
-`ColumnTransformer` is the only part of `bkit` that touches `arctic`
-([§4 of the design doc]).
+## Phase K6 — `Pipeline` + `ColumnTransformer` ✅
 
-## Phase K7 — `tree.b` and the `tree_` native family
+`ColumnTransformer` is the only part of `bkit` that touches `arctic`
+([§9 of the design doc]) — and it does so by **duck-typing**, not by including
+it, so `arctic` is an *optional* dependency and bkit works fully without it
+([K37]).
+
+| Item | Feature test | Status |
+|---|---|---|
+| `ColumnTransformer([[name, est, cols]], remainder)` | the composition equals the hand-written slice-and-concat to 1e-12, with the same column order | [x] exactness is the central gate; a merely plausible composition is the failure worth building against |
+| columns by index, by arctic name, or mixed | both resolve to integer positions against one materialised matrix before any transformer runs | [x] one code path after resolution, so the frame case cannot drift from the array case ([K37]) |
+| `remainder` = `drop` \| `passthrough` | the passthrough block is X's own columns in **ascending** index order | [x] |
+| `output_ranges()` / `n_features_out()` | `[name, start, stop)` per spec, so a one-hot block is attributable | [x] widths are *learned*, so both require a fit ([K41]) |
+| `"<name>__<param>"` in `set_params` | an unknown key raises; a grid search must not score a config it never tried | [x] same refusal as `Pipeline` ([K24]) |
+| deep `clone()` | fitting a clone leaves the original unfitted, and the column *list* is copied too | [x] lists are shared by reference in Bantu, so a shallow clone would leak |
+| a reordered frame at transform time | refused, naming both column lists | [x] the silent-wrong-answer case this exists to prevent ([K40]) |
+| **50-stage `Pipeline`** (deferred here from K1) | shape preserved, output still exactly standardised, `set_params` reaches the fiftieth step | [x] |
+
+**Gates, all green:** `tests/bkit_compose_test.b` (tiers 1, 2, 4),
+`tests/bkit_protocol_test.b` grown to **38 registry entries** with three
+`ColumnTransformer` modes — the protocol does not know it composes, which is the
+point of putting it there.
+
+**Not built, and why:** `make_pipeline` / `make_column_transformer` (sklearn's
+auto-naming conveniences). They would add surface without adding capability, and
+auto-generated step names make `"<step>__<param>"` addressing harder to predict,
+not easier. `FeatureUnion` is a `ColumnTransformer` whose every spec names all
+columns, so it is already expressible.
+
+## Phase K7 — `tree.b` and the `tree_` native family ✅
 
 The first native work in this package. Five kernels; the binned matrix is an
 **opaque handle**, not an `NdArray` ([K1] in DECISIONS).
 
 | Item | How | Feature test | Stress test | Status |
 |---|---|---|---|---|
-| `tree_bin` | quantile binning to ≤256 bins; `NaN` to a dedicated bin | bin edges match a reference quantile computation; constant column → 1 bin | 1M×100 binned, memory **= n×f bytes**, not 8× | [ ] |
-| `tree_hist` | the hot loop: byte load + 3 float adds per cell | histogram equals a pure-Bantu reference loop exactly | — | [ ] |
-| `tree_best_split` | regularised gain scan with a running prefix | best split matches a brute-force reference over all (feature, bin) | **hessian saturation drives `h→0`; must not produce a `NaN` gain that wins** | [ ] |
-| `tree_partition` | stable index partition | left ∪ right = parent, disjoint, order preserved | — | [ ] |
-| `tree_predict` | traversal | equals a Bantu reference traversal on every row | 10,000-node tree | [ ] |
-| `DecisionTreeClassifier`/`Regressor` | over the above | against scikit-learn reference values | depth-50 tree; single-sample leaves | [ ] |
-| **register `tree_` in `kNativeFamilies`** | `types.hpp:499`, so an unbound `tree_*` self-diagnoses ([B21]) | an unbound name names the family | — | [ ] |
+| `tree_bin` | bins from the **sorted distinct** values, ≤256; `NaN` to a dedicated bin, the highest | 7 distinct → 7 bins, constant → 1 bin, `NaN` → highest; binning is monotone | 200000×50 binned is **exactly 10,000,000 bytes** = n×f, not 8× | [x] ([K47]) |
+| `tree_hist` | the hot loop: byte load + 3 float adds per cell | **bit-identical** to a pure-Bantu triple loop over the same bins, not merely close | 10M cells | [x] |
+| `tree_best_split` | regularised gain scan, a running prefix, **two passes per feature** for the NaN direction | matches a brute-force Bantu reference over all (feature, bin); the chosen cut equals the argmax of a hand-computed **Gini** table, ratio 4.0 | **`h→0` with `λ=0` must not win — the danger is `+inf`, not `NaN`** | [x] ([K44], [K45]) |
+| `tree_partition` | stable index partition; `bin = -1` is the missing-vs-present split | left ∪ right = parent, disjoint, order preserved, every left row's bin ≤ the cut | — | [x] |
+| `tree_predict` | traversal over `[n_nodes, 7]`, **raw-value thresholds** | leaf values and `NaN` routing per node; malformed trees refused, cycles raise | large node array | [x] ([K46]) |
+| `DecisionTreeClassifier`/`Regressor` | over the above, `g = −y`, `h = 1` | the gain **is** variance reduction and **is proportional to Gini**, both asserted; leaf = mean; `λ` shrinks it | depth-50 on 600 distinct rows; single-sample leaves | [x] ([K42]) |
+| **register `tree_` in `kNativeFamilies`** | `types.hpp`, so an unbound `tree_*` self-diagnoses ([B21]) | an unbound name names the family | — | [x] |
+
+**Where the kernels live.** Their own file (`tree_native.hpp`), their own prefix,
+their own registration function — but **numba's translation unit**. Every kernel
+reads an `NdArray`'s raw storage; crossing the deliberately narrow
+`ndarray_api.hpp` wall would mean exporting X as a flat `std::vector<double>`,
+which for 1M×100 is **800 MB of copy** to feed kernels whose entire purpose is to
+replace those doubles with one byte per cell. Sharing the TU also gets them the
+`-O3 -ftree-vectorize` that `ndarray_native.cpp` alone is built with — which the
+histogram loop is the reason for. The family is separate; the compilation unit is
+shared, for a measured reason.
+
+**Not done, and recorded rather than faked:** true multiclass Gini needs the gain
+summed over K histograms *before* the argmax, i.e. a `tree_best_split` that takes
+a list. Multiclass is one-vs-rest here, which is a real difference from
+scikit-learn and is documented as one ([K43]). The list form is a K8 item.
 
 ## Phase K8 — `ensemble.b` — **the headline**
 
@@ -267,7 +307,8 @@ rather than reimplemented.
 
 ## Phase K10 — `neighbors.b`
 kNN classifier/regressor, Gaussian/Multinomial/Bernoulli naive Bayes, linear
-SVM. Full SMO is an open item ([§8.4 of the design doc]).
+SVM. Full SMO is an open item (§13 of the design doc, item 4 — the
+reference used to point at §8.4, which has never existed).
 
 ## Phase K11 — `persist.b`
 `.btsd` with `kind: "bkit.estimator"` ([C3]). **A loaded model predicts
@@ -294,12 +335,30 @@ Datasets fetched and SHA-256 verified, **never committed** — the method
 
 ## Where to resume
 
-**K0–K5 are done; K6 (`Pipeline` + `ColumnTransformer`) is next.** `base.b` is
-391 lines, `preprocess.b` 1,011, `selection.b` 926, `metrics.b` 701 and
-`linear.b` 798; `tests/bkit_base_test.b` is 53 assertions,
-`tests/bkit_preprocess_test.b` 174, `tests/bkit_selection_test.b` 117,
-`tests/bkit_metrics_test.b` 123, `tests/bkit_linear_test.b` 127 and
-`tests/bkit_protocol_test.b` 49 — all green. Read
+**K0–K7 are done; K8 (`ensemble.b` — the GBDT headline) is next.** It inherits
+a split finder that has already been checked against an independent criterion
+([K42]), so the new work is the boosting loop, histogram subtraction, the four
+objectives and early stopping — not split finding.
+
+**Two things K8 should not rediscover:**
+1. **True multiclass Gini needs `tree_best_split` to take a LIST of
+   histograms**, summing the gain over K before the argmax. K7's multiclass is
+   one-vs-rest, which is documented as a real difference from scikit-learn
+   ([K43]) rather than claimed as a match.
+2. **Histogram subtraction has no test yet** — a child's histogram is its
+   parent's minus its sibling's, and that is the single largest optimisation in
+   the algorithm. The assertion it needs is that the subtracted histogram is
+   **bit-identical** to one built directly from the child's index set, which
+   [K48] is the argument for: a reference computed from the same intermediate
+   structure as the code shares the code's errors.
+
+`base.b` is 391 lines, `preprocess.b` 1,011, `selection.b` 927, `metrics.b` 695,
+`linear.b` 857, `compose.b` 512 and `tree.b` 444, over the `tree_` family in
+`bantu-src/compiler/src/tree_native.hpp`; `tests/bkit_base_test.b` is 53
+assertions, `tests/bkit_preprocess_test.b` 174, `tests/bkit_selection_test.b`
+117, `tests/bkit_metrics_test.b` 123, `tests/bkit_linear_test.b` 135,
+`tests/bkit_compose_test.b` 77, `tests/bkit_tree_test.b` 118 and
+`tests/bkit_protocol_test.b` 42 registry entries — all green. Read
 [`../docs/bkit-architecture.md`](../docs/bkit-architecture.md) first, then
 [`DECISIONS.md`](DECISIONS.md).
 

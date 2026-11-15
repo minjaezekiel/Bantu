@@ -32,6 +32,8 @@ include "../bkit/base.b"       as base;
 include "../bkit/preprocess.b" as pre;
 include "../bkit/selection.b"  as sel;
 include "../bkit/linear.b"     as lin;
+include "../bkit/compose.b"    as compose;
+include "../bkit/tree.b"       as tree;
 
 $R = {"pass": 0, "fail": 0};
 def ok($c, $n) {
@@ -142,7 +144,30 @@ $registry = [
     ["SGDClassifier",      lin.SGDClassifier(null, null, 30, null, null, null), $Xc, $yb],
     // and a search over a REAL model, where the winner is knowable
     ["GridSearchCV(Ridge)", sel.GridSearchCV(lin.Ridge(1.0, null),
-                               {"alpha": [0.01, 1.0]}, sel.KFold(4, false)), $Xc, $yd]
+                               {"alpha": [0.01, 1.0]}, sel.KFold(4, false)), $Xc, $yd],
+    // K6. A ColumnTransformer is an estimator like any other, and the whole
+    // point of putting it here is that the protocol does not know it composes.
+    ["ColumnTransformer",  compose.ColumnTransformer(
+                               [["sc", pre.StandardScaler(null, null), [0, 1]]],
+                               null),                                $Xc, $yc],
+    ["ColumnTransformer(pass)", compose.ColumnTransformer(
+                               [["mx", pre.MaxAbsScaler(), [0]]],
+                               "passthrough"),                       $Xc, $yc],
+    ["ColumnTransformer(2 specs)", compose.ColumnTransformer(
+                               [["sc", pre.StandardScaler(null, null), [0]],
+                                ["bn", pre.Binarizer(0.0),            [1]]],
+                               null),                                $Xc, $yc],
+    // K7. The first estimators backed by native kernels, so the protocol is
+    // also checking that a `tree_*` handle survives clone/get_params/set_params
+    // without the contract knowing a handle exists.
+    ["DecisionTreeRegressor",  tree.DecisionTreeRegressor(3, 1, null, null, null, null),
+                                                                     $Xc, $yc],
+    ["DecisionTreeRegressor(lam)", tree.DecisionTreeRegressor(2, 2, 16, 1.0, 0.0, 0.0),
+                                                                     $Xc, $yc],
+    ["DecisionTreeClassifier", tree.DecisionTreeClassifier(3, 1, null, null, null, null),
+                                                                     $Xc, $yd],
+    ["DecisionTreeClassifier(shallow)", tree.DecisionTreeClassifier(1, 1, 8, null, null, null),
+                                                                     $Xc, $yd]
 ];
 
 print("");
@@ -159,8 +184,8 @@ while ($i < len($registry)) {
     else { ok(false, $nm + " violates the protocol: " + str($bad)); }
     $i = $i + 1;
 }
-eqs(len($registry), 35,
-    "the registry names every estimator K2-K5 added, in every mode");
+eqs(len($registry), 42,
+    "the registry names every estimator K2-K7 added, in every mode");
 
 // ── the check can still fail ────────────────────────────────────────────────
 // A conformance suite that cannot fail proves nothing. `bkit_base_test.b` has

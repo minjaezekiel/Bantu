@@ -784,3 +784,431 @@ different mini-batch shuffles from the global RNG — it was measuring RNG
 variation, not the parameter. The comparison now re-seeds before each fit, and
 a companion assertion checks that the same seed and schedule give bit-identical
 coefficients, which is what makes the comparison mean anything.
+
+---
+
+### K37 — `ColumnTransformer` lives in `compose.b`, not `base.b`
+
+`Pipeline` is in `base.b` because the protocol harness needs it and it depends
+on nothing but the contract. `ColumnTransformer` is the **only** part of bkit
+that knows `arctic` exists (design doc §8), and `base.b` is what `btext`
+imports for the contract alone.
+
+Putting them together would make importing the estimator protocol drag a
+dataframe package behind it. So composition splits by dependency, not by
+subject matter.
+
+**And `compose.b` does not `include` arctic either.** It duck-types: a frame is
+an instance carrying `names`, `cols` and `ncols`. Reading an undefined field on
+an instance yields null rather than raising, which is the same mechanism
+btorch's `is_dataset` uses. `arctic` is therefore an **optional** dependency in
+`package.json` — bkit works fully without it, and only the by-name column path
+needs it.
+
+**Rejected: a marker field added to arctic's `DataFrame`.** It is the cleaner
+test, and btorch does exactly that with `__bt_module`. But this is the only
+consumer in the ecosystem, and asking another package to carry a flag for one
+consumer inverts the dependency the rest of this decision is about. If a second
+consumer appears, the marker becomes right.
+
+---
+
+### K38 — blocks are concatenated in SPEC order, not column order
+
+A caller can predict spec order. They cannot predict column order, because a
+`OneHotEncoder` on one input column can emit any number of outputs — so
+"sorted by first input column" would still leave them unable to say where
+feature 37 came from.
+
+Hence `output_ranges()`, which returns `[name, start, stop)` per spec plus the
+remainder. It is not decoration: a 40-column one-hot block is otherwise
+unattributable, and *"which input produced feature 37"* is the first question
+anyone asks of a fitted composition. The test asserts the ranges, not just the
+total width.
+
+---
+
+### K39 — a column may feed two transformers; the same column twice in one spec may not
+
+Across specs it is legal and useful — a column can be both scaled and binarised
+(sklearn allows this too). Within one spec it would transform the column twice
+and silently widen that block by one, which no caller ever means. So the
+duplicate check is **per spec**, at fit, where the indices are resolved.
+
+`remainder` is computed from the union of all specs' columns, so a column used
+twice is still "used" once for that purpose, and the passthrough block is
+emitted in **ascending index order** — X's own order, not the order a dict
+iteration happened to produce.
+
+---
+
+### K40 — a reordered frame is refused at transform, not silently mistransformed
+
+Column names resolve to **positions** at fit time, which is what makes the array
+and frame paths one code path after resolution. The consequence is that a frame
+whose columns were reordered between `fit` and `transform` would resolve the
+same names to different positions and transform the wrong data — with the right
+shape and plausible numbers.
+
+So `transform` records and compares the fitted column *names*, not just the
+count. This is the K-series' recurring criterion: the failure worth building
+machinery against is the one that produces a wrong answer looking like a right
+one.
+
+A width change between fit and transform is caught for the same reason — a
+block that emits a different number of columns would shift every later block's
+meaning, so it is reported with both widths and the offending spec's name
+rather than producing a misaligned matrix.
+
+---
+
+### K41 — `fit` is `fit_transform`, and `fit` is the one that delegates
+
+Fitting a composition already computes every block, so `fit` followed by
+`transform` would do all of the work twice. `fit_transform` is the real
+implementation and `fit` calls it, discarding the result — the opposite of the
+base class's default, and deliberate.
+
+The cost is one wasted concatenation when a caller only wanted `fit`. The
+alternative is running every sub-transformer's `fit_transform` and then its
+`transform` again, which for a 20-spec composition over 5000 rows is measurably
+worse and, more importantly, would let a stateful transformer see the data twice
+per fit.
+
+**Also why `n_features_out()` and `output_ranges()` require a fit:** the widths
+are *learned*, not declared. A `OneHotEncoder`'s width is a property of the
+data, so there is no honest answer before fitting, and returning a guess would
+be worse than raising.
+
+---
+
+### K42 — one criterion serves both trees, because the gain IS Gini (up to a factor)
+
+Both `DecisionTreeRegressor` and `DecisionTreeClassifier` set `g = -y`, `h = 1`
+and use the regularised gradient-boosting gain
+
+    gain = ½[ G_L²/(H_L+λ) + G_R²/(H_R+λ) − G²/(H+λ) ] − γ
+
+which is also exactly what K8's booster will use. That is not a compromise in
+either direction:
+
+**Regression — it is variance reduction.** With `g = −y`, `h = 1`, `λ = 0`:
+`G = −Σy`, `H = n`, so `G²/H = n·ȳ²` and the gain is
+`½[n_L ȳ_L² + n_R ȳ_R² − n ȳ²]` — scikit-learn's `squared_error` criterion
+times ½. The leaf value `−G/(H+λ)` is `Σy/(n+λ)`, the mean at `λ = 0`.
+
+**Binary classification — it is proportional to Gini decrease.** With
+`y ∈ {0,1}` and `p = Σy/n` the same expression is `½[n_L p_L² + n_R p_R² − n p²]`.
+Expanding the weighted Gini decrease and using `n_L p_L + n_R p_R = n p`:
+
+    Σ n_m·Gini_m decrease = 2[n_L p_L² + n_R p_R² − n p²] = 4 × gain
+
+A positive constant, so **the argmax is identical** — this picks the split
+`criterion="gini"` picks, and the leaf value is the positive-class proportion,
+i.e. the probability.
+
+**The test computes the Gini table by hand** from counts, with no reference to
+the gain formula, asserts the kernel picks the same cut, and asserts the ratio
+is 4.0 to 1e-9. A derivation on paper is not evidence that the code implements
+it.
+
+**λ defaults to 0 for a tree**, not the booster's 1: a decision tree is
+expected to report its leaf's mean, and `λ > 0` shrinks it toward zero. The
+test pins that too — `Σy/(n+λ) = 12/6 = 2` against a mean of 4.
+
+---
+
+### K43 — multiclass is one-vs-rest, and that is a real difference from sklearn
+
+scikit-learn grows ONE tree whose leaves hold a K-way distribution. This grows
+K trees and takes the argmax. The predictions differ, and the documentation says
+so rather than claiming a match.
+
+It is the consistent choice here because the ecosystem's own GBDT design already
+uses one tree per class per round (design doc §8.4), so multiclass boosting and
+multiclass trees share a shape.
+
+**What it would take to do it properly:** multiclass Gini is the per-class gain
+*summed over K histograms before the argmax*, which needs a `tree_best_split`
+that takes a list of histograms rather than one. That is a small kernel
+extension and it is recorded as a **K8 item** — not faked here by averaging
+one-vs-rest gains, which is a different criterion wearing the right name.
+
+One-vs-rest scores do not sum to 1, so `predict_proba` normalises them. A row
+where every tree says "not mine" would divide by zero, so it falls back to
+uniform rather than returning `NaN`.
+
+---
+
+### K44 — the NaN direction is learned, and the scan and the partition agreed only after this was fixed
+
+The NaN bin is the **highest** bin index per feature, so a plain prefix scan
+leaves it in the right child for every cut — a fixed policy masquerading as an
+algorithm. Worse, `tree_partition` was first written with `nan_left` defaulting
+to *true*, so the partition would have sent missing rows the opposite way from
+the scan that chose the split. The tree's own splits would not have reproduced
+their own gains.
+
+**Found by writing the design comment**, before any of it ran: the two defaults
+were in the same file and disagreed.
+
+Fixed properly rather than by matching the defaults: `tree_best_split` scans
+each feature **twice**, once with the NaN bin's `(G,H,n)` added to the left
+accumulator and once without, and returns `nan_left` alongside the split. This
+is XGBoost's sparsity-aware behaviour, and it matters — imputing to the mean
+first is both lossy and a different model.
+
+The NaN-left pass also admits `bin = -1`, the cut with no value bins on the
+left: the **missing-vs-present** split. `tree_partition` therefore accepts
+`bin >= -1`, and its `nan_left` defaults to *false* (matching the scan's first
+pass) rather than true.
+
+The grower asserts that neither child came back empty. The guards should make
+that unreachable; it is checked anyway, because an empty child's histogram is
+all zeros and its leaf value is `0/λ` — a plausible-looking number from a node
+that represents nothing.
+
+---
+
+### K45 — the hessian guard skips before the division, not after it
+
+A saturated logistic gives `h → 0`, so with `λ = 0` the term `G²/(H+λ)` divides
+by zero.
+
+The tempting reasoning is that this is self-correcting: a `NaN` gain loses every
+`>` comparison, so a `NaN` split can never win. That is true and it is not the
+risk. **An infinite gain wins every comparison**, and `G²/0` with `G ≠ 0` is
+`+inf`, not `NaN` — so the split scan would pick a child with no weight in it,
+with maximum confidence.
+
+So a child whose `H + λ` is not strictly positive is skipped **before** the
+division. Written as `!(H + λ > 0.0)` rather than `H + λ <= 0.0` so a `NaN`
+total is also caught.
+
+The test drives it deliberately: every hessian zero with `λ = 0` must return
+`feature = -1` and gain `0`, the *same* histogram with `λ = 1` must split
+normally (proving the guard is about `H + λ` and not about refusing the data),
+and one zero-hessian row among healthy ones must not produce an infinite gain.
+
+---
+
+### K46 — thresholds are raw values, so a fitted tree is one matrix
+
+`tree_predict` takes `(nodes, X)` and nothing else. The design doc's sketch had
+`(nodes, X, edges)`, with bin indices as thresholds; storing the bin's upper
+**edge** as a raw value instead removes the edge table from prediction
+entirely.
+
+Consequences, all of them good:
+
+- A fitted tree is one `[n_nodes, 7]` f64 matrix — `(is_leaf, feature,
+  threshold, left, right, value, nan_left)`. K11's save/load is then trivial,
+  and the binned handle is purely a *training* structure.
+- Prediction is exact on values the training set never contained, where a bin
+  lookup would have to extrapolate.
+- The `-∞` threshold expresses the missing-vs-present split with no special
+  case in the traversal: no present value satisfies `x <= -∞`.
+
+`-∞` has to be built through the array path — Bantu raises on scalar division by
+zero, while `nd_log(0.0)` on an array is `-inf`.
+
+**Every node is validated once, before the row loop**, not per sample: a child
+index outside the tree, a self-child, or a split on a feature `X` does not have
+would otherwise be a per-row bounds check in the hot path, or a segfault. The
+traversal is also bounded by the node count, so a cycle raises instead of
+hanging — the four-minute hang in K2 is the precedent for not trusting a loop
+to terminate because its data "should" be acyclic.
+
+---
+
+### K47 — the opaque binned matrix gets accessors, for the tests
+
+[K1] made the binned matrix an opaque handle to get one byte per cell. The
+consequence nobody wrote down is that an opaque structure with no window is a
+structure whose contents are asserted by hope.
+
+So `tree_bin_shape`, `tree_bin_nbins`, `tree_bin_edges`, `tree_bin_at` and
+`tree_bin_bytes` exist **for the tests, not for callers** — and they are what
+make the suite possible at all:
+
+- `tree_bin_at` lets the reference histogram be computed in Bantu from the same
+  bins the kernel used, so `tree_hist` is checked against something that is not
+  itself.
+- `tree_bin_bytes` asserts the K1 claim directly: 200000×50 is **10,000,000
+  bytes**, not 80,000,000.
+- `tree_bin_nbins` is how the test knows a 7-distinct-value column got 7 bins
+  and a constant column got 1.
+
+Bins are taken from the **sorted distinct** values, not from quantiles of the
+raw array: a low-cardinality integer column then gets its own cardinality in
+bins rather than 256 mostly-empty ones, and a constant column gets exactly one.
+Quantiles of the raw array would place several edges between the same pair of
+values, producing empty bins that every later scan still has to walk.
+
+---
+
+### K48 — the bin assignment was off by one, and the GAIN was still right
+
+`tree_bin` assigned bins with `std::upper_bound`. The contract is *"bin b holds
+values ≤ edges[b]"*, i.e. `bin(x) = min{b : edges[b] ≥ x}` — which is
+`lower_bound`. `upper_bound` finds the first edge **strictly greater** than `x`,
+so a value sitting exactly on its own edge was pushed one bin to the right.
+
+Measured on 8 distinct values `0..7` with 8 bins and edges `[0,1,2,3,4,5,6]`:
+
+    bin per row: [1, 2, 3, 4, 5, 6, 7, 7]      (wrong)
+    bin per row: [0, 1, 2, 3, 4, 5, 6, 7]      (fixed)
+
+Bin 0 was empty and the top two values were collapsed into one bin.
+
+**What makes this worth a decision entry is what did *not* fail.** The split's
+*gain* was correct — `tree_best_split` reported `0.5625`, exactly the Gini
+argmax's `2.25 / 4`, because the same row partition was still reachable one bin
+over. So:
+
+- the brute-force reference agreed (it reads the same histogram);
+- the "Gini decrease = 4 × gain" assertion **passed**;
+- `tree_hist` against its Bantu reference **passed** (same bins both sides);
+- only the independently computed **bin index** disagreed.
+
+And the bin index is what `_threshold` looks up, so `edges[bin]` was one row
+wide: the depth-1 regressor put five rows in a leaf that should have held four,
+and failed its exactness assertion by 4.0.
+
+**The lesson for the rest of the `tree_` family.** A test that asks "is the
+gain right" cannot see this class of fault, because the gain is computed from
+the histogram and the histogram is computed from the same wrong bins — both
+sides of that comparison share the error. What caught it was asserting the
+*index* against a value derived with no reference to the kernel at all (a Gini
+table computed from counts). Every kernel in this family now has at least one
+assertion of that kind, and K47's accessors exist to make them possible.
+
+---
+
+### K49 — `get_params()` must not return a key `set_params()` refuses
+
+`ColumnTransformer.get_params()` returned `n_transformers` alongside
+`remainder`, and `set_params()` accepted only `remainder`. The protocol test
+found it immediately — `protocol_check` takes the **first** key `get_params()`
+returns and feeds it straight back into `set_params()`, which is the invariant
+`GridSearchCV` depends on: a search addresses a parameter by the name
+`get_params` gave it.
+
+Three ways out, and the choice matters:
+
+| | verdict |
+|---|---|
+| accept `n_transformers` in `set_params` and apply it | impossible — the count is the length of the spec list |
+| accept it and ignore it | **worse than the bug.** `set_params({"n_transformers": 5})` would succeed and change nothing, which is exactly the silent failure [K24] exists to prevent |
+| **stop exposing it as a parameter** | **chosen** — it is derived structure, not a hyperparameter |
+
+So it is a method, `n_transformers()`, and `get_params()` returns `remainder`
+plus the `"<name>__<param>"` keys. Everything `get_params` offers is now
+settable.
+
+**`Pipeline` keeps `n_steps`** and its `set_params` accepts it, which is the
+same shape and is left alone: it is a shipped surface, and setting it is
+harmless because `get_params` recomputes the value from `len(this.steps)` on
+every call rather than reading it back. Noted here so the difference is a
+recorded decision rather than an inconsistency someone finds later.
+
+---
+
+### K50 — a malformed column list fails at construction, where it was written
+
+`ColumnTransformer.init` validated spec shape, names and estimators but left
+the **column list** to `_resolve` at fit time. The init comment already
+promised the opposite — *"a malformed spec should fail once, where the caller
+wrote it"* — and two tests written against that promise failed.
+
+An empty column list and a *literally* repeated index need no knowledge of X, so
+they are checked at construction. What still needs the width is caught at fit:
+on a 4-column X, `[0, -4]` is the same column written two ways. So there are two
+layers, each with its own message — and the fit-time check cannot be removed,
+because the construction-time one cannot see it.
+
+A grid search clones and refits many times; a malformed spec should raise once,
+at the line that wrote it, not once per fold.
+
+---
+
+### K51 — `n_nodes()` reported a third of a 3-class model's size
+
+A multiclass `DecisionTreeClassifier` holds K node arrays in `trees_`, and
+`nodes_` was aliased to `trees_[0]` so that `_TreeBase`'s accessors had
+something to return. `n_nodes()` read `np.shape(this.nodes_)[0]` — so a 3-class
+model reported **one third of its own size**.
+
+That is a wrong number rather than a missing one, which is the category this
+package keeps finding and the reason the fix is recorded rather than quietly
+applied:
+
+- `n_nodes()` now sums over every tree.
+- `nodes($which)` takes a tree index instead of pretending there is one, and
+  refuses an out-of-range one by naming how many there are.
+- `n_trees()` says how many: 1 for a regressor or a binary classifier, K for
+  one-vs-rest.
+
+`trees_` is also initialised to `null` in `_TreeBase.init` rather than only on
+the classifier. Reading an undefined field on an instance yields `null`, which
+would have made the `trees_ == null` test accidentally correct for the
+regressor — and relying on that is exactly the subtlety that makes
+`compose.b`'s duck-typing ([K37]) something to use deliberately and not by
+accident.
+
+---
+
+### K52 — a mutation that is "caught by crashing" is caught, and is still worse
+
+The `tree_` mutation battery broke `tree_hist`'s count channel (`cell[2] += 1.0`
+→ `+= 0.0`). The suite did not report a failure — it **aborted**, with no
+`PASS:` line at all. The battery scored that as caught, correctly: a suite that
+does not print green is red.
+
+But an uncaught throw ends the run, so every assertion after it is never
+evaluated. For the battery that is harmless; for diagnosing a real regression it
+is the K2 problem again — *"a throwing assertion aborted the whole preprocess
+suite, hiding 40 assertions"* — which is why `safe_ok` exists. `bkit_tree_test.b`
+has `safe_ok` but uses it in only two places, so most of its estimator section
+is one throw away from hiding the rest.
+
+**Recorded rather than fixed now**, deliberately: converting the suite wholesale
+is a mechanical change to a file the battery is currently reading, and doing it
+mid-battery would invalidate the remaining results. The improvement is to wrap
+every estimator-level assertion in `safe_ok`, so a throw is attributed to the
+assertion that caused it and the rest still run.
+
+**What it already tells us about the kernel**, though, is useful: zeroing the
+count channel makes `min_data` unsatisfiable for every cut, so no split is ever
+found — and something downstream then threw rather than degrading. A grower that
+cannot split should produce a single-leaf tree, not an exception. Worth checking
+which guard fired once the battery is done; the candidates are the empty-child
+assertion and `_threshold`'s "no bin edges" refusal, both of which are supposed
+to be unreachable.
+
+---
+
+### K53 — the `tree_` battery so far: 3 of 3, and two of them by crashing
+
+The first `tree_` mutation battery was interrupted part-way (the work was
+committed at that point and the remainder re-run afterwards), so this records
+what it had established:
+
+| mutation | result |
+|---|---|
+| `tree_bin` back to `upper_bound` — i.e. [K48] reintroduced | **caught**, 4 assertions red |
+| `tree_hist` drops the count channel (`cell[2] += 0.0`) | **caught**, by abort |
+| `tree_hist` swaps the gradient and hessian channels | **caught**, by abort |
+
+T1 is the one that matters most: it proves the off-by-one that shipped and was
+fixed is now *gated*, so it cannot come back silently. The assertion that
+catches it is the bin-index comparison against an independently computed Gini
+argmax — exactly the one [K48] argues for.
+
+T2 and T3 were caught by **aborting** rather than failing cleanly, which is
+[K52]: `bkit_tree_test.b` needs `safe_ok` around its estimator section so a
+throw is attributed instead of ending the run. Both also point at the same
+unanswered question — a grower that can find no split should produce a
+single-leaf tree, not an exception — and the guards that could be throwing are
+both documented as unreachable. That is worth chasing on its own terms, not
+just as test hygiene.

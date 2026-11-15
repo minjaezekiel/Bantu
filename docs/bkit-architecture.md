@@ -16,9 +16,9 @@ package conforms to ([C1]).
 
 ## 1. Module layout
 
-One package, eleven files. The split is by what a user imports together, and
+One package, twelve files. The split is by what a user imports together, and
 `base.b` is deliberately tiny so `btext` can depend on it without pulling in
-GBDT ([E12]).
+GBDT ([E12]) — or, as `compose.b` shows, without pulling in `arctic` ([K37]).
 
 | file | contains |
 |---|---|
@@ -27,6 +27,7 @@ GBDT ([E12]).
 | `selection.b` | splits, K-fold, cross-validation, grid/randomised search |
 | `metrics.b` | classification, regression and ranking metrics |
 | `linear.b` | linear/ridge/lasso/elastic-net, logistic regression |
+| `compose.b` | `ColumnTransformer` — the only file that knows `arctic` exists |
 | `tree.b` | decision trees over the `tree_` family |
 | `ensemble.b` | random forest, extra trees, **gradient boosting** |
 | `cluster.b` | k-means, DBSCAN, Gaussian mixture |
@@ -679,11 +680,85 @@ form.
 
 ---
 
-## 7. Gradient boosting — the headline
+## 7. Composition — `ColumnTransformer`, and why it is not in `base.b`
+
+`Pipeline` lives in `base.b`: the protocol harness needs it, and it depends on
+nothing but the contract. `ColumnTransformer` lives in `compose.b`, because it
+is the **only** part of bkit that knows `arctic` exists (§9) and `base.b` is
+what `btext` imports for the contract alone. Importing the estimator protocol
+must not drag a dataframe package behind it ([K37]).
+
+`compose.b` does not `include` arctic either. It duck-types — a frame is an
+instance carrying `names`, `cols` and `ncols`, and reading an undefined field
+on an instance yields null rather than raising. So `arctic` is an **optional**
+dependency: bkit works fully without it, and only the by-name column path needs
+it.
+
+### 7.1 The spec
+
+```bantu
+$ct = compose.ColumnTransformer([
+    ["num", pre.StandardScaler(null, null), [0, 1, 2]],
+    ["cat", pre.OneHotEncoder(null),        ["colour"]]
+], "passthrough");
+```
+
+Each spec is `[name, estimator, columns]`. Columns are integer indices, arctic
+column names, or a mix. **Both resolve to integer positions against one
+materialised matrix before any transformer runs**, so there is exactly one code
+path after resolution and the frame case cannot drift from the array case. A
+frame is converted once, not once per spec.
+
+### 7.2 Output order is spec order
+
+Blocks are concatenated in the order the specs were given — **not** in column
+order ([K38]). A caller can predict spec order; they cannot predict column
+order, because a `OneHotEncoder` on one input column emits an arbitrary number
+of outputs.
+
+Hence `output_ranges()`, returning `[name, start, stop)` per spec plus the
+remainder. A 40-column one-hot block is otherwise unattributable, and *"which
+input produced feature 37"* is the first question anyone asks of a fitted
+composition. The widths are **learned**, not declared, so this and
+`n_features_out()` both require a fit ([K41]).
+
+### 7.3 The two failures this is built against
+
+Both produce a wrong answer that looks like a right one, which is the criterion
+the whole K series uses.
+
+**A reordered frame.** Names resolve to positions *at fit time*. A frame whose
+columns were reordered between `fit` and `transform` would resolve the same
+names to different positions and transform the wrong data, at the right shape,
+with plausible numbers. So `transform` compares the fitted column **names**, not
+just the count ([K40]).
+
+**A block that changes width.** A transformer emitting a different number of
+columns at transform time would shift every later block's meaning. Caught with
+both widths and the offending spec's name.
+
+### 7.4 Duplicates
+
+A column may feed two *different* specs — scaled and binarised, say, which
+sklearn also allows. The same column twice **within one spec** is refused: it
+would transform the column twice and silently widen that block ([K39]).
+`remainder` is the complement of the union, emitted in ascending index order, so
+the passthrough block is X's own order rather than a dict's.
+
+### 7.5 `fit` delegates to `fit_transform`, not the reverse
+
+Fitting a composition already computes every block, so the base class's default
+— `fit` then `transform` — would do all the work twice and let a stateful
+transformer see the data twice per fit. `fit_transform` is the implementation
+and `fit` calls it, discarding the result ([K41]).
+
+---
+
+## 8. Gradient boosting — the headline
 
 Histogram-based, LightGBM-shaped. The design choices and why.
 
-### 7.1 The algorithm
+### 8.1 The algorithm
 
 1. **Bin once, up front.** Each feature is quantile-binned into at most 256
    bins. All later work reads bin indices, never raw values. This is what makes
@@ -692,6 +767,12 @@ Histogram-based, LightGBM-shaped. The design choices and why.
    feature over that node's samples.
 3. **Scan bins for the best split**, gain being the standard regularised form
    `½[G_L²/(H_L+λ) + G_R²/(H_R+λ) − G²/(H+λ)] − γ`.
+
+   **This same expression is also a decision tree's criterion**, which is why
+   `tree.b` and the booster share one code path ([K42]). With `g = −y`, `h = 1`
+   it IS variance reduction for regression, and for binary classification it is
+   **proportional to Gini decrease** — `Σ n_m·Gini_m decrease = 4 × gain`, a
+   positive constant, so the argmax is identical to `criterion="gini"`.
 4. **Histogram subtraction:** a child's histogram is its parent's minus its
    sibling's. Compute the smaller child, subtract for the larger. This roughly
    halves the work per level and is the single largest optimisation in the
@@ -700,7 +781,7 @@ Histogram-based, LightGBM-shaped. The design choices and why.
    `max_depth` as a separate guard.
 6. **Predict** by traversing the node array.
 
-### 7.2 The `tree_` native family
+### 8.2 The `tree_` native family
 
 Five kernels. The Bantu side runs the boosting loop, computes gradients and
 hessians (vectorised over `nd_*`), handles early stopping and feature
@@ -708,18 +789,35 @@ importance — all of which are one call per *iteration*, not per element.
 
 | kernel | signature | why native |
 |---|---|---|
-| `tree_bin` | `(X, max_bins) -> handle, edges` | quantile binning over `n×f` values |
-| `tree_hist` | `(binned, grad, hess, idx, nbins) -> hist` | **the hot loop**: one byte load and three float adds per (sample, feature) per node |
-| `tree_best_split` | `(hist, λ, γ, min_child_weight, min_data) -> (feat, bin, gain)` | O(features × bins) scan with a running prefix |
-| `tree_partition` | `(binned, idx, feat, bin) -> (left, right)` | stable in-place partition of an index array |
-| `tree_predict` | `(nodes, X, edges) -> y` | per-sample tree traversal, branch-heavy |
+| `tree_bin` | `(X, max_bins?) -> handle` | binning over `n×f` values; bins come from the **sorted distinct** values, so a low-cardinality column gets its own cardinality rather than 256 mostly-empty bins |
+| `tree_hist` | `(binned, grad, hess, idx?) -> [f, bins, 3]` | **the hot loop**: one byte load and three float adds per (sample, feature) per node |
+| `tree_best_split` | `(hist, binned, λ?, γ?, min_child_weight?, min_data?) -> [feat, bin, gain, G_L, H_L, n_L, G_R, H_R, n_R, nan_left]` | O(features × bins) scan with a running prefix, run **twice per feature** so the `NaN` direction is learned ([K44]) |
+| `tree_partition` | `(binned, idx, feat, bin, nan_left?) -> [left, right]` | stable partition of an index array; `bin = -1` is the missing-vs-present split |
+| `tree_predict` | `(nodes, X) -> y` | per-sample traversal, branch-heavy. **No edge table**: thresholds are raw values, so a fitted tree is one `[n_nodes, 7]` matrix ([K46]) |
+
+Plus five accessors — `tree_bin_shape`, `tree_bin_nbins`, `tree_bin_edges`,
+`tree_bin_at`, `tree_bin_bytes` — which exist **for the tests, not for
+callers** ([K47]). An opaque structure with no window is a structure whose
+contents are asserted by hope: `tree_bin_at` is what lets the reference
+histogram be computed in Bantu from the same bins the kernel used, so
+`tree_hist` is checked against something that is not itself.
+
+**Where they are compiled.** Their own file (`tree_native.hpp`), their own
+prefix, their own registration function — but **numba's translation unit**.
+Every kernel reads an `NdArray`'s raw storage, and crossing the deliberately
+narrow `ndarray_api.hpp` wall would mean exporting X as a flat
+`std::vector<double>`: 800 MB of copy for 1M × 100, to feed kernels whose entire
+purpose is to replace those doubles with one byte per cell. Sharing the TU also
+gets them the `-O3 -ftree-vectorize` that `ndarray_native.cpp` alone is built
+with, which the histogram loop is the reason for. The family is separate; the
+compilation unit is shared, for a measured reason.
 
 A Bantu function call costs **1.78 µs** (btorch B1). `tree_hist` on a
 1M × 100 dataset touches 10⁸ cells per level — four orders of magnitude outside
 what Bantu can do per element. These five are not an optimisation; without them
 there is no GBDT.
 
-### 7.3 The binned matrix is an opaque handle, not an `NdArray`
+### 8.3 The binned matrix is an opaque handle, not an `NdArray`
 
 **A real blocker, found while writing this.** The binned matrix wants to be
 `u8` — one byte per cell. numba's `DType` is `{F64, I64, BOOL}`: there is no
@@ -745,7 +843,7 @@ entirely from the dtype roadmap.
 quantization, the handle can migrate to an `NdArray` behind the same API. It is
 not a dead end, just not a dependency.
 
-### 7.4 Objectives
+### 8.4 Objectives
 
 Gradients and hessians are pure Bantu over `nd_*` — one vectorised call per
 boosting iteration.
@@ -764,7 +862,7 @@ deliberately.
 
 ---
 
-## 8. Data input: arrays, with arctic as an adapter
+## 9. Data input: arrays, with arctic as an adapter
 
 Resolves open question 4 in the ecosystem doc.
 
@@ -781,7 +879,90 @@ arrays would pay for a column store they do not use, and every algorithm would
 carry two code paths — the condition that B18 avoided in btorch by composing
 convolution out of im2col and matmul rather than writing a second path.
 
-### 8.1 Missing values in the GBDT
+### 8.5 K8 needs no new kernels, and that is the finding
+
+The five `tree_` kernels K7 shipped are sufficient for the whole of `ensemble.b`.
+Worth stating explicitly, because the instinct is to add a kernel per feature:
+
+| K8 feature | how, over the existing kernels |
+|---|---|
+| **histogram subtraction** | `nd_subtract(parent_hist, sibling_hist)` — **one vectorised call per node**, on a `[features, bins, 3]` array. There is nothing per-element here for Bantu to be slow at |
+| **bootstrap sampling** (random forest) | `tree_hist` takes an index array, and a duplicated index is counted twice — which *is* bootstrap semantics. No kernel change |
+| **feature subsampling** | zero the unselected features' rows in the histogram before `tree_best_split`. A zeroed feature has `G = H = n = 0`, so every cut has `n_L = 0 < min_data` and is skipped |
+| **random split thresholds** (extra trees) | pick a bin per candidate feature and evaluate that one cut's gain in Bantu from the histogram. One cut is arithmetic on six numbers |
+| **leaf-wise growth** | a frontier keyed by gain, maintained in Bantu. One `tree_best_split` call per node either way |
+| **early stopping** | a validation fold scored per round; one `tree_predict` per round |
+
+So K8 is a boosting *loop*, not a kernel project. The expensive inner work —
+binning once up front, one histogram per node, one scan per node — is already
+native, and everything K8 adds is one call per node or per round.
+
+### 8.6 Growth: leaf-wise, with histogram subtraction
+
+K7's grower is **depth-wise** breadth-first, which is right for a single
+decision tree bounded by `max_depth`. The booster wants **leaf-wise** with a
+`max_leaves` cap (LightGBM's choice): repeatedly expand whichever frontier node
+has the highest gain, so a fixed budget of leaves is spent where it buys the
+most.
+
+**Both go in the shared grower in `tree.b`, behind a `max_leaves` parameter.**
+The alternative — a second grower inside `ensemble.b` — would mean two places
+that have to get the `NaN` direction, the empty-child assertion and the
+threshold lookup right, and [K44] is the record of how easy it is to get the
+`NaN` direction subtly wrong in *one* place.
+
+This is the opposite call from [B34] in btorch, where sharing one normalisation
+implementation cost four full tensor copies and was reverted. The difference is
+what sharing costs: there, four copies of the data; here, one `if` on a
+parameter. Worth noting the two decisions side by side so "share the
+implementation" is not read as a rule in either direction.
+
+**Histogram subtraction** is the single largest optimisation in the algorithm: a
+child's histogram is its parent's minus its sibling's, so computing the
+**smaller** child directly and subtracting for the larger roughly halves the
+work per level.
+
+Its gate is the one thing [K48] insists on. The assertion is that a subtracted
+histogram is **bit-identical** to one built directly from the child's own index
+set — not close, identical, because floating-point subtraction is exact here
+only if the summation orders agree. If they do not, the test says so and the
+design changes rather than the tolerance.
+
+### 8.7 Early stopping, and what it must not see
+
+A validation fold held out of training, scored every round, stopping after
+`n_iter_no_change` rounds without a `tol`-sized improvement.
+
+The failure to design against is the obvious one: **the validation fold must be
+split before binning**, or the bin edges are chosen using data the model is
+then scored on. That is a quieter leak than training on it, and it inflates the
+stopping round rather than the score, so it would not show up as an implausible
+accuracy. `train_test_split` from `selection.b` does the split; `tree_bin` sees
+only the training part.
+
+Reproducibility is [C4]: the split comes from `nd_seed` alone, and no estimator
+carries RNG state.
+
+### 8.8 Forests: bootstrap and random thresholds
+
+`RandomForest*` and `ExtraTrees*` are the same loop with two switches —
+bootstrap sampling on or off, best split or random split — over `n_estimators`
+independent trees. Both reduce to [§8.5](#85-k8-needs-no-new-kernels-and-that-is-the-finding).
+
+Two things to get right:
+
+- **Averaging happens in probability space**, not in label space. A forest of
+  classifiers averages `predict_proba` and then takes the argmax; a majority
+  vote over hard labels throws away every tree's confidence and is a different
+  (worse) estimator.
+- **Each tree needs its own index sample from one seeded stream**, so the forest
+  is reproducible from `nd_seed` alone and *not* dependent on how many trees
+  were fitted before it. The test for this is that fitting 10 trees and then
+  fitting 20 gives the same first 10.
+
+---
+
+### 9.1 Missing values in the GBDT
 
 `NaN` goes to a dedicated bin, and each split learns a default direction (the
 side with the higher gain) which is also used for unseen `NaN` at predict time.
@@ -790,7 +971,7 @@ first is both lossy and a different model.
 
 ---
 
-## 9. Persistence
+## 10. Persistence
 
 `.btsd` with `kind: "bkit.estimator"` ([C3]). One container, one SHA-256, one
 set of twelve load-failure messages — already written for btorch, not rewritten
@@ -808,7 +989,7 @@ memory.
 
 ---
 
-## 10. Gates
+## 11. Gates
 
 Six tiers, as every phase in this project. Gradcheck does not apply (no
 autograd here); its slot is taken by **differential testing against published
@@ -846,7 +1027,7 @@ measured from a reloaded `.btsd` model, not from memory.
 
 ---
 
-## 11. What is deliberately out
+## 12. What is deliberately out
 
 | item | why |
 |---|---|
@@ -859,7 +1040,7 @@ measured from a reloaded `.btsd` model, not from memory.
 
 ---
 
-## 12. Open items
+## 13. Open items
 
 | # | item | settled by |
 |---|---|---|

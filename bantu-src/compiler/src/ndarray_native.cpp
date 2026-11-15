@@ -20,6 +20,7 @@
 #include "ndarray_manip_reg.hpp"
 #include "ndarray_linalg_reg.hpp"
 #include "ndarray_dispatch.hpp"
+#include "tree_native.hpp"      // the tree_ family (bkit K7)
 
 namespace numba {
 
@@ -234,12 +235,22 @@ void registerBuiltins(const DefineFn& rawDefine) {
     initLimits();
 
     // ── threading (D3) ───────────────────────────────────────────────────────
-    // Default 1, i.e. opt-in. A library whose numeric results changed when it
-    // was installed on a machine with more cores would be a support nightmare;
-    // because a fixed partition makes every thread count give the SAME bits
-    // (DECISIONS N25), opting in is a performance decision and never a
-    // correctness one, and nd_set_threads(1) is always an exact reproduction
-    // path.
+    // Default 1, i.e. opt-in -- because this interpreter is embedded in sua,
+    // where a request handler must not silently take twelve cores for one
+    // request, and nothing in the process can tell a web server from a
+    // training script. One process, one answer, so the answer is the
+    // conservative one and code that wants the machine asks for it.
+    //
+    // This comment used to justify the default by saying that results would
+    // change on a machine with more cores. They do not: the fixed partition
+    // (DECISIONS N25) gives bit-identical results at every thread count, which
+    // was verified byte-for-byte at 1, 3, 7, 8 and 12 threads over a
+    // 1,000,003-element sum and mean and a 997x1013x601 matmul. Opting in is a
+    // performance decision and never a correctness one -- which means it is
+    // free for anyone not serving concurrent requests, i.e. for most numeric
+    // code. The old wording implied a risk that does not exist and left every
+    // ML package in the ecosystem at a fifth of the machine's throughput
+    // (docs/generative-architecture.md G1/G7).
     //
     // Process-global rather than thread_local, unlike the PRNG (N18/N32): a
     // shared PRNG lets one sua request reshape another's results, a shared
@@ -1337,6 +1348,10 @@ void registerBuiltins(const DefineFn& rawDefine) {
     registerSorting(define);
     registerManip(define);
     registerLinalg(define);
+    // The tree_ family. Its own file and its own prefix, but this translation
+    // unit, because every kernel reads an NdArray's raw storage and this is the
+    // one TU built at -O3 -- which the histogram loop is the reason for.
+    tree::registerTreeBuiltins(define);
 }
 
 // A scalar, a nested list or an array all become an array, so `nd_add($a, 2)`

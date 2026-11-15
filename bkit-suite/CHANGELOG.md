@@ -450,3 +450,192 @@ Seven estimators, 798 lines. Design:
   real estimators and a `GridSearchCV` over `Ridge`, so the contract is checked against models with
   a right answer of their own. The `ConstRegressor` double stays, with a new job — as the simplest
   conforming estimator, it tells a fault in the *check* apart from a fault in a model's arithmetic.
+
+---
+
+## Phase K6 — `Pipeline` + `ColumnTransformer`
+
+`bkit/compose.b`, 512 lines. `Pipeline` already shipped in K1; this phase adds
+`ColumnTransformer` and settles the 50-stage Pipeline stress K1 deferred.
+
+### Added
+
+- **[feature]** **`ColumnTransformer([[name, estimator, columns]], remainder)`** —
+  different preprocessing per column, concatenated into one matrix. Columns are
+  integer indices, arctic column **names**, or a mix; `remainder` is `"drop"`
+  (default) or `"passthrough"`.
+- **[feature]** **`output_ranges()`** returns `[name, start, stop)` per spec plus
+  the remainder, and **`n_features_out()`** the total. Not decoration: a
+  40-column one-hot block is otherwise unattributable, and *"which input
+  produced feature 37"* is the first question anyone asks of a fitted
+  composition. Both require a fit, because the widths are **learned** and there
+  is no honest answer before one ([K41]).
+- **[feature]** **`"<name>__<param>"`** in `get_params`/`set_params`, so
+  `GridSearchCV` can tune inside a composition — the same addressing `Pipeline`
+  uses, with the same refusal of an unknown key ([K24]): a search that silently
+  ignored one would report a best score for a configuration it never tried.
+- **[feature]** `get_transformer(name)`, which names what it *does* have when it
+  cannot find what was asked for.
+
+### Design
+
+- **[design]** **It is not in `base.b`** ([K37]). `ColumnTransformer` is the only
+  part of bkit that knows `arctic` exists, and `base.b` is what `btext` imports
+  for the contract alone — importing the estimator protocol must not drag a
+  dataframe package behind it. Composition splits by **dependency**, not by
+  subject matter.
+- **[design]** **`compose.b` does not `include` arctic.** It duck-types: a frame
+  is an instance carrying `names`, `cols` and `ncols`, and reading an undefined
+  field on an instance yields null rather than raising — the mechanism btorch's
+  `is_dataset` uses. So `arctic` is an **optional** dependency in
+  `package.json`; bkit works fully without it and only the by-name path needs it.
+  *Rejected:* a marker field added to arctic's `DataFrame`. It is the cleaner
+  test, but this is the ecosystem's only consumer, and asking another package to
+  carry a flag for one consumer inverts the dependency this decision is about.
+- **[design]** **Names and indices resolve to integer positions against one
+  materialised matrix** before any transformer runs. So there is exactly one code
+  path after resolution and the frame case cannot drift from the array case — and
+  a frame is converted **once**, not once per spec.
+- **[design]** **Blocks concatenate in spec order, not column order** ([K38]). A
+  caller can predict spec order; they cannot predict column order, because a
+  `OneHotEncoder` on one input emits an arbitrary number of outputs.
+- **[design]** **`fit` delegates to `fit_transform`**, not the reverse ([K41]).
+  Fitting already computes every block, so the base class's default would do all
+  the work twice and let a stateful transformer see the data twice per fit.
+
+### Fixed before it shipped
+
+- **[design]** **A reordered frame is refused at transform** ([K40]). Names
+  resolve to positions *at fit time*, so a frame whose columns were reordered in
+  between would transform the wrong data — at the right shape, with plausible
+  numbers. `transform` therefore compares the fitted column **names**, not just
+  the count. Same reasoning for a block whose width changes between fit and
+  transform: it would shift every later block's meaning, so it is reported with
+  both widths and the offending spec's name.
+- **[design]** **The same column twice in one spec is refused** ([K39]) — it
+  would transform the column twice and silently widen that block by one. Across
+  *different* specs it is legal and useful (a column both scaled and binarised),
+  which is why the check is per spec. `remainder` is the complement of the
+  union, emitted in **ascending index order** so the passthrough block carries
+  X's own order rather than a dict's.
+
+### Gates
+
+- **[test]** `tests/bkit_compose_test.b` — tiers 1, 2 and 4. The central gate is
+  **exactness**: the composition is built twice, once through
+  `ColumnTransformer` and once by slicing and concatenating by hand, and
+  required to agree to 1e-12 with the same column order. A composition that is
+  merely plausible — right shape, reasonable numbers — is the failure worth
+  building against, because a block in the wrong place produces a model that
+  trains fine and predicts from the wrong features.
+- **[test]** The **no-refit-leak** assertion: a `ColumnTransformer` fitted on one
+  matrix and applied to another with a different mean must *not* recentre it.
+  The classic silent leak, asserted directly rather than assumed.
+- **[test]** **50-stage Pipeline** (deferred here from K1). Standardising an
+  already-standardised matrix is idempotent, so after fifty passes the output
+  must still be exactly centred and unit-variance — which also proves no stage
+  was skipped — with `set_params` reaching the fiftieth step by name.
+- **[test]** **20 specs over `[5000, 30]`** with a passthrough tail, asserting
+  the tail is X's own columns untouched and that `output_ranges()` places the
+  twentieth block and the remainder correctly.
+- **[test]** `tests/bkit_protocol_test.b` grown to **38 registry entries** with
+  three `ColumnTransformer` modes. The protocol does not know it composes, which
+  is the point of putting it there.
+
+---
+
+## Phase K7 — `tree.b` and the `tree_` native family
+
+The first native work in this package. Five kernels plus five accessors in
+`bantu-src/compiler/src/tree_native.hpp`, and `bkit/tree.b` on top.
+
+### Added
+
+- **[feature]** **`tree_bin`** — bins from the **sorted distinct** values, at
+  most 256, with `NaN` getting a dedicated bin (the highest). A 7-distinct-value
+  integer column gets 7 bins, not 256 mostly-empty ones; a constant column gets
+  exactly 1. Quantiles of the raw array would put several edges between the same
+  pair of values and leave empty bins that every later scan still walks.
+- **[feature]** **`tree_hist`** — the hot loop: one byte load and three float
+  adds per (sample, feature). Output `[features, bins, 3]` holding
+  `(Σg, Σh, count)`.
+- **[feature]** **`tree_best_split`** — a running prefix per feature, scanned
+  **twice** so the `NaN` direction is learned ([K44]).
+- **[feature]** **`tree_partition`** — a stable index partition; `bin = -1` is
+  the missing-vs-present split.
+- **[feature]** **`tree_predict`** — traversal over a `[n_nodes, 7]` array with
+  **raw-value thresholds**, so a fitted tree is one matrix and prediction needs
+  no bin table at all ([K46]).
+- **[feature]** `DecisionTreeRegressor` and `DecisionTreeClassifier`, and
+  `tree_` registered in `kNativeFamilies` so an unbound `tree_*` self-diagnoses
+  as a stale binary rather than a bare `Undefined variable`.
+
+### Design
+
+- **[design]** **One criterion serves both estimators** ([K42]). Both set
+  `g = −y`, `h = 1` and use the same regularised gain K8's booster will. For
+  regression that **is** variance reduction (scikit-learn's `squared_error`
+  times ½, leaf = the mean). For binary classification it is **proportional to
+  Gini decrease** — `Σ n_m·Gini_m decrease = 4 × gain` — so the argmax is
+  identical to `criterion="gini"`, and the leaf is the positive-class
+  proportion, i.e. the probability. The derivation is in the file header; the
+  test computes a Gini table from counts and asserts both the cut and the
+  factor 4.0.
+- **[design]** **The kernels live in numba's translation unit**, with their own
+  file, prefix and registration function. Crossing the deliberately narrow
+  `ndarray_api.hpp` wall would mean exporting X as a flat `vector<double>` —
+  **800 MB of copy for 1M × 100**, to feed kernels whose purpose is to replace
+  those doubles with one byte per cell. Sharing the TU also gets `-O3
+  -ftree-vectorize`, which the histogram loop is the reason for.
+- **[design]** **The `NaN` direction is learned** ([K44]), not fixed. The `NaN`
+  bin is the highest index, so a plain prefix scan would always leave it in the
+  right child — and `tree_partition` was first written defaulting it *left*, so
+  the partition would have sent missing rows the opposite way from the scan that
+  chose the split. Found by writing the design comment, before any of it ran.
+- **[design]** **Multiclass is one-vs-rest**, which is a real difference from
+  scikit-learn's single K-way tree, and is documented as one rather than
+  claimed as a match ([K43]). True multiclass Gini needs the gain summed over K
+  histograms *before* the argmax — a `tree_best_split` taking a list, recorded
+  as a K8 item.
+
+### Fixed
+
+- **[bug fix]** **The bin assignment was off by one, and the gain was still
+  right** ([K48]). `upper_bound` pushed a value sitting exactly on its own edge
+  one bin right: 8 distinct values binned as `[1,2,3,4,5,6,7,7]` instead of
+  `[0..7]`, bin 0 empty and the top two collapsed. The *gain* was correct —
+  the same row partition was reachable one bin over — so the brute-force
+  reference agreed, the `4 × gain` ratio held and `tree_hist` matched its own
+  reference. Only the independently computed **bin index** disagreed, and that
+  index is what the threshold lookup uses, so predictions were one row wide.
+  `lower_bound` is the correct search for a "values ≤ edges[b]" contract.
+- **[design]** **The hessian guard skips before the division** ([K45]). A
+  saturated logistic gives `h → 0`; the tempting reasoning is that a resulting
+  `NaN` gain loses every comparison and is therefore safe. The real risk is the
+  other branch: `G²/0` with `G ≠ 0` is `+inf`, which **wins** every comparison
+  and would pick a split on a child with no weight in it, with maximum
+  confidence. Written `!(H + λ > 0.0)` so a `NaN` total is caught too.
+
+### Gates
+
+- **[test]** `tests/bkit_tree_test.b` — tiers 1, 2 and 4. Every kernel's
+  reference is computed **in Bantu from the bins the kernel itself produced**,
+  never by calling the kernel a second way. `tree_hist` is required to be
+  **bit-identical** to a pure-Bantu triple loop, not merely close.
+- **[test]** The hessian saturation case is driven deliberately: every hessian
+  zero with `λ = 0` must find no split and report gain `0`; the *same* histogram
+  with `λ = 1` must split normally, which proves the guard is about `H + λ` and
+  not about refusing the data.
+- **[test]** `tree_predict` refuses a malformed tree instead of walking off it —
+  wrong layout, a feature X does not have, a child index outside the tree, a
+  self-child, and a two-node **cycle**, which raises rather than hanging. The
+  four-minute hang in K2 is the precedent for not trusting a loop to terminate
+  because its data "should" be acyclic.
+- **[test]** **`tree_bin_bytes` asserts K1's whole justification directly**:
+  200000×50 binned is exactly **10,000,000 bytes**, not 80,000,000.
+- **[test]** A tree draws no randomness, so the suite asserts two fits are
+  bit-identical **without** reseeding, not just with.
+- **[test]** `tests/bkit_protocol_test.b` grown to **42 registry entries** —
+  the first estimators backed by native kernels, so the protocol is also
+  checking that a `tree_*` handle survives clone/get_params/set_params without
+  the contract knowing a handle exists.
