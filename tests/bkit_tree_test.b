@@ -196,6 +196,46 @@ raises(def() { return tree_hist($B, nd([1.0, 2.0], "f64"), $h, null); },
 raises(def() { return tree_hist($B, $g, $h, np.astype(nd([99.0], "f64"), "i64")); },
        "an index outside the matrix is refused");
 
+print("");
+print("== histogram subtraction: the count channel is EXACT, g and h are not ==");
+// A child's histogram is its parent's minus its sibling's -- the single largest
+// optimisation in the algorithm, and the grower uses it. The design's first
+// draft claimed the result would be BIT-IDENTICAL to building the child
+// directly. It is not, and the arithmetic says so: tree_hist accumulates in
+// index order, so the parent sums rows 0..n-1 while the sibling sums a
+// subsequence, and sum(A u B) - sum(A) = sum(B) does not hold exactly for
+// floating point.
+//
+// So the gate splits by channel, which says more than one tolerance would:
+// counts are integers held in doubles and must agree EXACTLY, while g and h
+// agree to a tight relative tolerance -- and the test reports the worst
+// observed difference, so a drift from 1e-16 to 1e-9 shows up as a number
+// rather than as a still-passing assertion.
+def chan($H, $c) {
+    $sh = np.shape($H);
+    return np.reshape(np.take($H, nd([$c], "i64"), 2), [$sh[0], $sh[1]]);
+}
+$hsParts = tree_partition($B, np.astype(np.arange(0.0, 7.0, 1.0), "i64"), 0, 2, false);
+$hsL = $hsParts[0];
+$hsR = $hsParts[1];
+$hsParent = tree_hist($B, $g, $h, null);
+$hsDirect = tree_hist($B, $g, $h, $hsR);
+$hsSubbed = np.subtract($hsParent, tree_hist($B, $g, $h, $hsL), null);
+
+ok(nd_tobytes(chan($hsDirect, 2), "f64") == nd_tobytes(chan($hsSubbed, 2), "f64"),
+   "the COUNT channel is bit-identical -- counts are exact in doubles");
+$dG = sc(np.max(np.abs(np.subtract(chan($hsDirect, 0), chan($hsSubbed, 0), null), null), null, null));
+$dH = sc(np.max(np.abs(np.subtract(chan($hsDirect, 1), chan($hsSubbed, 1), null), null), null, null));
+print("        worst gradient difference: " + str($dG));
+print("        worst hessian  difference: " + str($dH));
+ok($dG < 1.0e-12, "the gradient channel agrees to better than 1e-12");
+ok($dH < 1.0e-12, "the hessian channel agrees to better than 1e-12");
+// And the subtracted histogram must choose the SAME split as the direct one --
+// which is the property the grower actually depends on.
+eq(np.to_list(tree_best_split($hsDirect, $B, 1.0, 0.0, 0.0, 1.0)),
+   np.to_list(tree_best_split($hsSubbed, $B, 1.0, 0.0, 0.0, 1.0)),
+   "and both histograms pick an identical split");
+
 // ── tree_best_split ────────────────────────────────────────────────────────
 print("");
 print("== tree_best_split equals brute force over the same histogram ==");

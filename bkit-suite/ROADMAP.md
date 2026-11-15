@@ -353,11 +353,11 @@ objectives and early stopping — not split finding.
    structure as the code shares the code's errors.
 
 `base.b` is 391 lines, `preprocess.b` 1,011, `selection.b` 927, `metrics.b` 695,
-`linear.b` 857, `compose.b` 512 and `tree.b` 444, over the `tree_` family in
+`linear.b` 857, `compose.b` 512 and `tree.b` 509, over the `tree_` family in
 `bantu-src/compiler/src/tree_native.hpp`; `tests/bkit_base_test.b` is 53
 assertions, `tests/bkit_preprocess_test.b` 174, `tests/bkit_selection_test.b`
 117, `tests/bkit_metrics_test.b` 123, `tests/bkit_linear_test.b` 135,
-`tests/bkit_compose_test.b` 77, `tests/bkit_tree_test.b` 118 and
+`tests/bkit_compose_test.b` 77, `tests/bkit_tree_test.b` 127 and
 `tests/bkit_protocol_test.b` 42 registry entries — all green. Read
 [`../docs/bkit-architecture.md`](../docs/bkit-architecture.md) first, then
 [`DECISIONS.md`](DECISIONS.md).

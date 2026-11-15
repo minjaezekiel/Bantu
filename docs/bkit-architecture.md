@@ -897,36 +897,59 @@ So K8 is a boosting *loop*, not a kernel project. The expensive inner work —
 binning once up front, one histogram per node, one scan per node — is already
 native, and everything K8 adds is one call per node or per round.
 
-### 8.6 Growth: leaf-wise, with histogram subtraction
+### 8.6 Growth: depth-wise now, leaf-wise later, with histogram subtraction
 
-K7's grower is **depth-wise** breadth-first, which is right for a single
-decision tree bounded by `max_depth`. The booster wants **leaf-wise** with a
-`max_leaves` cap (LightGBM's choice): repeatedly expand whichever frontier node
-has the highest gain, so a fixed budget of leaves is spent where it buys the
-most.
+K7's grower is **depth-wise** breadth-first, bounded by `max_depth`. The
+booster uses **the same grower**, and that is a deliberate scope decision, not
+an omission: depth-wise is XGBoost's default `grow_policy`, and leaf-wise with a
+`max_leaves` cap is LightGBM's. Both are standard; neither is the correct one.
 
-**Both go in the shared grower in `tree.b`, behind a `max_leaves` parameter.**
-The alternative — a second grower inside `ensemble.b` — would mean two places
-that have to get the `NaN` direction, the empty-child assertion and the
-threshold lookup right, and [K44] is the record of how easy it is to get the
-`NaN` direction subtly wrong in *one* place.
+**Shipping with the shared depth-wise grower first** means K8's new code is the
+boosting *loop* — gradients, hessians, shrinkage, early stopping, importances —
+over a grower whose `NaN` direction, empty-child assertion and threshold lookup
+are already tested. A second grower inside `ensemble.b` would mean two places
+that have to get [K44]'s `NaN` direction right, and one place already got it
+subtly wrong.
+
+`max_leaves` and leaf-wise growth are then a follow-up *inside that same
+grower*: pick the highest-gain frontier node instead of draining a queue. Note
+that when `max_leaves` is unset the two policies produce the same set of splits
+— every node that can split, does — so adding it changes node *ordering* and
+not the model, which is what makes it a safe later change rather than a rewrite.
 
 This is the opposite call from [B34] in btorch, where sharing one normalisation
-implementation cost four full tensor copies and was reverted. The difference is
-what sharing costs: there, four copies of the data; here, one `if` on a
-parameter. Worth noting the two decisions side by side so "share the
-implementation" is not read as a rule in either direction.
+implementation cost four full tensor copies and was split apart. The difference
+is what sharing costs: there, four copies of the data; here, one `if` on a
+parameter. Worth noting the two side by side so "share the implementation" is
+not read as a rule in either direction.
 
 **Histogram subtraction** is the single largest optimisation in the algorithm: a
 child's histogram is its parent's minus its sibling's, so computing the
 **smaller** child directly and subtracting for the larger roughly halves the
 work per level.
 
-Its gate is the one thing [K48] insists on. The assertion is that a subtracted
-histogram is **bit-identical** to one built directly from the child's own index
-set — not close, identical, because floating-point subtraction is exact here
-only if the summation orders agree. If they do not, the test says so and the
-design changes rather than the tolerance.
+**Its gate cannot be bit-identity, and this paragraph said it could.** The
+first draft of this section asserted that a subtracted histogram must be
+*bit-identical* to one built directly from the child's index set. That is false
+and the arithmetic says so: `tree_hist` accumulates in index order, so the
+parent sums rows `0..n-1` while the sibling sums a subsequence, and
+`sum(A ∪ B) − sum(A) = sum(B)` does **not** hold exactly for floating point.
+Writing the gate down before writing the code is what exposed it.
+
+So the gate splits by channel, which is more informative than one tolerance
+would be:
+
+- the **count** channel must be bit-identical — counts are integers held in
+  doubles, and every one of them is exactly representable, so any difference
+  there is a real bug and not rounding;
+- the **gradient and hessian** channels are compared with a tight relative
+  tolerance, and the test also asserts the *maximum* observed difference so a
+  drift from 1e-16 to 1e-9 shows up as a number rather than as a still-passing
+  assertion.
+
+This is what LightGBM and XGBoost both accept, and the error does not
+accumulate across levels, because each child's histogram is derived from its
+parent's rather than from a running total.
 
 ### 8.7 Early stopping, and what it must not see
 

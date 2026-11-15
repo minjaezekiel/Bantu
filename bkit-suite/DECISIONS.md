@@ -1212,3 +1212,51 @@ unanswered question — a grower that can find no split should produce a
 single-leaf tree, not an exception — and the guards that could be throwing are
 both documented as unreachable. That is worth chasing on its own terms, not
 just as test hygiene.
+
+---
+
+### K54 — histogram subtraction landed in K7's grower, and its gate is per channel
+
+Subtraction was designed as a K8 item (§8.6) on the reasoning that the booster
+is where the cost lives. It went into K7's grower instead, because the grower is
+*shared* — K8 adds a boosting loop over it, so an optimisation inside it is
+work K8 does not repeat, and more importantly it is work K8 does not have to
+re-gate.
+
+A child's histogram is its parent's minus its sibling's. The grower builds the
+**smaller** child from the data and subtracts for the larger, which roughly
+halves the histogram work per level. The queue item grew a fourth slot to carry
+the histogram down from the parent; the root's is `null` and is built directly.
+
+**The gate I designed for it was false.** §8.6's first draft asserted the
+subtracted histogram would be *bit-identical* to one built from the child's own
+index set. `tree_hist` accumulates in index order, so the parent sums rows
+`0..n−1` while the sibling sums a subsequence, and `sum(A ∪ B) − sum(A) =
+sum(B)` does not hold exactly in floating point. Writing the assertion down
+before writing the code is what exposed it — the same order of operations that
+caught [K44]'s `NaN` direction.
+
+So the gate splits by **channel**, which says more than a single tolerance
+would:
+
+| channel | assertion | why |
+|---|---|---|
+| count | **bit-identical** via `nd_tobytes` | counts are integers held in doubles, all exactly representable, so any difference is a bug and not rounding |
+| gradient, hessian | `< 1e-12`, and the **worst observed** difference is printed | a drift from 1e-16 to 1e-9 then shows up as a number rather than as a still-passing assertion |
+
+Plus the property the grower actually depends on, which neither of those implies
+on its own: both histograms must choose an **identical split**. A tolerance on
+the channels permits a difference; a tie near the top of the gain ranking could
+in principle turn that difference into a different cut, and the direct assertion
+is the only thing that rules it out.
+
+Observed on the test's dataset: both differences are exactly 0. That is not
+evidence the identity holds — it is a seven-row matrix whose sums happen to be
+exact — which is why the tolerance stays and the number is printed rather than
+asserted to be zero.
+
+The error does not accumulate across levels: each child derives from its
+parent's histogram, not from a running total, so the depth of the tree does not
+enter the bound. This is what LightGBM and XGBoost both accept.
+
+`bkit_tree_test.b` 123 → 127 assertions.

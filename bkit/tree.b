@@ -157,9 +157,11 @@ class _TreeBase extends Estimator {
         $ncol  = np.get($shape, [1]);
 
         $nodes = [];                 // each a 7-element list
-        $pend  = [];                 // [idx, depth, slot]
+        // [idx, depth, slot, hist] -- hist is this node's histogram, carried
+        // from its parent by subtraction (see below) or null for the root.
+        $pend  = [];
         append($nodes, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-        append($pend,  [null, 0, 0]);
+        append($pend,  [null, 0, 0, null]);
         $qi = 0;
         $maxDepth = 0;
         $leaves = 0;
@@ -172,7 +174,24 @@ class _TreeBase extends Estimator {
             $slot  = $item[2];
             if ($depth > $maxDepth) { $maxDepth = $depth; }
 
-            $hist = tree_hist($B, $g, $h, $idx);
+            // HISTOGRAM SUBTRACTION. A child's histogram is its parent's minus
+            // its sibling's, so only one child per split is built from the data
+            // and the other is one vectorised subtract. Computing the SMALLER
+            // child directly roughly halves the work per level, and it is the
+            // single largest optimisation in the algorithm.
+            //
+            // It is NOT bit-identical to building the child directly, and the
+            // design doc's first draft claimed it would be: tree_hist
+            // accumulates in index order, so the parent sums rows 0..n-1 while
+            // the sibling sums a subsequence, and sum(A u B) - sum(A) = sum(B)
+            // does not hold exactly for floating point. The COUNT channel is
+            // exact (counts are integers in doubles); the gradient and hessian
+            // channels agree to a tight relative tolerance, which is what
+            // LightGBM and XGBoost both accept. The error does not accumulate
+            // across levels, because each child derives from its parent rather
+            // than from a running total.
+            $hist = $item[3];
+            if ($hist == null) { $hist = tree_hist($B, $g, $h, $idx); }
             $tot  = this._totals($hist);
             $G = $tot[0];  $H = $tot[1];  $n = $tot[2];
 
@@ -224,8 +243,19 @@ class _TreeBase extends Estimator {
                         append($nodes, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
                         $nodes[$slot] = [0.0, 1.0 * $feat, $thr, 1.0 * $li,
                                          1.0 * $ri, 0.0, $nanL];
-                        append($pend, [$L, $depth + 1, $li]);
-                        append($pend, [$R, $depth + 1, $ri]);
+                        // Build the smaller child, subtract for the larger.
+                        $hL = null;
+                        $hR = null;
+                        if (np.size($L) <= np.size($R)) {
+                            $hL = tree_hist($B, $g, $h, $L);
+                            $hR = np.subtract($hist, $hL, null);
+                        }
+                        if (np.size($L) > np.size($R)) {
+                            $hR = tree_hist($B, $g, $h, $R);
+                            $hL = np.subtract($hist, $hR, null);
+                        }
+                        append($pend, [$L, $depth + 1, $li, $hL]);
+                        append($pend, [$R, $depth + 1, $ri, $hR]);
                     }
                 }
             }

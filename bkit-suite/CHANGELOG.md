@@ -616,6 +616,28 @@ The first native work in this package. Five kernels plus five accessors in
   and would pick a split on a child with no weight in it, with maximum
   confidence. Written `!(H + λ > 0.0)` so a `NaN` total is caught too.
 
+- **[perf]** **Histogram subtraction**, the single largest optimisation in the
+  algorithm: a child's histogram is its parent's minus its sibling's, so the
+  grower builds the **smaller** child from the data and subtracts for the
+  larger. Roughly halves the histogram work per level. It was designed as a K8
+  item and moved here because the grower is *shared* — K8 adds a boosting loop
+  over it, so this is work K8 neither repeats nor has to re-gate.
+- **[test]** **The gate I wrote for it in the design was false, and the design
+  said so before the code ran.** §8.6's first draft asserted a subtracted
+  histogram would be **bit-identical** to one built directly. `tree_hist`
+  accumulates in index order, so the parent sums rows `0..n−1` while the sibling
+  sums a subsequence, and `sum(A ∪ B) − sum(A) = sum(B)` does not hold exactly
+  in floating point. The gate is now per **channel**: the **count** channel must
+  be bit-identical via `nd_tobytes` (counts are integers held in doubles, all
+  exactly representable, so any difference is a bug and not rounding), while the
+  gradient and hessian channels must agree to `< 1e-12` **and the worst observed
+  difference is printed**, so a drift from 1e-16 to 1e-9 shows up as a number
+  rather than as a still-passing assertion. Both differences are currently
+  exactly 0, which is a property of a seven-row matrix and not evidence the
+  identity holds. Plus the property the grower actually depends on and which
+  neither channel assertion implies: both histograms must choose an
+  **identical split**. (K54.)
+
 ### Gates
 
 - **[test]** `tests/bkit_tree_test.b` — tiers 1, 2 and 4. Every kernel's
