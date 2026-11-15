@@ -694,45 +694,83 @@ def leaky_relu($a, $slope) {
 // element that went into it. With an axis and keepdims=false the summed axis
 // has been dropped, so it is put back before broadcasting -- otherwise the
 // broadcast would align from the wrong end.
-def _sumBackward($shape, $axis) {
+// ── axis normalisation, shared by sum and mean ──────────────────────────────
+// nd_sum/nd_mean accept a LIST of axes, and the backward passes below used to
+// assume a scalar. The forward value was right and the backward then raised in
+// nd_reshape, so `bt.mean($x, [0,2,3], true)` -- which is exactly what
+// BatchNorm2d, GroupNorm and InstanceNorm2d need -- was unusable. One
+// normalisation here, used by both, rather than two sets of index arithmetic.
+//
+// Returns a list of non-negative axes, or null for "reduce everything".
+def _axes($axis, $rank) {
+    if ($axis == null) { return null; }
+    $raw = $axis;
+    if (type($axis) != "list") { $raw = [$axis]; }
+    $out = [];
+    $i = 0;
+    while ($i < len($raw)) {
+        $a = $raw[$i];
+        if (type($a) != "number" || $a != floor($a)) {
+            throw "btorch: an axis must be a whole number, got " + str($a);
+        }
+        if ($a < 0) { $a = $a + $rank; }
+        if ($a < 0 || $a >= $rank) {
+            throw "btorch: axis " + str($raw[$i]) + " is out of range for a rank-"
+                  + str($rank) + " tensor";
+        }
+        if (contains($out, $a)) {
+            throw "btorch: axis " + str($a) + " is repeated in " + str($raw);
+        }
+        push($out, $a);
+        $i = $i + 1;
+    }
+    return $out;
+}
+// $shape with a 1 in every reduced position -- the shape the gradient must take
+// before it broadcasts back over the input.
+def _keepShape($shape, $axes) {
+    $t = [];
+    $i = 0;
+    while ($i < len($shape)) {
+        if (contains($axes, $i)) { push($t, 1); } else { push($t, $shape[$i]); }
+        $i = $i + 1;
+    }
+    return $t;
+}
+// How many elements each output element averaged over.
+def _axesCount($shape, $axes) {
+    if ($axes == null) {
+        $n = 1; $i = 0;
+        while ($i < len($shape)) { $n = $n * $shape[$i]; $i = $i + 1; }
+        return $n;
+    }
+    $n = 1; $i = 0;
+    while ($i < len($axes)) { $n = $n * $shape[$axes[$i]]; $i = $i + 1; }
+    return $n;
+}
+
+def _sumBackward($shape, $axes) {
     return def($gr) {
         $g = $gr;
-        if ($axis != null) {
-            $ks = $shape;
-            $i = 0;
-            $target = [];
-            while ($i < len($ks)) {
-                if ($i == $axis) { push($target, 1); }
-                else { push($target, $ks[$i]); }
-                $i = $i + 1;
-            }
-            $g = nd_reshape($g, $target);
-        }
+        if ($axes != null) { $g = nd_reshape($g, _keepShape($shape, $axes)); }
         return [nd_multiply(nd_ones($shape, nd_dtype($gr)), $g, null)];
     };
 }
 def sum($a, $axis, $keepdims) {
     _need();
     $ta = _asT($a);
+    $shape = nd_shape($ta.data);
+    $ax = _axes($axis, len($shape));
     $out = nd_sum($ta.data, $axis, $keepdims);
-    return _mk($out, [$ta], "sum", _sumBackward(nd_shape($ta.data), $axis));
+    return _mk($out, [$ta], "sum", _sumBackward($shape, $ax));
 }
 
 // ── mean ────────────────────────────────────────────────────────────────────
 // Same as sum, divided by the number of elements that were averaged.
-def _meanBackward($shape, $axis, $n) {
+def _meanBackward($shape, $axes, $n) {
     return def($gr) {
         $g = $gr;
-        if ($axis != null) {
-            $i = 0;
-            $target = [];
-            while ($i < len($shape)) {
-                if ($i == $axis) { push($target, 1); }
-                else { push($target, $shape[$i]); }
-                $i = $i + 1;
-            }
-            $g = nd_reshape($g, $target);
-        }
+        if ($axes != null) { $g = nd_reshape($g, _keepShape($shape, $axes)); }
         return [nd_divide(nd_multiply(nd_ones($shape, nd_dtype($gr)), $g, null), $n, null)];
     };
 }
@@ -740,10 +778,9 @@ def mean($a, $axis, $keepdims) {
     _need();
     $ta = _asT($a);
     $shape = nd_shape($ta.data);
-    $n = nd_size($ta.data);
-    if ($axis != null) { $n = $shape[$axis]; }
+    $ax = _axes($axis, len($shape));
     $out = nd_mean($ta.data, $axis, $keepdims);
-    return _mk($out, [$ta], "mean", _meanBackward($shape, $axis, $n));
+    return _mk($out, [$ta], "mean", _meanBackward($shape, $ax, _axesCount($shape, $ax)));
 }
 
 // ── reshape / view ──────────────────────────────────────────────────────────
@@ -1772,4 +1809,32 @@ def allclose($a, $b, $tol) {
     if ($tol == null) { $tol = 0.00000001; }
     return nd_allclose(_arr($a), _arr($b), $tol, $tol);
 }
+// ── threads ─────────────────────────────────────────────────────────────────
+// numba defaults to ONE thread, and btorch never asked for more. Measured on a
+// 12-thread machine, a 1024^3 f64 matmul: 5.94 GFLOP/s at 1 thread, 31.58 at
+// 8. Every model this package has ever trained ran at a fifth of the machine.
+//
+// The default is right where it is: this interpreter is also embedded in sua,
+// and a request handler must not take twelve cores for one request. But a
+// training script is not a request handler, so it should ask -- and asking is
+// FREE, not a trade. The fixed partition (numba N25) gives bit-identical
+// results at every thread count, verified byte-for-byte at 1, 3, 7, 8 and 12.
+// There is no accuracy, no reproducibility and no seed behaviour to weigh:
+// the same script with more threads produces the same bits, sooner.
+//
+//     bt.use_all_cores();          // at the top of a training script
+//     bt.set_threads(4);           // or pick a number, e.g. to leave cores free
+//     bt.set_threads(1);           // back to the default
+//
+// Deliberately NOT done on include. A package that reaches out and reshapes a
+// process-global when it is merely imported would hit exactly the sua case the
+// default exists for -- an inference handler that imports btorch would start
+// oversubscribing the box, and the person who wrote the handler never asked for
+// threads at all. One line in a training script is the correct price.
+def set_threads($n)      { return nd_set_threads($n); }
+def threads()            { return nd_get_threads(); }
+def hardware_threads()   { return nd_hardware_threads(); }
+// Returns the count it set, so a script can print what it got.
+def use_all_cores()      { return nd_set_threads(nd_hardware_threads()); }
+
 def version() { return "btorch 0.2.0 (phases 1-4, indexing)"; }

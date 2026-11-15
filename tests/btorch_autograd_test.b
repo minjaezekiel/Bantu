@@ -394,6 +394,43 @@ gc(def($i) {
    }, [$mw1, $mb1, $mw2], "two-layer network through W1, b1, W2");
 
 print("");
+print("== reductions over a LIST of axes ==");
+// nd_sum/nd_mean have always accepted a list of axes. btorch's backward passes
+// assumed a scalar: `$shape[$axis]` with a list, and `$i == $axis` comparing a
+// number against a list, which is never true. So the forward value was right
+// and the backward raised inside nd_reshape -- which made bt.mean($x,[0,2,3])
+// unusable, and that is exactly the reduction BatchNorm2d, GroupNorm and
+// InstanceNorm2d need. One axis normalisation (_axes) now serves both.
+def mk4() { return [bt.tensor(nd_random_uniform([2,3,2,2], -1.0, 1.0), true, null)]; }
+
+$lx = bt.tensor(nd_random_uniform([2,3,2,2], -1.0, 1.0), true, null);
+$lm = bt.mean($lx, [0, 2, 3], true);
+eqList(nd_shape($lm.data), [1, 3, 1, 1], "mean over [0,2,3] keeps rank with keepdims");
+ok(nd_tobytes($lm.data, "f64") == nd_tobytes(nd_mean($lx.data, [0,2,3], true), "f64"),
+   "and is bit-identical to nd_mean's own answer");
+bt.sum($lm, null, null).backward(null);
+// d(sum of 3 channel means)/dx = 1/(N*H*W) = 1/8 at every element.
+close(nd_get($lx.grad, [0,0,0,0]), 0.125, 0.0000000001,
+      "the gradient divides by N*H*W (8), not by one axis");
+close(nd_get(nd_sum($lx.grad, null, null), []), 3.0, 0.0000000001,
+      "and sums to the number of outputs (3 channels)");
+
+gc(def($i) { return bt.sum(bt.mean($i[0], [0,2,3], true), null, null); },  mk4(), "mean [0,2,3] keepdims");
+gc(def($i) { return bt.sum(bt.mean($i[0], [0,2,3], false), null, null); }, mk4(), "mean [0,2,3] no keepdims");
+gc(def($i) { $s = bt.sum($i[0], [1,3], false); return bt.sum(bt.mul($s,$s), null, null); },
+   mk4(), "sum [1,3] through a square");
+gc(def($i) { return bt.sum(bt.mean($i[0], [-2,-1], true), null, null); }, mk4(), "mean over NEGATIVE axes [-2,-1]");
+// A scalar axis and a null axis must be untouched by the generalisation.
+gc(def($i) { return bt.sum(bt.mean($i[0], 1, true), null, null); },  mk4(), "scalar axis 1 still correct");
+gc(def($i) { return bt.sum(bt.mean($i[0], -1, true), null, null); }, mk4(), "scalar NEGATIVE axis -1");
+gc(def($i) { return bt.mean($i[0], null, null); },                   mk4(), "axis null (reduce everything)");
+
+raises(def() { return bt.mean($lx, [0, 0], true); },  "a repeated axis is refused");
+raises(def() { return bt.mean($lx, [0, 9], true); },  "an out-of-range axis is refused");
+raises(def() { return bt.mean($lx, [0, -9], true); }, "an out-of-range NEGATIVE axis is refused");
+raises(def() { return bt.mean($lx, [0.5], true); },   "a fractional axis is refused");
+
+print("");
 print("== the checker itself: it must FAIL on a wrong gradient ==");
 // A gradcheck that can never fail checks nothing. _wrongBackward returns 2*g
 // where the truth is g, so this must be detected.

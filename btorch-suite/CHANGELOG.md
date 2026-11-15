@@ -1042,3 +1042,84 @@ wants a packed micro-kernel, with its own gate. `f32` (B6) remains deferred.
   test** rather than a shared implementation. `tests/bkit_metrics_test.b` asserts they return
   identical numbers on a hand case and on 200 random rows of 10 classes, and that btorch's still
   refuses a label-count mismatch.
+
+---
+
+## Generative groundwork — what a GAN actually costs, measured
+
+Driven by a concrete objective: generative-adversarial models producing images,
+voices and video. The design is in
+[`docs/generative-architecture.md`](../docs/generative-architecture.md); this is
+what changed in btorch.
+
+### The headline finding is about btorch, and it is good news
+
+**btorch's autograd costs about 5%.** A tree-walking interpreter was the prime
+suspect for why a DCGAN step takes seconds, and it is not guilty:
+
+| | |
+|---|---|
+| native `nd_im2col` + `nd_matmul`, `[16,64,32,32]` k=3 | 270.1 ms |
+| the same conv through `bt.conv2d` (autograd tensors) | **284.8 ms — 1.054×** |
+| forward + backward | 757.3 ms = 2.80× the kernel, near-optimal |
+| `bt.relu` with grad / without, 2.1M elements | 4.0 ms / 4.6 ms |
+| native call dispatch | 5.87 µs |
+
+At ML tensor sizes one native call per op amortises dispatch into nothing, and
+btorch makes one call per op. **Writing generative layers in pure Bantu costs
+nothing measurable**; making them fast is a kernel problem.
+
+### Baselines
+
+- **DCGAN, 64×64, batch 16.** 461k params: 1,875 ms/step. 1.31M params:
+  4,627 ms/step, 3,196 ms on 8 threads. A 50k-step run is 26–44 hours —
+  reachable, in days.
+- **A Conv1d keyword spotter**, 134k params, `[80 mels, 101 frames]`, batch 32:
+  292 ms/step → **one epoch of Speech Commands (85k clips) in 12.9 min.**
+- Upsampling is `repeat_interleave`, which already differentiates — and which
+  modern generators prefer over transposed convolution anyway, since it cannot
+  produce checkerboard artifacts.
+
+### Changed
+
+- **[bug fix]** **`sum`/`mean` over a LIST of axes gave the right value and then
+  raised** ([B33]). `nd_mean` always accepted a list; the backward passes
+  compared an axis index *against* a list and indexed a shape with one. So
+  `bt.mean($x, [0,2,3], true)` — the reduction every per-channel norm needs —
+  was unusable with autograd. One `_axes()` helper now serves both, and
+  **negative axes were silently wrong too** (`$i == -1` is never true, so the
+  keepdims reshape was skipped). Gradchecked across list, scalar, negative,
+  negative-list and null axes; repeated, out-of-range and fractional axes raise.
+- **[performance]** **`BatchNorm2d` normalises in place** ([B34]), reducing over
+  `(0,2,3)` instead of permuting to `[N·H·W, C]` and back. The honest record:
+  this was expected to take 112 ms to ~16 ms and delivered **109 ms**. The
+  permutes were real (13.8 ms each) but were a 29 ms side-show in front of a
+  72 ms main event — broadcasting against `[1,C,1,1]`, which had no fast tier in
+  numba and cost 18 ms per op. Fixed there instead (numba N40: 18.0 → 4.9 ms).
+  Kept for the copying it does remove and because it is the shape `GroupNorm`
+  and `InstanceNorm2d` want. The child `BatchNorm1d` stays registered so every
+  serialized name is unchanged and **old checkpoints still load**.
+- **[feature]** **`bt.use_all_cores()`, `bt.set_threads(n)`, `bt.threads()`,
+  `bt.hardware_threads()`** ([B35]). Every model this package ever trained ran
+  single-threaded: 5.94 GFLOP/s against 31.58 on the same 1024³ matmul. Not done
+  on include — `sua` embeds this interpreter and an inference handler must not
+  take twelve cores per request.
+- **[test]** Threading is asserted to be **free, not a trade**: five Adam steps
+  over a model with a `BatchNorm1d` are compared **byte for byte** via
+  `nd_tobytes` at 1, 4 and all threads. An `allclose` there would pass even if
+  threading perturbed the arithmetic, which is the one thing that must not
+  happen.
+
+### Audio, proven end to end with no new kernels
+
+Relevant to btorch because it is what a voice model consumes.
+
+- A 16 kHz mono WAV decodes in ~60 lines of pure Bantu (walk the RIFF chunks,
+  `nd_frombytes(…, "i16")`, scale by 1/32768). Verified against a file written by
+  Python's `wave`: peak reads back `0.610352`, exactly the `20000/32768` written.
+- **Log-mel at 98× realtime** (60 s of audio → 613 ms), with the STFT done as a
+  matmul against a real DFT basis. Verified exact, not approximate: 1000 / 2000 /
+  4000 Hz tones peak in bins 25 / 50 / 100.
+- **So `nd_rfft` is not on the critical path for voice.** At `n_fft = 400` the
+  dense matmul wins on constants, because it runs in native GEMM where a
+  radix-2 FFT written in Bantu would run in the evaluator.

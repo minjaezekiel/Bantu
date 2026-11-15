@@ -457,6 +457,56 @@ $deep.eval();
 ok(!$deep.get("fc3").training, "eval() reaches a child added at the third level");
 
 print("");
+print("== threads: asking for the machine must not change the answer ==");
+// btorch now exposes numba's thread knob (bt.use_all_cores / bt.set_threads),
+// because every model this package trained ran single-threaded: 5.94 GFLOP/s
+// against 31.58 on the same 1024^3 matmul. The whole case for opting in rests
+// on the claim that it is FREE -- that the fixed partition (numba N25) makes
+// more threads produce the SAME BITS, not merely similar numbers.
+//
+// So train the same model twice, once at 1 thread and once at all of them, and
+// require every parameter to match byte for byte. A test that used allclose
+// here would pass even if threading perturbed the arithmetic, which is the one
+// thing that must not happen.
+def _trainSteps($threads) {
+    bt.set_threads($threads);
+    bt.manual_seed(4242);
+    $m = nn.Sequential([nn.Linear(12, 24, true), nn.ReLU(),
+                        nn.BatchNorm1d(24, null, null),
+                        nn.Linear(24, 3, true)]);
+    $o = optim.Adam($m.parameters(), 0.01, null, null, null);
+    bt.manual_seed(99);
+    $x = bt.randn([64, 12], false);
+    $y = bt.randn([64, 3], false);
+    $i = 0;
+    while ($i < 5) {
+        $o.zero_grad();
+        nn.mse_loss($m.forward($x), $y, null).backward(null);
+        $o.step();
+        $i = $i + 1;
+    }
+    $bytes = "";
+    for $p in $m.parameters() { $bytes = $bytes + nd_tobytes($p.data, "f64"); }
+    return $bytes;
+}
+$keepT = bt.threads();
+$one   = _trainSteps(1);
+$many  = _trainSteps(bt.hardware_threads());
+$four  = _trainSteps(4);
+bt.set_threads($keepT);
+ok($one == $many, "5 Adam steps are bit-identical at 1 thread and at "
+                  + str(bt.hardware_threads()));
+ok($one == $four, "and bit-identical at 4 threads");
+ok(len($one) > 0, "the comparison actually had parameter bytes to compare");
+
+eq(bt.set_threads(3), 3, "set_threads returns the count it set");
+eq(bt.threads(), 3, "and threads() reads it back");
+ok(bt.hardware_threads() >= 1, "hardware_threads() reports at least one core");
+eq(bt.use_all_cores(), bt.hardware_threads(), "use_all_cores() takes every core");
+eq(bt.set_threads($keepT), $keepT, "and the default is restorable");
+bt.set_threads($keepT);
+
+print("");
 print("========================================");
 print("  PASS: " + str($R.pass) + "   FAIL: " + str($R.fail));
 print("========================================");

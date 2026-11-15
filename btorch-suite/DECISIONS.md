@@ -684,3 +684,98 @@ What does **not** follow: optimizer state slots already allocated. So `to()` is
 documented as "call it before building the optimizer", and the MNIST sample
 does exactly that. An integer buffer — `BatchNorm`'s `num_batches_tracked` — is
 left alone, because casting a count to a float would be wrong.
+
+---
+
+### B33 — reductions take a LIST of axes, because every per-channel norm needs one
+
+`nd_sum`/`nd_mean` have always accepted a list of axes. btorch's backward passes
+assumed a scalar:
+
+```bantu
+if ($i == $axis) { push($target, 1); }   // a number against a list: never true
+$n = $shape[$axis];                      // indexing a shape with a list
+```
+
+So `bt.mean($x, [0,2,3], true)` produced the **right forward value** — `nd_mean`
+did the work — and then raised inside `nd_reshape` on the backward pass, because
+the gradient was never reshaped to the keepdims shape. Multi-axis reductions
+were unusable with autograd, which is exactly the reduction `BatchNorm2d`,
+`GroupNorm` and `InstanceNorm2d` need.
+
+It raised rather than returning a wrong gradient, which is the good failure
+mode — but it meant the only way to normalise per channel was to permute the
+tensor into a shape a scalar axis could handle, which is what `BatchNorm2d` did
+(see [B34]).
+
+**Fix:** one `_axes($axis, $rank)` helper shared by `sum` and `mean`, which
+normalises a scalar, a list or `null` into one form, and resolves negative axes
+while it is there. `_keepShape` and `_axesCount` follow from it. Gradchecked
+across list, scalar, negative, negative-list and null axes, with the repeat,
+out-of-range and fractional cases asserted to raise.
+
+**Negative axes were also wrong before** and nobody had noticed: `$i == -1` is
+never true, so the keepdims reshape was skipped. It happened to work when the
+caller passed `keepdims = true` (the gradient already had the right shape) and
+was wrong otherwise.
+
+---
+
+### B34 — `BatchNorm2d` normalises in place, and the permutes were not the cost
+
+It used to fold the spatial axes into the batch — permute `[N,C,H,W]` to
+`[N,H,W,C]`, reshape to `[N·H·W, C]`, delegate to `BatchNorm1d`, permute back —
+so that there was **one** normalisation implementation. That is the right
+instinct and it was the wrong call here: the two permutes materialise the whole
+tensor in a cache-hostile stride order, twice forward and twice backward, to
+share twenty lines of arithmetic.
+
+It now reduces over axes `(0,2,3)` directly ([B33] made that possible) and
+broadcasts the `[1,C,1,1]` statistics back. No permute, no reshape, no copy.
+
+**Honest record of the measurement, because it refuted the reason for the
+change.** The rewrite was expected to take 112 ms down to ~16 ms. It gave
+**109 ms** — about 2%. The permutes were real (13.8 ms each) but they were a
+29 ms side-show in front of a 72 ms main event: *broadcasting* against a
+`[1,C,1,1]` operand cost 18 ms per op because numba had no fast tier for a
+broadcast vector. That was fixed in the kernel (numba [N40], 18.0 → 4.9 ms),
+and the rewrite is kept for the 29 ms of copying it genuinely removes, plus
+being the shape `GroupNorm` and `InstanceNorm2d` will want.
+
+**The child `BatchNorm1d` is still registered**, and that is deliberate rather
+than vestigial: it owns `gamma`, `beta` and the running buffers, so every
+serialized name (`bn.gamma`, `bn.running_mean`, …) is unchanged and checkpoints
+written before this change still load. `named_buffers()` prefixes by child name,
+so flattening the tree would have silently broken every saved model with a
+`BatchNorm2d` in it.
+
+Verified against the previous implementation element by element: both running
+statistics bit-identical, output values identical to printed precision, and the
+only differences at the noise floor (`3.6e-15` against `0` for a sum that is
+zero by construction) from a changed summation order.
+
+---
+
+### B35 — btorch asks for threads; it does not take them on include
+
+Every model this package has trained ran **single-threaded**, because numba
+defaults to one thread and btorch never asked. On a 12-thread machine, a 1024³
+f64 matmul: 5.94 GFLOP/s at 1 thread, **31.58 at 8**.
+
+So `bt.set_threads(n)`, `bt.threads()`, `bt.hardware_threads()` and
+`bt.use_all_cores()` are now part of btorch's surface — a training script should
+not have to reach past btorch into numba for this.
+
+**Why opting in is free, not a trade.** numba's fixed partition (N25) makes
+results bit-identical at any thread count. The test asserts it rather than
+repeating it: five Adam steps over a model with a `BatchNorm1d` are compared
+**byte for byte** at 1, 4 and all threads via `nd_tobytes`. An `allclose` there
+would pass even if threading perturbed the arithmetic, which is the one thing
+that must not happen.
+
+**Rejected: setting threads on include.** This interpreter is also embedded in
+`sua`. An inference handler that imports btorch would start taking twelve cores
+per request, and whoever wrote the handler never asked for threads at all. One
+line at the top of a training script is the correct price. The numba default
+stays at 1 for the same reason — and its *documented* reason, that results
+change on a machine with more cores, was wrong and has been corrected (N25).

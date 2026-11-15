@@ -11,6 +11,14 @@ is no, and the reasoning is [E2](#e2).
 
 ---
 
+**Generative models** (GANs for images, voices and video) are a target laid over
+these stages rather than a stage of their own, because what they need is spread
+across all three tiers. Their design, and the measurements that decide the order
+of the work, are in
+[generative-architecture.md](generative-architecture.md) — including the finding
+that the package layer costs only 5% over its kernels, so the work is almost
+entirely below it.
+
 ## 1. Three tiers, not two
 
 The framing that resolves most of the packaging questions. Every item on the
@@ -95,6 +103,7 @@ Two edges deserve comment:
 | **`bonnx`** | onnxruntime (import side) | ONNX model import → `nn.Module`; export later | — | numba, btorch | 4 |
 | **`btext`** | tokenizers + sklearn.feature_extraction.text | BPE/WordPiece/Unigram, normalizers, vocab, tf-idf, n-grams | `tok_` | numba, bkit | 5 |
 | **`bsci`** | scipy | optimize, stats, signal, sparse, interpolate, special | `sp_` | numba | 6 |
+| **`sauti`** | librosa + soundfile | WAV read/write, framing/windows/STFT, mel filterbanks, MFCC, resample, SpecAugment, Griffin–Lim | — | numba | gen |
 | `bvision` *(deferred)* | torchvision | augmentation, transforms, CIFAR/ImageFolder readers | — | pillow, btorch | — |
 | `bstats` *(deferred)* | statsmodels | GLM, ARIMA/ETS, survival, inference | — | bsci, arctic | — |
 
@@ -104,6 +113,8 @@ Two edges deserve comment:
 |---|---|---|
 | dtype templating, f32, threading, packed GEMM, FFT, `nd_memmap`, int8 dtype | **binary + `numba`** | it is the array layer; a package cannot add a dtype |
 | RNN/GRU/LSTM, MultiheadAttention, TransformerEncoder | **`btorch`** (`rnn.b`, `attention.b`) | they are `nn.Module`s over primitives that already exist; torch ships them in core |
+| the four adversarial objectives, `gradient_penalty`, R1, spectral norm, generator EMA | **`btorch`** (`gan.b`) | a loss is not a layer, and a GAN's correctness lives almost entirely in its objective |
+| `InstanceNorm2d`, `GroupNorm`, `PixelShuffle`, `Upsample` | **`btorch`** (`nn.b`) | same as ConvTranspose2d below |
 | ConvTranspose2d, grouped/depthwise conv, AdaptiveAvgPool2d | **`btorch`** (`nn.b`) | same |
 | int8 quantization | **`btorch`** (`quant.b`) | it must know every layer type to swap it ([E5](#e5)) |
 | Parquet, Arrow, out-of-core scans | **`arctic`** | Parquet is a dataframe format; arctic already has optional Arrow |
@@ -125,7 +136,7 @@ are a deliberate, enumerable commitment — not an accident.
 | `aead_` `sodium_` `pwhash_` `b64url_` `ct_` | crypto | shipped | — |
 | `webpush_` | Web Push | shipped | — |
 | `gc_` | the collector | shipped | — |
-| **`tree_`** | bkit | planned | stage 3 |
+| **`tree_`** | bkit | **shipped** | stage 3 (K7) |
 | **`tok_`** | btext | planned | stage 5 |
 | **`q8_`** | btorch.quant | planned | stage 6 |
 | **`sp_`** | bsci.sparse | planned | stage 6 |

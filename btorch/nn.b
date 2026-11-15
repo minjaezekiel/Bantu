@@ -726,10 +726,57 @@ class _BatchNorm2d extends Module {
         if (len($s) != 4) {
             throw "btorch.nn.BatchNorm2d: expected [N, C, H, W], got " + str($s);
         }
-        // [N,C,H,W] -> [N*H*W, C], normalize, and back.
-        $nhwc = bt.reshape(bt.permute($x, [0, 2, 3, 1]), [$s[0] * $s[2] * $s[3], $s[1]]);
-        $out = this.get("bn").forward($nhwc);
-        return bt.permute(bt.reshape($out, [$s[0], $s[2], $s[3], $s[1]]), [0, 3, 1, 2]);
+        // Normalize per channel over (N, H, W) IN PLACE on the [N,C,H,W] layout:
+        // reduce over axes [0,2,3] and broadcast the [1,C,1,1] statistics back.
+        //
+        // This used to fold the spatial axes into the batch -- permute to
+        // [N,H,W,C], reshape to [N*H*W, C], hand it to BatchNorm1d, and permute
+        // back -- so that there was ONE normalization implementation. That
+        // instinct is right in general and was wrong here: the two permutes
+        // materialize the whole tensor in a cache-hostile stride order, twice
+        // forward and twice backward, for the sake of sharing twenty lines.
+        // Measured on [16,32,64,64] at 8 threads: 112 ms, against ~16 ms for
+        // the passes over the data the arithmetic actually needs (docs/
+        // generative-architecture.md G4). Every GAN generator is a stack of
+        // these, so it sat on the critical path of the whole objective.
+        //
+        // The child BatchNorm1d is still registered and still owns gamma, beta
+        // and the running buffers. That is deliberate and not vestigial: it
+        // keeps the parameter tree and therefore every serialized name
+        // ("bn.gamma", "bn.running_mean", ...) byte-identical, so checkpoints
+        // written before this change still load.
+        $bn  = this.get("bn");
+        $c   = [1, $s[1], 1, 1];
+        $gam = bt.reshape($bn.param("gamma"), $c);
+        $bet = bt.reshape($bn.param("beta"), $c);
+        if (this.training) {
+            // Biased variance to normalize with, Bessel-corrected for the
+            // stat that gets stored -- which is what PyTorch does.
+            $mu   = bt.mean($x, [0, 2, 3], true);
+            $cen  = bt.sub($x, $mu);
+            $var  = bt.mean(bt.mul($cen, $cen), [0, 2, 3], true);
+            $norm = bt.div($cen, bt.sqrt(bt.add($var, $bn.eps)));
+            $cnt  = $s[0] * $s[2] * $s[3];
+            bt.no_grad(def() {
+                $m = nd_reshape($mu.data, [$s[1]]);
+                $v = nd_reshape($var.data, [$s[1]]);
+                if ($cnt > 1) {
+                    $v = nd_multiply($v, ($cnt * 1.0) / ($cnt - 1.0), null);
+                }
+                $rm = $bn.buffer("running_mean");
+                $rv = $bn.buffer("running_var");
+                $rm.data = nd_add(nd_multiply($rm.data, 1.0 - $bn.momentum, null),
+                                  nd_multiply($m, $bn.momentum, null), null);
+                $rv.data = nd_add(nd_multiply($rv.data, 1.0 - $bn.momentum, null),
+                                  nd_multiply($v, $bn.momentum, null), null);
+                return null;
+            });
+            return bt.add(bt.mul($norm, $gam), $bet);
+        }
+        $rm = bt.tensor(nd_reshape($bn.buffer("running_mean").data, $c), false);
+        $rv = bt.tensor(nd_reshape($bn.buffer("running_var").data, $c), false);
+        $norm = bt.div(bt.sub($x, $rm), bt.sqrt(bt.add($rv, $bn.eps)));
+        return bt.add(bt.mul($norm, $gam), $bet);
     }
 }
 def BatchNorm2d($c, $eps, $momentum) { return new _BatchNorm2d($c, $eps, $momentum); }
