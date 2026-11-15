@@ -57,6 +57,12 @@ def _negInf() {
     return np.get(np.log(np.zeros([1], "f64"), null), [0]);
 }
 
+// A full reduction returns a 0-d ndarray HANDLE, and every handle is truthy
+// (numba N41), so it has to be read out rather than used as a number.
+def _scalar($x) {
+    return np.get(np.reshape($x, [1]), [0]);
+}
+
 def _checkDepth($d) {
     if ($d == null) { return 6; }
     if (type($d) != "number" || $d != floor($d) || $d < 1) {
@@ -110,6 +116,27 @@ class _TreeBase extends Estimator {
         this.n_feat_ = 0;
         this.depth_  = 0;
         this.leaves_ = 0;
+        // Per-feature split gain and split count for the LAST tree _grow grew.
+        // They are a side output of the grower rather than a column of the node
+        // array, and that is deliberate: a node is 7 doubles and tree_predict
+        // strides by 7 in C++, so an 8th column would be a native change and a
+        // breaking change to every saved model, to carry a number prediction
+        // never reads. The caller accumulates across trees (K57).
+        this.lastGains_  = null;
+        this.lastSplits_ = null;
+        this.gains_      = null;   // accumulated over every tree in the model
+        this.splits_     = null;
+        // Column subsampling, per §8.5: a [f,1,1] mask of 1s and 0s multiplied
+        // into the histogram the SCAN sees. A zeroed feature has G = H = n = 0
+        // in every bin, so every cut on it has n_L = 0 < min_data AND fails the
+        // hessian guard -- two independent reasons to skip it, neither of which
+        // is a special case in the kernel. null means every feature.
+        //
+        // The mask is applied to a COPY handed to tree_best_split, never to
+        // $hist itself: $hist is what _totals reads and what the children are
+        // derived from by subtraction, and masking it would make a child's
+        // histogram the difference of a masked and an unmasked one.
+        this.featMask_ = null;
     }
 
     def _prepare($X, $y, $who) {
@@ -143,25 +170,60 @@ class _TreeBase extends Estimator {
         return [np.get($s, [0]), np.get($s, [1]), np.get($s, [2])];
     }
 
+    // THE SAME GUARD tree_best_split applies to the gain, applied to the leaf.
+    // The kernel refuses a child with !(H + λ > 0) because G²/0 with G ≠ 0 is
+    // +inf, which wins every comparison (K45). The leaf value is computed from
+    // the same two quantities and had no guard at all, so a node whose hessians
+    // sum to zero raised "Division by zero" out of the middle of _grow -- a
+    // scalar /0 raises in Bantu, unlike the array case.
+    //
+    // Not reachable from K7's own estimators: both set h = 1 per row, so
+    // H = n ≥ 1. It is reachable from K8's booster, where logistic h = p(1−p)
+    // underflows to 0 across a saturated node and reg_lambda defaults to 0 —
+    // i.e. the first thing K8 does with this grower would have hit it. Fixing
+    // it in the grower rather than in the booster is the point: there is one
+    // grower, and the asymmetry (kernel guards, caller does not) is the defect.
+    //
+    // Zero is the right value, not a fallback. −G/(H+λ) is the minimiser of the
+    // second-order loss approximation; at H + λ = 0 that approximation has no
+    // curvature and the minimiser is unbounded, which is an artefact of the
+    // approximation rather than a step worth taking. XGBoost's CalcWeight
+    // returns 0 in exactly this case and LightGBM does the same. Written
+    // !(x > 0.0) so a negative or NaN total is caught too, matching the kernel
+    // character for character.
     def _leafValue($G, $H) {
-        return 0.0 - $G / ($H + this.params_.reg_lambda);
+        $d = $H + this.params_.reg_lambda;
+        if (!($d > 0.0)) { return 0.0; }
+        return 0.0 - $G / $d;
     }
 
     // Grows one tree over (g, h) and returns the [n_nodes, 7] node array.
     // Breadth-first over an explicit queue: Bantu's call depth is capped at
     // 1000 and a recursive grower would also make the node indices awkward,
     // since a child's slot has to exist before its parent can point at it.
-    def _grow($B, $g, $h) {
+    def _grow($B, $g, $h, $rootIdx) {
         $shape = tree_bin_shape($B);
         $nrow  = np.get($shape, [0]);
         $ncol  = np.get($shape, [1]);
+
+        // Per-feature gain and split count for THIS tree. Built as Bantu lists
+        // because there are n_features of them and one += per split, not per
+        // element -- a tree with 1,000 splits does 1,000 of these.
+        $gainF  = [];
+        $splitF = [];
+        $fi = 0;
+        while ($fi < $ncol) { append($gainF, 0.0); append($splitF, 0.0); $fi = $fi + 1; }
 
         $nodes = [];                 // each a 7-element list
         // [idx, depth, slot, hist] -- hist is this node's histogram, carried
         // from its parent by subtraction (see below) or null for the root.
         $pend  = [];
         append($nodes, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-        append($pend,  [null, 0, 0, null]);
+        // $rootIdx null means every row. A booster passes a row subsample and a
+        // forest passes a BOOTSTRAP sample -- an index array with repeats, which
+        // tree_hist counts once per occurrence, i.e. bootstrap semantics with no
+        // kernel change (§8.5).
+        append($pend,  [$rootIdx, 0, 0, null]);
         $qi = 0;
         $maxDepth = 0;
         $leaves = 0;
@@ -205,7 +267,11 @@ class _TreeBase extends Estimator {
                     $leaves = $leaves + 1;
                 }
                 if ($n >= 2.0 * this.params_.min_samples_leaf) {
-                    $bs = tree_best_split($hist, $B,
+                    $scan = $hist;
+                    if (this.featMask_ != null) {
+                        $scan = np.multiply($hist, this.featMask_, null);
+                    }
+                    $bs = tree_best_split($scan, $B,
                                           this.params_.reg_lambda,
                                           this.params_.gamma,
                                           this.params_.min_child_weight,
@@ -243,6 +309,11 @@ class _TreeBase extends Estimator {
                         append($nodes, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
                         $nodes[$slot] = [0.0, 1.0 * $feat, $thr, 1.0 * $li,
                                          1.0 * $ri, 0.0, $nanL];
+                        // Recorded where the gain is still in hand. Reading it
+                        // back off the node array afterwards is impossible --
+                        // the node holds the threshold, not the gain.
+                        $gainF[$feat]  = $gainF[$feat] + $gain;
+                        $splitF[$feat] = $splitF[$feat] + 1.0;
                         // Build the smaller child, subtract for the larger.
                         $hL = null;
                         $hR = null;
@@ -262,6 +333,8 @@ class _TreeBase extends Estimator {
         }
         this.depth_  = $maxDepth;
         this.leaves_ = $leaves;
+        this.lastGains_  = np.array($gainF,  "f64");
+        this.lastSplits_ = np.array($splitF, "f64");
         return np.array($nodes, "f64");
     }
 
@@ -336,6 +409,53 @@ class _TreeBase extends Estimator {
     }
     def depth()    { this._check("depth");    return this.depth_; }
     def n_leaves() { this._check("n_leaves"); return this.leaves_; }
+
+    // Per-feature importance, NORMALISED to sum to 1 as scikit-learn's is.
+    //
+    //   kind = "gain"  (default) -- the total gain of every split on a feature,
+    //                               which is what the model actually used it for
+    //   kind = "split"           -- how many splits used it, which a single
+    //                               high-gain split and ten marginal ones look
+    //                               identical under, and which is therefore
+    //                               reported separately rather than averaged in
+    //
+    // A model with NO splits (a single leaf -- a constant target, or every gain
+    // non-positive) has total 0. That returns ZEROS rather than dividing: an
+    // array /0 is NaN in numba and a vector of NaNs reads as "unknown" when the
+    // truthful answer is "this model uses no feature at all" ([K57]).
+    def feature_importances_($kind) {
+        this._check("feature_importances_");
+        $k = $kind;
+        if ($k == null) { $k = "gain"; }
+        if ($k != "gain" && $k != "split") {
+            throw this.name_ + ".feature_importances_: kind must be \"gain\" or "
+                  + "\"split\", got " + str($kind);
+        }
+        $v = this.gains_;
+        if ($k == "split") { $v = this.splits_; }
+        if ($v == null) {
+            throw this.name_ + ".feature_importances_: this model recorded no "
+                  + "importances, which should be impossible after a fit";
+        }
+        $tot = _scalar(np.sum($v, null, false));
+        if (!($tot > 0.0)) { return np.zeros([np.size($v)], "f64"); }
+        return np.divide($v, $tot, null);
+    }
+
+    // Accumulates one grown tree's side outputs into the model's totals. The
+    // grower overwrites lastGains_ on every call, so a multiclass or boosted
+    // model must fold them in after each _grow rather than reading them at the
+    // end.
+    def _accImportance() {
+        if (this.gains_ == null) {
+            this.gains_  = np.copy(this.lastGains_);
+            this.splits_ = np.copy(this.lastSplits_);
+            return null;
+        }
+        this.gains_  = np.add(this.gains_,  this.lastGains_,  null);
+        this.splits_ = np.add(this.splits_, this.lastSplits_, null);
+        return null;
+    }
 }
 
 // ── regressor ───────────────────────────────────────────────────────────────
@@ -356,7 +476,10 @@ class _DecisionTreeRegressor extends _TreeBase {
         // and the leaf value is the mean (at reg_lambda = 0).
         $g = np.multiply($v, 0.0 - 1.0, null);
         $h = np.ones([np.shape($A)[0]], "f64");
-        this.nodes_  = this._grow($B, $g, $h);
+        this.gains_  = null;
+        this.splits_ = null;
+        this.nodes_  = this._grow($B, $g, $h, null);
+        this._accImportance();
         this.fitted_ = true;
         return this;
     }
@@ -420,13 +543,16 @@ class _DecisionTreeClassifier extends _TreeBase {
         $k = np.size(this.classes_);
         $B = tree_bin($A, this.params_.max_bins);
         $h = np.ones([np.shape($A)[0]], "f64");
+        this.gains_  = null;
+        this.splits_ = null;
 
         if ($k == 2) {
             // y mapped to 0/1 against classes_[1]; g = -y, h = 1 makes the gain
             // proportional to Gini decrease (header) and the leaf the positive
             // proportion.
             $pos = np.astype(np.equal($v, np.get(this.classes_, [1]), null), "f64");
-            this.nodes_ = this._grow($B, np.multiply($pos, 0.0 - 1.0, null), $h);
+            this.nodes_ = this._grow($B, np.multiply($pos, 0.0 - 1.0, null), $h, null);
+            this._accImportance();
             this.trees_ = null;
         }
         if ($k != 2) {
@@ -437,7 +563,11 @@ class _DecisionTreeClassifier extends _TreeBase {
             while ($i < $k) {
                 $pos = np.astype(np.equal($v, np.get(this.classes_, [$i]), null), "f64");
                 append(this.trees_,
-                       this._grow($B, np.multiply($pos, 0.0 - 1.0, null), $h));
+                       this._grow($B, np.multiply($pos, 0.0 - 1.0, null), $h, null));
+                // Folded in per tree: _grow overwrites lastGains_ on every call,
+                // so a K-class model that read them at the end would report only
+                // its last class's splits.
+                this._accImportance();
                 if (this.depth_ > $deepest) { $deepest = this.depth_; }
                 $allLeaves = $allLeaves + this.leaves_;
                 $i = $i + 1;
@@ -506,4 +636,141 @@ def DecisionTreeClassifier($max_depth, $min_samples_leaf, $max_bins, $reg_lambda
                                        $reg_lambda, $gamma, $min_child_weight);
 }
 
-def version() { return "bkit.tree 0.7.0 (decision trees over tree_*)"; }
+// ── the grower, as a reusable object ────────────────────────────────────────
+// K8's booster grows a tree over arbitrary (g, h) rather than over a target,
+// and §8.6 of the design is explicit that it must be THE SAME grower: a second
+// one inside ensemble.b would be a second place that has to get [K44]'s NaN
+// direction, the empty-child assertion and the raw-value threshold lookup
+// right, and one place already got the NaN direction subtly wrong.
+//
+// So the grower is EXPOSED rather than copied. _TreeGrower adds no growth logic
+// at all -- it inherits _grow unchanged and only validates its arguments, which
+// the estimators do not have to because they build g and h themselves.
+//
+// It is not an Estimator in the protocol sense: fit/predict are refused by name
+// rather than left to fail somewhere unrelated, because a grower has no target
+// and nothing to predict with on its own.
+class _TreeGrower extends _TreeBase {
+    def init($max_depth, $min_samples_leaf, $max_bins, $reg_lambda, $gamma,
+             $min_child_weight) {
+        super($max_depth, $min_samples_leaf, $max_bins, $reg_lambda, $gamma,
+              $min_child_weight);
+        this.name_ = "TreeGrower";
+        this.task_ = "grower";
+    }
+
+    // Returns the [n_nodes, 7] node array for one tree over (g, h), and leaves
+    // depth(), n_leaves(), n_nodes() and feature_importances_ reporting it.
+    //
+    // $rootIdx null grows over every row; an index array grows over those rows
+    // only, with repeats counted once each -- which is a row subsample for a
+    // booster and a bootstrap sample for a forest. g and h stay FULL LENGTH
+    // either way: they are indexed by row, not by position in the subsample,
+    // and re-indexing them would be a copy per tree for no gain.
+    def grow($B, $g, $h, $rootIdx) {
+        if ($B == null) {
+            throw "TreeGrower.grow: a binned matrix from tree_bin is required";
+        }
+        if ($g == null || $h == null) {
+            throw "TreeGrower.grow: both g and h are required; a booster that "
+                  + "passes only gradients is using the wrong grower";
+        }
+        $gv = base._asarray($g);
+        $hv = base._asarray($h);
+        $sh = tree_bin_shape($B);
+        $n  = np.get($sh, [0]);
+        if (np.size($gv) != $n || np.size($hv) != $n) {
+            throw "TreeGrower.grow: the binned matrix has " + str($n)
+                  + " rows but g has " + str(np.size($gv)) + " and h has "
+                  + str(np.size($hv));
+        }
+        if (len(np.shape($gv)) != 1 || len(np.shape($hv)) != 1) {
+            throw "TreeGrower.grow: g and h must be 1-d, got "
+                  + str(np.shape($gv)) + " and " + str(np.shape($hv));
+        }
+        this.n_feat_ = np.get($sh, [1]);
+        this.nodes_  = this._grow($B, $gv, $hv, $rootIdx);
+        this._accImportance();
+        this.fitted_ = true;
+        return this.nodes_;
+    }
+
+    // The columns this grower may split on, as a list of feature indices. null
+    // restores all of them. Stored as a [f,1,1] mask so the histogram multiply
+    // broadcasts (numba tier 1b), rather than as a list the scan would have to
+    // consult per bin.
+    def set_features($cols) {
+        if ($cols == null) { this.featMask_ = null; return null; }
+        if (this.n_feat_ == 0) {
+            throw "TreeGrower.set_features: the number of features is not known "
+                  + "until the first grow; pass n_features to known_features() "
+                  + "first, or call set_features after a grow";
+        }
+        $m = [];
+        $i = 0;
+        while ($i < this.n_feat_) { append($m, 0.0); $i = $i + 1; }
+        $j = 0;
+        while ($j < len($cols)) {
+            $c = $cols[$j];
+            if (type($c) != "number" || $c != floor($c) || $c < 0
+                || $c >= this.n_feat_) {
+                throw "TreeGrower.set_features: " + str($c) + " is not a feature "
+                      + "index in 0.." + str(this.n_feat_ - 1);
+            }
+            if ($m[$c] != 0.0) {
+                throw "TreeGrower.set_features: feature " + str($c) + " is listed "
+                      + "twice; a repeated column does not weight it, it just "
+                      + "hides the typo";
+            }
+            $m[$c] = 1.0;
+            $j = $j + 1;
+        }
+        if (len($cols) == 0) {
+            throw "TreeGrower.set_features: an empty column list would grow a "
+                  + "single leaf for every tree; pass null for all features";
+        }
+        this.featMask_ = np.reshape(np.array($m, "f64"), [this.n_feat_, 1, 1]);
+        return null;
+    }
+
+    // Declare the feature count before the first grow, so set_features can be
+    // called up front.
+    def known_features($f) {
+        if (type($f) != "number" || $f != floor($f) || $f < 1) {
+            throw "TreeGrower.known_features: expected a whole number >= 1, got "
+                  + str($f);
+        }
+        this.n_feat_ = $f;
+        return null;
+    }
+
+    // Forget the accumulated importances without rebuilding the object, so a
+    // booster can reuse one grower for every round and still report per-model
+    // totals.
+    def reset_importance() {
+        this.gains_  = null;
+        this.splits_ = null;
+        return null;
+    }
+
+    def fit($X, $y) {
+        throw "TreeGrower is not an estimator: it grows one tree over (g, h). "
+              + "Use DecisionTreeRegressor/Classifier, or ensemble.b.";
+    }
+    def predict($X) {
+        throw "TreeGrower does not predict: pass the node array it returns to "
+              + "tree_predict(nodes, X).";
+    }
+    def clone() {
+        return TreeGrower(this.params_.max_depth, this.params_.min_samples_leaf,
+            this.params_.max_bins, this.params_.reg_lambda, this.params_.gamma,
+            this.params_.min_child_weight);
+    }
+}
+def TreeGrower($max_depth, $min_samples_leaf, $max_bins, $reg_lambda, $gamma,
+               $min_child_weight) {
+    return new _TreeGrower($max_depth, $min_samples_leaf, $max_bins, $reg_lambda,
+                           $gamma, $min_child_weight);
+}
+
+def version() { return "bkit.tree 0.7.1 (decision trees over tree_*)"; }

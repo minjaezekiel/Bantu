@@ -1213,6 +1213,16 @@ single-leaf tree, not an exception — and the guards that could be throwing are
 both documented as unreachable. That is worth chasing on its own terms, not
 just as test hygiene.
 
+**Both halves are now resolved, and neither resolution was test hygiene.**
+Chasing the throw found [K55]: a third site, `_leafValue`, divided by `H + λ`
+with no guard at all, so a zero-hessian node raised `Division by zero` out of
+the middle of `_grow`. A grower that can find no split now returns a single-leaf
+tree with value 0 — gated four ways, and reached two different ways (a zero
+hessian, and a row subsample whose target is constant). The attribution itself
+is [K56]: all 33 sections are wrapped, and the same two mutations that used to
+report *"(crashed)"* now report `PASS: 79  FAIL: 33` with the throwing section
+named. T4–T12 were re-run against the restored kernel afterwards.
+
 ---
 
 ### K54 — histogram subtraction landed in K7's grower, and its gate is per channel
@@ -1260,3 +1270,310 @@ parent's histogram, not from a running total, so the depth of the tree does not
 enter the bound. This is what LightGBM and XGBoost both accept.
 
 `bkit_tree_test.b` 123 → 127 assertions.
+
+---
+
+### K55 — the kernel guarded the gain, the caller divided by zero
+
+[K45] is the record of `tree_best_split` refusing a child with
+`!(HL + λ > 0.0)`: the danger with a saturated hessian is not a `NaN` gain,
+which loses every comparison, but `G²/0` with `G ≠ 0`, which is `+inf` and
+**wins** every comparison. The kernel has had that guard since it was written.
+
+`_leafValue` computes `−G / (H + λ)` **from the same two quantities** and had no
+guard at all. In Bantu a scalar `/ 0` raises (an array `0/0` is `NaN`), so a
+node whose hessians sum to zero did not produce a wrong leaf — it threw
+`Division by zero` out of the middle of `_grow`, with no node, no tree and no
+indication of which node.
+
+**Reachability is the part worth being precise about.** It is *not* reachable
+from K7's two estimators: both set `h = 1` per row, so `H = n ≥ 1` and the
+denominator is at least `1 + λ`. It is reachable from **K8's booster**, where
+logistic `h = p(1−p)` underflows to 0 across a saturated node and `reg_lambda`
+defaults to 0 — so the first thing K8 does with this grower would have hit it.
+That is precisely why it is fixed in the grower and not in the booster: there is
+one grower ([§8.6]), and the defect is the *asymmetry* between a kernel that
+guards and a caller that does not, not the booster's loss function.
+
+**Zero is the correct value, not a fallback.** `−G/(H+λ)` is the minimiser of
+the second-order approximation of the loss; at `H + λ = 0` that approximation
+has no curvature and its minimiser is unbounded, which is an artefact of the
+approximation rather than a step worth taking. XGBoost's `CalcWeight` returns 0
+in exactly this case and LightGBM does the same. Written `!($d > 0.0)` so a
+negative total (a non-convex loss) and a `NaN` total are caught too — character
+for character the kernel's guard.
+
+Gated four ways, and the mutation was run: removing the guard turns the section
+red with 4 failures rather than aborting the file.
+
+| assertion | what it pins |
+|---|---|
+| all-zero hessians, `λ = 0` → a tree comes back | it does not raise |
+| that tree is `[1, 7]` | a grower that can find no split yields a **single leaf**, which is [K52]'s open question answered |
+| its value is `0.0` | not `inf`, not `NaN` |
+| the same `g`, `h` with `λ = 1` grow a real tree | the guard is about `H + λ`, not about refusing the data |
+| hessians that **cancel** to exactly zero | the negative-hessian path reaches the same guard |
+
+The general lesson, recorded in the language traps as well: **a guard the native
+kernel applies, every Bantu caller computing from the same quantities must apply
+too.** The kernel having one is not protection for the caller.
+
+---
+
+### K56 — a throw must name its section, and a `def` inside a `try` disappears
+
+[K52] asked for this: two `tree_` mutations were "caught by aborting", which
+counts as caught and is still worse than a clean red, because the battery
+learned nothing about *which* assertion or *which* guard, and every section
+after the throw went unreported.
+
+`bkit_tree_test.b` now wraps **each of its 33 sections** in its own
+`try`/`catch`, and a throw is attributed:
+
+```
+  FAIL  [section aborted] tree_hist over a subset
+          threw: {message: ..., line: 212}
+```
+
+One failure, named by section, and the remaining sections still run and still
+report. The whole-file alternative — one `try` around everything — gives one
+attribution and loses every later section, which is most of what was wrong with
+aborting in the first place.
+
+This is cheap only because of a Bantu property that had to be verified rather
+than assumed: **a top-level `try` block does not open a new scope for
+variables.** Anything assigned inside it is visible after the `catch`, so the
+file's straight-line flow — later sections reading `$B`, `$g`, `$hist` from
+earlier ones — is unchanged. Converting every assertion to a closure-taking
+`safe_ok` was the alternative and was rejected: Bantu closures capture by
+reference, so 132 closures over shared script variables is a trap-rich rewrite
+of a file whose job is to be trustworthy.
+
+**But a `def` inside a `try` block *is* scoped to that block.** Four reference
+helpers (`refHist`, `chan`, `bruteSplit`, `giniDecrease`) were defined
+mid-section and became invisible to the sections that consumed them, failing as
+`Undefined variable: refHist` from a line in a different block — the first run
+after wrapping caught it, attributed to the right section by the very mechanism
+being added. All four are hoisted above their `try`. Recorded as language trap
+33, because the asymmetry (variables leak, functions do not) is not guessable.
+
+One case was fixed rather than wrapped. The new [K55] section read `$lzN` in two
+assertions after the call that produces it, so removing the guard aborted the
+run on `nd_shape(null)` — a caught throw cascading into an uncaught one. Those
+assertions now fail explicitly when `$lzN` is null. A section `try` is a
+backstop, not a licence to let an assertion depend on a value that may not
+exist.
+
+---
+
+### K57 — the gain is a grower side output, not an eighth node column
+
+`feature_importances_` needs the gain of every split. A node is **7 doubles**
+and `tree_predict` strides by 7 in C++, so an eighth column would be a native
+change *and* a breaking change to the format every saved model uses — to carry
+a number prediction never reads.
+
+The gain is therefore recorded where it is still in hand, as `_grow` accepts
+each split, into a per-feature vector published as `lastGains_` / `lastSplits_`.
+Reading it back off the node array afterwards is not merely awkward, it is
+impossible: the node holds the **threshold**, not the gain.
+
+Two importances, reported separately rather than blended:
+
+- **gain** — the total gain of every split on a feature, which is what the model
+  actually used it for;
+- **split** — how many splits used it, which one decisive split and ten marginal
+  ones look identical under.
+
+The accumulation is per tree, not per model, and that is the subtle part:
+`_grow` overwrites its side outputs on every call, so a K-class one-vs-rest
+classifier (or a 100-round booster) that read them at the end would report only
+its **last** tree. `_accImportance()` folds each tree in as it is grown, and the
+test asserts a 3-class model counts at least one split per tree.
+
+A model with **no splits at all** — a constant target, or every gain
+non-positive — has total 0. It returns **zeros**, not `total/0`: an array `0/0`
+is `NaN` in numba, and a vector of `NaN`s reads as "unknown" when the truthful
+answer is "this model uses no feature at all".
+
+---
+
+### K58 — the hessian clamp was harmful, and the measurement says so
+
+The design doc said, in §8.4: *"The hessian clamp (`max(h, 1e-16)`) is not
+cosmetic"* — reasoning that a saturated logistic gives `h → 0`, and keeping the
+Newton step finite beats discarding it. `ensemble.b` shipped it that way for
+about an hour. **It is the opposite of safe**, measured directly on the grower:
+
+| h | λ | min_child_weight | result |
+|---|---|---|---|
+| **1e-16** | 0 | 0 | **splits; leaves of ±5e15** |
+| 0 | 0 | 0 | one leaf, value 0 |
+| 1e-16 | 1 (the default) | 1 | one leaf, value 0 |
+
+The middle row is the correct answer and the two existing guards already give
+it: `tree_best_split` refuses a child with `!(H + λ > 0)` ([K45]) and
+`_leafValue` returns 0 for the same condition ([K55]). Lifting `h` to `1e-16`
+makes `H + λ` clear **both** of them by a hair, and converts a refused split
+into a step of five quadrillion — the `+inf` failure mode [K45] exists to
+prevent, scaled down just far enough to survive a finiteness check. **The clamp
+defeated the guards in exactly the configuration where they are needed**, and
+it was invisible at the defaults (λ = 1 and `min_child_weight` = 1 both rescue
+it), which is the worst place for a hazard to hide.
+
+`_clampH` is now `_validH`, and it corrects only what is **invalid**:
+
+- a **negative** hessian — no convex objective produces one, and `G²/(H+λ)` is
+  meaningless for it;
+- a **NaN** — which would make the gain lose every comparison and the leaf
+  `NaN`.
+
+Both become 0, which the guards then handle correctly. A genuine zero is
+**passed through**, and a genuinely tiny hessian (1e-20) is left alone, so this
+is not a floor. `np.maximum` **propagates** `NaN` rather than dropping it the
+way IEEE `fmax` does, so the `NaN` case needs its own `where()` — asserted, not
+assumed.
+
+**Its gate is a unit test on the function, and that choice is the finding.**
+Reintroducing the 1e-16 clamp left all 108 assertions green, including a
+150-round saturated logistic at λ = 0: on a saturated logistic `g → 0` as fast
+as `h` does, so the quotient stays small and the clamp looks harmless. The
+±5e15 case needs `g` to survive while `h` vanishes — a *confidently wrong*
+point — and even a deliberately mislabelled row did not reach it through two
+guards and a scan. Rather than keep hunting for a fixture, the contract is
+pinned on `_validH` directly, where the decision lives. All three mutations
+(clamp reintroduced, negatives passed through, `NaN`s passed through) are now
+caught.
+
+---
+
+### K59 — `get_params()` handed out the live dict, so a read accessor could write
+
+Found by chasing a mutation that turned out to be **equivalent**. "Clone shares
+the parameter dict" passed, and it passed for a good reason: the constructor
+builds a fresh `_defaults()` dict and copies into it, so handing it the live
+dict aliases nothing. Equivalent mutations are worth reporting as equivalent
+rather than as weak tests — and following this one up found a real defect one
+level out.
+
+`Estimator.get_params()` returned `this.params_` itself, and Bantu hands dicts
+over by reference. So the estimator was **writable through a read accessor**,
+which bypassed both guards documented immediately beside it:
+
+```
+$p = $scaler.get_params();
+$p.with_mean = false;     // changed a FITTED scaler, left fitted_ = true
+$p.with_men  = true;      // ADDED a parameter nobody reads
+```
+
+The first is exactly the wrong answer `set_params`' fit-invalidation exists to
+prevent — `transform` then runs with parameters that do not match the statistics
+it learned. The second is [K24]'s mistyped-key bug, reachable through the
+accessor next to the check for it. This was in `base.b`, so it applied to
+**every estimator in the package**.
+
+`get_params()` now returns a copy. Nothing in bkit mutated the result — every
+use is a read — so the change removes only a capability that was never intended
+and that defeats two documented guards.
+
+**How deep the copy goes was measured, because Bantu's answer is asymmetric**
+(language trap 35): the copy loop leaves **list** values independent, because
+binding a dict's list value copies it, while a nested **dict** stays aliased.
+That makes it deep enough for every parameter bkit has — `ColumnTransformer`'s
+specs are lists, and `GridSearchCV` keeps its grid in `grid_`, not `params_` —
+and a dict-valued parameter added later would still alias through. Both halves
+are asserted in `bkit_base_test.b`, so the limit is recorded rather than
+discovered.
+
+---
+
+### K60 — the booster's first battery: 11 of 17 missed, and five distinct reasons
+
+`bkit_ensemble_test.b` passed 82 assertions on its first run, over an 800-line
+module written in one pass. The session's own rule — *a gate nobody has tried to
+break is a gate nobody has tested* — says that is a reason for suspicion, and it
+was: **11 of the first 17 mutations survived.** Writing them down by cause
+matters more than the count, because the causes repeat.
+
+| cause | mutations | the shape of it |
+|---|---|---|
+| **a gate that proves a disjunction** | E10, E11 | "without reseeding the model differs" is satisfied by *either* subsample or colsample being drawn, so dropping one stayed green |
+| **an inequality true of anything in range** | E8, E12 | `best_round() <= n_rounds()` holds for a `best_round` that kept the **worst** round, and for a `predict` that ignored it entirely |
+| **an output recomputed on the read path** | E5 | `predict_proba` recomputes the softmax, so a wrong **training** gradient is invisible in it |
+| **a quantity that only changes the rate** | E4, E17 | dropping the hessian to 1 turns Newton into gradient descent; on separable data it still converges to the same place |
+| **a branch no test entered** | E7, E16, E6 | nothing early-stopped a *classifier*, so a flipped log-loss sign was unreachable; no fixture made an improvement follow a stall, so the patience reset was never exercised |
+
+Each fix is a gate of a different kind, and the pattern is that **a weak gate
+asserts something true of the right answer, while a strong one asserts something
+false of every wrong answer**:
+
+- the subsamples are pinned **individually and deterministically** — under one
+  seed, turning each on must change the model, which needs no randomness to be
+  present to mean something;
+- `best_round` is checked against the stopping rule **reimplemented in the
+  test**, and `predict` is required to equal `staged_predict[best_round − 1]`;
+- the hessian is pinned by **hand-derived leaf values** — a depth-1 logistic
+  tree on `y = [0,0,0,0,1,1,1,1]` has `F0 = 0`, `p = 0.5`, `h = 0.25`, so its
+  leaves are exactly **−2 and +2**; with `h = 1` they would be ∓0.5;
+- softmax is pinned by the fact that `F0 = 0` for every class makes
+  `p_k = 1/K` **exactly** — a number a per-column sigmoid cannot produce for
+  K ≠ 2, giving leaves of 3 and −1.5 against the sigmoid's 2 and −2;
+- the stopping fixture was **replaced** with one that improves, stalls and
+  improves again, and the test asserts that property of the fixture so it fails
+  loudly if it stops holding.
+
+Final: **19 mutations, 18 caught, 1 equivalent** (E14, which led to [K59]).
+`bkit_ensemble_test.b` 82 → 112 assertions. Three of the fixes exist because
+the first version of the gate was *vacuous rather than wrong*, which is the same
+fault numba's `ok(nd_all(...))` had (N41) — the third time this session that the
+instrument, not the thing measured, was the defect.
+
+---
+
+### K61 — "no new kernels" was checked against the kernels, not against the caller
+
+[§8.5] is the record of checking each K8 feature against K7's five `tree_`
+kernels and concluding none was missing. For the boosters that held exactly: the
+whole of `ensemble.b` is one `nd_subtract` per node, an index array `tree_hist`
+already accepts, and a `[f,1,1]` mask multiplied into the histogram the scan
+sees. **For `ExtraTrees` it is true of the arithmetic and false of the control
+flow**, and the gap is worth naming because of *how* it was missed.
+
+§8.5 says random split thresholds reduce to *"pick a bin per candidate feature
+and evaluate that one cut's gain in Bantu from the histogram"*. The arithmetic
+is six numbers. But `_grow` calls `tree_best_split` **itself**, and there is no
+way to hand it a cut — so the feature needs a change to the grower's structure,
+not to its kernels. The check compared the feature against the kernel list and
+never asked which code path would invoke it. **A sufficiency argument about
+primitives says nothing about who gets to call them.**
+
+Two resolutions, and the rejected one is the instructive half:
+
+- **a new kernel** `tree_eval_split(..., chosen_bins)` — rejected. It is
+  `tree_best_split` with the argmax removed, so the regularised gain formula
+  would exist in two translation-unit locations. [K42]'s argument is that one
+  criterion serving every estimator is what makes the ×4 Gini proof worth
+  anything; two copies of the formula means the proof covers one of them.
+- **one virtual method**, `_chooseSplit($hist, $B)`, returning the same 10-slot
+  vector `tree_best_split` returns. `_TreeBase`'s implementation *is* that call;
+  an extra-trees grower overrides it. Everything else — the partition, the `NaN`
+  direction, the empty-child assertion, the threshold lookup, the subtraction,
+  the leaf guard — stays the one implementation, which is [§8.6]'s argument for
+  sharing the grower applied one level down.
+
+Cost stated rather than assumed: a Bantu method call is 1.78 µs ([B1]) and this
+one is **per node**, beside a `tree_hist` that touches `n_rows × n_features`
+cells. A 1,000-node tree pays 1.8 ms of dispatch against histogram work measured
+in hundreds of milliseconds, and the override's body is `O(max_features)`
+vectorised slices, not one call per bin.
+
+The override still owes the same two things the depth-wise scan does, and the
+10-slot return type is what forces it to: the chosen cut is evaluated **both
+ways** for `NaN` ([K44] — the `NaN` bin is the highest index, so a prefix sum
+leaves it right unless the direction is chosen on merit), and it returns
+`feature = −1` when either child fails `!(H + λ > 0)` ([K45], [K55]) rather than
+leaving a zero-weight child to the caller.
+
+Recorded as a decision rather than folded into §8.9 silently, because the
+*method* that produced the wrong answer is reusable: a "needs no new X" claim
+has to be checked against the call sites, not only against the inventory of X.

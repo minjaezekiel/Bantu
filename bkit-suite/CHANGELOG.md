@@ -637,6 +637,43 @@ The first native work in this package. Five kernels plus five accessors in
   identity holds. Plus the property the grower actually depends on and which
   neither channel assertion implies: both histograms must choose an
   **identical split**. (K54.)
+- **[bug fix] The kernel guarded the gain; the caller divided by zero.** [K45] is
+  the record of `tree_best_split` refusing a child with `!(H + λ > 0)`, because
+  `G²/0` with `G ≠ 0` is `+inf` and **wins** every comparison. `_leafValue`
+  computes `−G/(H + λ)` from the **same two quantities** and had no guard at all
+  — and a scalar `/0` *raises* in Bantu, so a node whose hessians sum to zero
+  threw `Division by zero` out of the middle of `_grow` with no node, no tree and
+  no indication of which node. Not reachable from K7's estimators (both set
+  `h = 1`, so `H = n ≥ 1`); **reachable from K8's booster**, where logistic
+  `h = p(1−p)` underflows to 0 across a saturated node and `reg_lambda` defaults
+  to 0. Fixed in the *grower*, because the grower is shared and the defect is the
+  asymmetry between a kernel that guards and a caller that does not. **Zero is
+  the right value, not a fallback**: at `H + λ = 0` the second-order
+  approximation has no curvature and its minimiser is unbounded, which is an
+  artefact of the approximation — XGBoost's `CalcWeight` returns 0 here and
+  LightGBM does the same. Written `!($d > 0.0)` so a negative or `NaN` total is
+  caught too. (K55.)
+- **[test]** The mutation was run: removing that guard turns the section **red
+  with 4 failures** instead of aborting the file. The gate also answers [K52]'s
+  open question directly — a grower that can find no split returns a
+  **single-leaf `[1,7]` tree** with value 0, and the same `g`/`h` with
+  `reg_lambda = 1` grow a real tree, so the guard is about `H + λ` and not about
+  refusing the data. Hessians that *cancel* to exactly zero are covered
+  separately, since that is the path a negative-hessian loss reaches.
+- **[test] A throw now names its section.** [K52]: two `tree_` mutations were
+  "caught by aborting", which counts as caught and is still worse than a clean
+  red — the battery learned nothing about which assertion fired and every later
+  section went unreported. Each of `bkit_tree_test.b`'s **33 sections** is
+  wrapped in its own `try`, and a throw prints
+  `FAIL [section aborted] <section>` plus the message, as one failure, with the
+  remaining sections still running. Cheap only because a top-level `try` in
+  Bantu **does not open a new scope for variables** (verified, not assumed), so
+  the file's straight-line flow is unchanged; converting 132 assertions to
+  closure-taking `safe_ok` was rejected, because Bantu closures capture by
+  reference. **A `def` inside a `try` *is* scoped to it**, though — four
+  reference helpers vanished and failed as `Undefined variable` from a different
+  block, caught on the first run by the mechanism being added, and all four are
+  now hoisted. (K56, language trap 33.)
 
 ### Gates
 
@@ -661,3 +698,95 @@ The first native work in this package. Five kernels plus five accessors in
   the first estimators backed by native kernels, so the protocol is also
   checking that a `tree_*` handle survives clone/get_params/set_params without
   the contract knowing a handle exists.
+
+---
+
+## Phase K8 — `ensemble.b`, gradient boosting
+
+- **[feature]** `GradientBoostingRegressor` and `GradientBoostingClassifier`,
+  over **four objectives**: `squared_error`, `logistic`, `softmax` (K trees per
+  round, normalised jointly) and `poisson`. Shrinkage, row subsampling
+  (`subsample`), column subsampling (`colsample`), early stopping on a held-out
+  fold, `staged_predict`, and gain / split-count feature importances.
+- **[design] It adds NO kernels, and that was the point of §8.5.** K7's five
+  `tree_` kernels are sufficient, checked feature by feature: histogram
+  subtraction is one `nd_subtract` per node; row subsampling is an index array
+  `tree_hist` already accepts; column subsampling zeroes the unselected
+  features' rows in the histogram the *scan* sees, so a zeroed feature has
+  `G = H = n = 0` and fails both `min_data` and the hessian guard — two
+  independent reasons, neither a special case in C++. The new work is the
+  boosting *loop*, and the per-element work stayed in C++.
+- **[design] ONE grower, exposed rather than copied** ([§8.6]). Every tree is
+  grown by `tree.TreeGrower`, which *is* `_TreeBase._grow` unchanged. The gate
+  is an identity, not a similarity: **one round at `learning_rate = 1.0` is
+  bit-identical to `DecisionTreeRegressor` fitted to `y − ȳ`**, because
+  `squared_error` sets `F0 = ȳ` and `g = F0 − y = −(y − ȳ)`, `h = 1`, which is
+  exactly what the tree computes. That ties everything K7 already tests
+  (binning, the scan, the `NaN` direction, the threshold lookup) to gates that
+  have been broken twelve ways, and leaves this file testing what is new.
+- **[design] Parameters arrive as a DICT**, a deliberate break with the rest of
+  bkit's positional constructors. A booster has fourteen; a fourteen-slot
+  positional constructor is where transposing two arguments is silent and
+  unreadable at the call site, and `get_params`/`set_params` have always spoken
+  dicts. **An unknown key raises** ([K24]).
+- **[design]** Early stopping **splits the validation fold before binning**
+  ([§8.7]), so bin edges cannot be chosen using data the model is scored on —
+  a quieter leak than training on it, because it inflates the stopping round
+  rather than the score. Asserted structurally, not by eye: a 24-row single
+  feature bins to 24 bins, and the model trained with a 25% fold reports 18.
+- **[bug fix] The hessian clamp was harmful and is gone** (K58). `max(h, 1e-16)`
+  was prescribed by the design doc and shipped for about an hour. Measured: at
+  `λ = 0` it turns a correctly refused split into **leaves of ±5e15**, because
+  lifting `h` makes `H + λ` clear both [K45]'s and [K55]'s guards by a hair. It
+  was invisible at the defaults, which is the worst place for a hazard to hide.
+  Only *invalid* hessians are now corrected — negative and `NaN`, both to 0 —
+  and a genuine zero is passed through to the guards. `np.maximum` propagates
+  `NaN` rather than dropping it like IEEE `fmax`, so that case needs its own
+  `where()`; asserted, not assumed.
+- **[bug fix] `get_params()` returned the live dict**, so every bkit estimator
+  was writable through a read accessor (K59): `$p = $m.get_params();
+  $p.with_mean = false;` reconfigured a **fitted** model and left `fitted_`
+  true, and `$p.with_men = true` added a parameter — [K24]'s bug reachable
+  through the accessor beside the check for it. It returns a copy now. How deep
+  that copy goes was **measured**, because Bantu is asymmetric: list values come
+  out independent, nested dicts still alias (language trap 35).
+- **[feature]** `feature_importances_("gain" | "split")` on the boosters **and**
+  on K7's trees. The gain is recorded as a grower side output, not an eighth
+  node column: a node is 7 doubles and `tree_predict` strides by 7 in C++, so an
+  eighth would be a native change *and* a format break, to carry a number
+  prediction never reads (K57). Folded in per tree, because `_grow` overwrites
+  its side outputs — read at the end, a K-class model would report only its last
+  tree.
+
+### Gates
+
+- **[test]** `tests/bkit_ensemble_test.b` — **112 assertions**, tiers 1, 2 and 4,
+  every section wrapped in its own `try` so a throw is attributed (K56).
+- **[test] The first run passed 82 of 82, and 11 of the first 17 mutations
+  survived it** (K60). The five causes are written up individually, because they
+  repeat: a gate proving a *disjunction* (either subsample **or** colsample being
+  drawn satisfied it); an inequality true of anything in range
+  (`best_round <= n_rounds` holds for a `best_round` that kept the **worst**
+  round); an output **recomputed on the read path** (`predict_proba` recomputes
+  the softmax, hiding a wrong training gradient); a quantity that only changes
+  the **rate** (dropping the hessian to 1 is gradient descent, which still
+  converges); and a **branch no test entered** (nothing early-stopped a
+  classifier, so a flipped log-loss sign was unreachable).
+- **[test]** The replacements pin numbers rather than directions: the hessian is
+  checked against **hand-derived leaf values** (a depth-1 logistic tree on
+  `[0,0,0,0,1,1,1,1]` has `F0 = 0`, `p = 0.5`, `h = 0.25`, so its leaves are
+  exactly **−2 and +2**; with `h = 1` they would be ∓0.5), and softmax by the
+  fact that `F0 = 0` makes `p_k = 1/K` **exactly** — a value a per-column
+  sigmoid cannot produce for K ≠ 2. Final: **19 mutations, 18 caught, 1
+  equivalent**, and the equivalent one led to K59.
+- **[test]** The early-stopping fixture was replaced with one that improves,
+  stalls and improves again, **and the test asserts that property of the
+  fixture**, so it fails loudly if it stops exercising the patience reset.
+- **[test]** `tests/bkit_protocol_test.b` grown to **47 registry entries** — the
+  first estimators built from a parameter *dict*, so the protocol also checks
+  that construction style against `protocol_check`'s round-trip.
+- **[test]** `tests/bkit_tree_test.b` grown to **156**: `TreeGrower` is asserted
+  bit-identical to `DecisionTreeRegressor` on the same `g`/`h`, the column mask
+  is asserted to confine every split to the allowed features *and* to restore
+  the unmasked tree bit-for-bit when cleared, and a row subsample over a
+  constant target must grow a single leaf.

@@ -148,6 +148,49 @@ $ac.fit($X, null);
 eqs(nd_get($ac.transform(nd_zeros([1], "f64")), 0), 5.0, "the new parameter is used");
 eqs($ac.set_params(null), $ac, "set_params(null) is a no-op that still chains");
 
+// get_params returns a COPY, and this is a real defect that was shipped (K59).
+// It used to return the live `params_` dict, and Bantu hands dicts over by
+// reference -- so the estimator was writable through a READ accessor, which
+// bypassed both guards written right next to it.
+$ga = AddConst(2.0);
+$ga.fit($X, null);
+$gp = $ga.get_params();
+$gp.k = 99.0;
+eqs($ga.get_params().k, 2.0,
+    "mutating the dict get_params returned does NOT change the estimator");
+ok($ga.fitted(),
+   "and the fit is still valid, because nothing about the model changed");
+// The same alias also walked straight past the unknown-key check: `$p.k2 = 1`
+// ADDED a parameter, which is K24's mistyped-key bug reachable through the
+// accessor beside the check for it.
+$gp.k2 = 1.0;
+ok(!contains($ga.get_params().keys(), "k2"),
+   "and it cannot ADD a parameter -- K24's mistyped key is unreachable here");
+// Round-tripping must still work, or the copy has broken the protocol it was
+// meant to protect.
+$ga.set_params($ga.get_params());
+eqs($ga.get_params().k, 2.0, "set_params(get_params()) still round-trips");
+// How deep the copy goes is ASYMMETRIC in Bantu, and both halves are asserted
+// here because neither is guessable (language trap 35). A LIST value comes out
+// independent -- binding a dict's list value copies it -- so every parameter
+// bkit actually has is fully protected.
+$gl = AddConst(2.0);
+$gl.set_params({"k": [1.0, 2.0]});
+$glp = $gl.get_params();
+$glp.k[0] = 7.0;
+eqs($gl.get_params().k[0], 1.0,
+    "a LIST parameter comes back independent -- binding a dict's list copies it");
+// A DICT value does NOT: it is handed over by reference and still aliases
+// through. No bkit estimator has a dict-valued parameter today (GridSearchCV
+// keeps its grid in grid_, not params_), so this is a recorded limit rather
+// than a live hazard -- and it is asserted so that adding one is noticed.
+$gd = AddConst(2.0);
+$gd.set_params({"k": {"inner": 1.0}});
+$gdp = $gd.get_params();
+$gdp.k.inner = 7.0;
+eqs($gd.get_params().k.inner, 7.0,
+    "but a DICT parameter still aliases through -- the known limit of the copy");
+
 // AN UNKNOWN KEY IS REFUSED (K24). It used to be accepted and added to
 // params_, so a grid search over a mistyped key ran every candidate with
 // identical settings and reported a best configuration it never tried -- a

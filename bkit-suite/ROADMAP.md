@@ -292,13 +292,23 @@ scikit-learn and is documented as one ([K43]). The list form is a K8 item.
 
 | Item | How | Status |
 |---|---|---|
-| `RandomForestClassifier`/`Regressor` | bootstrap + feature subsampling, seeded via `nd_seed` | [ ] |
+| **`GradientBoostingClassifier`/`Regressor`** | histogram-based over the **shared** grower; histogram subtraction landed in K7 | [x] |
+| objectives | `squared_error`, `logistic`, `softmax` (one tree per class per round), `poisson` | [x] |
+| the hessian | **not** clamped at 1e-16 — that was measured to be harmful ([K58]); only negative and `NaN` are corrected, and a zero goes to the guards | [x] |
+| missing values | `NaN` to its own bin; each split learns a default direction, used for unseen `NaN` at predict time | [x] |
+| early stopping | on a validation fold split **before binning**, with `n_iter_no_change` and `tol` | [x] |
+| row / column subsampling | `subsample`, `colsample`; seeded via `nd_seed` alone, no estimator carries RNG state | [x] |
+| `feature_importances_` | gain and split count, recorded as a grower side output ([K57]) | [x] |
+| `RandomForestClassifier`/`Regressor` | bootstrap + feature subsampling, over the same grower and the same two switches | [ ] |
 | `ExtraTrees*` | random split thresholds | [ ] |
-| **`GradientBoostingClassifier`/`Regressor`** | histogram-based, leaf-wise with `max_leaves`, **histogram subtraction** for the larger child | [ ] |
-| objectives | `squared_error`, `logistic`, `softmax` (one tree per class per round), `poisson`; hessian clamped at 1e-16 | [ ] |
-| missing values | `NaN` to its own bin; each split learns a default direction, used for unseen `NaN` at predict time | [ ] |
-| early stopping | on a validation fold, with `n_iter_no_change` | [ ] |
-| `feature_importances_` | gain, split count and permutation importance | [ ] |
+| permutation importance | model-agnostic, so it belongs beside `score()` rather than inside the booster | [ ] |
+| leaf-wise growth (`max_leaves`) | a follow-up *inside* the shared grower ([§8.6]); with `max_leaves` unset the two policies produce the same splits, so it changes node ordering and not the model | [ ] |
+
+**K8 is split along the roadmap's own rows.** The boosters, the four objectives,
+stopping, the subsamples and the importances are done and gated
+(`tests/bkit_ensemble_test.b`, 112 assertions, 19 mutations with 18 caught and
+one equivalent). The forests are the same loop with two switches over the same
+grower, and are the remaining K8 work.
 
 ## Phase K9 — `cluster.b`, `decompose.b`
 `KMeans` (k-means++ init, seeded), `DBSCAN`, `GaussianMixture`; `PCA`,
@@ -335,7 +345,7 @@ Datasets fetched and SHA-256 verified, **never committed** — the method
 
 ## Where to resume
 
-**K0–K7 are done; K8 (`ensemble.b` — the GBDT headline) is next.** It inherits
+**K0–K7 are done, and K8's boosters are done; the forests are what remains of K8.** It inherits
 a split finder that has already been checked against an independent criterion
 ([K42]), so the new work is the boosting loop, histogram subtraction, the four
 objectives and early stopping — not split finding.
@@ -353,12 +363,13 @@ objectives and early stopping — not split finding.
    structure as the code shares the code's errors.
 
 `base.b` is 391 lines, `preprocess.b` 1,011, `selection.b` 927, `metrics.b` 695,
-`linear.b` 857, `compose.b` 512 and `tree.b` 509, over the `tree_` family in
+`linear.b` 857, `compose.b` 512 and `tree.b` 532, over the `tree_` family in
 `bantu-src/compiler/src/tree_native.hpp`; `tests/bkit_base_test.b` is 53
 assertions, `tests/bkit_preprocess_test.b` 174, `tests/bkit_selection_test.b`
 117, `tests/bkit_metrics_test.b` 123, `tests/bkit_linear_test.b` 135,
-`tests/bkit_compose_test.b` 77, `tests/bkit_tree_test.b` 127 and
-`tests/bkit_protocol_test.b` 42 registry entries — all green. Read
+`tests/bkit_compose_test.b` 77, `tests/bkit_tree_test.b` 156,
+`tests/bkit_ensemble_test.b` 112 and `tests/bkit_protocol_test.b` 47 registry
+entries — all green. Read
 [`../docs/bkit-architecture.md`](../docs/bkit-architecture.md) first, then
 [`DECISIONS.md`](DECISIONS.md).
 

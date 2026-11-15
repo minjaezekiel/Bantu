@@ -855,10 +855,106 @@ boosting iteration.
 | `softmax` (K-class) | `p_k − y_k` | `p_k(1−p_k)`, one tree per class per round |
 | `poisson` | `e^p − y` | `e^p` |
 
-The hessian clamp (`max(h, 1e-16)`) is not cosmetic: a saturated logistic gives
-`h → 0`, and `G²/(H+λ)` with `λ=0` then divides by zero and produces a `NaN`
-gain that wins every split comparison. A test drives the model to saturation
-deliberately.
+A saturated logistic gives `h → 0`, and `G²/(H+λ)` with `λ=0` then divides by
+zero. **This paragraph used to say the result is a `NaN` gain that wins every
+comparison, and that is backwards** — [K45] is the correction. A `NaN` *loses*
+every `>` comparison and is therefore harmless; the danger is the other branch,
+`G²/0` with `G ≠ 0`, which is `+inf` and **wins** every comparison, picking a
+split on a child with no weight in it with maximum confidence. A test drives the
+model to saturation deliberately.
+
+The same paragraph also prescribed a **hessian clamp**, `max(h, 1e-16)`, and
+called it "not cosmetic". It is worse than cosmetic, which [K58] measured: it
+was implemented, then removed, because the number it protects against is not the
+one it creates:
+
+| h | λ | min_child_weight | result |
+|---|---|---|---|
+| **1e-16** | 0 | 0 | **splits; leaves of ±5e15** |
+| 0 | 0 | 0 | one leaf, value 0 |
+| 1e-16 | 1 (the default) | 1 | one leaf, value 0 |
+
+The middle row is correct and two guards already produce it. Lifting `h` to
+`1e-16` makes `H + λ` clear **both** of them by a hair and turns a refused split
+into a step of five quadrillion — the `+inf` failure mode above, scaled down
+just far enough to survive a finiteness check. It was invisible at the defaults,
+which is the worst place for a hazard to hide. So the objective corrects only
+what is **invalid** — a negative hessian or a `NaN`, both to 0 — and a genuine
+zero is passed through to the guards that handle it:
+
+1. `tree_best_split`'s `!(H + λ > 0.0)`, which refuses the *split* ([K45]);
+2. `_leafValue`'s identical guard, which bounds the *leaf* ([K55]).
+
+Layer 2 was missing, and that was [K55]: the kernel refused the split while the
+caller, computing `−G/(H+λ)` from the same two quantities, raised
+`Division by zero` out of the middle of `_grow`. K7's estimators cannot reach it
+(`h = 1`, so `H = n ≥ 1`); K8's logistic objective is exactly what reaches it.
+The guard returns `0.0`, which is what XGBoost's `CalcWeight` and LightGBM both
+do: at `H + λ = 0` the second-order approximation has no curvature and its
+minimiser is unbounded, which is an artefact of the approximation and not a step
+worth taking. **A guard in the kernel is not protection for the caller**, and a
+clamp upstream of a guard can disarm it.
+
+### 8.9 The forests, and the one structural change ExtraTrees needs
+
+`RandomForest*` and `ExtraTrees*` are [§8.8](#88-forests-bootstrap-and-random-thresholds)'s
+two switches over `n_estimators` independent trees, grown by the same
+`tree.TreeGrower` the booster uses. Three of the four pieces need nothing new:
+
+| piece | how |
+|---|---|
+| **bootstrap** | an index array **with repeats**, which `tree_hist` counts once per occurrence — that *is* bootstrap semantics, and `TreeGrower.grow` already takes a root index |
+| **feature subsampling** (`max_features`) | `set_features(cols)` per tree, which is the `[f,1,1]` histogram mask already gated in `bkit_tree_test.b` |
+| **averaging** | in **probability space**: average `predict_proba`, then `argmax`. A majority vote over hard labels throws away every tree's confidence and is a different, worse estimator |
+
+**ExtraTrees is the one that does not fit, and the design doc should say so
+before the code does.** §8.5 claimed it reduces to "pick a bin per candidate
+feature and evaluate that one cut's gain in Bantu from the histogram". That is
+true of the *arithmetic* and false of the *control flow*: the grower calls
+`tree_best_split` itself, deep inside `_grow`, and there is no way to hand it a
+cut. Nothing in §8.5 noticed, because the claim was checked against the kernels
+and not against the caller.
+
+Two ways out, and the choice matters more than it looks:
+
+| option | verdict |
+|---|---|
+| a new kernel, `tree_eval_split(hist, binned, λ, γ, …, chosen_bins)` | **rejected.** It is `tree_best_split` with the argmax removed, so the gain formula would exist in two places — and [K42]'s whole argument is that one criterion serving every estimator is what makes the ×4 Gini proof worth anything |
+| **one virtual method on the grower** | **chosen.** `_chooseSplit($hist, $B)` returns the same 10-slot vector `tree_best_split` returns; `_TreeBase`'s implementation *is* that call, and an extra-trees grower overrides it |
+
+The override is the only thing that differs. Partitioning, the `NaN` direction,
+the empty-child assertion, the raw-value threshold lookup, histogram
+subtraction and the leaf guard are all still the one implementation — which is
+the same argument [§8.6] makes for sharing the grower in the first place, and
+the reason this is a method and not a second grower.
+
+**What it costs, stated rather than assumed.** A Bantu method call is 1.78 µs
+and this one happens **per node**, not per element, alongside a `tree_hist`
+that touches `n_rows × n_features` cells. For a tree with 1,000 nodes that is
+1.8 ms of dispatch against histogram work measured in hundreds of milliseconds.
+The override's own body is a handful of small reductions per candidate feature —
+`O(max_features)` slices of a `[f, bins, 3]` array — so it is one vectorised
+call per candidate, not one per bin.
+
+Two details the override must get right, both of which the depth-wise scan
+already taught us:
+
+- **the chosen cut is evaluated BOTH ways for `NaN`**, exactly as [K44]
+  requires. The `NaN` bin is the highest index, so a prefix sum always leaves it
+  right; a random cut inherits that bias unless the direction is chosen on
+  merit. Evaluating one cut twice is cheap, and the alternative is a tree whose
+  splits do not reproduce their own gains.
+- **the same guards still apply.** A randomly chosen cut can easily produce an
+  empty or zero-hessian child, so the override returns `feature = −1` when
+  `!(H_L + λ > 0)` or `!(H_R + λ > 0)` rather than leaving it to the caller —
+  the same condition [K45] and [K55] enforce, which is the point of returning
+  the identical 10-slot vector.
+
+**Reproducibility** is [C4] and has a sharper test here than elsewhere: each
+tree draws its index sample and its column sample from one seeded stream, so
+**fitting 10 trees and then fitting 20 must give the same first 10**. That rules
+out a per-tree seed derived from the tree count, which is the natural wrong
+implementation and which looks reproducible until `n_estimators` changes.
 
 ---
 

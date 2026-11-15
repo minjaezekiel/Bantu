@@ -83,7 +83,39 @@ class Estimator {
                                + "estimator writes its own (DECISIONS K3)"; }
 
     // ── provided, in terms of `this` ────────────────────────────────────────
-    def get_params() { return this.params_; }
+    // A COPY, not the live dict. It used to return `this.params_` itself, and
+    // Bantu hands dicts over by reference, so the estimator's own parameters
+    // were writable through a read accessor -- which bypassed BOTH guards
+    // documented immediately below:
+    //
+    //   $p = $s.get_params();  $p.with_mean = false;
+    //
+    // changed a FITTED scaler's parameters and left `fitted_` true, so
+    // `transform` then ran with parameters that did not match the statistics it
+    // had learned -- exactly the wrong answer `set_params`' invalidation exists
+    // to prevent. And `$p.with_men = true` ADDED a parameter, which is [K24]'s
+    // mistyped-key bug reachable through the accessor next to the check for it.
+    //
+    // How deep the copy goes was MEASURED, not assumed, because Bantu's answer
+    // is asymmetric and neither half is guessable:
+    //
+    //   for $k, $v in src.items() { out[$k] = $v; }
+    //     a LIST value  -> independent;  out.lst[0] = 7 leaves src.lst alone
+    //     a DICT value  -> still ALIASED; out.dct.k  = 7 changes src.dct
+    //
+    // Binding a dict's list value to a name copies it, while a nested dict is
+    // handed over by reference (language trap 35). So this loop is already deep
+    // enough for every parameter bkit has -- `ColumnTransformer`'s specs are
+    // lists, and no estimator holds a dict-valued parameter; `GridSearchCV`
+    // keeps its grid in `grid_`, not in `params_`. A dict-valued parameter
+    // added later WOULD still alias through, which is recorded here and
+    // asserted in `bkit_base_test.b` so it is known rather than discovered.
+    // (bkit DECISIONS K59.)
+    def get_params() {
+        $out = {};
+        for $k, $v in this.params_.items() { $out[$k] = $v; }
+        return $out;
+    }
 
     // Setting a parameter invalidates the fit. Leaving `fitted_` true would let
     // `predict` run with coefficients belonging to the OLD parameters, which is

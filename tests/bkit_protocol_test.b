@@ -34,6 +34,7 @@ include "../bkit/selection.b"  as sel;
 include "../bkit/linear.b"     as lin;
 include "../bkit/compose.b"    as compose;
 include "../bkit/tree.b"       as tree;
+include "../bkit/ensemble.b"   as ens;
 
 $R = {"pass": 0, "fail": 0};
 def ok($c, $n) {
@@ -93,6 +94,9 @@ $yd = nd_astype(nd_arange(0, 20, null), "f64");
 // has enough members for the classifiers and for a 4-fold split.
 $yb = nd_astype(nd_mod(nd_arange(0, 20, null), 2, null), "f64");
 $y3 = nd_astype(nd_mod(nd_arange(0, 20, null), 3, null), "f64");
+// Non-negative counts, for the poisson objective. Built, not drawn: the
+// objective needs a POSITIVE mean, and log of a zero mean is undefined.
+$yp = nd_add(nd_astype(nd_mod(nd_arange(0, 20, null), 4, null), "f64"), 1.0, null);
 // Categorical: small integers, repeated, so nd_unique finds real categories.
 $Xk = nd_astype(nd_random_int([20, 3], 0, 4), "f64");
 // One label column, for LabelEncoder.
@@ -167,7 +171,25 @@ $registry = [
     ["DecisionTreeClassifier", tree.DecisionTreeClassifier(3, 1, null, null, null, null),
                                                                      $Xc, $yd],
     ["DecisionTreeClassifier(shallow)", tree.DecisionTreeClassifier(1, 1, 8, null, null, null),
-                                                                     $Xc, $yd]
+                                                                     $Xc, $yd],
+    // K8. The first estimators whose parameters arrive as a DICT rather than
+    // positionally, so the protocol is also checking that construction style
+    // against the same contract: protocol_check feeds the FIRST key get_params
+    // returns straight back into set_params, which is the invariant
+    // GridSearchCV rests on.
+    ["GradientBoostingRegressor", ens.GradientBoostingRegressor({"n_estimators": 6,
+                                                                 "max_depth": 2}),
+                                                                     $Xc, $yc],
+    ["GradientBoostingRegressor(poisson)", ens.GradientBoostingRegressor(
+        {"n_estimators": 6, "max_depth": 2, "objective": "poisson"}), $Xc, $yp],
+    ["GradientBoostingClassifier", ens.GradientBoostingClassifier({"n_estimators": 6,
+                                                                   "max_depth": 2}),
+                                                                     $Xc, $yb],
+    ["GradientBoostingClassifier(3-class)", ens.GradientBoostingClassifier(
+        {"n_estimators": 6, "max_depth": 2}),                        $Xc, $y3],
+    ["GradientBoostingRegressor(subsampled)", ens.GradientBoostingRegressor(
+        {"n_estimators": 6, "max_depth": 2, "subsample": 0.7,
+         "colsample": 0.7}),                                         $Xc, $yc]
 ];
 
 print("");
@@ -184,8 +206,8 @@ while ($i < len($registry)) {
     else { ok(false, $nm + " violates the protocol: " + str($bad)); }
     $i = $i + 1;
 }
-eqs(len($registry), 42,
-    "the registry names every estimator K2-K7 added, in every mode");
+eqs(len($registry), 47,
+    "the registry names every estimator K2-K8 added, in every mode");
 
 // ── the check can still fail ────────────────────────────────────────────────
 // A conformance suite that cannot fail proves nothing. `bkit_base_test.b` has
