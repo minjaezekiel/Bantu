@@ -30,6 +30,9 @@ def ok($cond, $name) {
     if ($cond) { $R.pass = $R.pass + 1; print("  ok    " + $name); }
     else { $R.fail = $R.fail + 1; print("  FAIL  " + $name); }
 }
+// A 0-d reduction result is an ndarray HANDLE, and every handle is truthy, so
+// `ok(nd_all(...))` is an assertion that cannot fail. Extract it first.
+def sc($x) { return nd_get(nd_reshape($x, [1]), [0]); }
 def eqs($got, $want, $name) {
     if ($got == $want) { $R.pass = $R.pass + 1; print("  ok    " + $name); }
     else {
@@ -117,8 +120,8 @@ close32(nd_exp($m32, null),            nd_exp($m64, null),            "strided u
 
 // a comparison on f32 still yields bool, and the same bools as f64
 eqs(nd_dtype(nd_greater($a32, $b32, null)), "bool", "f32 comparison yields bool");
-ok(nd_all(nd_equal(nd_greater($a32, $b32, null),
-                   nd_greater($a64, $b64, null), null), null, null),
+ok(sc(nd_all(nd_equal(nd_greater($a32, $b32, null),
+                      nd_greater($a64, $b64, null), null), null, null)) == true,
    "f32 and f64 comparisons agree element for element");
 
 // ── 4. reduction RESULT dtypes ───────────────────────────────────────────────
@@ -231,7 +234,7 @@ eqs(item(nd_astype($under, "f64")), 0.0, "1e-60 underflows to exactly 0");
 
 // round-trip: f32 -> f64 -> f32 is the identity
 $rt = nd_astype(nd_astype($a32, "f64"), "f32");
-ok(nd_all(nd_equal($rt, $a32, null), null, null), "f32 -> f64 -> f32 is EXACTLY the identity");
+ok(sc(nd_all(nd_equal($rt, $a32, null), null, null)) == true, "f32 -> f64 -> f32 is EXACTLY the identity");
 
 // a bad dtype name names the valid ones
 $threw = false;

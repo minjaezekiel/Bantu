@@ -35,7 +35,13 @@ def same($x, $y, $name) {
     }
     $eq = nd_equal($x, $y, null);
     $bothnan = nd_logical_and(nd_isnan($x, null), nd_isnan($y, null), null);
-    ok(nd_all(nd_logical_or($eq, $bothnan, null), null, null), $name);
+    // nd_all returns a 0-d ndarray HANDLE, and a handle is always truthy, so
+    // `ok(nd_all(...))` could never fail -- this comparison, in the file whose
+    // whole purpose is "the fast paths must agree BIT FOR BIT", was a vacuous
+    // assertion. Found by mutating a new fast path five ways and watching four
+    // of the five mutations pass. The 0-d reduction result has to be extracted
+    // to a Bantu value before it can be tested, which is what sc() is for.
+    ok(sc(nd_all(nd_logical_or($eq, $bothnan, null), null, null)) == true, $name);
     return null;
 }
 def sc($x) { return nd_get(nd_reshape($x, [1]), [0]); }
@@ -181,8 +187,13 @@ ok($allok, "fast and generic agree exactly over 7 shapes, including both sides o
 // Vectors, which take a different branch.
 $v = nd_random_normal([25]);
 same(nd_matmul($af, $v, null), nd_matmul($af, nd_copy($v, null), null), "matrix . vector");
-same(nd_matmul($v, nd_random_normal([25, 4]), null),
-     nd_matmul(nd_copy($v, null), nd_random_normal([25, 4]), null), "vector . matrix -- shape");
+// Draw the right-hand operand ONCE. This and the two below used to call
+// nd_random_normal() separately on each side, so the two matmuls multiplied
+// DIFFERENT matrices and could never have agreed -- three assertions that only
+// passed because ok(nd_all(...)) could not fail. Both were found together.
+$vm = nd_random_normal([25, 4]);
+same(nd_matmul($v, $vm, null),
+     nd_matmul(nd_copy($v, null), $vm, null), "vector . matrix -- shape");
 ok(nd_shape(nd_matmul($v, $v, null)) == [], "vector . vector is a 0-d scalar");
 // Mismatched inner dimensions must still raise, on both paths.
 def raises($f, $name) {
@@ -220,15 +231,17 @@ ok($allok, "A^T . B via the view == via a materialised copy, over 6 shapes");
 
 // And against the reference loop.
 $raw = nd_random_normal([30, 8]);
-same(nd_matmul(nd_transpose($raw, null), nd_random_normal([30, 4]), null),
-     nd_matmul(nd_copy(nd_transpose($raw, null), null), nd_random_normal([30, 4]), null),
+$rhs = nd_random_normal([30, 4]);
+same(nd_matmul(nd_transpose($raw, null), $rhs, null),
+     nd_matmul(nd_copy(nd_transpose($raw, null), null), $rhs, null),
      "...which is the shape conv2d's weight gradient uses");
 
 // A DOUBLE transpose is contiguous again, and must not be mistaken for one.
 $tt = nd_transpose(nd_transpose($raw, null), null);
 ok(nd_array_equal($tt, $raw), "transposing twice gives the original back");
-same(nd_matmul($tt, nd_random_normal([8, 3]), null),
-     nd_matmul($raw, nd_random_normal([8, 3]), null), "and multiplies identically");
+$ttr = nd_random_normal([8, 3]);
+same(nd_matmul($tt, $ttr, null),
+     nd_matmul($raw, $ttr, null), "and multiplies identically");
 
 // A square transpose has strides [1, n] AND the same shape either way -- the
 // one case where misreading the orientation would be silent.
@@ -278,6 +291,184 @@ nd_matmul(nd_transpose($big, null), $grad, null);
 $tat = clock() - $t0;
 print("        [25,100352]^T x [100352,6]: " + str($tat) + " ms  (was 45.8 ms)");
 budget($tat, 40, "the transposed-A path holds: under 40 ms, not 46");
+
+print("");
+print("== tier 1b: a BROADCAST VECTOR operand ==");
+// A broadcast operand used to fall to tier 2's per-element odometer: same
+// memory traffic, 3.4x the time (18.0 ms against 5.3 ms on [16,32,64,64]).
+// Tier 1b hands each innermost run to the SAME vectorized kernel tier 0 and
+// tier 1 already use, so the reference here is the generic path computing the
+// identical thing: broadcast the small operand into a full array first, which
+// makes it a same-shape tier-0 call.
+//
+// The danger in this fast path is operand ORDER. Mode 2 (the broadcast side on
+// the LEFT) calls tier1r, and getting that backwards would compute b - a for
+// a - b -- which is why every non-commutative op below is checked in BOTH
+// orders. A commutative-only test would pass with the operands swapped.
+def expand($small, $shape) { return nd_copy(nd_broadcast_to($small, $shape), null); }
+
+$bx = nd_random_uniform([4, 5, 3, 2], -3.0, 3.0);
+$bc = nd_add(nd_random_uniform([1, 5, 1, 1], 0.5, 3.0), 0.25, null);   // no zeros, for divide
+$bE = expand($bc, [4, 5, 3, 2]);
+
+same(nd_add($bx, $bc, null),      nd_add($bx, $bE, null),      "mode 1: x + [1,C,1,1]");
+same(nd_subtract($bx, $bc, null), nd_subtract($bx, $bE, null), "mode 1: x - [1,C,1,1]  (NOT commutative)");
+same(nd_divide($bx, $bc, null),   nd_divide($bx, $bE, null),   "mode 1: x / [1,C,1,1]  (NOT commutative)");
+same(nd_multiply($bx, $bc, null), nd_multiply($bx, $bE, null), "mode 1: x * [1,C,1,1]");
+same(nd_power($bc, $bc, null),    nd_power($bc, $bc, null),    "mode 1: power is reflexive");
+
+same(nd_subtract($bc, $bx, null), nd_subtract($bE, $bx, null), "mode 2: [1,C,1,1] - x  (broadcast on the LEFT)");
+same(nd_divide($bc, $bx, null),   nd_divide($bE, $bx, null),   "mode 2: [1,C,1,1] / x  (broadcast on the LEFT)");
+same(nd_add($bc, $bx, null),      nd_add($bE, $bx, null),      "mode 2: [1,C,1,1] + x");
+
+// Mode 0: the broadcast operand is contiguous over the innermost run and
+// repeats once per outer step -- the trailing-vector shape, [N,C] op [1,C].
+$tx = nd_random_uniform([64, 7], -2.0, 2.0);
+$tv = nd_add(nd_random_uniform([1, 7], 0.5, 2.0), 0.25, null);
+$tE = expand($tv, [64, 7]);
+same(nd_subtract($tx, $tv, null), nd_subtract($tx, $tE, null), "mode 0: [N,C] - [1,C] trailing vector");
+same(nd_divide($tv, $tx, null),   nd_divide($tE, $tx, null),   "mode 0 reversed: [1,C] / [N,C]");
+
+// A bare [C] operand, not [1,C] -- broadcasting aligns from the right.
+same(nd_subtract($tx, nd_reshape($tv, [7]), null), nd_subtract($tx, $tE, null),
+     "a rank-1 [C] operand aligns from the right");
+
+// Other broadcast axes: the middle, and the innermost only.
+$t3 = nd_random_uniform([3, 4, 5], -2.0, 2.0);
+$m3 = nd_add(nd_random_uniform([1, 4, 1], 0.5, 2.0), 0.25, null);
+$i3 = nd_add(nd_random_uniform([1, 1, 5], 0.5, 2.0), 0.25, null);
+same(nd_subtract($t3, $m3, null), nd_subtract($t3, expand($m3, [3,4,5]), null), "3-d: middle axis broadcast");
+same(nd_subtract($t3, $i3, null), nd_subtract($t3, expand($i3, [3,4,5]), null), "3-d: innermost axis broadcast");
+same(nd_divide($t3, $m3, null),   nd_divide($t3, expand($m3, [3,4,5]), null),   "3-d: middle axis, divide");
+
+// Both operands broadcast against each other -- neither is the full shape.
+$ra = nd_random_uniform([4, 1, 3], -2.0, 2.0);
+$rb = nd_add(nd_random_uniform([1, 5, 1], 0.5, 2.0), 0.25, null);
+same(nd_subtract($ra, $rb, null),
+     nd_subtract(expand($ra, [4,5,3]), expand($rb, [4,5,3]), null),
+     "mutual broadcast: [4,1,3] - [1,5,1]");
+
+// f32 and i64 take tier 1b too, each with its own arm.
+$fx = nd_astype($bx, "f32");
+$fc = nd_astype($bc, "f32");
+same(nd_subtract($fx, $fc, null), nd_subtract($fx, nd_astype($bE, "f32"), null), "f32 broadcast subtract");
+$ix = nd_astype(nd_random_int([6, 4], -50, 50), "i64");
+$iv = nd_astype(nd_add(nd_random_int([1, 4], 1, 9), 0, null), "i64");
+same(nd_subtract($ix, $iv, null), nd_subtract($ix, expand($iv, [6,4]), null), "i64 broadcast subtract");
+same(nd_divide($ix, $iv, null),   nd_divide($ix, expand($iv, [6,4]), null),   "i64 broadcast divide (integer semantics)");
+
+// MIXED DTYPES must not enter the fast path. tier 1b casts both buffers to the
+// COMPUTE type, so an operand stored as i64 against an f64 array would be read
+// as doubles -- reinterpreted bits, not converted values. The guard that stops
+// it (`b->dtype == cdt`) is invisible in every same-dtype test, and dropping it
+// passed the whole suite until these four assertions existed.
+$mdF = nd([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0], [10.0, 11.0, 12.0]], "f64");
+$mdI = nd_astype(nd([[10.0, 20.0, 30.0]], "f64"), "i64");         // [1,3] i64
+$mdE = nd_astype(expand($mdI, [4, 3]), "i64");
+// THE REFERENCE MUST NOT TRAVEL THE SAME PATH. These four assertions first
+// compared `op(f64, i64_broadcast)` against `op(f64, i64_expanded)` -- and an
+// expanded i64 array still enters tier 1b, so a mutation that dropped the dtype
+// guard broke BOTH sides into the same garbage and the comparison passed. The
+// `a->dtype` guard was dropped and the whole suite stayed green.
+//
+// So the reference converts to the compute dtype FIRST and is then a same-shape
+// f64 pair -- tier 0, which every other assertion in this file has already
+// pinned. That is the N41 lesson for the second time in one file: a reference
+// computed through the code under test shares its faults.
+def asF64($a, $shape) { return nd_astype(expand($a, $shape), "f64"); }
+
+same(nd_subtract($mdF, $mdI, null),
+     nd_subtract($mdF, asF64($mdI, [4, 3]), null),
+     "f64 array minus an i64 broadcast vector is CONVERTED, not reinterpreted");
+same(nd_subtract($mdI, $mdF, null),
+     nd_subtract(asF64($mdI, [4, 3]), $mdF, null),
+     "and with the i64 broadcast operand on the LEFT (the a-side dtype guard)");
+// The same thing one rank up, where the broadcast axis is the innermost.
+$mdC = nd_astype(nd([[5.0], [6.0], [7.0], [8.0]], "f64"), "i64");  // [4,1] i64
+same(nd_multiply($mdF, $mdC, null),
+     nd_multiply($mdF, asF64($mdC, [4, 3]), null),
+     "an i64 column broadcast across an f64 row");
+same(nd_multiply($mdC, $mdF, null),
+     nd_multiply(asF64($mdC, [4, 3]), $mdF, null),
+     "and that column on the left");
+// f32 against f64: the compute type is f64, so the f32 side must widen.
+$md32 = nd_astype(nd([[0.5, 1.5, 2.5]], "f64"), "f32");
+same(nd_add($mdF, $md32, null),
+     nd_add($mdF, asF64($md32, [4, 3]), null),
+     "an f32 broadcast vector against an f64 array widens correctly");
+same(nd_add($md32, $mdF, null),
+     nd_add(asF64($md32, [4, 3]), $mdF, null),
+     "and on the left");
+
+// A STRIDED destination and strided inputs must still be right -- these
+// disqualify the fast path and fall to tier 2, which is the point.
+$sv = nd_slice($bx, [[0, 4, 1], [0, 5, 2], [0, 3, 1], [0, 2, 1]]);
+$se = nd_copy($sv, null);
+same(nd_subtract($sv, nd_slice($bc, [[0,1,1],[0,5,2],[0,1,1],[0,1,1]]), null),
+     nd_subtract($se, nd_copy(nd_slice($bc, [[0,1,1],[0,5,2],[0,1,1],[0,1,1]]), null), null),
+     "a strided view broadcasts identically");
+
+// Comparisons produce BOOL and are deliberately left on tier 2.
+same(nd_astype(nd_greater($bx, $bc, null), "f64"),
+     nd_astype(nd_greater($bx, $bE, null), "f64"), "a BOOL result is unchanged");
+
+// out= with a broadcast operand, including writing into the full operand.
+$ox = nd_copy($bx, null);
+nd_subtract($ox, $bc, $ox);
+same($ox, nd_subtract($bx, $bE, null), "out= in place over a broadcast operand");
+
+// An out= whose dtype differs from the COMPUTE dtype. planOut hands the
+// caller's array straight to the kernel when nothing aliases, WITHOUT checking
+// its dtype -- so `out->dtype == rdt` is a reachable guard, and dropping it
+// writes doubles into an i64 buffer as reinterpreted bits. Nothing in this file
+// tested that, for tier 1b or for the two tiers above it, and a mutation that
+// removed the guard passed the whole suite.
+//
+// Every value is integral, so the f64 -> i64 conversion is exact and the
+// reference cannot disagree over rounding. The reference is a same-shape f64
+// pair (tier 0) converted afterwards, so it cannot travel the path under test.
+$oiA = nd([[10.0, 20.0, 30.0], [40.0, 50.0, 60.0],
+           [70.0, 80.0, 90.0], [100.0, 110.0, 120.0]], "f64");
+$oiV = nd([[1.0, 2.0, 3.0]], "f64");
+$oiDst = nd_astype(nd_zeros([4, 3], "f64"), "i64");
+nd_subtract($oiA, $oiV, $oiDst);
+ok(nd_dtype($oiDst) == "i64", "an i64 out= keeps its own dtype");
+same(nd_astype($oiDst, "f64"),
+     nd_subtract($oiA, nd_copy(nd_broadcast_to($oiV, [4, 3]), null), null),
+     "a broadcast op into an i64 out= CONVERTS rather than reinterpreting");
+$ofDst = nd_astype(nd_zeros([4, 3], "f64"), "f32");
+nd_multiply($oiA, $oiV, $ofDst);
+ok(nd_dtype($ofDst) == "f32", "an f32 out= keeps its own dtype");
+same(nd_astype($ofDst, "f64"),
+     nd_multiply($oiA, nd_copy(nd_broadcast_to($oiV, [4, 3]), null), null),
+     "and an f32 out= narrows the f64 result rather than reinterpreting it");
+
+// And the determinism contract: the fast path must give the same bits at any
+// thread count, exactly as N25 requires of every other path.
+$keep = nd_get_threads();
+$big  = nd_random_uniform([8, 16, 32, 32], -2.0, 2.0);
+$bigc = nd_add(nd_random_uniform([1, 16, 1, 1], 0.5, 2.0), 0.25, null);
+nd_set_threads(1);
+$r1 = nd_tobytes(nd_divide($big, $bigc, null), "f64");
+nd_set_threads(8);
+$r8 = nd_tobytes(nd_divide($big, $bigc, null), "f64");
+nd_set_threads(3);
+$r3 = nd_tobytes(nd_divide($big, $bigc, null), "f64");
+nd_set_threads($keep);
+ok($r1 == $r8, "tier 1b is bit-identical at 1 and 8 threads");
+ok($r1 == $r3, "tier 1b is bit-identical at 1 and 3 threads");
+
+// The speed it was added for. [16,32,64,64] f64 measured 18.0 ms on tier 2
+// and 4.9 ms on tier 1b; the floor is set well above the fast number so a
+// loaded machine does not flake it, but far below the old one.
+$px = nd_random_uniform([16, 32, 64, 64], -1.0, 1.0);
+$pc = nd_random_uniform([1, 32, 1, 1], 0.5, 2.0);
+nd_subtract($px, $pc, null);
+$pt0 = clock();
+$pi = 0;
+while ($pi < 5) { nd_subtract($px, $pc, null); $pi = $pi + 1; }
+$pel = (clock() - $pt0) / 5.0;
+budget($pel, 12, "a broadcast subtract of 2.1M f64 stays under 12 ms, not 18");
 
 print("");
 print("========================================");

@@ -28,6 +28,9 @@ def ok($cond, $name) {
     if ($cond) { $R.pass = $R.pass + 1; print("  ok    " + $name); }
     else { $R.fail = $R.fail + 1; print("  FAIL  " + $name); }
 }
+// A 0-d reduction result is an ndarray HANDLE, and every handle is truthy, so
+// `ok(nd_all(...))` is an assertion that cannot fail. Extract it first.
+def sc($x) { return nd_get(nd_reshape($x, [1]), [0]); }
 
 // Exact equality over every element, and the shapes must match too.
 def same($x, $y, $name) {
@@ -43,7 +46,13 @@ def same($x, $y, $name) {
     // `equal OR both-NaN`, elementwise.
     $eq      = nd_equal($x, $y, null);
     $bothnan = nd_logical_and(nd_isnan($x, null), nd_isnan($y, null), null);
-    ok(nd_all(nd_logical_or($eq, $bothnan, null), null, null), $name);
+    // nd_all returns a 0-d ndarray HANDLE, and a handle is always truthy, so
+    // `ok(nd_all(...))` could never fail -- this comparison, in the file whose
+    // whole purpose is "the fast paths must agree BIT FOR BIT", was a vacuous
+    // assertion. Found by mutating a new fast path five ways and watching four
+    // of the five mutations pass. The 0-d reduction result has to be extracted
+    // to a Bantu value before it can be tested, which is what sc() is for.
+    ok(sc(nd_all(nd_logical_or($eq, $bothnan, null), null, null)) == true, $name);
     return null;
 }
 

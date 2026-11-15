@@ -71,7 +71,69 @@ All notable changes to the Bantu programming language are documented in this fil
   release break a btorch install. A differential test asserts the two agree on the same inputs —
   that, rather than a shared implementation, is what keeps them from drifting.
 
+### Added
+
+- **[feature] A new native family: `tree_*`, ten builtins for histogram-based decision trees.**
+  `tree_bin`, `tree_hist`, `tree_best_split`, `tree_partition`, `tree_predict`, plus five
+  accessors onto the opaque binned matrix. These are not an optimisation: a Bantu function call
+  costs 1.78 µs, and `tree_hist` on a 1M × 100 dataset touches 10⁸ cells per tree level — four
+  orders of magnitude outside what the evaluator can do per element.
+
+  **The binned matrix is an opaque handle owning a `uint8_t` buffer**, like the existing `col_*`
+  and `bp_*` handles. numba's dtypes have no `u8`, and `i64` bins would cost 8 bytes a cell —
+  800 MB for 1M × 100, which defeats the entire point of binning. Asserted directly rather than
+  claimed: 200000×50 binned is exactly **10,000,000 bytes**. Adding a real `u8` dtype was
+  rejected as scope creep — it would need the full ufunc, reduction and linalg surface for a
+  dtype nobody does arithmetic in.
+
+  `tree_` is registered in `kNativeFamilies`, so an unbound `tree_*` says it is probably a stale
+  binary instead of a bare `Undefined variable`. (bkit `DECISIONS` K1, K42-K48.)
+
 ### Fixed
+
+- **[bug fix] A broadcast operand had no fast tier, and cost 3.4× the same-shape one.**
+  `nd_add`, `nd_subtract`, `nd_multiply` and the rest had a vectorized path for two same-shape
+  arrays and another for an array against a single value — and nothing for an array against a
+  broadcast **vector**, which fell to a per-element odometer. Measured on `[16,32,64,64]` f64,
+  the shape every normalization layer uses:
+
+  | | before | after |
+  |---|---|---|
+  | `x * y` same shape | 5.3 ms | — |
+  | `x - [1,C,1,1]` | **18.0 ms** | **4.9 ms** |
+  | `[65536,32] - [1,32]` | 17.8 ms | ~6 ms |
+
+  Strictly less memory traffic than the same-shape case and 3.4× the time. **3.7× faster now, and
+  faster than the same-shape case**, which is correct: it reads 16.8 MB plus 32 elements instead
+  of 33.6 MB. After coalescing, the innermost run of any broadcast is one of three shapes, and each
+  already had a vectorized kernel — so only the *walk* changed. Each run goes to the identical
+  kernel on the identical values in the identical order, and the result is **bit-for-bit** what the
+  generic path produced, asserted at 1, 3 and 8 threads rather than assumed. BOOL results
+  (comparisons) deliberately stay on the generic path. This sat underneath every per-channel
+  bias, scale and normalization in the ML stack. (numba `DECISIONS` N40.)
+
+- **[bug fix] The fast-path tests could not fail, and four of five mutations proved it.**
+  `same()` — the helper whose only job is bit-for-bit comparison — wrote
+  `ok(nd_all(...), $name)`. A full reduction returns a **0-d ndarray handle**, and every handle is
+  truthy, so the assertion was unconditionally true. Every `same()` in `numba_fastpath_test.b` and
+  `numba_splat_test.b` — the two files that exist to prove optimized paths agree bit for bit — had
+  been unable to fail, plus three sites in the f32 tests. Found only because a new fast path was
+  broken on purpose five ways and four breakages passed, one of them an operand swap in `a - b`.
+
+  Repairing it exposed **three assertions that had never been meaningful**: they called
+  `nd_random_normal(...)` twice, once per side, so they compared products of *different* random
+  matrices. Fixed by extracting the reduction (`sc(nd_all(...)) == true`) and drawing each random
+  operand once. (numba `DECISIONS` N41.)
+
+- **[patch] `nd_set_threads`' documented rationale was wrong.** The comment and `DECISIONS` N25
+  justified the default of 1 by saying a library's numeric results change on a machine with more
+  cores. **They do not** — the fixed partition gives bit-identical results at every thread count,
+  verified byte-for-byte at 1, 3, 7, 8 and 12 threads over a 1,000,003-element `sum`/`mean` and a
+  997×1013×601 `matmul`. The default stays at 1 for the reason that survives measurement:
+  this interpreter is embedded in `sua`, and a request handler must not silently take twelve cores.
+  That matters because the two reasons point at different people — under the real one, opting in is
+  **free** for anything not serving concurrent requests, which is most numeric code, and the ML
+  packages had consequently been running at a fifth of the machine for no reason at all.
 
 - **[bug fix] `--quiet` did not silence the `[class] X extends Y` line.** It went to **stdout**,
   once per class per included file — thirteen lines for a script that includes `bkit`. `--quiet`

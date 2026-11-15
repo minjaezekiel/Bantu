@@ -239,6 +239,52 @@ inline void binTier1(const NdArray& arr, const NdArray& scl, NdArray& out,
     }
 }
 
+// Tier 1b: ONE operand is broadcast, and the other is contiguous along the
+// innermost axis. After coalescing, that makes every innermost run either
+//
+//   mode 0  both operands contiguous over the run  -- a [1,C] against [N,C],
+//           i.e. the vector repeats once per outer step            -> tier0
+//   mode 1  B has stride 0 over the run, so it is ONE value there  -> tier1
+//   mode 2  A has stride 0 over the run                            -> tier1r
+//
+// and each run is handed to the same vectorizable kernel tier 0 and tier 1
+// already use. Only the walk changes; the arithmetic is the identical kernel
+// on the identical values in the identical order, so results stay
+// bit-for-bit what tier 2 produced (E15/N25 still hold).
+//
+// Without this, a broadcast vector fell to tier 2's per-element odometer.
+// Measured on [16,32,64,64] f64, the shape every normalization layer uses:
+//
+//     same shape      x * y            5.3 ms
+//     broadcast       x - [1,C,1,1]    18.0 ms   <- 3.4x slower
+//     broadcast       x * [1,C,1,1]    16.0 ms
+//     trailing        [65536,32]-[1,32] 17.8 ms  <- same penalty
+//
+// Same memory traffic, 3.4x the time -- which is the tier-1 scalar story over
+// again (see the tier-1 comment in applyBinary), one rank up. It is the
+// dominant cost in BatchNorm2d, and therefore in every GAN generator built on
+// this stack (docs/generative-architecture.md G3/G4).
+template <class T, class Op>
+inline void binTier1b(const NdArray& A, const NdArray& B, NdArray& O,
+                      const std::vector<size_t>& osh,
+                      const std::vector<std::vector<ptrdiff_t>>& ost,
+                      const std::vector<size_t>& offs,
+                      size_t m, int mode, Cost cost, Op op) {
+    // buf->data is the base; nditer's offsets are absolute element indices
+    // from it, exactly as tier 2's load/store use them.
+    const T* abase = static_cast<const T*>(A.buf->data);
+    const T* bbase = static_cast<const T*>(B.buf->data);
+    T*       obase = static_cast<T*>(O.buf->data);
+    nditer(osh, ost, offs, [&](const size_t* o) {
+        const T* ap = abase + o[0];
+        const T* bp = bbase + o[1];
+        T*       dp = obase + o[2];
+        if      (mode == 0) tier0 (ap, bp, dp, m, cost, op);
+        else if (mode == 1) tier1 (ap, *bp, dp, m, cost, op);
+        else                tier1r(*ap, bp, dp, m, cost, op);
+    });
+}
+
 template <class T, class Op>
 inline void binTier2(const NdArray& A, const NdArray& B, NdArray& O,
                      const std::vector<size_t>& sh,
@@ -372,6 +418,51 @@ inline Value applyBinary(const char* what, Kind kind,
             else binTier1<int64_t>(arr, scl, *out, n, boolOut1, scalarRight, cost, fi);
             if (plan.finalOut) copyInto(*out, *plan.finalOut, what);
             return wrap(plan.finalOut ? plan.finalOut : out);
+        }
+    }
+
+    // ── tier 1b ─────────────────────────────────────────────────────────────
+    // A broadcast VECTOR operand -- `x - mean` where mean is [1,C,1,1], a bias
+    // add, a per-channel scale. See binTier1b for the measurements.
+    //
+    // Deliberately NOT taken when the result is BOOL: a comparison would need
+    // a per-block tier0cmp arm for a path that is not on any hot loop here,
+    // and tier 2 is already correct for it.
+    if (rdt != DType::BOOL && a->dtype == cdt && b->dtype == cdt &&
+        out->dtype == rdt &&
+        (cdt == DType::F64 || cdt == DType::F32 || cdt == DType::I64)) {
+        std::vector<size_t> bsh = shape;
+        std::vector<std::vector<ptrdiff_t>> bst = {
+            stridesFor(*a, shape), stridesFor(*b, shape), out->strides
+        };
+        coalesce(bsh, bst);
+        if (!bsh.empty()) {
+            const size_t L = bsh.size() - 1;
+            const size_t m = bsh[L];
+            const ptrdiff_t sa = bst[0][L], sb = bst[1][L], so = bst[2][L];
+            int mode = -1;
+            if (so == 1 && m > 1) {
+                if      (sa == 1 && sb == 1) mode = 0;
+                else if (sa == 1 && sb == 0) mode = 1;
+                else if (sa == 0 && sb == 1) mode = 2;
+            }
+            if (mode >= 0) {
+                const std::vector<size_t> osh(bsh.begin(), bsh.begin() + (long)L);
+                const std::vector<std::vector<ptrdiff_t>> ost = {
+                    std::vector<ptrdiff_t>(bst[0].begin(), bst[0].begin() + (long)L),
+                    std::vector<ptrdiff_t>(bst[1].begin(), bst[1].begin() + (long)L),
+                    std::vector<ptrdiff_t>(bst[2].begin(), bst[2].begin() + (long)L)
+                };
+                const std::vector<size_t> boffs = { a->offset, b->offset, out->offset };
+                if      (cdt == DType::F64)
+                    binTier1b<double >(*a, *b, *out, osh, ost, boffs, m, mode, cost, fd);
+                else if (cdt == DType::F32)
+                    binTier1b<float  >(*a, *b, *out, osh, ost, boffs, m, mode, cost, fd);
+                else
+                    binTier1b<int64_t>(*a, *b, *out, osh, ost, boffs, m, mode, cost, fi);
+                if (plan.finalOut) copyInto(*out, *plan.finalOut, what);
+                return wrap(plan.finalOut ? plan.finalOut : out);
+            }
         }
     }
 

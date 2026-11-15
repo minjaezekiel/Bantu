@@ -27,6 +27,9 @@ def ok($cond, $name) {
     if ($cond) { $R.pass = $R.pass + 1; print("  ok    " + $name); }
     else { $R.fail = $R.fail + 1; print("  FAIL  " + $name); }
 }
+// A 0-d reduction result is an ndarray HANDLE, and every handle is truthy, so
+// `ok(nd_all(...))` is an assertion that cannot fail. Extract it first.
+def sc($x) { return nd_get(nd_reshape($x, [1]), [0]); }
 def eqs($got, $want, $name) {
     if ($got == $want) { $R.pass = $R.pass + 1; print("  ok    " + $name); }
     else {
@@ -177,7 +180,7 @@ eqs($reload.dtype(), "f32", "an f32 model reloads as f32, not widened to f64");
 // bit-identical prediction, the same gate the MNIST numbers are quoted under
 $a = $model.forward($xs);
 $b = $reload.forward($xs);
-ok(nd_all(nd_equal($a.data, $b.data, null), null, null),
+ok(sc(nd_all(nd_equal($a.data, $b.data, null), null, null)) == true,
    "the reloaded f32 model predicts BIT-IDENTICALLY");
 
 // and the file is about half the size of the f64 equivalent

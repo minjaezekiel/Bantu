@@ -312,10 +312,35 @@ regulated setting. A few percent of scheduling efficiency is not worth it.
 So: a fixed partition computed from shape, giving **bit-identical results at
 any thread count**, plus `nd_set_threads(n)`.
 
-**Default 1, opt-in.** A library whose numeric results change when it is
-installed on a machine with more cores is a support nightmare; opt-in means the
-user chooses the moment their results change, and `nd_set_threads(1)` is always
-an exact reproduction path. No pool is created at `n == 1`.
+**Default 1, opt-in.** No pool is created at `n == 1`.
+
+> **Corrected 2026-11-11.** The reason originally given here was wrong, and it
+> was wrong in a way that contradicted the paragraph above it:
+>
+> > ~~A library whose numeric results change when it is installed on a machine
+> > with more cores is a support nightmare; opt-in means the user chooses the
+> > moment their results change.~~
+>
+> Results **do not change.** That is the whole point of the fixed partition two
+> paragraphs up, and it was verified byte-for-byte via `nd_tobytes` at 1, 3, 7,
+> 8 and 12 threads on deliberately non-round shapes — a 1,000,003-element `sum`
+> and `mean`, and a 997×1013×601 `matmul`. All identical. So there is no
+> "moment their results change" for the user to choose, and `nd_set_threads(1)`
+> is a reproduction path only in the trivial sense that every thread count is.
+>
+> **The reason that survives measurement** is oversubscription, not
+> reproducibility: this interpreter is embedded in `sua`, where a request
+> handler must not silently take twelve cores for one request, and nothing in
+> the process can know whether it is a web server or a training script. One
+> process, one answer — so the answer defaults to the conservative one and the
+> program that wants the machine asks for it.
+>
+> This matters beyond pedantry, because the two reasons point at different
+> people. Under the old reason, opting in is a risk the user accepts. Under the
+> real one, opting in is free for anyone not serving concurrent requests — and
+> that is most numeric code, including every ML package in this ecosystem,
+> which was consequently running at a fifth of the machine's throughput for no
+> reason at all (`docs/generative-architecture.md` G1, G7).
 
 Ecosystem-wide this is [E15]. **Rejected:** language-level threads — they touch
 the GC and the evaluator, a far larger change for the same arithmetic benefit.
@@ -802,3 +827,188 @@ all-false was branch misprediction, not work.
 keeps its own index, and a tie goes to the lowest index (hence the strict
 `>` / `<`). Asserted for a NaN at index 0, in the middle, and in the last
 position, plus the all-equal case.
+
+---
+
+### N40 — a broadcast operand had no fast tier, and cost 3.4x the same-shape one
+
+`applyBinary` had tier 0 (same shape, contiguous, vectorizable) and tier 1 (one
+operand a single value, vectorizable). Everything else fell to tier 2, a
+per-element odometer with a lambda call and a dtype-dispatched `load`/`store`
+per element. A broadcast **vector** matched neither fast tier, and paid for it:
+
+| `[16,32,64,64]` f64, 8 threads | time |
+|---|---|
+| `nd_multiply(x, y)` same shape | 5.3 ms |
+| `nd_add(x, 1.0)` scalar, tier 1 | 4.8 ms |
+| `nd_subtract(x, [1,C,1,1])` | **18.0 ms** |
+| `[65536,32] - [1,32]` | **17.8 ms** |
+
+Strictly less memory traffic than the same-shape case, 3.4x the time. And not a
+stride accident: broadcasting on the innermost axis and on the outermost cost
+the same, so the cost was the walk, not the layout.
+
+This is [N-tier-1]'s own story one rank up. Tier 1 exists because a *scalar*
+operand was found to be 4.5x slower than same-shape for less traffic; the same
+reasoning was never extended to a vector.
+
+**Tier 1b.** After coalescing, the innermost run of any broadcast is one of
+three shapes, and each is already solved:
+
+| | innermost strides | per-run kernel |
+|---|---|---|
+| mode 0 | both contiguous (`[N,C]` op `[1,C]`) | `tier0` |
+| mode 1 | right operand stride 0 — one value over the run | `tier1` |
+| mode 2 | left operand stride 0 | `tier1r` |
+
+Only the **walk** changes. Each run goes to the identical kernel tier 0 and
+tier 1 already use, on the same values in the same order, so the result is
+bit-for-bit what tier 2 produced — N25's determinism contract is untouched, and
+the test asserts it at 1, 3 and 8 threads rather than assuming it.
+
+| | before | after |
+|---|---|---|
+| `x - [1,C,1,1]`, 2.1M f64 | 18.0 ms | **4.9 ms** |
+
+3.7x, and now *faster* than the same-shape case (4.9 vs 5.9 ms), which is the
+right answer: it reads 16.8 MB plus 32 elements rather than 33.6 MB.
+
+**Why it mattered.** Broadcasting against a per-channel vector is every
+normalisation layer, every bias add and every per-channel scale in a neural
+network. It sat underneath all of them — see
+`docs/generative-architecture.md` G4, where it was found by chasing the wrong
+suspect (`BatchNorm2d`'s permutes, which turned out to be a 29 ms side-show in
+front of a 72 ms main event).
+
+**BOOL results are deliberately excluded.** A comparison would need a per-block
+`tier0cmp` arm, and comparisons are not on this hot path; tier 2 is already
+correct for them. The test asserts a BOOL result is unchanged rather than
+leaving that as an assumption.
+
+**Rejected: threading tier 2's odometer.** It makes a slow walk wider instead
+of removing it, and would have left the single-thread case — the default — just
+as slow.
+
+---
+
+### N41 — the fast-path tests could not fail, and four of five mutations proved it
+
+[N40] added tier 1b. The new tests passed, 73 green. Then the gate was tested
+the way every gate in this project is supposed to be: break the kernel
+deliberately and require the suite to turn red.
+
+**Four of the five mutations passed.** Including one that swapped the operand
+order of `a - b`.
+
+The cause was not in the kernel. It was one line in `same()`, the helper whose
+entire job is bit-for-bit comparison, in both `numba_fastpath_test.b` and
+`numba_splat_test.b`:
+
+```bantu
+ok(nd_all(nd_logical_or($eq, $bothnan, null), null, null), $name);
+```
+
+`nd_all` with `axis = null` returns a **0-d ndarray handle**, not a Bantu
+boolean — and every handle is truthy. So `ok(...)` received `true`
+unconditionally. Verified directly: `nd_all(nd_equal(nd([1.0,2.0]),
+nd([1.0,9.0])))` is falsy in content, `nd_get` extracts `false`, and
+`if ($it)` takes the true branch.
+
+Every `same()` assertion in both files — the two files whose stated purpose is
+*"the optimized paths must agree with the generic ones, BIT FOR BIT"* — had been
+unable to fail. Three more sites were the same shape: `numba_f32_test.b` ×2 and
+`btorch_f32_test.b` ×1.
+
+**And it was hiding real defects.** With the comparison repaired, three
+long-standing assertions failed immediately:
+
+```bantu
+same(nd_matmul($v, nd_random_normal([25, 4]), null),
+     nd_matmul(nd_copy($v, null), nd_random_normal([25, 4]), null), ...);
+```
+
+`nd_random_normal` is called **twice** — so the two matmuls multiplied different
+matrices, and the assertion could never have held even with a correct kernel.
+Three of these, across the vector, transposed-A and double-transpose matmul
+paths. The right-hand operand is now drawn once into a variable.
+
+**Fixed** by extracting the reduction before testing it:
+`ok(sc(nd_all(...)) == true, $name)`. With that one change M1 was caught by
+exactly the two assertions written for it, and nothing else.
+
+**The lesson is not "check 0-d results".** It is that a test suite is a program
+whose correctness is as unproven as any other until something tries to break
+it. Thirteen phases of this project have ended with a mutation battery for that
+reason; this is the first time the battery found the fault in the *harness*
+rather than in the code, and it would have gone on hiding operand-order bugs in
+every fast path added from here.
+
+**Rejected: making a 0-d array falsy when it holds zero.** It would fix this
+specific footgun and silently change the meaning of `if ($arr)` for every
+program already using an array as a presence check. The language is in
+production; a test-harness bug is not a reason to change truthiness under it.
+
+---
+
+### N42 — the reference travelled the same code path, again
+
+[N41] found that `same()` could not fail. With it repaired, tier 1b's battery
+caught six of eight mutations; one of the two misses was an equivalent mutation
+(`*bp` and `bp[0]` are identical C++, my error), and the other was a real gap:
+there was no **mixed-dtype** broadcast test, so dropping `b->dtype == cdt` let
+an i64 vector be read as doubles and the suite stayed green.
+
+Four assertions were added and the `b`-side guard became catchable. The
+`a`-side guard **still was not**, and the reason is worth recording because it
+is N41's lesson in a second disguise.
+
+The assertions compared
+
+    nd_subtract($f64, $i64_broadcast)   against   nd_subtract($f64, $i64_expanded)
+
+and an *expanded* i64 array still enters tier 1b. So a mutation that dropped the
+dtype guard broke **both sides into the same garbage**, and the comparison was
+satisfied. The reference was independent of the *shape* under test and not of
+the *code path* under test.
+
+**Fixed** by converting to the compute dtype first, so the reference is a
+same-shape f64 pair — tier 0, which every other assertion in the file has
+already pinned — and by adding the left-operand case for each of the three
+dtype combinations.
+
+**The rule this file now follows:** a reference for a fast path must be reachable
+only through a path the mutation cannot touch. "Compute it a different way" is
+not enough if both ways go through the same `if`.
+
+**The complete tally for tier 1b**, across both rounds — twelve mutations, and
+the three that were missed are the three findings:
+
+| | |
+|---|---|
+| mode-2 operands swapped | caught |
+| mode-0 vector treated as a constant | caught |
+| out-stride check dropped | caught |
+| mode-1 operands swapped | caught |
+| BOOL results let in | caught |
+| mode-2 detection dropped | caught |
+| mode-1 constant taken from A | caught |
+| `b->dtype` guard dropped | caught *after* the mixed-dtype tests existed |
+| `*bp` → `bp[0]` | **equivalent mutation** — identical C++, my error |
+| `a->dtype` guard dropped | **missed** → the reference shared the path |
+| `out->dtype` guard dropped | **missed** → nothing tested `out=` with a differing dtype, for any tier |
+
+Nine real mutations, all caught once the three gaps were closed — the two that
+had been missed were re-run against the repaired suite and both turn it red
+now (`a->dtype`: 3 assertions; `out->dtype`: the suite aborts). The one
+equivalent mutation is worth leaving in the record: a battery is only as good as
+its mutations, and "it passed" can mean the test is weak *or* that the mutation
+changed nothing.
+
+The suite went from 73 assertions to **83** in the course of this: +4 for
+mixed-dtype broadcasts in both operand orders, +4 for an `out=` whose dtype
+differs from the compute dtype, and the rest from making the three
+double-draw comparisons real.
+
+That is twice in one file: `ok(nd_all(...))` could not fail at all, and then a
+reference that could fail only when the code was already right. Both were found
+by mutation and neither by review.
