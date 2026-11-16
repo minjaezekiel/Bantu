@@ -304,7 +304,7 @@ scikit-learn and is documented as one ([K43]). The list form is a K8 item.
 | `max_features` defaults by task | every feature for a regressor, `sqrt(f)` for a classifier — scikit-learn's split, and the measured reason for it | [x] |
 | `ExtraTrees*` | random split thresholds, via one optional `cuts` argument to `tree_best_split` ([K65]) — **not** the `_chooseSplit` override [K61] chose, whose stated reason for rejecting a kernel argument was itself wrong | [x] |
 | permutation importance | `selection.b`, beside `cross_val_score` — model-agnostic, needs `score()` and nothing else. **Does not refit** ([K66]): that is the definition, not an optimisation | [x] |
-| leaf-wise growth (`max_leaves`) | a follow-up *inside* the shared grower ([§8.6]); with `max_leaves` unset the two policies produce the same splits, so it changes node ordering and not the model | [ ] |
+| leaf-wise growth (`max_leaves`) | one swap into the queue head, inside the shared grower ([K67]). With the cap unset the two policies predict **bit-identically** while building different node arrays — ordering, not the model | [x] |
 
 **K8 is split along the roadmap's own rows**, and all but two are done: the
 boosters, the four objectives, stopping, the subsamples, the importances, the
@@ -314,10 +314,10 @@ behind them — 19 booster mutations (18 caught, 1 equivalent), 12 `tree_` kerne
 mutations (12 caught), 10 forest mutations (10 caught) and 7 ExtraTrees
 mutations (7 caught).
 
-**Permutation importance and leaf-wise growth are what remain.** Permutation
-importance is model-agnostic, so it belongs beside `score()` rather than inside
-any one estimator; leaf-wise growth goes *inside* the shared grower ([§8.6]) and
-changes node ordering rather than the model when `max_leaves` is unset.
+**K8 is complete.** Every row is built and gated, behind seven mutation
+batteries: 19 booster (18 caught, 1 equivalent), 12 `tree_` kernel (12), 10
+forest (10), 12 ExtraTrees (12), 9 permutation importance (9), 9 leaf-wise and
+parameter validation (9).
 
 ## Phase K9 — `cluster.b`, `decompose.b`
 `KMeans` (k-means++ init, seeded), `DBSCAN`, `GaussianMixture`; `PCA`,
@@ -375,12 +375,12 @@ objectives and early stopping — not split finding.
 `base.b` is 391 lines, `preprocess.b` 1,011, `selection.b` 1,051, `metrics.b` 695,
 `linear.b` 857, `compose.b` 512, `tree.b` 870 and `ensemble.b` 1,290, over the
 `tree_` family in `bantu-src/compiler/src/tree_native.hpp`;
-`tests/bkit_base_test.b` is 59 assertions,
+`tests/bkit_base_test.b` is 61 assertions,
 `tests/bkit_preprocess_test.b` 174, `tests/bkit_selection_test.b`
 117, `tests/bkit_metrics_test.b` 123, `tests/bkit_linear_test.b` 135,
-`tests/bkit_compose_test.b` 77, `tests/bkit_tree_test.b` 188,
-`tests/bkit_ensemble_test.b` 197 and `tests/bkit_protocol_test.b` 55 registry
-entries — **1,139 assertions**, all green. Read
+`tests/bkit_compose_test.b` 77, `tests/bkit_tree_test.b` 229,
+`tests/bkit_ensemble_test.b` 210 and `tests/bkit_protocol_test.b` 55 registry
+entries — **1,195 assertions**, all green. Read
 [`../docs/bkit-architecture.md`](../docs/bkit-architecture.md) first, then
 [`DECISIONS.md`](DECISIONS.md).
 

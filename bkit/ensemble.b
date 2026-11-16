@@ -92,7 +92,10 @@ def _defaults($objective) {
         "objective":           $objective,
         "validation_fraction": 0.1,
         "n_iter_no_change":    null,
-        "tol":                 0.0001
+        "tol":                 0.0001,
+        // Leaf-wise growth, inside the SHARED grower (§8.6). null is
+        // depth-wise, which is XGBoost's default; a number is LightGBM's.
+        "max_leaves":          null
     };
 }
 
@@ -150,6 +153,9 @@ def _checkParams($p, $who) {
     }
     if ($p.n_iter_no_change != null) {
         _whole($p.n_iter_no_change, 1, "n_iter_no_change");
+    }
+    if ($p.max_leaves != null) {
+        _whole($p.max_leaves, 2, "max_leaves");
     }
     if (!contains(["squared_error", "logistic", "softmax", "poisson"],
                   $p.objective)) {
@@ -356,6 +362,11 @@ class _BoostBase extends Estimator {
     // class the model never trained on.
     def _stratifyOn($v) { return null; }
 
+    // [K68]: set_params validated the KEY and never the VALUE, so every check
+    // in _checkParams was bypassable through the method GridSearchCV drives
+    // estimators with. base.b calls this after applying a dict.
+    def _validateParams() { return _checkParams(this.params_, this.name_); }
+
     // ── fit ────────────────────────────────────────────────────────────────
     def fit($X, $y) {
         $who = this.name_ + ".fit";
@@ -440,6 +451,7 @@ class _BoostBase extends Estimator {
                              this.params_.gamma, this.params_.min_child_weight);
         $G.known_features(this.n_feat_);
         $G.reset_importance();
+        $G.set_max_leaves(this.params_.max_leaves);
 
         this.rounds_     = [];
         this.val_scores_ = [];
@@ -865,7 +877,8 @@ def _forestDefaults() {
         "gamma":            0.0,
         "min_child_weight": 0.0,
         "max_features":     null,    // set per task by the subclass
-        "bootstrap":        true
+        "bootstrap":        true,
+        "max_leaves":       null     // leaf-wise growth, inside the shared grower
     };
 }
 
@@ -921,6 +934,9 @@ class _ForestBase extends Estimator {
         if ($p.reg_lambda < 0.0 || $p.gamma < 0.0 || $p.min_child_weight < 0.0) {
             throw this.name_ + ": reg_lambda, gamma and min_child_weight must be >= 0";
         }
+        if ($p.max_leaves != null) {
+            _whole($p.max_leaves, 2, "max_leaves");
+        }
         if (type($p.bootstrap) != "bool") {
             throw this.name_ + ": bootstrap must be true or false, got "
                   + str($p.bootstrap);
@@ -935,6 +951,11 @@ class _ForestBase extends Estimator {
     // The split policy, and the ONLY thing an ExtraTrees differs by. §8.8 calls
     // the forests "the same loop with two switches"; this is the second one.
     def _randomCuts() { return false; }
+
+    // [K68]: set_params validated the KEY and never the VALUE, so every check
+    // here was bypassable through the method GridSearchCV drives estimators
+    // with. base.b calls this after applying a dict.
+    def _validateParams() { return this._checkForest(); }
 
     def fit($X, $y) {
         $who = this.name_ + ".fit";
@@ -972,6 +993,7 @@ class _ForestBase extends Estimator {
         $G.known_features(this.n_feat_);
         $G.reset_importance();
         $G.set_random_cuts(this._randomCuts());
+        $G.set_max_leaves(this.params_.max_leaves);
 
         // Out-of-bag coverage, counted while the samples are drawn. A row that
         // no tree left out cannot be scored out of bag, and a caller who asks

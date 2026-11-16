@@ -1930,3 +1930,109 @@ itself"` rather than a generic complaint from three frames down. The gate now
 asserts the message text, which is the only thing that distinguishes them.
 
 Final: **9 mutations, 9 caught.**
+
+---
+
+### K67 — leaf-wise growth is one swap, and the equivalence is the gate
+
+[§8.6] said `max_leaves` would be *"a follow-up inside that same grower: pick
+the highest-gain frontier node instead of draining a queue"*, and that with the
+cap unset *"the two policies produce the same set of splits, so it changes node
+ordering and not the model"*. Both halves held, and the second is now a
+measurement rather than an argument.
+
+**The policy is one swap into the queue head.** The depth-wise loop drains
+`$pend` in order; leaf-wise scans the live frontier for the highest gain and
+swaps that item into the position the loop is about to read. Everything below
+the swap is identical under both policies — a second loop would have been a
+second place to get the `NaN` direction, the empty-child assertion and the
+histogram subtraction right, which is the argument [§8.6] makes for sharing the
+grower, applied one level down.
+
+**The restructuring it did require was moving the scan.** Leaf-wise has to
+compare gains *before* choosing, so a node's histogram, totals and best split
+are now computed when it **joins** the frontier rather than when it leaves it,
+and cached on the queue item. `_evalNode` holds that, and depth-wise calls it
+identically and simply ignores the ranking — which is why the change is
+measurable as *ordering only*. Computing the split twice, once to rank and once
+to use, would have put the scan, the feature mask and the random-cut draw in two
+places.
+
+The scan is skipped for a node that cannot split anyway. That is not an
+optimisation added afterwards: the two conditions are exactly the ones the
+depth-wise loop already tested before scanning, so the work is identical.
+
+**The equivalence gate needs both halves.** With no cap:
+
+| assertion | why |
+|---|---|
+| the two policies predict **bit-identically** | the set of splits is the same, so the partition is the same and so are the leaf values |
+| the node **arrays differ** | without this, the first assertion would also hold if the switch did nothing at all |
+
+**Split counts are exact; gains are not** — [K54]'s per-channel structure
+arriving a second time, for the same reason. The per-feature split counts are
+integers held in doubles and agree bit for bit; the gains are the same floats
+summed in a *different order*, and floating-point addition is not associative,
+so they agree to **2.1e-16 relative** (one ULP) and the gate says so rather than
+demanding identity.
+
+**What the policy is for, measured.** On a target with structure concentrated in
+a narrow region — a staircase below `x = 0.25`, a plateau above — at an
+**identical** seven-leaf budget:
+
+| policy | depth | training MSE |
+|---|---|---|
+| depth-wise, `max_depth = 3` | 3 | 0.1797 |
+| leaf-wise, `max_leaves = 7` | **4** | **0.1406** |
+
+Leaf-wise goes a level deeper where the gain is, because it is not obliged to
+split the plateau at every level. On a *smooth* target the two produce the same
+tree, which is why the gate uses an asymmetric fixture and says so: the
+advantage is data-dependent, and claiming it generally would be claiming more
+than the measurement supports.
+
+`max_leaves` is **not a constructor argument**. Adding a seventh positional slot
+to six existing ones is where transposing two becomes silent, and every
+estimator already has `set_params` — which, as [K68] found immediately, was not
+checking anything.
+
+---
+
+### K68 — `set_params` validated the key and never the value
+
+Found by writing a gate for `max_leaves = 1` and watching it pass. The cap is
+refused by the constructor; through `set_params` it was accepted, and the
+estimator grew a **one-node tree** and reported it as a fit.
+
+It was not specific to the new parameter. Driving nine invalid values through
+`set_params` on a `DecisionTreeRegressor`:
+
+| value | before |
+|---|---|
+| `max_depth = 0` | **accepted** — one-node tree |
+| `max_depth = −5` | **accepted** — one-node tree |
+| `min_samples_leaf = 0` | **accepted** |
+| `min_samples_leaf = 2.5` | **accepted** |
+| `max_leaves = 1` | **accepted** — one-node tree |
+| `max_leaves = "many"` | **accepted** — one-node tree, from a *string* |
+| `max_bins = 1` | refused — **by the kernel** |
+| `max_bins = 9999` | refused — **by the kernel** |
+| `reg_lambda = −1` | refused — **by the kernel** |
+
+Five accepted outright, and the four that were refused were refused three calls
+later by C++, with a message naming a kernel the caller never invoked. **Every
+check bkit performs in a constructor was bypassable**, and bypassable through
+precisely the method that matters most: `GridSearchCV` never calls a
+constructor. A grid containing `max_depth: 0` scored a degenerate model and
+reported it as a legitimate candidate — which is [K24]'s failure exactly, one
+level down. [K24] fixed the mistyped **key**; this is the unchecked **value**.
+
+The fix is a protocol hook, not a patch per estimator. `Estimator.set_params`
+calls `this._validateParams()` after applying the dict, and the base
+implementation is a **no-op**, so an estimator with nothing to check is
+unaffected. `tree.b` overrides it with the routine its *constructor* already
+calls, so the two cannot drift — the override is the routine, not a copy of it —
+and `ensemble.b` overrides it with `_checkParams`/`_checkForest`.
+
+All nine values are now refused by bkit, by name, before anything is fitted.
+Nothing in the package relied on the hole: every suite stayed green.

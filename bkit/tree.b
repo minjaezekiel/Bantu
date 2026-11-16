@@ -100,17 +100,16 @@ class _TreeBase extends Estimator {
             "max_bins":         _checkPos($max_bins, 256, "max_bins", false),
             "reg_lambda":       _checkPos($reg_lambda, 0.0, "reg_lambda", true),
             "gamma":            _checkPos($gamma, 0.0, "gamma", true),
-            "min_child_weight": _checkPos($min_child_weight, 0.0, "min_child_weight", true)
+            "min_child_weight": _checkPos($min_child_weight, 0.0, "min_child_weight", true),
+            // Leaf-wise growth's cap. null means depth-wise, which is this
+            // package's default and XGBoost's; a number switches the policy to
+            // LightGBM's. Not a constructor argument, because adding a seventh
+            // positional slot to six existing ones is where transposing two
+            // becomes silent -- it is set through set_params, which every
+            // estimator already has ([K67]).
+            "max_leaves":       null
         };
-        if (this.params_.min_samples_leaf != floor(this.params_.min_samples_leaf)) {
-            throw "bkit.tree: min_samples_leaf must be a whole number, got "
-                  + str(this.params_.min_samples_leaf);
-        }
-        if (this.params_.max_bins != floor(this.params_.max_bins)
-            || this.params_.max_bins < 2 || this.params_.max_bins > 256) {
-            throw "bkit.tree: max_bins must be a whole number in 2..256 (one "
-                  + "byte per cell is the point), got " + str(this.params_.max_bins);
-        }
+        this._validateParams();
         this.nodes_  = null;    // [n_nodes, 7] once fitted
         this.trees_  = null;    // K node arrays, for multiclass one-vs-rest
         this.n_feat_ = 0;
@@ -152,6 +151,59 @@ class _TreeBase extends Estimator {
         // alone ([C4]) and the kernel stays deterministic given its argument,
         // which is what makes it testable against a known vector ([K65]).
         this.randomCuts_ = false;
+    }
+
+    // The parameter checks, in ONE place so the constructor and set_params
+    // cannot drift ([K68]). base.b's set_params calls this after applying a
+    // dict, which is what makes a GridSearchCV candidate with max_depth = 0 an
+    // error rather than a one-node tree reported as a legitimate score.
+    //
+    // Only the values that arrive through set_params are re-checked here; the
+    // constructor's own coercion of nulls to defaults happens before this runs,
+    // so by the time it is called every entry is a concrete value.
+    def _validateParams() {
+        $p = this.params_;
+        if (type($p.max_depth) != "number" || $p.max_depth != floor($p.max_depth)
+            || $p.max_depth < 1) {
+            throw "bkit.tree: max_depth must be a whole number >= 1, got "
+                  + str($p.max_depth);
+        }
+        if ($p.max_depth > 60) {
+            throw "bkit.tree: max_depth " + str($p.max_depth) + " would allow 2^"
+                  + str($p.max_depth) + " nodes. The cap is 60; a tree that deep "
+                  + "is memorising rows.";
+        }
+        if (type($p.min_samples_leaf) != "number"
+            || $p.min_samples_leaf != floor($p.min_samples_leaf)
+            || $p.min_samples_leaf < 1) {
+            throw "bkit.tree: min_samples_leaf must be a whole number >= 1, got "
+                  + str($p.min_samples_leaf);
+        }
+        if (type($p.max_bins) != "number" || $p.max_bins != floor($p.max_bins)
+            || $p.max_bins < 2 || $p.max_bins > 256) {
+            throw "bkit.tree: max_bins must be a whole number in 2..256 (one "
+                  + "byte per cell is the point), got " + str($p.max_bins);
+        }
+        if (type($p.reg_lambda) != "number" || $p.reg_lambda < 0.0) {
+            throw "bkit.tree: reg_lambda must be a number >= 0, got "
+                  + str($p.reg_lambda);
+        }
+        if (type($p.gamma) != "number" || $p.gamma < 0.0) {
+            throw "bkit.tree: gamma must be a number >= 0, got " + str($p.gamma);
+        }
+        if (type($p.min_child_weight) != "number" || $p.min_child_weight < 0.0) {
+            throw "bkit.tree: min_child_weight must be a number >= 0, got "
+                  + str($p.min_child_weight);
+        }
+        if ($p.max_leaves != null) {
+            if (type($p.max_leaves) != "number"
+                || $p.max_leaves != floor($p.max_leaves) || $p.max_leaves < 2) {
+                throw "bkit.tree: max_leaves must be a whole number >= 2 (a cap "
+                      + "of 1 is a tree that cannot split), got "
+                      + str($p.max_leaves);
+            }
+        }
+        return null;
     }
 
     def _prepare($X, $y, $who) {
@@ -212,6 +264,78 @@ class _TreeBase extends Estimator {
         return 0.0 - $G / $d;
     }
 
+    // EVERYTHING ABOUT ONE FRONTIER NODE: its histogram, its totals, and the
+    // split the scan would choose for it. Returned as
+    // [hist, G, H, n, bs, gain], where gain is -1 when the node cannot split at
+    // all.
+    //
+    // It exists because leaf-wise growth has to COMPARE gains before deciding
+    // which node to expand, so the scan has to happen at the moment a node
+    // joins the frontier rather than at the moment it leaves it. Computing it
+    // twice -- once to rank, once to use -- would put the scan, the feature
+    // mask and the random-cut draw in two places, which is the thing §8.6 is
+    // written to avoid. Depth-wise uses the identical evaluation and simply
+    // ignores the ranking ([K67]).
+    //
+    // The scan is SKIPPED for a node that cannot split anyway. That is not an
+    // optimisation bolted on afterwards: the two conditions are exactly the
+    // ones the depth-wise loop already tested before scanning, so skipping them
+    // here keeps the work identical rather than adding any.
+    def _evalNode($B, $g, $h, $idx, $depth, $hist0, $ncol, $vbins) {
+        $hist = $hist0;
+        if ($hist == null) { $hist = tree_hist($B, $g, $h, $idx); }
+        $tot = this._totals($hist);
+        $G = $tot[0];  $H = $tot[1];  $n = $tot[2];
+        $bs   = null;
+        $gain = 0.0 - 1.0;              // "this node cannot split"
+        if ($depth < this.params_.max_depth
+            && $n >= 2.0 * this.params_.min_samples_leaf) {
+            // Redrawn per node when featK_ is set. Built with three native
+            // calls and no Bantu loop: the rank of a uniform draw is a uniform
+            // permutation, so "rank < k" selects k features without
+            // replacement (K18's construction).
+            if (this.featK_ != null) {
+                $rk = np.argsort(np.argsort(np.random([$ncol], 0.0, 1.0),
+                                            null), null);
+                this.featMask_ = np.reshape(
+                    np.astype(np.less($rk, this.featK_, null), "f64"),
+                    [$ncol, 1, 1]);
+            }
+            $scan = $hist;
+            if (this.featMask_ != null) {
+                $scan = np.multiply($hist, this.featMask_, null);
+            }
+            // One candidate cut per feature, redrawn at every node.
+            // floor(u * (vbins - 1)) lands in 0..vbins-2, which is exactly the
+            // admissible range -- a cut at the last bin would put every row
+            // left. A feature with vbins < 2 gets -1, because it has no cut to
+            // offer; clamping it to 0 instead would be an out-of-range index
+            // the kernel rightly refuses.
+            $cuts = null;
+            if ($vbins != null) {
+                $cuts = np.floor(np.multiply(np.random([$ncol], 0.0, 1.0),
+                                             np.subtract($vbins, 1.0, null),
+                                             null), null);
+                $cuts = np.where(np.less($vbins, 2.0, null), 0.0 - 1.0, $cuts);
+            }
+            $bs = tree_best_split($scan, $B,
+                                  this.params_.reg_lambda,
+                                  this.params_.gamma,
+                                  this.params_.min_child_weight,
+                                  1.0 * this.params_.min_samples_leaf,
+                                  $cuts);
+            // A gain of zero is not an improvement; splitting on it doubles the
+            // tree for nothing and is how a "max_depth" tree ends up memorising
+            // singleton leaves.
+            if (np.get($bs, [0]) < 0.0 || np.get($bs, [2]) <= 0.0) {
+                $gain = 0.0 - 1.0;
+            } else {
+                $gain = np.get($bs, [2]);
+            }
+        }
+        return [$hist, $G, $H, $n, $bs, $gain];
+    }
+
     // Grows one tree over (g, h) and returns the [n_nodes, 7] node array.
     // Breadth-first over an explicit queue: Bantu's call depth is capped at
     // 1000 and a recursive grower would also make the node indices awkward,
@@ -246,25 +370,60 @@ class _TreeBase extends Estimator {
         while ($fi < $ncol) { append($gainF, 0.0); append($splitF, 0.0); $fi = $fi + 1; }
 
         $nodes = [];                 // each a 7-element list
-        // [idx, depth, slot, hist] -- hist is this node's histogram, carried
-        // from its parent by subtraction (see below) or null for the root.
+        // [idx, depth, slot, eval] -- eval is this node's _evalNode result,
+        // computed when the node JOINS the frontier rather than when it leaves
+        // it, because leaf-wise growth ranks the frontier by gain before
+        // choosing. The histogram inside it is carried from the parent by
+        // subtraction, or built directly for the root.
         $pend  = [];
         append($nodes, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
         // $rootIdx null means every row. A booster passes a row subsample and a
         // forest passes a BOOTSTRAP sample -- an index array with repeats, which
         // tree_hist counts once per occurrence, i.e. bootstrap semantics with no
         // kernel change (§8.5).
-        append($pend,  [$rootIdx, 0, 0, null]);
+        append($pend,  [$rootIdx, 0, 0,
+                        this._evalNode($B, $g, $h, $rootIdx, 0, null, $ncol, $vbins)]);
         $qi = 0;
         $maxDepth = 0;
         $leaves = 0;
+        // A tree with L leaves has L-1 splits, so the root counts as one leaf
+        // before anything is split and each split adds one. The cap is checked
+        // against this rather than against $leaves, which only counts nodes
+        // already FINALISED and so undercounts the frontier mid-grow.
+        $leafCount = 1;
+        $maxLeaves = this.params_.max_leaves;
 
         while ($qi < len($pend)) {
+            // THE ONE LINE THAT IS THE POLICY. Depth-wise drains the queue in
+            // order; leaf-wise expands whichever frontier node has the highest
+            // gain, which is the same set of nodes in a different order unless
+            // max_leaves cuts the run short. Implemented as a swap into the
+            // queue head so everything below is identical under both policies
+            // -- a second loop would be a second place to get the NaN
+            // direction, the empty-child assertion and the subtraction right.
+            if ($maxLeaves != null) {
+                $bestAt = $qi;
+                $bestG  = $pend[$qi][3][5];
+                $sj = $qi + 1;
+                while ($sj < len($pend)) {
+                    if ($pend[$sj][3][5] > $bestG) {
+                        $bestG = $pend[$sj][3][5];
+                        $bestAt = $sj;
+                    }
+                    $sj = $sj + 1;
+                }
+                if ($bestAt != $qi) {
+                    $swap = $pend[$qi];
+                    $pend[$qi] = $pend[$bestAt];
+                    $pend[$bestAt] = $swap;
+                }
+            }
             $item = $pend[$qi];
             $qi   = $qi + 1;
             $idx   = $item[0];
             $depth = $item[1];
             $slot  = $item[2];
+            $ev    = $item[3];
             if ($depth > $maxDepth) { $maxDepth = $depth; }
 
             // HISTOGRAM SUBTRACTION. A child's histogram is its parent's minus
@@ -283,66 +442,28 @@ class _TreeBase extends Estimator {
             // LightGBM and XGBoost both accept. The error does not accumulate
             // across levels, because each child derives from its parent rather
             // than from a running total.
-            $hist = $item[3];
-            if ($hist == null) { $hist = tree_hist($B, $g, $h, $idx); }
-            $tot  = this._totals($hist);
-            $G = $tot[0];  $H = $tot[1];  $n = $tot[2];
+            $hist = $ev[0];
+            $G = $ev[1];  $H = $ev[2];  $n = $ev[3];
 
             // Written as a leaf first, then overwritten if it splits. That way
             // a node is never left in a half-built state if a guard fires.
             $nodes[$slot] = [1.0, 0.0, 0.0, 0.0, 0.0, this._leafValue($G, $H), 0.0];
 
-            if ($depth >= this.params_.max_depth) { $leaves = $leaves + 1; }
-            if ($depth < this.params_.max_depth) {
-                if ($n < 2.0 * this.params_.min_samples_leaf) {
-                    $leaves = $leaves + 1;
-                }
-                if ($n >= 2.0 * this.params_.min_samples_leaf) {
-                    // Redrawn per node when featK_ is set. Built with three
-                    // native calls and no Bantu loop: the rank of a uniform
-                    // draw is a uniform permutation, so "rank < k" selects k
-                    // features without replacement (K18's construction).
-                    if (this.featK_ != null) {
-                        $rk = np.argsort(np.argsort(np.random([$ncol], 0.0, 1.0),
-                                                    null), null);
-                        this.featMask_ = np.reshape(
-                            np.astype(np.less($rk, this.featK_, null), "f64"),
-                            [$ncol, 1, 1]);
-                    }
-                    $scan = $hist;
-                    if (this.featMask_ != null) {
-                        $scan = np.multiply($hist, this.featMask_, null);
-                    }
-                    // One candidate cut per feature, redrawn at every node.
-                    // floor(u * (vbins - 1)) lands in 0..vbins-2, which is
-                    // exactly the admissible range -- a cut at the last bin
-                    // would put every row left. A feature with vbins < 2 gets
-                    // -1, because it has no cut to offer; clamping it to 0
-                    // instead would be an out-of-range index the kernel
-                    // rightly refuses.
-                    $cuts = null;
-                    if ($vbins != null) {
-                        $cuts = np.floor(np.multiply(np.random([$ncol], 0.0, 1.0),
-                                                     np.subtract($vbins, 1.0, null),
-                                                     null), null);
-                        $cuts = np.where(np.less($vbins, 2.0, null),
-                                         0.0 - 1.0, $cuts);
-                    }
-                    $bs = tree_best_split($scan, $B,
-                                          this.params_.reg_lambda,
-                                          this.params_.gamma,
-                                          this.params_.min_child_weight,
-                                          1.0 * this.params_.min_samples_leaf,
-                                          $cuts);
+            // The cap. A node that would otherwise split becomes a leaf once
+            // the budget is spent, and under the leaf-wise policy the nodes
+            // that got the budget are the highest-gain ones, which is the whole
+            // point of ranking them.
+            $capped = false;
+            if ($maxLeaves != null && $leafCount >= $maxLeaves) { $capped = true; }
+
+            if ($ev[5] <= 0.0 || $capped) { $leaves = $leaves + 1; }
+            if ($ev[5] > 0.0 && !$capped) {
+                    $bs   = $ev[4];
                     $feat = np.get($bs, [0]);
                     $bin  = np.get($bs, [1]);
                     $gain = np.get($bs, [2]);
                     $nanL = np.get($bs, [9]);
-                    // A gain of zero is not an improvement; splitting on it
-                    // doubles the tree for nothing and is how a "max_depth"
-                    // tree ends up memorising singleton leaves.
-                    if ($feat < 0 || $gain <= 0.0) { $leaves = $leaves + 1; }
-                    if ($feat >= 0 && $gain > 0.0) {
+                    if (true) {
                         $parts = tree_partition($B, this._idxOrAll($idx, $nrow),
                                                 $feat, $bin, $nanL != 0.0);
                         $L = $parts[0];
@@ -383,10 +504,21 @@ class _TreeBase extends Estimator {
                             $hR = tree_hist($B, $g, $h, $R);
                             $hL = np.subtract($hist, $hR, null);
                         }
-                        append($pend, [$L, $depth + 1, $li, $hL]);
-                        append($pend, [$R, $depth + 1, $ri, $hR]);
+                        // Each split turns one leaf into two, so the budget
+                        // goes up by one.
+                        $leafCount = $leafCount + 1;
+                        // Children are EVALUATED as they join the frontier, not
+                        // when they leave it, because the leaf-wise policy ranks
+                        // the frontier by gain. Depth-wise does exactly the same
+                        // evaluations in the same order; it just never consults
+                        // the ranking.
+                        append($pend, [$L, $depth + 1, $li,
+                                       this._evalNode($B, $g, $h, $L, $depth + 1,
+                                                      $hL, $ncol, $vbins)]);
+                        append($pend, [$R, $depth + 1, $ri,
+                                       this._evalNode($B, $g, $h, $R, $depth + 1,
+                                                      $hR, $ncol, $vbins)]);
                     }
-                }
             }
         }
         this.depth_  = $maxDepth;
@@ -808,6 +940,27 @@ class _TreeGrower extends _TreeBase {
         }
         if ($k == this.n_feat_) { this.featK_ = null; this.featMask_ = null; return null; }
         this.featK_ = $k;
+        return null;
+    }
+
+    // The growth policy. null is depth-wise breadth-first (this package's
+    // default, and XGBoost's); a number switches to leaf-wise with that many
+    // leaves (LightGBM's). With no cap the two produce the SAME SET of splits
+    // -- every node that can split, does -- so the policy changes node ordering
+    // and not the model, which is what makes this a safe late addition rather
+    // than a rewrite ([K67]).
+    def set_max_leaves($n) {
+        // Validated BEFORE assigning. The first version assigned first and
+        // reset to null on the throw, so a rejected value silently replaced the
+        // previous cap with "no cap" -- a refused call that still changed the
+        // object is worse than either outcome on its own.
+        if ($n != null) {
+            if (type($n) != "number" || $n != floor($n) || $n < 2) {
+                throw "TreeGrower.set_max_leaves: expected a whole number >= 2 "
+                      + "(a cap of 1 is a tree that cannot split), got " + str($n);
+            }
+        }
+        this.params_.max_leaves = $n;
         return null;
     }
 

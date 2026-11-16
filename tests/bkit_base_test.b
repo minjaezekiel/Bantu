@@ -180,6 +180,16 @@ $glp = $gl.get_params();
 $glp.k[0] = 7.0;
 eqs($gl.get_params().k[0], 1.0,
     "a LIST parameter comes back independent -- binding a dict's list copies it");
+
+// set_params re-checks the VALUE, not only the key (K68). The default hook is a
+// no-op, so an estimator with nothing to validate is unaffected; AddConst has
+// none, so it must still accept anything its constructor would.
+$vd = AddConst(2.0);
+$vd.set_params({"k": 0.0 - 99.0});
+eqs($vd.get_params().k, 0.0 - 99.0,
+    "an estimator that validates nothing still accepts anything");
+// And the hook exists on the base, so every estimator has one to override.
+eqs($vd._validateParams(), null, "the default _validateParams is a no-op");
 // A DICT value does NOT: it is handed over by reference and still aliases
 // through. No bkit estimator has a dict-valued parameter today (GridSearchCV
 // keeps its grid in grid_, not params_), so this is a recorded limit rather

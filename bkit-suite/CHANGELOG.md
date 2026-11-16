@@ -964,3 +964,54 @@ The first native work in this package. Five kernels plus five accessors in
   permutations once it reseeds, so asserting equality would be asserting noise.
   A missing restore instead charges feature 1 the cost of breaking 0 **and** 1,
   so the gate is that features 1–3 **together** cost under a tenth of feature 0.
+
+### Leaf-wise growth, and the parameter check that was not there (K67, K68)
+
+- **[feature]** `max_leaves` switches the **shared** grower from depth-wise
+  breadth-first to leaf-wise. It is **one swap into the queue head**: leaf-wise
+  scans the live frontier for the highest gain and swaps that item into the
+  position the loop is about to read, so everything below the swap is identical
+  under both policies.
+- **[design]** What it required was **moving the scan**. Leaf-wise compares
+  gains *before* choosing, so a node's histogram, totals and best split are now
+  computed when it **joins** the frontier and cached on the queue item;
+  `_evalNode` holds that and depth-wise calls it identically, ignoring the
+  ranking. Computing the split twice — once to rank, once to use — would have
+  put the scan, the feature mask and the random-cut draw in two places.
+- **[test] The equivalence gate needs both halves**: with no cap the two
+  policies predict **bit-identically** *and* build **different node arrays**.
+  Without the second, the first would also hold if the switch did nothing.
+- **[test] Split counts are exact, gains are not** — [K54]'s per-channel
+  structure again, for the same reason: counts are integers in doubles, gains
+  are the same floats summed in a different order, and addition is not
+  associative. They agree to **2.1e-16 relative** (one ULP).
+- **[perf]** What the policy is for, measured on an asymmetric target (a
+  staircase below `x = 0.25`, a plateau above) at an **identical** seven-leaf
+  budget: depth-wise reaches depth 3 for a training MSE of **0.1797**,
+  leaf-wise reaches depth **4** for **0.1406**. On a *smooth* target the two
+  produce the same tree — the advantage is data-dependent and the gate says so.
+- **[bug fix] `set_params` validated the KEY and never the VALUE** (K68), found
+  by writing a gate for `max_leaves = 1` and watching it pass. Nine invalid
+  values driven through it: **five were accepted** — `max_depth = 0` and
+  `max_leaves = "many"` among them, each growing a **one-node tree** reported
+  as a fit — and the four that were refused were refused **by the kernel**,
+  three calls later, naming a kernel the caller never invoked. Every check bkit
+  performs in a constructor was bypassable, through precisely the method that
+  matters most: **`GridSearchCV` never calls a constructor**, so a grid
+  containing `max_depth: 0` scored a degenerate model and reported it as a
+  legitimate candidate. That is [K24]'s failure one level down — K24 fixed the
+  mistyped key, this is the unchecked value.
+- **[design]** Fixed as a **protocol hook**, not a patch per estimator:
+  `Estimator.set_params` calls `this._validateParams()` after applying the
+  dict, with a **no-op** default so an estimator with nothing to check is
+  unaffected. `tree.b` overrides it with the routine its *constructor* already
+  calls — the override **is** that routine, not a copy — and `ensemble.b`
+  overrides it with `_checkParams`/`_checkForest`. Nothing in the package
+  relied on the hole: every suite stayed green.
+- **[bug fix]** `TreeGrower.set_max_leaves` assigned before validating and
+  reset to `null` on the throw, so a rejected value silently replaced the
+  previous cap with "no cap". A refused call that still changes the object is
+  worse than either outcome alone.
+- **[test]** `tests/bkit_tree_test.b` 188 → **229**,
+  `tests/bkit_ensemble_test.b` 197 → **210**, `tests/bkit_base_test.b` 59 →
+  **61**. Nine mutations on the policy and the validator, nine caught.

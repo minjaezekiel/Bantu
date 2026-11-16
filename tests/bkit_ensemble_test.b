@@ -1060,6 +1060,52 @@ raises(def() { return sel.permutation_importance($piM, np.ones([300], "f64"),
        "a 1-d X is refused");
 } catch ($e) { section_threw("permutation importance: scorer and refusals", $e); }
 
+print("");
+print("== max_leaves reaches the booster and the forest ==");
+try {
+// §8.6's follow-up, inside the SHARED grower: the boosters and the forests get
+// it by passing a parameter, not by growing trees a second way.
+$mlB = ens.GradientBoostingRegressor({"n_estimators": 5, "max_depth": 12,
+                                      "max_leaves": 4, "learning_rate": 0.3});
+$mlB.fit($fX, $fY);
+$mlCount = 0;
+$r = 0;
+while ($r < $mlB.n_rounds()) {
+    // A tree with L leaves has 2L-1 nodes, so a cap of 4 means at most 7.
+    ok(np.shape($mlB.nodes($r, null))[0] <= 7,
+       "booster round " + str($r) + " is capped at 7 nodes");
+    $mlCount = $mlCount + 1;
+    $r = $r + 1;
+}
+eq($mlCount, 5, "all five rounds were checked");
+$mlU = ens.GradientBoostingRegressor({"n_estimators": 5, "max_depth": 12,
+                                      "learning_rate": 0.3});
+$mlU.fit($fX, $fY);
+ok($mlU.n_nodes() > $mlB.n_nodes(),
+   "and an uncapped booster builds more nodes (" + str($mlU.n_nodes()) + " > "
+   + str($mlB.n_nodes()) + ")");
+$mlF = ens.RandomForestRegressor({"n_estimators": 6, "max_depth": 12,
+                                  "max_leaves": 5});
+$mlF.fit($fX, $fY);
+ok($mlF.nodes(0, null) != null, "the forest grows with a cap");
+ok(np.shape($mlF.nodes(0, null))[0] <= 9, "and its trees are capped at 9 nodes");
+raises(def() { return ens.GradientBoostingRegressor({"max_leaves": 1}); },
+       "max_leaves = 1 is refused by the booster");
+raises(def() { return ens.RandomForestRegressor({"max_leaves": 0}); },
+       "and by the forest");
+// set_params re-validates on the ensembles too (K68).
+raises(def() {
+    $m = ens.GradientBoostingRegressor(null);
+    return $m.set_params({"learning_rate": 0.0 - 1.0});
+}, "a negative learning_rate is refused by set_params, not only by the "
+   + "constructor");
+raises(def() {
+    $m = ens.RandomForestRegressor(null);
+    return $m.set_params({"n_estimators": 0});
+}, "and n_estimators = 0 on a forest");
+} catch ($e) { section_threw("max_leaves reaches the booster and the forest", $e); }
+
+
 
 
 

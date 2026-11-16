@@ -142,9 +142,30 @@ class Estimator {
             }
             this.params_[$k] = $v;
         }
+        // THE VALUE IS CHECKED TOO, and it used to not be (K68). set_params
+        // validated the KEY and nothing else, so every check a constructor
+        // performs was bypassable: `set_params({"max_depth": 0})` on a decision
+        // tree was accepted and grew a one-node tree, and `{"max_leaves": "many"}`
+        // did the same. The constructor refuses both.
+        //
+        // That matters most where estimators are driven entirely through this
+        // method: GridSearchCV never calls a constructor, so a grid containing
+        // an invalid value scored a degenerate model and reported it as a
+        // legitimate candidate -- the same failure K24 fixed for a mistyped KEY,
+        // one level down.
+        //
+        // The default is a no-op, so an estimator that has nothing to check is
+        // unaffected; one that validates in its constructor overrides this and
+        // calls the same routine from both places.
+        this._validateParams();
         this.fitted_ = false;
         return this;
     }
+
+    // Re-check the parameter VALUES. Overridden by any estimator whose
+    // constructor validates, so the two cannot drift: the override should be
+    // the routine the constructor calls, not a copy of it.
+    def _validateParams() { return null; }
 
     def fit_transform($X, $y) {
         this.fit($X, $y);

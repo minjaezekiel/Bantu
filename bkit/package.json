@@ -1,10 +1,10 @@
 {
   "name": "bkit",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "bantu": ">=1.4.0",
   "main": "base.b",
   "license": "MIT",
-  "description": "Classical machine learning for Bantu: scikit-learn's shape, with a histogram-based gradient-boosting implementation inside it rather than beside it. Phases K1-K8 of twelve: the estimator protocol, Pipeline with step__param addressing, eleven preprocessing transformers, model selection, metrics, linear models -- LinearRegression, Ridge, Lasso, ElasticNet, LogisticRegression (binary IRLS, multiclass one-vs-rest) and mini-batch SGD -- ColumnTransformer for per-column preprocessing, and decision trees over the tree_ native family -- histogram-based, one byte per binned cell, with the NaN direction learned per split. Both trees use the same regularised gain the gradient booster will: for regression it IS variance reduction, and for binary classification it is proportional to Gini decrease, so one criterion serves both. Gradient boosting over the same grower the decision trees use -- four objectives (squared_error, logistic, softmax, poisson), shrinkage, row and column subsampling, early stopping on a fold split BEFORE binning, and gain/split-count feature importances; its parameters arrive as a dict because a booster has fourteen of them. Random forests and extremely randomized trees over that same grower: bootstrap sampling, feature sampling redrawn at every NODE (per-tree sampling is a random subspace ensemble and measurably worse), random split thresholds via one optional cuts argument to tree_best_split rather than a second kernel, and averaging in probability space. Permutation importance lives in selection.b beside cross_val_score, is model-agnostic, and does NOT refit -- that is the definition, not an optimisation. No model forms X'X: the Gram matrix squares the condition number, so every fit goes through lstsq on the design matrix.",
+  "description": "Classical machine learning for Bantu: scikit-learn's shape, with a histogram-based gradient-boosting implementation inside it rather than beside it. Phases K1-K8 of twelve: the estimator protocol, Pipeline with step__param addressing, eleven preprocessing transformers, model selection, metrics, linear models -- LinearRegression, Ridge, Lasso, ElasticNet, LogisticRegression (binary IRLS, multiclass one-vs-rest) and mini-batch SGD -- ColumnTransformer for per-column preprocessing, and decision trees over the tree_ native family -- histogram-based, one byte per binned cell, with the NaN direction learned per split. Both trees use the same regularised gain the gradient booster will: for regression it IS variance reduction, and for binary classification it is proportional to Gini decrease, so one criterion serves both. Gradient boosting over the same grower the decision trees use -- four objectives (squared_error, logistic, softmax, poisson), shrinkage, row and column subsampling, early stopping on a fold split BEFORE binning, and gain/split-count feature importances; its parameters arrive as a dict because a booster has fourteen of them. Random forests and extremely randomized trees over that same grower: bootstrap sampling, feature sampling redrawn at every NODE (per-tree sampling is a random subspace ensemble and measurably worse), random split thresholds via one optional cuts argument to tree_best_split rather than a second kernel, and averaging in probability space. Permutation importance lives in selection.b beside cross_val_score, is model-agnostic, and does NOT refit -- that is the definition, not an optimisation. max_leaves switches the shared grower from depth-wise to leaf-wise; with no cap the two predict bit-identically, so the policy changes node ordering and not the model. set_params re-validates parameter VALUES through a protocol hook, because it used to check only the key -- and GridSearchCV never calls a constructor. No model forms X'X: the Gram matrix squares the condition number, so every fit goes through lstsq on the design matrix.",
   "keywords": [
     "machine-learning",
     "scikit-learn",
@@ -28,7 +28,9 @@
     "early-stopping",
     "random-forest",
     "extra-trees",
-    "permutation-importance"
+    "permutation-importance",
+    "leaf-wise",
+    "max-leaves"
   ],
   "dependencies": {
     "numba": "1.0.0"

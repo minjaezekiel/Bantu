@@ -1210,6 +1210,182 @@ ok($nOk,
    + "value-bin count excludes the NaN bin, so no draw lands out of range");
 } catch ($e) { section_threw("TreeGrower.set_random_cuts", $e); }
 
+print("");
+print("== leaf-wise growth: the same splits in a different order ==");
+try {
+// §8.6's claim, measured rather than asserted in prose: with no cap, leaf-wise
+// and depth-wise produce the SAME SET of splits -- every node that can split,
+// does -- so the policy changes node ORDERING and not the model. Both halves
+// are needed: identical predictions, and a node array that is NOT identical.
+// Without the second, the first would also hold if the switch did nothing.
+np.seed(7);
+$lwX = np.random([200, 4], 0.0, 1.0);
+$lwY = np.add(np.multiply(np.reshape(np.take($lwX, np.astype(nd([0.0], "f64"), "i64"), 1),
+                                     [200]), 3.0, null),
+              np.random([200], 0.0, 0.3), null);
+$lwB = tree_bin($lwX, 256);
+$lwG = np.multiply($lwY, 0.0 - 1.0, null);
+$lwH = np.ones([200], "f64");
+
+$dw = tree.TreeGrower(5, 1, 256, 0.0, 0.0, 0.0);
+$dwN = $dw.grow($lwB, $lwG, $lwH, null);
+$lw = tree.TreeGrower(5, 1, 256, 0.0, 0.0, 0.0);
+$lw.set_max_leaves(1000);           // a cap far above what the depth allows
+$lwN = $lw.grow($lwB, $lwG, $lwH, null);
+
+eq(np.shape($lwN)[0], np.shape($dwN)[0],
+   "uncapped, the two policies build the same NUMBER of nodes");
+eq($lw.n_leaves(), $dw.n_leaves(), "and the same number of leaves");
+ok(nd_tobytes(tree_predict($dwN, $lwX), "f64")
+   == nd_tobytes(tree_predict($lwN, $lwX), "f64"),
+   "and predict BIT-IDENTICALLY -- the set of splits is the same, so the "
+   + "partition of the input space is the same and so are the leaf values");
+ok(nd_tobytes($lwN, "f64") != nd_tobytes($dwN, "f64"),
+   "while the node ARRAYS differ, which is what makes the line above a claim "
+   + "about ordering rather than a claim that the switch does nothing");
+// The importances are a property of the splits, not of their order, so they
+// must agree too -- by a different route than the predictions, since they are
+// accumulated as the splits are accepted.
+//
+// SPLIT COUNTS ARE EXACT, GAINS ARE NOT, and this is [K54]'s per-channel
+// structure arriving a second time for the same reason: counts are integers
+// held in doubles and every one is exactly representable, while the gains are a
+// sum of the same floats in a DIFFERENT ORDER, and floating-point addition is
+// not associative. Asserting bit-identity on the gains fails at one ULP.
+ok(nd_tobytes($lw.lastSplits_, "f64") == nd_tobytes($dw.lastSplits_, "f64"),
+   "the per-feature SPLIT COUNTS are bit-identical -- integers in doubles");
+$lwGd = sc(np.max(np.abs(np.subtract($lw.lastGains_, $dw.lastGains_, null), null),
+                  null, false));
+$lwGs = sc(np.max(np.abs($dw.lastGains_, null), null, false));
+print("        gain difference: " + str($lwGd) + " absolute, "
+      + str($lwGd / $lwGs) + " relative");
+ok($lwGd / $lwGs < 1.0e-12,
+   "and the GAINS agree to better than 1e-12 relative, which is the most that "
+   + "can be asked of the same numbers summed in a different order");
+} catch ($e) { section_threw("leaf-wise: same splits, different order", $e); }
+
+print("");
+print("== the leaf budget binds exactly ==");
+try {
+$capN = [2, 3, 5, 8, 13];
+$ci = 0;
+while ($ci < len($capN)) {
+    $cg = tree.TreeGrower(12, 1, 256, 0.0, 0.0, 0.0);
+    $cg.set_max_leaves($capN[$ci]);
+    $cn = $cg.grow($lwB, $lwG, $lwH, null);
+    eq($cg.n_leaves(), $capN[$ci],
+       "max_leaves = " + str($capN[$ci]) + " gives exactly that many leaves");
+    // A tree with L leaves has L-1 splits, so 2L-1 nodes. That is arithmetic,
+    // not an observation, and it catches a cap that stops one node early or
+    // late in a way the leaf count alone would not.
+    eq(np.shape($cn)[0], 2 * $capN[$ci] - 1,
+       "  and 2L-1 = " + str(2 * $capN[$ci] - 1) + " nodes");
+    $ci = $ci + 1;
+}
+raises(def() { return tree.TreeGrower(5, 1, 256, 0.0, 0.0, 0.0).set_max_leaves(1); },
+       "a cap of 1 is refused -- it is a tree that cannot split");
+raises(def() { return tree.TreeGrower(5, 1, 256, 0.0, 0.0, 0.0).set_max_leaves(2.5); },
+       "a fractional cap is refused");
+// A refused call must not change the object. The first version of this setter
+// assigned before validating and reset to null on the throw, so a rejected
+// value silently replaced the previous cap with "no cap".
+$keep = tree.TreeGrower(12, 1, 256, 0.0, 0.0, 0.0);
+$keep.set_max_leaves(5);
+try { $keep.set_max_leaves(0); } catch ($e) { $e = $e; }
+eq($keep.get_params().max_leaves, 5,
+   "and a REFUSED call leaves the previous cap in place");
+} catch ($e) { section_threw("the leaf budget binds exactly", $e); }
+
+print("");
+print("== leaf-wise spends the budget where the gain is ==");
+try {
+// The reason the policy exists. Structure concentrated in a narrow region: a
+// staircase below x = 0.25 and a flat plateau above it. At an IDENTICAL leaf
+// budget, depth-wise must split the plateau at every level while leaf-wise can
+// go deeper into the steps.
+$asX = np.reshape(np.divide(np.astype(np.arange(0.0, 256.0, 1.0), "f64"), 256.0, null),
+                  [256, 1]);
+$asV = np.reshape($asX, [256]);
+$asY = np.where(np.less($asV, 0.25, null),
+                np.floor(np.multiply($asV, 64.0, null), null), 20.0);
+$asB = tree_bin($asX, 256);
+$asG = np.multiply($asY, 0.0 - 1.0, null);
+$asH = np.ones([256], "f64");
+def mseOf($nodes) {
+    $d = np.subtract(tree_predict($nodes, $asX), $asY, null);
+    return sc(np.mean(np.multiply($d, $d, null), null, false));
+}
+$asD = tree.TreeGrower(3, 1, 256, 0.0, 0.0, 0.0);
+$asDN = $asD.grow($asB, $asG, $asH, null);
+$asL = tree.TreeGrower(20, 1, 256, 0.0, 0.0, 0.0);
+$asL.set_max_leaves($asD.n_leaves());      // the SAME budget, exactly
+$asLN = $asL.grow($asB, $asG, $asH, null);
+eq($asL.n_leaves(), $asD.n_leaves(), "both trees get the same leaf budget");
+print("        depth-wise: depth " + str($asD.depth()) + " mse " + str(mseOf($asDN))
+      + "   leaf-wise: depth " + str($asL.depth()) + " mse " + str(mseOf($asLN)));
+ok($asL.depth() > $asD.depth(),
+   "leaf-wise goes DEEPER (" + str($asL.depth()) + " vs " + str($asD.depth())
+   + ") on the same budget, because it is not obliged to split the plateau");
+ok(mseOf($asLN) < mseOf($asDN),
+   "and fits better for it: " + str(mseOf($asLN)) + " < " + str(mseOf($asDN)));
+} catch ($e) { section_threw("leaf-wise spends the budget where the gain is", $e); }
+
+print("");
+print("== max_leaves reaches the estimators through set_params ==");
+try {
+// Not a constructor argument: adding a seventh positional slot to six existing
+// ones is where transposing two becomes silent. Every estimator already has
+// set_params, and it already refuses unknown keys ([K24]).
+$lwEst = tree.DecisionTreeRegressor(12, 1, 256, 0.0, 0.0, 0.0);
+$lwEst.set_params({"max_leaves": 6});
+$lwEst.fit($lwX, $lwY);
+eq($lwEst.n_leaves(), 6, "a capped estimator grows exactly six leaves");
+eq($lwEst.n_nodes(), 11, "and eleven nodes");
+$lwUn = tree.DecisionTreeRegressor(12, 1, 256, 0.0, 0.0, 0.0);
+$lwUn.fit($lwX, $lwY);
+ok($lwUn.n_leaves() > 6, "while the uncapped one grows more ("
+   + str($lwUn.n_leaves()) + ")");
+// set_params RE-CHECKS THE VALUE, which it used not to (K68). Every one of
+// these was accepted before, and five of them grew a silently degenerate tree:
+// max_depth = 0 produced a one-node model and reported it as a fit. The four
+// that did raise were raised by the KERNEL, not by bkit -- so the package's own
+// checks were entirely bypassable through the method GridSearchCV drives
+// estimators with, which never calls a constructor at all.
+def badParam($d, $name) {
+    raises(def() {
+        $bad = tree.DecisionTreeRegressor(5, 1, 256, 0.0, 0.0, 0.0);
+        return $bad.set_params($d);
+    }, $name);
+    return null;
+}
+badParam({"max_leaves": 1},        "max_leaves = 1 is refused by set_params");
+badParam({"max_leaves": 2.5},      "a fractional max_leaves is refused");
+badParam({"max_leaves": "many"},   "a STRING max_leaves is refused -- it used "
+                                   + "to be accepted and grow a one-node tree");
+badParam({"max_depth": 0},         "max_depth = 0 is refused");
+badParam({"max_depth": 0.0 - 5.0}, "a negative max_depth is refused");
+badParam({"max_depth": 61},        "max_depth past the 60 cap is refused");
+badParam({"min_samples_leaf": 0},  "min_samples_leaf = 0 is refused");
+badParam({"min_samples_leaf": 2.5},"a fractional min_samples_leaf is refused");
+badParam({"max_bins": 1},          "max_bins = 1 is refused by BKIT, not by the "
+                                   + "kernel three calls later");
+badParam({"max_bins": 9999},       "max_bins past 256 is refused");
+badParam({"reg_lambda": 0.0 - 1.0},"a negative reg_lambda is refused");
+badParam({"gamma": 0.0 - 1.0},     "a negative gamma is refused");
+badParam({"min_child_weight": 0.0 - 1.0},
+                                   "a negative min_child_weight is refused");
+// The constructor and set_params must use the SAME routine, or they drift.
+// Asserted by driving one value through both and requiring the same answer.
+raises(def() { return tree.DecisionTreeRegressor(0, 1, 256, 0.0, 0.0, 0.0); },
+       "and the constructor refuses max_depth = 0 too, by the same routine");
+// A valid value still goes through, or the check is just a wall.
+$okSet = tree.DecisionTreeRegressor(5, 1, 256, 0.0, 0.0, 0.0);
+$okSet.set_params({"max_depth": 4, "max_leaves": 6, "reg_lambda": 0.5});
+eq($okSet.get_params().max_depth, 4, "a valid max_depth is still accepted");
+eq($okSet.get_params().max_leaves, 6, "and a valid max_leaves");
+} catch ($e) { section_threw("max_leaves through set_params", $e); }
+
+
 
 
 print("");
