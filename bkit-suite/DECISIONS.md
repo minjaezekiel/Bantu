@@ -1847,3 +1847,86 @@ as well mostly just removes training data. The test asserts the difference
 structurally — with no bootstrap and every feature available, a RandomForest
 grows five **identical** trees while an ExtraTrees still grows five different
 ones, which isolates the switch to the one thing that changed.
+
+---
+
+### K66 — permutation importance, and what it says about a duplicated column
+
+It lives in `selection.b`, beside `cross_val_score`, and not in `ensemble.b`.
+It needs `score()` and nothing else, so it works on a pipeline, a linear model
+and a forest alike; putting it inside any one estimator would be a copy per
+estimator, and putting it in `base.b` would give the dependency-free protocol
+file a reason to know about permutations.
+
+**It does not refit, and that is the definition rather than an optimisation.**
+Refitting on a shuffled column measures how well the model *class* can do
+without the feature. Permuting without refitting measures how much *this fitted
+model* depends on it. They are different quantities, scikit-learn answers the
+second, and the second is also the one worth having after a long fit. An
+unfitted estimator is **refused** rather than fitted for the caller, because
+fitting it here would silently answer the other question.
+
+**The column is permuted, not zeroed.** Shuffling preserves the feature's
+marginal distribution and destroys only its relationship to `y`, so the model is
+still handed values it considers plausible. Zeroing moves every row to a point
+the model may never have seen, which measures extrapolation rather than
+reliance. The mutation that zeroes instead of shuffles is in the battery.
+
+**What it says about redundant columns was measured, and it is not the usual
+one-line warning.** The familiar caveat — *"correlated features can both score
+near zero"* — covers one of two cases, and the one this suite exercises behaves
+differently:
+
+| case | result |
+|---|---|
+| two **identical** columns | the split finder breaks ties toward the lower feature index ([K62]), so the model genuinely never reads the duplicate. Measured: the copy scores **exactly 0** while the original scores **2.03** |
+| two **correlated but distinct** columns | the model reads some signal off each, so permuting either leaves the rest recoverable and both under-report |
+
+The first answer is **correct** and is not the same claim as "that feature does
+not matter": its twin matters enormously. It is a fact about the fitted model,
+and it is the clearest demonstration available that permutation importance and
+`feature_importances_("gain")` answer different questions — gain says what the
+model used, permutation says what breaking it costs, and they disagree exactly
+where redundancy lives. Both are reported; neither replaces the other.
+
+**The restore is gated by the shape of the result, not by a reference run**, and
+the reason is worth recording because the first version of that gate was wrong.
+Each feature's column must be put back before the next is permuted, or every
+importance after the first is measured against a model whose earlier columns are
+still shuffled — and all of them would still look plausible. The obvious gate is
+to re-run one feature in isolation and compare, but a re-run that reseeds and
+rebuilds `X` draws *different* permutations, so it is not the same computation
+and asserting equality would be asserting noise. What a missing restore actually
+does is specific: feature 1 would be charged the cost of breaking features 0
+**and** 1, around 2.0 instead of around 0, and so would every feature after it.
+So the gate is that features 1–3 **together** cost less than a tenth of feature
+0 — which is exactly the statement that each column was put back, phrased in
+quantities the run already produces.
+
+**`> 0.0` is not an assertion that anything varies**, and this is the finding
+worth carrying elsewhere. The gate for "the drops differ between permutations"
+was written as `importances_std[0] > 0.0`, and the mutation that replaces the
+shuffle with a **deterministic** fill (zeroing the column) sailed through it.
+Five identical drops do not produce a standard deviation of zero — they produce
+**4.44e-16**, the residue of `mean((d − mean(d))²)` where `mean(d)` differs from
+`d` in the last bit. That is [K60]'s "inequality true of anything in range" in a
+numerical disguise, and it is worse than the arithmetic version because the
+number *looks* like zero in any printout.
+
+The repaired gate is phrased against the quantity it qualifies —
+`std > 0.001 × mean` — which 0.0706 against 2.03 clears by a factor of thirty
+and 4.44e-16 fails by thirteen orders of magnitude. A third mutation was added
+to pin it from the other side: replacing the column with **its own mean** is
+deterministic *and* stays inside the feature's range, so it defeats both a
+naive "did anything change" check and any gate that only knows about
+out-of-range values. It is caught.
+
+One mutation was **near-equivalent and became a real gate only by reading the
+message**. Dropping the explicit "must be fitted" check still raises, because
+`score()` carries its own `_check_fitted` — so `raises()` cannot tell the two
+apart and the mutation survived. The guard's entire value is *which* error
+arrives: `"this measures what a fitted model relies on; it does not fit anything
+itself"` rather than a generic complaint from three frames down. The gate now
+asserts the message text, which is the only thing that distinguishes them.
+
+Final: **9 mutations, 9 caught.**

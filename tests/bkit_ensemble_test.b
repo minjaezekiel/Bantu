@@ -25,6 +25,7 @@
 include "../numba/numba.b" as np;
 include "../bkit/base.b" as base;
 include "../bkit/tree.b" as tree;
+include "../bkit/selection.b" as sel;
 include "../bkit/ensemble.b" as ens;
 
 $R = {"pass": 0, "fail": 0};
@@ -934,6 +935,131 @@ $xtB.fit($fX, $fY);
 ok($xtB.n_in_bag() != null,
    "turning bootstrap on gives an out-of-bag set again");
 } catch ($e) { section_threw("ExtraTrees classification", $e); }
+
+print("");
+print("== permutation importance: what a FITTED model relies on ==");
+try {
+// Model-agnostic, so it lives in selection.b beside cross_val_score rather than
+// inside any one estimator. Feature 0 carries the target, 1 and 2 are noise,
+// and 3 is an exact COPY of feature 0 -- which is the interesting one.
+np.seed(13);
+$piS = np.random([300], 0.0, 1.0);
+$piX = np.concat([np.reshape($piS, [300, 1]),
+                  np.random([300, 2], 0.0, 1.0),
+                  np.reshape($piS, [300, 1])], 1);
+$piY = np.add(np.multiply($piS, 5.0, null), np.random([300], 0.0, 0.2), null);
+$piM = ens.RandomForestRegressor({"n_estimators": 25, "max_depth": 8});
+$piM.fit($piX, $piY);
+$pi = sel.permutation_importance($piM, $piX, $piY, 5, null);
+$pim = $pi.importances_mean;
+print("        means: " + str(np.to_list($pim)));
+eq(np.size($pim), 4, "one importance per feature");
+eq(len($pi.importances), 4, "and the raw drops are kept per feature");
+eq(len($pi.importances[0]), 5, "five repeats each");
+close($pi.baseline, $piM.score($piX, $piY), 1.0e-12,
+      "the baseline is the model's own score, not a re-derivation");
+ok(np.get($pim, [0]) > 1.0,
+   "breaking the informative feature costs over a point of R² ("
+   + str(np.get($pim, [0])) + ")");
+ok(np.get($pim, [1]) < 0.01 && np.get($pim, [2]) < 0.01,
+   "breaking a noise feature costs almost nothing");
+// The duplicate. Ties go to the LOWEST feature index ([K62]), so the model
+// never reads column 3 at all and permuting it changes NOTHING -- exactly 0,
+// not "approximately 0". That answer is correct and is not the same claim as
+// "this feature does not matter": its twin matters enormously.
+eq(np.get($pim, [3]), 0,
+   "an exact duplicate of the informative column scores EXACTLY 0, because "
+   + "the tie-break means the model never splits on it");
+ok(np.get($pim, [0]) > np.get($pim, [3]),
+   "so two identical columns get wildly different permutation importances, "
+   + "which is a fact about the fitted model rather than about the data");
+// The std is what makes the mean readable.
+ok(np.get($pi.importances_std, [3]) == 0,
+   "and the unused column's spread is 0 too -- every repeat agreed");
+// NOT `> 0.0`. Five identical drops give a standard deviation of 4.44e-16 --
+// floating-point residue from mean((d - mean(d))^2), not zero -- so `> 0.0` is
+// true of a column that was replaced DETERMINISTICALLY and tests nothing. That
+// is [K60]'s "inequality true of anything in range" wearing a numerical
+// disguise. The claim is that the spread is MEANINGFUL, so it is phrased
+// against the mean it qualifies.
+ok(np.get($pi.importances_std, [0]) > 0.001 * np.get($pim, [0]),
+   "while the informative one varies MEANINGFULLY between permutations ("
+   + str(np.get($pi.importances_std, [0])) + " on a mean of "
+   + str(np.get($pim, [0])) + ") -- a deterministic replacement such as "
+   + "zeroing the column would leave only 1e-16 of rounding here");
+} catch ($e) { section_threw("permutation importance", $e); }
+
+print("");
+print("== permutation importance does not disturb what it measures ==");
+try {
+// The caller's X must come back untouched, and -- the subtler one -- each
+// feature must be RESTORED before the next is permuted. If it were not, every
+// importance after the first would be measured against a model whose earlier
+// columns are still shuffled, and all of them would still look plausible.
+$piBefore = nd_tobytes($piX, "f64");
+$pi2 = sel.permutation_importance($piM, $piX, $piY, 3, null);
+ok(nd_tobytes($piX, "f64") == $piBefore,
+   "X is byte-identical afterwards -- the working copy is the only thing "
+   + "written to");
+// The restore is pinned by the SHAPE of the result rather than by a reference
+// run: a reference that reseeds and rebuilds X draws different permutations,
+// so it is not the same computation and asserting it would be asserting noise.
+//
+// What a missing restore does is specific. Feature 1 would be measured with
+// feature 0 still shuffled, so its "importance" would be the cost of breaking
+// BOTH -- around 2.0, not around 0 -- and the same for every feature after it.
+// So the sweep's later features reading near zero is exactly the statement
+// that each column was put back.
+$piLater = np.get($pim, [1]) + np.get($pim, [2]) + np.get($pim, [3]);
+print("        features 1-3 together: " + str($piLater)
+      + "  (feature 0 alone: " + str(np.get($pim, [0])) + ")");
+ok($piLater < 0.1 * np.get($pim, [0]),
+   "features 1-3 TOGETHER cost less than a tenth of feature 0 -- had feature "
+   + "0's shuffle not been undone, each of them would have inherited it");
+ok($pi2.n_repeats == 3, "n_repeats is reported back");
+} catch ($e) { section_threw("permutation importance does not disturb", $e); }
+
+print("");
+print("== permutation importance: a custom scorer, and what it refuses ==");
+try {
+// The default scorer is the estimator's own score(), which is higher-is-better
+// for every task base.b defines. A custom one must keep that direction.
+def negMSE($est, $X, $y) {
+    $d = np.subtract($est.predict($X), $y, null);
+    return 0.0 - np.get(np.reshape(np.mean(np.multiply($d, $d, null), null, false), [1]), [0]);
+}
+np.seed(13);
+$piC = sel.permutation_importance($piM, $piX, $piY, 3, negMSE);
+ok(np.get($piC.importances_mean, [0]) > 0.0,
+   "a custom higher-is-better scorer ranks the informative feature first");
+eq(np.get($piC.importances_mean, [3]), 0, "and still finds the duplicate unused");
+raises(def() { return sel.permutation_importance(null, $piX, $piY, 3, null); },
+       "a null estimator is refused");
+// Dropping the explicit fitted-check still raises, because score() has its own
+// -- so `raises()` alone cannot tell the two apart, and the mutation that
+// removes the guard survives it. The guard's entire value is WHICH error
+// arrives, so the gate reads the message.
+$unfitMsg = "";
+try {
+    $un = ens.RandomForestRegressor({"n_estimators": 3});
+    sel.permutation_importance($un, $piX, $piY, 3, null);
+} catch ($e) { $unfitMsg = str($e); }
+ok($unfitMsg != "", "an UNFITTED estimator is refused");
+ok(indexOf($unfitMsg, "does not fit anything itself") >= 0,
+   "and refused BY NAME, explaining that this measures a fitted model rather "
+   + "than falling through to score()'s generic complaint: " + $unfitMsg);
+raises(def() { return sel.permutation_importance($piM, $piX, $piY, 0, null); },
+       "n_repeats 0 is refused");
+raises(def() { return sel.permutation_importance($piM, $piX, null, 3, null); },
+       "a null y is refused");
+raises(def() { return sel.permutation_importance($piM, $piX,
+                                                 np.ones([7], "f64"), 3, null); },
+       "a y of the wrong length is refused");
+raises(def() { return sel.permutation_importance($piM, np.ones([300], "f64"),
+                                                 $piY, 3, null); },
+       "a 1-d X is refused");
+} catch ($e) { section_threw("permutation importance: scorer and refusals", $e); }
+
 
 
 

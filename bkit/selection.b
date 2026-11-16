@@ -925,3 +925,127 @@ class _RandomizedSearchCV extends Estimator {
 def RandomizedSearchCV($est, $grid, $n_iter, $cv) {
     return new _RandomizedSearchCV($est, $grid, $n_iter, $cv);
 }
+
+// ── permutation importance ──────────────────────────────────────────────────
+// How much a FITTED model relies on each feature, measured by breaking that
+// feature and watching the score fall. It lives here rather than in
+// `ensemble.b` because it is model-agnostic -- it needs `score()` and nothing
+// else, so it works on a pipeline, a linear model or a forest alike, and
+// putting it inside any one estimator would be a copy per estimator.
+//
+// IT DOES NOT REFIT, and that is the whole definition rather than an
+// optimisation. Refitting on a shuffled column measures how well the model
+// CLASS can do without the feature; permuting without refitting measures how
+// much THIS fitted model depends on it. They are different quantities and
+// scikit-learn's answer to the question is the second one. Refitting would also
+// cost n_features x n_repeats fits instead of that many scores.
+//
+// The column is PERMUTED, not zeroed or dropped: shuffling preserves the
+// feature's marginal distribution and destroys only its relationship to y, so
+// the model is still handed values it considers plausible. Zeroing moves every
+// row to a point the model may never have seen, which measures extrapolation
+// rather than reliance.
+//
+// WHAT IT DOES WITH REDUNDANT FEATURES, measured rather than assumed, because
+// the two cases differ and the usual one-line warning covers only one of them:
+//
+//   - two IDENTICAL columns: the split finder breaks ties toward the lower
+//     feature index ([K62]), so the model genuinely never reads the duplicate,
+//     and permuting it changes nothing. Measured: a copy of the informative
+//     column scores EXACTLY 0 while the original scores 2.03. That answer is
+//     correct -- this fitted model really does not use that column -- and it is
+//     *not* the same as "the feature does not matter".
+//   - two CORRELATED but distinct columns: the model reads some signal off
+//     each, so permuting either leaves the rest recoverable and BOTH
+//     under-report. This is the familiar caveat, and it is a property of the
+//     method rather than of this implementation.
+//
+// Both are reasons to report `feature_importances_("gain")` alongside rather
+// than in place of this: gain says what the model used, permutation says what
+// breaking it costs, and they disagree exactly where redundancy lives.
+//
+// Reproducible from `nd_seed` alone ([C4]): the permutations come from the same
+// stream everything else here uses, and nothing carries RNG state.
+def permutation_importance($est, $X, $y, $n_repeats, $scorer) {
+    $who = "permutation_importance";
+    if ($est == null) { throw $who + ": the estimator is null"; }
+    if (!$est.fitted()) {
+        throw $who + ": the estimator must be FITTED. This measures what a "
+              + "fitted model relies on; it does not fit anything itself.";
+    }
+    $r = $n_repeats;
+    if ($r == null) { $r = 5; }
+    if (type($r) != "number" || $r != floor($r) || $r < 1) {
+        throw $who + ": n_repeats must be a whole number >= 1, got " + str($n_repeats);
+    }
+    $A = base._asarray($X);
+    if (len(nd_shape($A)) != 2) {
+        throw $who + ": X must be 2-d [n_samples, n_features], got shape "
+              + str(nd_shape($A));
+    }
+    $n = nd_shape($A)[0];
+    $f = nd_shape($A)[1];
+    if ($n < 2) {
+        throw $who + ": need at least 2 rows to permute, got " + str($n);
+    }
+    if ($y == null) { throw $who + ": y is required"; }
+    $yv = base._asarray($y);
+    if (nd_shape($yv)[0] != $n) {
+        throw $who + ": y has " + str(nd_shape($yv)[0]) + " elements and X has "
+              + str($n) + " rows";
+    }
+
+    // The scorer defaults to the estimator's own score(), which is the protocol
+    // contract and is higher-is-better for every task base.b defines. A custom
+    // one must keep that direction, or the sign of every importance flips --
+    // said here because a LOSS passed in would silently rank the most important
+    // feature last.
+    $sc = $scorer;
+    $base0 = 0.0;
+    if ($sc == null) { $base0 = $est.score($A, $yv); }
+    else             { $base0 = $sc($est, $A, $yv); }
+
+    // One working copy for the whole run. The caller's X is never touched, and
+    // the column is restored after each feature rather than re-copying the
+    // matrix n_features x n_repeats times.
+    $W = nd_copy($A);
+    // Flat indices of column j are j, j+f, j+2f, ... in row-major order.
+    $rows = nd_astype(nd_multiply(nd_arange(0, $n, null), $f, null), "i64");
+
+    $means = [];
+    $stds  = [];
+    $all   = [];
+    $j = 0;
+    while ($j < $f) {
+        $idx  = nd_astype(nd_add($rows, $j, null), "i64");
+        $orig = nd_copy(nd_take(nd_reshape($A, [$n * $f]), $idx, 0));
+        $drops = [];
+        $k = 0;
+        while ($k < $r) {
+            nd_put($W, $idx, nd_take($orig, _permutation($n), 0));
+            $s = 0.0;
+            if ($sc == null) { $s = $est.score($W, $yv); }
+            else             { $s = $sc($est, $W, $yv); }
+            append($drops, $base0 - $s);
+            $k = $k + 1;
+        }
+        // Restored before moving on, or feature j+1 would be measured against a
+        // model whose feature j is still shuffled -- every importance after the
+        // first would then be wrong and all of them would still look plausible.
+        nd_put($W, $idx, $orig);
+        $d = nd($drops, "f64");
+        $m = nd_get(nd_mean($d, null, null), 0);
+        append($means, $m);
+        append($all, $drops);
+        // Population standard deviation over the repeats, which is what makes
+        // the mean readable: an importance of 0.01 +- 0.03 is noise.
+        $dev = nd_subtract($d, $m, null);
+        append($stds, sqrt(nd_get(nd_mean(nd_multiply($dev, $dev, null), null, null), 0)));
+        $j = $j + 1;
+    }
+    return {"importances_mean": nd($means, "f64"),
+            "importances_std":  nd($stds,  "f64"),
+            "importances":      $all,
+            "baseline":         $base0,
+            "n_repeats":        $r};
+}

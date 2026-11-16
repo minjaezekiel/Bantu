@@ -927,3 +927,40 @@ The first native work in this package. Five kernels plus five accessors in
 - **[test]** `tests/bkit_tree_test.b` 166 → **188**,
   `tests/bkit_ensemble_test.b` 156 → **175**,
   `tests/bkit_protocol_test.b` 51 → **55 registry entries**.
+
+### Permutation importance (K66)
+
+- **[feature]** `selection.permutation_importance(est, X, y, n_repeats?,
+  scorer?)` — how much a **fitted** model relies on each feature, measured by
+  shuffling that column and watching the score fall. It lives beside
+  `cross_val_score` rather than inside `ensemble.b` because it needs `score()`
+  and nothing else, so it works on a pipeline, a linear model and a forest
+  alike. Returns the per-feature mean and standard deviation over repeats, the
+  raw drops, and the baseline.
+- **[design] It does not refit**, and that is the definition rather than an
+  optimisation: refitting on a shuffled column measures what the model *class*
+  can do without the feature, while permuting measures what *this fitted model*
+  depends on. An **unfitted estimator is refused** rather than fitted for the
+  caller, because fitting it here would silently answer the other question.
+- **[design] The column is permuted, not zeroed.** Shuffling preserves the
+  feature's marginal distribution and destroys only its relationship to `y`;
+  zeroing moves every row somewhere the model may never have seen, which
+  measures extrapolation rather than reliance.
+- **[docs] What it says about a duplicated column was measured, and the usual
+  one-line warning covers the other case.** With two **identical** columns the
+  split finder breaks ties toward the lower index ([K62]), so the model never
+  reads the duplicate: it scores **exactly 0** while its twin scores **2.03**.
+  That is correct, and is not the claim "this feature does not matter". With
+  two **correlated but distinct** columns the familiar caveat applies and both
+  under-report. It is the clearest demonstration that gain importance and
+  permutation importance answer different questions — gain says what the model
+  used, permutation says what breaking it costs — so both are reported and
+  neither replaces the other.
+- **[test] The restore gate is phrased in the run's own quantities**, and the
+  first version of it was wrong. Each column must be put back before the next
+  is permuted, or every later importance is measured against a model whose
+  earlier columns are still shuffled — and all of them still look plausible.
+  The obvious gate, re-running one feature in isolation, draws *different*
+  permutations once it reseeds, so asserting equality would be asserting noise.
+  A missing restore instead charges feature 1 the cost of breaking 0 **and** 1,
+  so the gate is that features 1–3 **together** cost under a tenth of feature 0.
