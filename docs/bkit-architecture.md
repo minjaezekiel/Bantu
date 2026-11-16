@@ -882,10 +882,22 @@ which is the worst place for a hazard to hide. So the objective corrects only
 what is **invalid** — a negative hessian or a `NaN`, both to 0 — and a genuine
 zero is passed through to the guards that handle it:
 
-1. `tree_best_split`'s `!(H + λ > 0.0)`, which refuses the *split* ([K45]);
-2. `_leafValue`'s identical guard, which bounds the *leaf* ([K55]).
+1. `tree_best_split`'s `!(Hs + λ > 0.0)` on the **parent total**, which skips
+   the whole *feature* ([K45]);
+2. the same test per **candidate cut**, on `H_L` and `H_R`, which skips that
+   *split*;
+3. `_leafValue`'s identical guard, which bounds the *leaf* ([K55]).
 
-Layer 2 was missing, and that was [K55]: the kernel refused the split while the
+Layers 1 and 2 look redundant and are not, which [K62] found the hard way:
+removing layer 2 left all 156 assertions green, because the only fixture that
+drove hessians to zero drove **all** of them to zero — so layer 1 skipped the
+feature and layer 2 was never reached. **A fixture that trips the outer guard
+cannot exercise the inner one.** Reaching layer 2 needs a healthy parent and a
+starved child: `h = 1` on three rows and `h = 0` on four, so the parent total is
+3 and the feature is scanned, while one cut leaves `H_R = 0` with `G_R ≠ 0` —
+a `+inf` gain that wins every comparison.
+
+Layer 3 was missing, and that was [K55]: the kernel refused the split while the
 caller, computing `−G/(H+λ)` from the same two quantities, raised
 `Division by zero` out of the middle of `_grow`. K7's estimators cannot reach it
 (`h = 1`, so `H = n ≥ 1`); K8's logistic objective is exactly what reaches it.
@@ -897,6 +909,10 @@ clamp upstream of a guard can disarm it.
 
 ### 8.9 The forests, and the one structural change ExtraTrees needs
 
+**Status: `RandomForest*` is built and gated; `ExtraTrees*` is the design
+below.** The section is kept as written, including the row this work corrected,
+because what it got wrong is the useful part.
+
 `RandomForest*` and `ExtraTrees*` are [§8.8](#88-forests-bootstrap-and-random-thresholds)'s
 two switches over `n_estimators` independent trees, grown by the same
 `tree.TreeGrower` the booster uses. Three of the four pieces need nothing new:
@@ -904,7 +920,7 @@ two switches over `n_estimators` independent trees, grown by the same
 | piece | how |
 |---|---|
 | **bootstrap** | an index array **with repeats**, which `tree_hist` counts once per occurrence — that *is* bootstrap semantics, and `TreeGrower.grow` already takes a root index |
-| **feature subsampling** (`max_features`) | `set_features(cols)` per tree, which is the `[f,1,1]` histogram mask already gated in `bkit_tree_test.b` |
+| **feature subsampling** (`max_features`) | `set_features_per_split(k)`, the `[f,1,1]` histogram mask **redrawn at every node**. This paragraph first said "`set_features(cols)` per tree", reusing the booster's hook, and [K63] is the record of why that is wrong: drawing once per tree is a random *subspace* ensemble, and with `f = 6`, `k = 2` a tree never sees the one informative feature with probability 2/3 — measured R² 0.66 against 0.995 |
 | **averaging** | in **probability space**: average `predict_proba`, then `argmax`. A majority vote over hard labels throws away every tree's confidence and is a different, worse estimator |
 
 **ExtraTrees is the one that does not fit, and the design doc should say so

@@ -299,16 +299,19 @@ scikit-learn and is documented as one ([K43]). The list form is a K8 item.
 | early stopping | on a validation fold split **before binning**, with `n_iter_no_change` and `tol` | [x] |
 | row / column subsampling | `subsample`, `colsample`; seeded via `nd_seed` alone, no estimator carries RNG state | [x] |
 | `feature_importances_` | gain and split count, recorded as a grower side output ([K57]) | [x] |
-| `RandomForestClassifier`/`Regressor` | bootstrap + feature subsampling, over the same grower and the same two switches | [ ] |
-| `ExtraTrees*` | random split thresholds | [ ] |
+| `RandomForestClassifier`/`Regressor` | bootstrap + **per-node** feature sampling, over the same grower | [x] |
+| feature sampling, per node not per tree | a forest redraws the candidate set at every split ([K63]); per-tree sampling is a random *subspace* ensemble and scored R² 0.66 where this scores 0.995 | [x] |
+| `max_features` defaults by task | every feature for a regressor, `sqrt(f)` for a classifier — scikit-learn's split, and the measured reason for it | [x] |
+| `ExtraTrees*` | random split thresholds, via one `_chooseSplit` override on the shared grower ([§8.9], [K61]) | [ ] |
 | permutation importance | model-agnostic, so it belongs beside `score()` rather than inside the booster | [ ] |
 | leaf-wise growth (`max_leaves`) | a follow-up *inside* the shared grower ([§8.6]); with `max_leaves` unset the two policies produce the same splits, so it changes node ordering and not the model | [ ] |
 
 **K8 is split along the roadmap's own rows.** The boosters, the four objectives,
-stopping, the subsamples and the importances are done and gated
-(`tests/bkit_ensemble_test.b`, 112 assertions, 19 mutations with 18 caught and
-one equivalent). The forests are the same loop with two switches over the same
-grower, and are the remaining K8 work.
+stopping, the subsamples, the importances **and the random forests** are done
+and gated (`tests/bkit_ensemble_test.b`, 140 assertions; 19 booster mutations
+with 18 caught and one equivalent). `ExtraTrees`, permutation importance and
+leaf-wise growth are what remain; §8.9 and [K61] record the design for the
+first, including the one structural change it needs that the boosters did not.
 
 ## Phase K9 — `cluster.b`, `decompose.b`
 `KMeans` (k-means++ init, seeded), `DBSCAN`, `GaussianMixture`; `PCA`,
@@ -355,21 +358,23 @@ objectives and early stopping — not split finding.
    histograms**, summing the gain over K before the argmax. K7's multiclass is
    one-vs-rest, which is documented as a real difference from scikit-learn
    ([K43]) rather than claimed as a match.
-2. **Histogram subtraction has no test yet** — a child's histogram is its
-   parent's minus its sibling's, and that is the single largest optimisation in
-   the algorithm. The assertion it needs is that the subtracted histogram is
-   **bit-identical** to one built directly from the child's index set, which
-   [K48] is the argument for: a reference computed from the same intermediate
-   structure as the code shares the code's errors.
+2. ~~**Histogram subtraction has no test yet**~~ — **done in K7** ([K54]), and
+   the assertion this list asked for was **false**: a subtracted histogram is
+   *not* bit-identical to one built directly, because `tree_hist` accumulates in
+   index order and `sum(A ∪ B) − sum(A) = sum(B)` does not hold in floating
+   point. The gate splits by channel instead — counts bit-identical, gradients
+   and hessians to a tolerance with the worst observed difference printed, and
+   both histograms required to choose an identical split.
 
 `base.b` is 391 lines, `preprocess.b` 1,011, `selection.b` 927, `metrics.b` 695,
-`linear.b` 857, `compose.b` 512 and `tree.b` 532, over the `tree_` family in
-`bantu-src/compiler/src/tree_native.hpp`; `tests/bkit_base_test.b` is 53
-assertions, `tests/bkit_preprocess_test.b` 174, `tests/bkit_selection_test.b`
+`linear.b` 857, `compose.b` 512, `tree.b` 816 and `ensemble.b` 1,191, over the
+`tree_` family in `bantu-src/compiler/src/tree_native.hpp`;
+`tests/bkit_base_test.b` is 59 assertions,
+`tests/bkit_preprocess_test.b` 174, `tests/bkit_selection_test.b`
 117, `tests/bkit_metrics_test.b` 123, `tests/bkit_linear_test.b` 135,
-`tests/bkit_compose_test.b` 77, `tests/bkit_tree_test.b` 156,
-`tests/bkit_ensemble_test.b` 112 and `tests/bkit_protocol_test.b` 47 registry
-entries — all green. Read
+`tests/bkit_compose_test.b` 77, `tests/bkit_tree_test.b` 166,
+`tests/bkit_ensemble_test.b` 156 and `tests/bkit_protocol_test.b` 51 registry
+entries — **1,072 assertions**, all green. Read
 [`../docs/bkit-architecture.md`](../docs/bkit-architecture.md) first, then
 [`DECISIONS.md`](DECISIONS.md).
 

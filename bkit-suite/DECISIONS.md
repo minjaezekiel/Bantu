@@ -1577,3 +1577,177 @@ leaving a zero-weight child to the caller.
 Recorded as a decision rather than folded into §8.9 silently, because the
 *method* that produced the wrong answer is reusable: a "needs no new X" claim
 has to be checked against the call sites, not only against the inventory of X.
+
+---
+
+### K62 — the `tree_` battery, all twelve: a guard hidden behind a guard, and a tie nobody made
+
+[K53] recorded the first three mutations of the `tree_` kernels before the
+battery was interrupted. Re-run in full against the restored kernel and the
+156-assertion suite:
+
+| mutation | result |
+|---|---|
+| T1 `tree_bin` back to `upper_bound` ([K48]'s bug) | caught, 4 red |
+| T2 `tree_hist` drops the count channel | caught, 35 red |
+| T3 `tree_hist` swaps gradient and hessian | caught, 33 red |
+| **T4 `best_split`'s per-CHILD hessian guard removed** | **MISSED** |
+| **T5 ties go to the HIGHEST index** | **MISSED** |
+| T6 `best_split` never tries NaN-left | caught, 4 red |
+| T7 `partition` uses `<` instead of `<=` | caught |
+| T8 `partition` swaps the children | caught, 10 red |
+| T9 `predict` inverts the NaN direction | caught, 2 red |
+| T10 `predict` uses `<` on the threshold | caught, 3 red |
+| T11 `tree_bin` puts NaN in bin 0 | caught, 7 red |
+| T12 `predict`'s cycle bound removed | caught, 2 red |
+
+T2 and T3, which [K53] could only record as *"caught by aborting"*, now report
+`PASS: 121 FAIL: 35` and `PASS: 123 FAIL: 33` with the throwing section named —
+[K56] working as intended.
+
+**T4 is the one worth generalising: a guard was hidden behind another guard.**
+`tree_best_split` checks the hessian **twice**, and the two are not redundant:
+
+```
+if (!(Hs + lam > 0.0)) continue;            // per FEATURE, on the parent total
+    ...
+    if (!(HL + lam > 0.0) || !(HR + lam > 0.0)) continue;   // per CUT
+```
+
+Removing the second left all 156 assertions green. The reason is entirely about
+the fixture: the only test that drove hessians to zero drove **all of them** to
+zero, so the parent total was zero, the *first* guard skipped the whole feature,
+and the second was never reached. **A fixture that trips the outer guard can
+never exercise the inner one** — and the suite had been reading as though it
+tested "the hessian guard" when it tested one of two.
+
+The gate that reaches it keeps the parent healthy and starves one child: rows
+0–2 carry `h = 1` and rows 3–6 carry `h = 0`, so the parent total is 3 and the
+feature is scanned, while the cut at bin 2 gives `H_R = 0` with `G_R = 2`. Its
+gain without the guard is `G²/0 = +inf`, which wins every comparison — [K45]'s
+failure mode exactly, reached through the path [K45]'s own test could not take.
+Asserted on the returned slots (`H_L > 0` and `H_R > 0`) rather than on the gain
+alone, so it names the property instead of a symptom.
+
+**T5 is simpler and was invisible for a simpler reason: no fixture had a tie.**
+Changing `gain > bestGain` to `>=` moves the winner from the first maximal cut
+to the last, and nothing in 156 assertions produced two equal gains. That is not
+cosmetic. Duplicate and perfectly correlated columns are ordinary, and which one
+a tree splits on decides what `feature_importances_` reports and whether two
+fits of the same data agree on their structure rather than only on their
+predictions. The gate uses two **identical** columns, and asserts the tie is
+real — the two features' best gains compared bit for bit — before asserting the
+lower index wins. Without that first half the second proves nothing.
+
+Both causes are the same species as [K60]'s five: **a branch no fixture entered**
+and **a comparison no fixture made ambiguous**. The battery is the only thing
+that finds either, because both read as fully covered from the test file alone.
+
+`bkit_tree_test.b` 156 → 166 assertions.
+
+---
+
+### K63 — a random forest samples features per NODE, and the accuracy gate is what said so
+
+`RandomForest*` reuses the booster's column-sampling hook on its first draft:
+draw `max_features` columns, call `set_features(cols)`, grow the tree. That is a
+**random subspace ensemble**, not a random forest, and the difference is not
+pedantry about a name:
+
+> With `f = 6` features and `k = 2`, a tree that draws its columns **once**
+> never sees the one informative feature with probability 2/3. Two thirds of the
+> forest is then fitted to noise.
+
+Measured, on a target one feature explains: **R² 0.66 where it should be 0.995**,
+and a held-out MSE *worse* than a single deep tree — which inverts the one claim
+a forest exists to make. Breiman's forests redraw the candidate set at **every
+node**, and that is what lets every tree use the informative feature while still
+decorrelating them.
+
+**The gate that caught it was the accuracy gate, not the structural one.** The
+structural assertion — *"with `max_features = 1` no tree references more than
+one split feature"* — passed, because the implementation was per-tree and the
+assertion described per-tree behaviour. A test written from the implementation
+agrees with the implementation. The two assertions that failed were
+`R² > 0.9` and *"the forest generalises better than one deep tree"*, both of
+which are statements about the **estimator's purpose** rather than about its
+mechanics. That is the argument for keeping at least one gate per component
+phrased in terms of what the thing is *for*.
+
+The structural assertion is now **inverted**, and in that form it distinguishes
+the two designs rather than restating one of them: per-node sampling makes a
+single tree reference *many* features (6 of 6, measured), while per-tree
+sampling pins it at two — one real feature plus the leaves' filler zero.
+
+**Two hooks, not one switch.** `set_features(cols)` samples once per tree and
+stays the **booster's**, because that is XGBoost's `colsample_bytree` and is
+correct there; `set_features_per_split(k)` is the **forest's**, and `_grow`
+redraws the mask at each node. A single parameter serving both would have to
+mean different things to different callers, which is how the first version came
+to be wrong. The mask is rebuilt in three native calls and no Bantu loop —
+`rank(uniform(f)) < k` selects `k` of `f` without replacement, [K18]'s
+construction reused.
+
+**The defaults differ by task, and that is scikit-learn's behaviour for a
+reason**: a regressor considers every feature at each split (`max_features =
+1.0`) while a classifier considers `sqrt(f)`. Using `"sqrt"` for both — the
+first draft again — is precisely the configuration measured above. Each subclass
+sets its own default, and `_forestDefaults()` leaves it `null` so the choice is
+visible at the subclass rather than buried in a shared table.
+
+---
+
+### K64 — an average is only checkable by reproducing the average
+
+The forest battery's two survivors were the same defect wearing different
+clothes, and the shape is worth keeping:
+
+| mutation | why every gate stayed green |
+|---|---|
+| **F4** the forest averages over `n − 1` trees | a *uniform scale error*. Every prediction is multiplied by 30/29; `R² > 0.9` absorbs it, and the classifier's row normalisation **cancels it exactly** |
+| **F9** the classifier averages thresholded 0/1 labels instead of probabilities | a majority vote still classifies easy data perfectly, and the rows still sum to 1 after normalisation — so "it classifies well" and "every row sums to 1" are both true of the wrong estimator |
+
+F9 is the sharper one, because §8.8 names it specifically as the thing not to
+do — *"a majority vote over hard labels throws away every tree's confidence and
+is a different, worse estimator"* — and the suite had an assertion for each of
+the properties a vote preserves and none for the property it destroys.
+
+**Normalisation is an information-destroying step, and every assertion
+downstream of one is blind to anything it cancels.** Row-normalised
+probabilities cannot see a scale error at all. Accuracy cannot see one either,
+because argmax is invariant under it. Between them they covered the whole
+classifier surface and tested nothing about the average.
+
+The fix is the same for both and is not a threshold: **reconstruct the average
+from the public node arrays and demand bit equality.**
+
+```
+sum over trees of tree_predict(nodes(t, k), X)  /  n_trees   ==  predict(X)
+```
+
+That is an independent computation in the sense [K48] requires — it goes through
+`tree_predict` and the node arrays, not through `_avgCols` — and it is exact, so
+it catches a wrong divisor, a sum instead of a mean, a threshold inserted before
+the average, and any future change to that path, none of which a tolerance or an
+accuracy bound can see. The classifier's version reproduces the clip, the
+concat and the row normalisation too, which is the point: the gate has to end up
+where `predict_proba` ends up, or it is comparing different things.
+
+Both reconstructions were added, and F4, F9 and F10 (sum instead of mean) are
+caught by them. The general rule: **an aggregate's gate must recompute the
+aggregate, because every property that survives aggregating is by definition
+insensitive to how it was aggregated.**
+
+Final: **10 forest mutations, 10 caught.** `bkit_ensemble_test.b` 140 → 156
+assertions. Two of the ten (F6 `sqrt(f)` computed as `f`, F8 the out-of-bag
+counter marking every row) were caught only by the **unit** gates on
+`_nFeatures` and `n_in_bag` — both added because listing the mutations *before
+running them* made the holes obvious. Writing the battery is itself a review of
+the suite, and the cheapest part of it happens before any mutation runs.
+
+One process note, because it is the second time this session: the first run of
+this battery was invalidated part-way because the test file it reads was being
+edited while it ran. The numbers for F1–F8 remained valid (assertions were only
+added, never weakened), but the battery was re-run end to end against the final
+file rather than reported from a mixture. **A battery pins the file it reads;
+editing that file mid-run forfeits the run.**

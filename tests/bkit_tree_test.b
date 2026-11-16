@@ -344,6 +344,92 @@ ok(np.get($bmix, [2]) < 1.0e300, "one zero-hessian row does not yield an infinit
 } catch ($e) { section_threw("the hessian guard: h -> 0 must not win with an INFINITE gain", $e); }
 
 print("");
+print("== the guard on the CHILD, which the guard on the parent was hiding ==");
+try {
+// tree_best_split has TWO hessian guards: one on the feature's parent total
+// (!(Hs + lambda > 0) -> skip the feature) and one per candidate cut
+// (!(HL + lambda > 0) || !(HR + lambda > 0) -> skip the cut). Removing the
+// SECOND one left all 156 assertions green, because the only fixture that
+// drove hessians to zero drove ALL of them to zero -- so the parent guard
+// skipped the feature and the child guard was never reached.
+//
+// This reaches it: rows 0-2 carry h = 1 and rows 3-6 carry h = 0. The parent
+// total is 3, so the feature is scanned; the cut at bin 2 gives HR = 0 with
+// GR = -4+5-6+7 = 2, so without the child guard its gain is G^2/0 = +inf and
+// it WINS every comparison -- a split on a child with no weight in it, chosen
+// with maximum confidence.
+$hChild = nd([1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0], "f64");
+$bChild = tree_best_split(tree_hist($B, $g, $hChild, null), $B, 0.0, 0.0, 0.0, 1.0);
+print("        chosen: feature " + str(np.get($bChild, [0])) + " bin "
+      + str(np.get($bChild, [1])) + " gain " + str(np.get($bChild, [2]))
+      + "  HL " + str(np.get($bChild, [4])) + " HR " + str(np.get($bChild, [7])));
+ok(np.get($bChild, [2]) < 1.0e300,
+   "the winning gain is FINITE -- no child divided by a zero hessian");
+ok(np.get($bChild, [4]) > 0.0,
+   "the left child has positive hessian weight");
+ok(np.get($bChild, [7]) > 0.0,
+   "and so does the right -- the per-CUT guard is what enforces this, and the "
+   + "per-FEATURE guard cannot, because the parent total here is 3");
+// The same histogram with a positive lambda may legitimately take that cut:
+// H + lambda is then positive for both children. Asserted so the guard is
+// shown to be about H + lambda and not about refusing the data, exactly as the
+// all-zero case already asserts for the parent guard.
+$bChildL = tree_best_split(tree_hist($B, $g, $hChild, null), $B, 1.0, 0.0, 0.0, 1.0);
+ok(np.get($bChildL, [2]) < 1.0e300,
+   "with lambda = 1 the gain is still finite");
+ok(np.get($bChildL, [0]) >= 0.0, "and a split is found");
+} catch ($e) { section_threw("the guard on the child", $e); }
+
+print("");
+print("== ties go to the LOWEST feature and the LOWEST bin ==");
+try {
+// Changing the scan's `gain > bestGain` to `>=` left all 156 assertions green:
+// no fixture had a tie, so the tie-break was never exercised. That is not a
+// cosmetic difference -- duplicate or perfectly correlated columns are common,
+// and which one a tree splits on decides what feature_importances_ reports and
+// whether two fits of the same data agree.
+//
+// Two IDENTICAL informative columns tie by construction.
+$tieX = nd([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0],
+            [5.0, 5.0], [6.0, 6.0], [7.0, 7.0]], "f64");
+$tieB = tree_bin($tieX, 256);
+$tieH = tree_hist($tieB, $g, $h, null);
+$tieS = tree_best_split($tieH, $tieB, 0.0, 0.0, 0.0, 1.0);
+// First prove the tie is real, or the assertion below proves nothing: scan the
+// two features' best gains independently and require them equal to the bit.
+def bestOfFeature($Hv, $Bv, $f) {
+    $one = np.reshape(np.take($Hv, np.astype(nd([1.0 * $f], "f64"), "i64"), 0),
+                      [1, np.shape($Hv)[1], 3]);
+    return $one;
+}
+$g0 = tree_best_split(bestOfFeature($tieH, $tieB, 0),
+                      tree_bin(np.reshape(np.take($tieX,
+                          np.astype(nd([0.0], "f64"), "i64"), 1), [7, 1]), 256),
+                      0.0, 0.0, 0.0, 1.0);
+$g1 = tree_best_split(bestOfFeature($tieH, $tieB, 1),
+                      tree_bin(np.reshape(np.take($tieX,
+                          np.astype(nd([1.0], "f64"), "i64"), 1), [7, 1]), 256),
+                      0.0, 0.0, 0.0, 1.0);
+ok(nd_tobytes(np.take($g0, np.astype(nd([2.0], "f64"), "i64"), 0), "f64")
+   == nd_tobytes(np.take($g1, np.astype(nd([2.0], "f64"), "i64"), 0), "f64"),
+   "the two identical columns really do tie, bit for bit");
+eq(np.get($tieS, [0]), 0,
+   "and the tie goes to the LOWEST feature index, so a duplicated column "
+   + "cannot change which feature the tree reports");
+eq(np.get($tieS, [1]), np.get($g0, [1]),
+   "on the same bin the single-feature scan chose");
+// And the estimator inherits it, which is what makes two fits of the same data
+// agree on more than their predictions.
+$tieEst = tree.DecisionTreeRegressor(1, 1, 256, 0.0, 0.0, 0.0);
+$tieEst.fit($tieX, nd([1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0], "f64"));
+eq(np.get($tieEst.nodes(null), [0, 1]), 0,
+   "a fitted tree splits on feature 0 of two identical columns");
+eq(np.to_list($tieEst.feature_importances_("split")), [1, 0],
+   "so the importance lands on feature 0, not spread arbitrarily");
+} catch ($e) { section_threw("ties go to the lowest index", $e); }
+
+
+print("");
 print("== the LEAF side of the same guard: a zero-hessian node must not raise ==");
 try {
 // tree_best_split refuses a child with !(H + lambda > 0). _leafValue is

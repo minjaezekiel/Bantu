@@ -561,6 +561,282 @@ ok($top3 > 0.8, "the three real features hold " + str($top3) + " of the gain");
 } catch ($e) { section_threw("tier 4", $e); }
 
 print("");
+print("== RandomForest: the same grower, n_estimators times ==");
+try {
+np.seed(23);
+$fX = np.random([300, 6], 0.0, 1.0);
+$fSig = np.reshape(np.take($fX, np.astype(nd([0.0], "f64"), "i64"), 1), [300]);
+$fY = np.add(np.multiply($fSig, 4.0, null), np.random([300], 0.0, 0.4), null);
+$rf = ens.RandomForestRegressor({"n_estimators": 30, "max_depth": 6});
+$rf.fit($fX, $fY);
+eq($rf.n_trees(), 30, "thirty trees");
+eq($rf.n_outputs(), 1, "one output column for a regressor");
+ok($rf.n_nodes() > 30, "and n_nodes sums over all of them (" + str($rf.n_nodes()) + ")");
+ok($rf.score($fX, $fY) > 0.9, "R² over 0.9 (" + str($rf.score($fX, $fY)) + ")");
+ok(np.get($rf.feature_importances_(null), [0]) > 0.8,
+   "the one informative feature takes most of the gain");
+// The prediction IS the mean of the trees' predictions, reconstructed here from
+// the public node arrays rather than taken on trust. An accuracy threshold
+// cannot see a divisor error: averaging over n-1 trees instead of n scales
+// every prediction by 30/29, which R² > 0.9 absorbs and which the classifier's
+// row normalisation cancels outright. This is exact.
+$rfSum = np.zeros([300], "f64");
+$t = 0;
+while ($t < $rf.n_trees()) {
+    $rfSum = np.add($rfSum, tree_predict($rf.nodes($t, null), $fX), null);
+    $t = $t + 1;
+}
+ok(bits($rf.predict($fX))
+   == bits(np.divide($rfSum, 1.0 * $rf.n_trees(), null)),
+   "predict is the MEAN of its trees, bit for bit -- not a sum, and not a mean "
+   + "over the wrong count");
+} catch ($e) { section_threw("RandomForest regression", $e); }
+
+print("");
+print("== C4, the sharp version: fitting 20 gives the same first 10 ==");
+try {
+// §8.8's stated test, and it rules out the NATURAL WRONG IMPLEMENTATION: a
+// per-tree seed derived from the tree count looks reproducible until
+// n_estimators changes. Each tree draws from one stream in tree order, so the
+// first ten node arrays must be bit-identical between the two fits.
+def fitN($n) {
+    np.seed(77);
+    $m = ens.RandomForestRegressor({"n_estimators": $n, "max_depth": 5});
+    $m.fit($fX, $fY);
+    return $m;
+}
+$f10 = fitN(10);
+$f20 = fitN(20);
+eq($f20.n_trees(), 20, "the second fit really grew twenty");
+$same = 0;
+$i = 0;
+while ($i < 10) {
+    if (nd_tobytes($f10.nodes($i, null), "f64") == nd_tobytes($f20.nodes($i, null), "f64")) {
+        $same = $same + 1;
+    }
+    $i = $i + 1;
+}
+eq($same, 10, "all ten of the first fit's trees appear unchanged in the second");
+// And the extra ten are NOT copies of the first ten, or the stream is not
+// advancing and the assertion above is vacuous.
+ok(nd_tobytes($f20.nodes(10, null), "f64") != nd_tobytes($f20.nodes(0, null), "f64"),
+   "while tree 10 differs from tree 0, so the stream really advances");
+} catch ($e) { section_threw("C4: 20 gives the same first 10", $e); }
+
+print("");
+print("== bootstrap and max_features are what separate the trees ==");
+try {
+// With bootstrap off and every feature available, a forest draws NO randomness
+// at all -- so every tree sees identical data and must be the identical tree.
+// That is the cleanest possible proof that the two switches are the only
+// source of variation, and it needs no seeding to hold.
+$det = ens.RandomForestRegressor({"n_estimators": 5, "max_depth": 5,
+                                  "bootstrap": false, "max_features": "all"});
+$det.fit($fX, $fY);
+$allSame = true;
+$i = 1;
+while ($i < 5) {
+    if (nd_tobytes($det.nodes($i, null), "f64") != nd_tobytes($det.nodes(0, null), "f64")) {
+        $allSame = false;
+    }
+    $i = $i + 1;
+}
+ok($allSame,
+   "no bootstrap and no column sampling -> five IDENTICAL trees, bit for bit");
+// Turn either switch on and they must diverge.
+np.seed(31);
+$bs = ens.RandomForestRegressor({"n_estimators": 5, "max_depth": 5,
+                                 "bootstrap": true, "max_features": "all"});
+$bs.fit($fX, $fY);
+ok(nd_tobytes($bs.nodes(1, null), "f64") != nd_tobytes($bs.nodes(0, null), "f64"),
+   "bootstrap ALONE makes them differ");
+np.seed(31);
+$cs = ens.RandomForestRegressor({"n_estimators": 5, "max_depth": 5,
+                                 "bootstrap": false, "max_features": 2});
+$cs.fit($fX, $fY);
+ok(nd_tobytes($cs.nodes(1, null), "f64") != nd_tobytes($cs.nodes(0, null), "f64"),
+   "and max_features ALONE does too");
+// max_features = 1 means each SPLIT considers one feature, redrawn at every
+// node -- which is the random forest's defining behaviour (Breiman 2001) and
+// NOT the same as giving each tree one feature. The two are distinguishable on
+// the node arrays, deterministically and without depending on which feature
+// wins: per-node sampling makes a single tree reference MANY features, while
+// per-tree sampling confines it to one.
+//
+// This file first asserted the per-tree version, and asserted it successfully,
+// because the implementation was per-tree too. What exposed it was not this
+// assertion but the two accuracy gates: with 6 features and k = 2, two thirds
+// of the trees never saw an informative feature, and R² came out 0.66 where it
+// should be 0.995 ([K63]).
+np.seed(5);
+$one = ens.RandomForestRegressor({"n_estimators": 8, "max_depth": 4,
+                                  "bootstrap": false, "max_features": 1});
+$one.fit($fX, $fY);
+$maxDistinct = 0;
+$t = 0;
+while ($t < 8) {
+    // Column 1 of the node array is the split feature; a LEAF stores 0 there as
+    // filler, so a tree confined to one real feature shows at most two distinct
+    // values and a tree that ignored the mask would show several.
+    $nd8   = $one.nodes($t, null);
+    $feats = np.reshape(np.take($nd8, np.astype(nd([1.0], "f64"), "i64"), 1),
+                        [np.shape($nd8)[0]]);
+    $d = np.size(np.unique($feats));
+    if ($d > $maxDistinct) { $maxDistinct = $d; }
+    $t = $t + 1;
+}
+ok($maxDistinct > 2,
+   "with max_features = 1 a SINGLE tree still references several features ("
+   + str($maxDistinct) + "), because the draw is per NODE -- per-tree sampling "
+   + "would pin it at two (one real feature plus the leaves' filler zero)");
+// And it is genuinely constrained: the same forest with every feature available
+// at every split must differ, or max_features is being ignored.
+np.seed(5);
+$all6 = ens.RandomForestRegressor({"n_estimators": 8, "max_depth": 4,
+                                   "bootstrap": false, "max_features": "all"});
+$all6.fit($fX, $fY);
+ok(bits($one.nodes(0, null)) != bits($all6.nodes(0, null)),
+   "and max_features = 1 really does constrain the scan: the tree differs from "
+   + "the one grown with every feature available");
+// _nFeatures as a unit. The names are the whole surface a caller touches, and
+// nothing above pins what they MAP TO -- every structural gate passes an
+// explicit count, so "sqrt" resolving to f would go unnoticed.
+eq(ens._nFeatures("sqrt", 16, "t"), 4,   "sqrt of 16 features is 4");
+eq(ens._nFeatures("log2", 16, "t"), 4,   "log2 of 16 features is 4");
+eq(ens._nFeatures("all",  16, "t"), 16,  "\"all\" is every feature");
+eq(ens._nFeatures(null,   16, "t"), 16,  "and so is null");
+eq(ens._nFeatures(0.5,    16, "t"), 8,   "a fraction is a fraction of them");
+eq(ens._nFeatures(3,      16, "t"), 3,   "a whole count is itself");
+eq(ens._nFeatures("sqrt", 2,  "t"), 1,   "and it never rounds down to zero");
+raises(def() { return ens._nFeatures("cbrt", 16, "t"); }, "an unknown name raises");
+raises(def() { return ens._nFeatures(17, 16, "t"); },     "a count past f raises");
+raises(def() { return ens._nFeatures(0, 16, "t"); },      "a count of zero raises");
+
+// Out-of-bag coverage. A bootstrap sample of n draws leaves about 1/e of the
+// rows out, so ONE tree should cover about 63.2% of them -- a number worth
+// asserting against rather than trusting a counter nobody checked.
+np.seed(67);
+$oob1 = ens.RandomForestRegressor({"n_estimators": 1, "max_depth": 3});
+$oob1.fit($fX, $fY);
+print("        one bootstrap sample covered " + str($oob1.n_in_bag()) + " of 300 rows");
+ok($oob1.n_in_bag() > 165 && $oob1.n_in_bag() < 210,
+   "one tree covers roughly 1 - 1/e of the rows (expected ~190)");
+$oob9 = ens.RandomForestRegressor({"n_estimators": 9, "max_depth": 3});
+$oob9.fit($fX, $fY);
+ok($oob9.n_in_bag() > $oob1.n_in_bag(), "and nine trees cover more than one");
+ok($oob9.n_in_bag() <= 300, "but never more rows than exist");
+$noBag = ens.RandomForestRegressor({"n_estimators": 2, "max_depth": 3,
+                                    "bootstrap": false});
+$noBag.fit($fX, $fY);
+eq($noBag.n_in_bag(), null,
+   "and with bootstrap off there is no out-of-bag set to report, so it says so "
+   + "rather than returning every row");
+} catch ($e) { section_threw("bootstrap and max_features separate the trees", $e); }
+
+print("");
+print("== the forest averages in PROBABILITY space ==");
+try {
+np.seed(19);
+$cX = np.random([240, 5], 0.0, 1.0);
+$cY = np.astype(np.floor(np.multiply(np.reshape(np.take($cX,
+          np.astype(nd([0.0], "f64"), "i64"), 1), [240]), 3.0, null), null), "f64");
+$rfc = ens.RandomForestClassifier({"n_estimators": 25, "max_depth": 6});
+$rfc.fit($cX, $cY);
+eq($rfc.n_outputs(), 3, "three classes, three columns per tree");
+$P = $rfc.predict_proba($cX);
+eq(np.shape($P), [240, 3], "predict_proba is [n, K]");
+ok(mae(np.sum($P, 1, false), np.ones([240], "f64")) < 1.0e-12,
+   "every row sums to 1");
+ok(sc(np.min($P, null, false)) >= 0.0, "and no probability is negative");
+ok(bits(np.astype($rfc.predict($cX), "f64"))
+   == bits(np.astype(np.take($rfc.classes(),
+                             np.astype(np.argmax($P, 1, false), "i64"), 0), "f64")),
+   "predict IS the argmax of predict_proba -- not a separate majority vote");
+ok($rfc.score($cX, $cY) > 0.9,
+   "and it classifies well (" + str($rfc.score($cX, $cY)) + ")");
+// The same exact reconstruction the regressor gets, and it is needed for the
+// same reason: thresholding each tree's probability at 0.5 before averaging
+// turns the forest into a MAJORITY VOTE -- the one thing §8.8 says not to do --
+// and leaves "rows sum to 1" and "it classifies well" both green, because
+// normalisation hides the change and easy data survives it. Averaging in
+// probability space is only checkable by reproducing the average.
+$rcCols = [];
+$i = 0;
+while ($i < 3) {
+    $acc = np.zeros([240], "f64");
+    $t = 0;
+    while ($t < $rfc.n_trees()) {
+        $acc = np.add($acc, tree_predict($rfc.nodes($t, $i), $cX), null);
+        $t = $t + 1;
+    }
+    append($rcCols, np.reshape(np.clip(np.divide($acc, 1.0 * $rfc.n_trees(), null),
+                                       0.0, 1.0, null), [240, 1]));
+    $i = $i + 1;
+}
+$rcP = np.concat($rcCols, 1);
+$rcS = np.sum($rcP, 1, true);
+$rcS = np.where(np.equal($rcS, 0.0, null), 1.0, $rcS);
+ok(bits(np.divide($rcP, $rcS, null)) == bits($P),
+   "predict_proba IS the mean of the trees' leaf PROBABILITIES, bit for bit -- "
+   + "not a vote over thresholded labels");
+} catch ($e) { section_threw("the forest averages in probability space", $e); }
+
+print("");
+print("== a forest beats one deep tree on held-out data ==");
+try {
+// The whole point of bagging: variance reduction. Asserted on HELD-OUT data,
+// because on training data a deep single tree wins by memorising.
+np.seed(43);
+$trX = np.random([250, 5], 0.0, 1.0);
+$trY = np.add(np.multiply(np.reshape(np.take($trX, np.astype(nd([0.0], "f64"), "i64"), 1),
+                                     [250]), 3.0, null),
+              np.random([250], 0.0, 0.8), null);
+$teX = np.random([250, 5], 0.0, 1.0);
+$teY = np.add(np.multiply(np.reshape(np.take($teX, np.astype(nd([0.0], "f64"), "i64"), 1),
+                                     [250]), 3.0, null),
+              np.random([250], 0.0, 0.8), null);
+$single = tree.DecisionTreeRegressor(12, 1, 256, 0.0, 0.0, 0.0);
+$single.fit($trX, $trY);
+$forest = ens.RandomForestRegressor({"n_estimators": 40, "max_depth": 12});
+$forest.fit($trX, $trY);
+$eT = mse($single.predict($teX), $teY);
+$eF = mse($forest.predict($teX), $teY);
+print("        held-out MSE: one deep tree " + str($eT) + ", forest " + str($eF));
+ok($eF < $eT, "the forest generalises better, which is what bagging is for");
+} catch ($e) { section_threw("a forest beats one deep tree", $e); }
+
+print("");
+print("== what the forest refuses ==");
+try {
+raises(def() { return ens.RandomForestRegressor({"n_estimater": 10}); },
+       "a mistyped key raises");
+raises(def() { return ens.RandomForestRegressor({"n_estimators": 0}); },
+       "n_estimators 0 is refused");
+raises(def() { return ens.RandomForestRegressor({"bootstrap": "yes"}); },
+       "a non-boolean bootstrap is refused");
+raises(def() {
+    $m = ens.RandomForestRegressor({"max_features": "cbrt"});
+    return $m.fit($fX, $fY);
+}, "an unknown max_features name is refused");
+raises(def() {
+    $m = ens.RandomForestRegressor({"max_features": 99});
+    return $m.fit($fX, $fY);
+}, "a max_features count larger than the feature count is refused");
+raises(def() {
+    $m = ens.RandomForestClassifier(null);
+    return $m.fit($fX, np.ones([300], "f64"));
+}, "a single-class target is refused");
+raises(def() { return ens.RandomForestRegressor(null).predict($fX); },
+       "predict before fit is refused");
+raises(def() {
+    $m = ens.RandomForestRegressor({"n_estimators": 3});
+    $m.fit($fX, $fY);
+    return $m.nodes(3, null);
+}, "a tree index past the end is refused");
+} catch ($e) { section_threw("what the forest refuses", $e); }
+
+
+print("");
 print("== the HESSIAN is used, and its value is hand-derivable ==");
 try {
 // Dropping the logistic hessian to 1 left the whole suite green: the model is

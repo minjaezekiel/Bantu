@@ -790,3 +790,89 @@ The first native work in this package. Five kernels plus five accessors in
   is asserted to confine every split to the allowed features *and* to restore
   the unmasked tree bit-for-bit when cleared, and a row subsample over a
   constant target must grow a single leaf.
+
+### The `tree_` kernel battery, all twelve (K62)
+
+- **[test]** [K53] recorded three mutations before the battery was interrupted;
+  re-run in full against the restored kernel and the 156-assertion suite,
+  **10 of 12 were caught** — and T2/T3, which could previously only be recorded
+  as *"caught by aborting"*, now report `PASS: 121 FAIL: 35` and
+  `PASS: 123 FAIL: 33` with the throwing section named ([K56] working).
+- **[test] T4 found a guard hidden behind a guard.** `tree_best_split` checks
+  the hessian twice — once per **feature** on the parent total, once per
+  **candidate cut** on `H_L`/`H_R` — and removing the second left all 156
+  assertions green. The only fixture that drove hessians to zero drove *all* of
+  them to zero, so the parent total was zero, the first guard skipped the whole
+  feature, and the second was unreachable. **A fixture that trips the outer
+  guard cannot exercise the inner one**, and the suite had read as though it
+  tested "the hessian guard" when it tested one of two. The new gate keeps the
+  parent healthy (`h = 1` on three rows) and starves one child (`h = 0` on
+  four), so a cut with `H_R = 0` and `G_R = 2` would score `+inf` and win —
+  [K45]'s failure mode reached by the path [K45]'s own test could not take.
+- **[test] T5 found a tie nobody had made.** Changing the scan's
+  `gain > bestGain` to `>=` moves the winner from the first maximal cut to the
+  last, and nothing in 156 assertions produced two equal gains. Not cosmetic:
+  duplicate and perfectly correlated columns are ordinary, and which one a tree
+  splits on decides what `feature_importances_` reports and whether two fits
+  agree on their *structure* and not only their predictions. The gate uses two
+  identical columns and **asserts the tie is real** — the two features' best
+  gains compared bit for bit — before asserting the lower index wins; without
+  that first half the second proves nothing.
+- **[test]** `tests/bkit_tree_test.b` 156 → **166 assertions**.
+
+### Random forests (K63)
+
+- **[feature]** `RandomForestRegressor` and `RandomForestClassifier`, over the
+  same `tree.TreeGrower`. Bootstrap sampling, per-node feature sampling, and
+  averaging **in probability space** — a classifier averages `predict_proba` and
+  then takes the argmax, because a majority vote over hard labels discards every
+  tree's confidence and is a different, worse estimator.
+- **[bug fix] Feature sampling must be per NODE, not per tree** — the first
+  draft reused the booster's `set_features()` hook, which draws once per tree.
+  That is a random **subspace** ensemble: with 6 features and `k = 2`, a tree
+  never sees the one informative feature with probability 2/3, so two thirds of
+  the forest fits noise. Measured **R² 0.66 where it should be 0.995**, and a
+  held-out MSE *worse than a single deep tree* — inverting the one claim a
+  forest exists to make. `set_features_per_split(k)` redraws the mask at every
+  node; the mask is three native calls and no Bantu loop
+  (`rank(uniform(f)) < k`, [K18]'s construction).
+- **[bug fix] `max_features` defaults differ BY TASK**, as scikit-learn's do:
+  every feature for a regressor, `sqrt(f)` for a classifier. Using `"sqrt"` for
+  both is exactly the configuration measured above.
+- **[test] The gate that caught both was the ACCURACY gate, not the structural
+  one.** The structural assertion — *"with `max_features = 1` no tree references
+  more than one split feature"* — passed, because the implementation was
+  per-tree and the assertion described per-tree behaviour; a test written from
+  the implementation agrees with the implementation. What failed was `R² > 0.9`
+  and *"the forest generalises better than one deep tree"*, both statements
+  about what the estimator is **for**. The structural assertion is now inverted
+  so it distinguishes the two designs instead of restating one.
+- **[test]** §8.8's sharp reproducibility gate: **fitting 20 trees reproduces
+  the first 10 exactly**, which rules out a per-tree seed derived from the tree
+  count — the natural wrong implementation, and one that looks reproducible
+  until `n_estimators` changes. Paired with an assertion that tree 10 differs
+  from tree 0, so the first is not vacuous.
+- **[test]** With `bootstrap: false` and every feature available a forest draws
+  **no randomness at all**, so its trees must be bit-identical to one another —
+  the cleanest available proof that the two switches are the only source of
+  variation, and it needs no seeding to hold. Turning on either switch alone
+  must then make them diverge.
+- **[perf]** Out-of-bag coverage is counted with `np.bincount`, one O(n) native
+  call per tree. The obvious construction — compare `arange(n)` against the
+  sample broadcast the other way — builds an n×n boolean **per tree**: 10¹⁰
+  cells for 10,000 rows and 100 trees. Caught by reading the code for cost
+  before it was ever run.
+- **[test] An average is only checkable by reproducing the average** (K64). The
+  forest battery's two survivors were one defect in two costumes: averaging over
+  `n − 1` trees (a *uniform scale error*, which `R² > 0.9` absorbs and which the
+  classifier's row normalisation **cancels exactly**), and averaging thresholded
+  0/1 labels instead of probabilities — a majority vote, the one thing §8.8
+  names as wrong, which still classifies easy data perfectly and still produces
+  rows summing to 1. The suite had an assertion for every property a vote
+  *preserves* and none for the property it destroys. **Normalisation is an
+  information-destroying step, and every assertion downstream of one is blind to
+  whatever it cancels.** Both are now gated by reconstructing the average from
+  the public node arrays — `Σ tree_predict(nodes(t,k), X) / n_trees` — and
+  demanding **bit equality**, which no tolerance or accuracy bound can
+  substitute for.
+- **[test]** `tests/bkit_ensemble_test.b` 112 → **156 assertions**.

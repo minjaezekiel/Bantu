@@ -286,6 +286,15 @@ def _rowSample($n, $frac) {
                      "i64");
 }
 
+// A BOOTSTRAP sample: n draws from 0..n-1 WITH replacement. The repeats are the
+// point -- tree_hist counts an index once per occurrence, so a row drawn three
+// times weighs three times, which is bootstrap semantics with no kernel change
+// (§8.5). About 36.8% of rows are absent from any given sample, which is what
+// decorrelates the trees.
+def _bootstrap($n) {
+    return np.astype(np.randint([$n], 0, $n), "i64");
+}
+
 // `frac` of 0..f-1 as a LIST of feature indices, or null for all of them.
 def _colSample($f, $frac) {
     if ($frac >= 1.0) { return null; }
@@ -835,4 +844,349 @@ def GradientBoostingClassifier($params) {
     return new _GradientBoostingClassifier($params);
 }
 
-def version() { return "bkit.ensemble 0.8.0 (gradient boosting over tree_*)"; }
+// ── forests ─────────────────────────────────────────────────────────────────
+// §8.8. The same grower, n_estimators times, over two switches: bootstrap on or
+// off, and a per-tree column sample. Nothing here is a second implementation of
+// anything -- a forest differs from the booster in WHAT it averages, not in how
+// a tree is grown.
+//
+// g = -y and h = 1, the same criterion K7's decision trees use (K42), so each
+// tree's leaf is the mean (regression) or the positive-class proportion
+// (classification) and reg_lambda defaults to 0 rather than the booster's 1: a
+// forest averages unshrunken trees, and shrinking each one toward zero before
+// averaging would bias the ensemble, not regularise it.
+def _forestDefaults() {
+    return {
+        "n_estimators":     100,
+        "max_depth":        12,
+        "min_samples_leaf": 1,
+        "max_bins":         256,
+        "reg_lambda":       0.0,
+        "gamma":            0.0,
+        "min_child_weight": 0.0,
+        "max_features":     null,    // set per task by the subclass
+        "bootstrap":        true
+    };
+}
+
+// max_features as a COUNT. "sqrt" and "log2" are the two names scikit-learn
+// uses; a fraction in (0,1] and a whole count both work, and null means all.
+def _nFeatures($spec, $f, $who) {
+    if ($spec == null)     { return $f; }
+    if ($spec == "all")    { return $f; }
+    if ($spec == "sqrt")   { $m = floor(sqrt(1.0 * $f)); if ($m < 1) { $m = 1; } return $m; }
+    if ($spec == "log2")   { $m = floor(log(1.0 * $f) / log(2.0)); if ($m < 1) { $m = 1; } return $m; }
+    if (type($spec) != "number") {
+        throw $who + ": max_features must be \"sqrt\", \"log2\", \"all\", a "
+              + "fraction in (0,1] or a whole count, got " + str($spec);
+    }
+    if ($spec > 0.0 && $spec < 1.0) {
+        $m = floor(1.0 * $f * $spec); if ($m < 1) { $m = 1; } return $m;
+    }
+    if ($spec != floor($spec) || $spec < 1.0 || $spec > 1.0 * $f) {
+        throw $who + ": max_features " + str($spec) + " is not a whole count in "
+              + "1.." + str($f);
+    }
+    return $spec;
+}
+
+class _ForestBase extends Estimator {
+    def init($params, $name, $task) {
+        super();
+        this.name_   = $name;
+        this.task_   = $task;
+        this.params_ = _forestDefaults();
+        this.set_params($params);
+        this.fitted_ = false;
+        this._checkForest();
+
+        this.trees_    = null;   // list of trees; each a list of K node arrays
+        this.n_feat_   = 0;
+        this.classes_  = null;
+        this.n_out_    = 1;
+        this.gains_    = null;
+        this.splits_   = null;
+        this.oob_      = null;   // rows absent from every bootstrap sample
+    }
+
+    def _checkForest() {
+        $p = this.params_;
+        _whole($p.n_estimators, 1, "n_estimators");
+        _whole($p.max_depth, 1, "max_depth");
+        _whole($p.min_samples_leaf, 1, "min_samples_leaf");
+        _whole($p.max_bins, 2, "max_bins");
+        _num($p.reg_lambda, "reg_lambda");
+        _num($p.gamma, "gamma");
+        _num($p.min_child_weight, "min_child_weight");
+        if ($p.reg_lambda < 0.0 || $p.gamma < 0.0 || $p.min_child_weight < 0.0) {
+            throw this.name_ + ": reg_lambda, gamma and min_child_weight must be >= 0";
+        }
+        if (type($p.bootstrap) != "bool") {
+            throw this.name_ + ": bootstrap must be true or false, got "
+                  + str($p.bootstrap);
+        }
+        return null;
+    }
+
+    def _targets($yv) { return [$yv]; }
+    def _prepareTarget($v, $who) {
+        throw this.name_ + "._prepareTarget is not implemented";
+    }
+
+    def fit($X, $y) {
+        $who = this.name_ + ".fit";
+        $A = base._asarray($X);
+        if (len(np.shape($A)) != 2) {
+            throw $who + ": X must be 2-d [n_samples, n_features], got shape "
+                  + str(np.shape($A));
+        }
+        if (np.shape($A)[0] == 0) { throw $who + ": X has no rows"; }
+        if ($y == null) { throw $who + ": y is required"; }
+        $v = base._asarray($y);
+        if (len(np.shape($v)) != 1) { $v = np.reshape($v, [np.size($v)]); }
+        if (np.shape($v)[0] != np.shape($A)[0]) {
+            throw $who + ": y has " + str(np.shape($v)[0]) + " elements and X has "
+                  + str(np.shape($A)[0]) + " rows";
+        }
+        this._checkForest();
+        $n = np.shape($A)[0];
+        this.n_feat_ = np.shape($A)[1];
+        this._prepareTarget($v, $who);
+        $Y = this._targets($v);
+        $k = len($Y);
+        this.n_out_ = $k;
+
+        // Binned ONCE for the whole forest. Every tree sees the same bins, and
+        // only its row and column samples differ -- so bootstrap variance is
+        // the only thing separating the trees, which is what a forest is.
+        $B = tree_bin($A, this.params_.max_bins);
+        $h = np.ones([$n], "f64");
+        $mf = _nFeatures(this.params_.max_features, this.n_feat_, $who);
+
+        $G = tree.TreeGrower(this.params_.max_depth, this.params_.min_samples_leaf,
+                             this.params_.max_bins, this.params_.reg_lambda,
+                             this.params_.gamma, this.params_.min_child_weight);
+        $G.known_features(this.n_feat_);
+        $G.reset_importance();
+
+        // Out-of-bag coverage, counted while the samples are drawn. A row that
+        // no tree left out cannot be scored out of bag, and a caller who asks
+        // for an OOB estimate deserves to know how many rows it covers rather
+        // than to receive an average over an unstated subset.
+        $seen = np.zeros([$n], "f64");
+
+        this.trees_ = [];
+        $t = 0;
+        while ($t < this.params_.n_estimators) {
+            // Drawn in TREE ORDER and depending on nothing but the stream, so
+            // fitting 10 trees and then 20 gives the same first 10 ([C4]). A
+            // per-tree seed derived from n_estimators would look reproducible
+            // until n_estimators changed, which is the natural wrong answer.
+            $rows = null;
+            if (this.params_.bootstrap) {
+                $rows = _bootstrap($n);
+                // bincount, not a comparison matrix. The obvious way to mark
+                // which rows a sample contains -- compare arange(n) against the
+                // sample broadcast the other way -- builds an n x n boolean per
+                // TREE: 10^10 cells for 10,000 rows and 100 trees. One native
+                // bincount is O(n) and gives the draw count per row directly.
+                $cnt  = np.bincount($rows, $n);
+                $seen = np.add($seen,
+                               np.astype(np.greater($cnt, 0.0, null), "f64"), null);
+            }
+            // Per NODE, not per tree -- set before each tree and redrawn inside
+            // the grower at every split ([K63]).
+            $G.set_features_per_split($mf);
+            $tree = [];
+            $i = 0;
+            while ($i < $k) {
+                append($tree, $G.grow($B, np.multiply($Y[$i], 0.0 - 1.0, null),
+                                      $h, $rows));
+                $i = $i + 1;
+            }
+            append(this.trees_, $tree);
+            $t = $t + 1;
+        }
+        if (this.params_.bootstrap) { this.oob_ = $seen; }
+        this.gains_  = $G.gains_;
+        this.splits_ = $G.splits_;
+        this.fitted_ = true;
+        return this;
+    }
+
+    // The averaged leaf value per output column. Averaging happens HERE, in
+    // value space, and for a classifier that is probability space (§8.8): a
+    // majority vote over hard labels throws away every tree's confidence and is
+    // a different, worse estimator.
+    def _avgCols($X, $who) {
+        this._check_fitted($who);
+        $A = base._asarray($X);
+        if (len(np.shape($A)) != 2 || np.shape($A)[1] != this.n_feat_) {
+            throw $who + ": X must have " + str(this.n_feat_) + " features, got "
+                  + "shape " + str(np.shape($A));
+        }
+        $n = np.shape($A)[0];
+        $acc = [];
+        $i = 0;
+        while ($i < this.n_out_) { append($acc, np.zeros([$n], "f64")); $i = $i + 1; }
+        $t = 0;
+        while ($t < len(this.trees_)) {
+            $i = 0;
+            while ($i < this.n_out_) {
+                $acc[$i] = np.add($acc[$i], tree_predict(this.trees_[$t][$i], $A), null);
+                $i = $i + 1;
+            }
+            $t = $t + 1;
+        }
+        $m = 1.0 * len(this.trees_);
+        $out = [];
+        $i = 0;
+        while ($i < this.n_out_) { append($out, np.divide($acc[$i], $m, null)); $i = $i + 1; }
+        return $out;
+    }
+
+    def n_trees()   { this._check_fitted("n_trees");   return len(this.trees_); }
+    def n_outputs() { this._check_fitted("n_outputs"); return this.n_out_; }
+
+    def n_nodes() {
+        this._check_fitted("n_nodes");
+        $t = 0; $j = 0;
+        while ($j < len(this.trees_)) {
+            $i = 0;
+            while ($i < len(this.trees_[$j])) {
+                $t = $t + np.shape(this.trees_[$j][$i])[0];
+                $i = $i + 1;
+            }
+            $j = $j + 1;
+        }
+        return $t;
+    }
+
+    def nodes($which, $out) {
+        this._check_fitted("nodes");
+        $o = $out;
+        if ($o == null) { $o = 0; }
+        if (type($which) != "number" || $which != floor($which) || $which < 0
+            || $which >= len(this.trees_)) {
+            throw this.name_ + ".nodes: tree " + str($which) + " is out of range; "
+                  + "this forest holds " + str(len(this.trees_));
+        }
+        if (type($o) != "number" || $o != floor($o) || $o < 0 || $o >= this.n_out_) {
+            throw this.name_ + ".nodes: output " + str($out) + " is out of range; "
+                  + "this forest has " + str(this.n_out_);
+        }
+        return this.trees_[$which][$o];
+    }
+
+    // How many rows appeared in at least one bootstrap sample. Reported rather
+    // than assumed to be all of them: with few trees it is not.
+    def n_in_bag() {
+        this._check_fitted("n_in_bag");
+        if (this.oob_ == null) { return null; }
+        return _scalar(np.sum(np.astype(np.greater(this.oob_, 0.0, null), "f64"),
+                              null, false));
+    }
+
+    def feature_importances_($kind) {
+        this._check_fitted("feature_importances_");
+        $k = $kind;
+        if ($k == null) { $k = "gain"; }
+        if ($k != "gain" && $k != "split") {
+            throw this.name_ + ".feature_importances_: kind must be \"gain\" or "
+                  + "\"split\", got " + str($kind);
+        }
+        $v = this.gains_;
+        if ($k == "split") { $v = this.splits_; }
+        $tot = _scalar(np.sum($v, null, false));
+        if (!($tot > 0.0)) { return np.zeros([np.size($v)], "f64"); }
+        return np.divide($v, $tot, null);
+    }
+
+    def _paramsCopy() {
+        $d = {};
+        for $kk, $vv in this.params_.items() { $d[$kk] = $vv; }
+        return $d;
+    }
+}
+
+// scikit-learn's defaults differ BY TASK and the difference is not arbitrary:
+// a regressor uses every feature at each split (max_features = 1.0) and a
+// classifier uses sqrt(f). Using "sqrt" for both -- which this file did first --
+// measurably hurts regression: with 6 features and k = 2, two thirds of the
+// splits cannot see an informative feature, and the forest scored R² 0.66 where
+// it should score 0.95. The gate caught it ([K63]).
+class _RandomForestRegressor extends _ForestBase {
+    def init($params) {
+        super($params, "RandomForestRegressor", "regressor");
+        if (this.params_.max_features == null) { this.params_.max_features = "all"; }
+    }
+    def _prepareTarget($v, $who) { return null; }
+    def predict($X) {
+        return this._avgCols($X, "RandomForestRegressor.predict")[0];
+    }
+    def clone() { return RandomForestRegressor(this._paramsCopy()); }
+}
+def RandomForestRegressor($params) { return new _RandomForestRegressor($params); }
+
+class _RandomForestClassifier extends _ForestBase {
+    def init($params) {
+        super($params, "RandomForestClassifier", "classifier");
+        if (this.params_.max_features == null) { this.params_.max_features = "sqrt"; }
+        this.classes_ = null;
+    }
+    def _prepareTarget($v, $who) {
+        $u = np.unique($v);
+        $k = np.size($u);
+        if ($k < 2) {
+            throw $who + ": y has " + str($k) + " distinct label(s). A classifier "
+                  + "needs at least two, and a model fitted on one would score "
+                  + "100% on anything.";
+        }
+        if ($k > 1000) {
+            throw $who + ": y has " + str($k) + " distinct labels, which is a "
+                  + "regression target rather than a class set";
+        }
+        this.classes_ = $u;
+        return null;
+    }
+    // One column per class, each tree holding that class's proportion in its
+    // leaves -- one-vs-rest WITHIN a tree, as K7's classifier does (K43).
+    def _targets($yv) {
+        $out = [];
+        $i = 0;
+        while ($i < np.size(this.classes_)) {
+            append($out, np.astype(np.equal($yv, np.get(this.classes_, [$i]), null), "f64"));
+            $i = $i + 1;
+        }
+        return $out;
+    }
+    def predict_proba($X) {
+        $who = "RandomForestClassifier.predict_proba";
+        $C = this._avgCols($X, $who);
+        $n = np.shape(base._asarray($X))[0];
+        $cols = [];
+        $i = 0;
+        while ($i < len($C)) {
+            append($cols, np.reshape(np.clip($C[$i], 0.0, 1.0, null), [$n, 1]));
+            $i = $i + 1;
+        }
+        $P = np.concat($cols, 1);
+        // One-vs-rest columns do not sum to 1, so they are normalised to be read
+        // as probabilities. A row where every tree says "not mine" would divide
+        // by zero, so it falls back to uniform rather than producing NaN.
+        $s = np.sum($P, 1, true);
+        $s = np.where(np.equal($s, 0.0, null), 1.0, $s);
+        $P = np.divide($P, $s, null);
+        $allZero = np.equal(np.sum($P, 1, true), 0.0, null);
+        return np.where($allZero, 1.0 / (1.0 * np.size(this.classes_)), $P);
+    }
+    def predict($X) {
+        $P = this.predict_proba($X);
+        return np.take(this.classes_, np.astype(np.argmax($P, 1, false), "i64"), 0);
+    }
+    def classes() { this._check_fitted("classes"); return this.classes_; }
+    def clone() { return RandomForestClassifier(this._paramsCopy()); }
+}
+def RandomForestClassifier($params) { return new _RandomForestClassifier($params); }
+
+def version() { return "bkit.ensemble 0.9.0 (gradient boosting and forests over tree_*)"; }

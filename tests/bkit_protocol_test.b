@@ -189,7 +189,21 @@ $registry = [
         {"n_estimators": 6, "max_depth": 2}),                        $Xc, $y3],
     ["GradientBoostingRegressor(subsampled)", ens.GradientBoostingRegressor(
         {"n_estimators": 6, "max_depth": 2, "subsample": 0.7,
-         "colsample": 0.7}),                                         $Xc, $yc]
+         "colsample": 0.7}),                                         $Xc, $yc],
+    // The forests. Their max_features default is set by the SUBCLASS rather
+    // than by the shared defaults table ([K63]), so clone/get_params/set_params
+    // are checked against a parameter whose value the constructor supplied.
+    ["RandomForestRegressor", ens.RandomForestRegressor({"n_estimators": 5,
+                                                         "max_depth": 3}),
+                                                                     $Xc, $yc],
+    ["RandomForestClassifier", ens.RandomForestClassifier({"n_estimators": 5,
+                                                           "max_depth": 3}),
+                                                                     $Xc, $yb],
+    ["RandomForestClassifier(3-class)", ens.RandomForestClassifier(
+        {"n_estimators": 5, "max_depth": 3}),                        $Xc, $y3],
+    ["RandomForestRegressor(no bootstrap)", ens.RandomForestRegressor(
+        {"n_estimators": 5, "max_depth": 3, "bootstrap": false,
+         "max_features": "all"}),                                    $Xc, $yc]
 ];
 
 print("");
@@ -206,7 +220,7 @@ while ($i < len($registry)) {
     else { ok(false, $nm + " violates the protocol: " + str($bad)); }
     $i = $i + 1;
 }
-eqs(len($registry), 47,
+eqs(len($registry), 51,
     "the registry names every estimator K2-K8 added, in every mode");
 
 // ── the check can still fail ────────────────────────────────────────────────

@@ -137,6 +137,15 @@ class _TreeBase extends Estimator {
         // derived from by subtraction, and masking it would make a child's
         // histogram the difference of a masked and an unmasked one.
         this.featMask_ = null;
+        // Features considered PER SPLIT. null means "use featMask_ as given,
+        // or every feature". A random forest's defining behaviour is that this
+        // is redrawn at every NODE (Breiman 2001) -- per-tree sampling is a
+        // random-subspace ensemble, which is a different and weaker estimator:
+        // with f = 6 and k = 2, two thirds of the trees never see an
+        // informative feature at all. A booster's colsample is per tree on
+        // purpose (XGBoost's colsample_bytree), so the two use different hooks
+        // rather than one switch pretending to serve both ([K63]).
+        this.featK_ = null;
     }
 
     def _prepare($X, $y, $who) {
@@ -267,6 +276,17 @@ class _TreeBase extends Estimator {
                     $leaves = $leaves + 1;
                 }
                 if ($n >= 2.0 * this.params_.min_samples_leaf) {
+                    // Redrawn per node when featK_ is set. Built with three
+                    // native calls and no Bantu loop: the rank of a uniform
+                    // draw is a uniform permutation, so "rank < k" selects k
+                    // features without replacement (K18's construction).
+                    if (this.featK_ != null) {
+                        $rk = np.argsort(np.argsort(np.random([$ncol], 0.0, 1.0),
+                                                    null), null);
+                        this.featMask_ = np.reshape(
+                            np.astype(np.less($rk, this.featK_, null), "f64"),
+                            [$ncol, 1, 1]);
+                    }
                     $scan = $hist;
                     if (this.featMask_ != null) {
                         $scan = np.multiply($hist, this.featMask_, null);
@@ -700,6 +720,7 @@ class _TreeGrower extends _TreeBase {
     // broadcasts (numba tier 1b), rather than as a list the scan would have to
     // consult per bin.
     def set_features($cols) {
+        this.featK_ = null;
         if ($cols == null) { this.featMask_ = null; return null; }
         if (this.n_feat_ == 0) {
             throw "TreeGrower.set_features: the number of features is not known "
@@ -730,6 +751,25 @@ class _TreeGrower extends _TreeBase {
                   + "single leaf for every tree; pass null for all features";
         }
         this.featMask_ = np.reshape(np.array($m, "f64"), [this.n_feat_, 1, 1]);
+        return null;
+    }
+
+    // How many features each SPLIT may consider, redrawn per node. null turns it
+    // off and leaves set_features() in charge. This is the random forest's hook;
+    // set_features() is the booster's, which samples once per tree ([K63]).
+    def set_features_per_split($k) {
+        if ($k == null) { this.featK_ = null; return null; }
+        if (this.n_feat_ == 0) {
+            throw "TreeGrower.set_features_per_split: the number of features is "
+                  + "not known yet; call known_features() first";
+        }
+        if (type($k) != "number" || $k != floor($k) || $k < 1
+            || $k > this.n_feat_) {
+            throw "TreeGrower.set_features_per_split: expected a whole number in "
+                  + "1.." + str(this.n_feat_) + ", got " + str($k);
+        }
+        if ($k == this.n_feat_) { this.featK_ = null; this.featMask_ = null; return null; }
+        this.featK_ = $k;
         return null;
     }
 
