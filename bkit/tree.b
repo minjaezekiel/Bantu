@@ -146,6 +146,12 @@ class _TreeBase extends Estimator {
         // purpose (XGBoost's colsample_bytree), so the two use different hooks
         // rather than one switch pretending to serve both ([K63]).
         this.featK_ = null;
+        // ExtraTrees: when true, each node draws ONE candidate cut per feature
+        // and tree_best_split evaluates only those. The draw lives here rather
+        // than in the kernel so the forest stays reproducible from nd_seed
+        // alone ([C4]) and the kernel stays deterministic given its argument,
+        // which is what makes it testable against a known vector ([K65]).
+        this.randomCuts_ = false;
     }
 
     def _prepare($X, $y, $who) {
@@ -214,6 +220,22 @@ class _TreeBase extends Estimator {
         $shape = tree_bin_shape($B);
         $nrow  = np.get($shape, [0]);
         $ncol  = np.get($shape, [1]);
+
+        // Value bins per feature, EXCLUDING the NaN bin, computed once per tree
+        // rather than per node: it is a property of the binned matrix. A
+        // feature with fewer than two of them has no cut at all, and its entry
+        // is -1 -- which the scan already treats as "skip" when the feature has
+        // no NaN bin, and as the missing-vs-present cut when it does.
+        $vbins = null;
+        if (this.randomCuts_) {
+            $vb = [];
+            $vi = 0;
+            while ($vi < $ncol) {
+                append($vb, 1.0 * np.size(tree_bin_edges($B, $vi)) + 1.0);
+                $vi = $vi + 1;
+            }
+            $vbins = np.array($vb, "f64");
+        }
 
         // Per-feature gain and split count for THIS tree. Built as Bantu lists
         // because there are n_features of them and one += per split, not per
@@ -291,11 +313,27 @@ class _TreeBase extends Estimator {
                     if (this.featMask_ != null) {
                         $scan = np.multiply($hist, this.featMask_, null);
                     }
+                    // One candidate cut per feature, redrawn at every node.
+                    // floor(u * (vbins - 1)) lands in 0..vbins-2, which is
+                    // exactly the admissible range -- a cut at the last bin
+                    // would put every row left. A feature with vbins < 2 gets
+                    // -1, because it has no cut to offer; clamping it to 0
+                    // instead would be an out-of-range index the kernel
+                    // rightly refuses.
+                    $cuts = null;
+                    if ($vbins != null) {
+                        $cuts = np.floor(np.multiply(np.random([$ncol], 0.0, 1.0),
+                                                     np.subtract($vbins, 1.0, null),
+                                                     null), null);
+                        $cuts = np.where(np.less($vbins, 2.0, null),
+                                         0.0 - 1.0, $cuts);
+                    }
                     $bs = tree_best_split($scan, $B,
                                           this.params_.reg_lambda,
                                           this.params_.gamma,
                                           this.params_.min_child_weight,
-                                          1.0 * this.params_.min_samples_leaf);
+                                          1.0 * this.params_.min_samples_leaf,
+                                          $cuts);
                     $feat = np.get($bs, [0]);
                     $bin  = np.get($bs, [1]);
                     $gain = np.get($bs, [2]);
@@ -770,6 +808,22 @@ class _TreeGrower extends _TreeBase {
         }
         if ($k == this.n_feat_) { this.featK_ = null; this.featMask_ = null; return null; }
         this.featK_ = $k;
+        return null;
+    }
+
+    // ExtraTrees' switch: one randomly drawn candidate cut per feature per node,
+    // instead of scanning every bin. Everything else about the grower is
+    // unchanged, which is the whole argument of §8.9 -- the NaN double pass,
+    // the guards, the tie-break and the 10-slot return are inherited rather
+    // than reimplemented, and a random cut needs those guards MORE than a
+    // scanned one because it is far likelier to leave a child weightless.
+    def set_random_cuts($on) {
+        if ($on == null) { this.randomCuts_ = false; return null; }
+        if (type($on) != "bool") {
+            throw "TreeGrower.set_random_cuts: expected true or false, got "
+                  + str($on);
+        }
+        this.randomCuts_ = $on;
         return null;
     }
 

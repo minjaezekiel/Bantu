@@ -932,6 +932,9 @@ class _ForestBase extends Estimator {
     def _prepareTarget($v, $who) {
         throw this.name_ + "._prepareTarget is not implemented";
     }
+    // The split policy, and the ONLY thing an ExtraTrees differs by. §8.8 calls
+    // the forests "the same loop with two switches"; this is the second one.
+    def _randomCuts() { return false; }
 
     def fit($X, $y) {
         $who = this.name_ + ".fit";
@@ -968,6 +971,7 @@ class _ForestBase extends Estimator {
                              this.params_.gamma, this.params_.min_child_weight);
         $G.known_features(this.n_feat_);
         $G.reset_importance();
+        $G.set_random_cuts(this._randomCuts());
 
         // Out-of-bag coverage, counted while the samples are drawn. A row that
         // no tree left out cannot be scored out of bag, and a caller who asks
@@ -1189,4 +1193,98 @@ class _RandomForestClassifier extends _ForestBase {
 }
 def RandomForestClassifier($params) { return new _RandomForestClassifier($params); }
 
-def version() { return "bkit.ensemble 0.9.0 (gradient boosting and forests over tree_*)"; }
+// ── extremely randomized trees ──────────────────────────────────────────────
+// §8.9. One switch over the forest: each node draws ONE candidate cut per
+// feature instead of scanning every bin, so the split is chosen at random among
+// a handful of random thresholds rather than optimised over all of them. That
+// trades a little fit for a lot of variance reduction, and it is faster,
+// because the scan evaluates `max_features` cuts per node instead of
+// `max_features x bins`.
+//
+// Geurts et al. default to bootstrap = FALSE, and that is not an oversight on
+// their part or a copy on ours: the randomness is already in the thresholds, so
+// resampling the rows as well mostly removes training data. The default here
+// matches, and bootstrap remains available.
+def _extraDefaults($base) {
+    $d = {};
+    for $k, $v in $base.items() { $d[$k] = $v; }
+    $d.bootstrap = false;
+    return $d;
+}
+
+class _ExtraTreesRegressor extends _ForestBase {
+    def init($params) {
+        super(_extraDefaults(_forestDefaults()), "ExtraTreesRegressor", "regressor");
+        this.set_params($params);
+        this._checkForest();
+        if (this.params_.max_features == null) { this.params_.max_features = "all"; }
+    }
+    def _randomCuts() { return true; }
+    def _prepareTarget($v, $who) { return null; }
+    def predict($X) {
+        return this._avgCols($X, "ExtraTreesRegressor.predict")[0];
+    }
+    def clone() { return ExtraTreesRegressor(this._paramsCopy()); }
+}
+def ExtraTreesRegressor($params) { return new _ExtraTreesRegressor($params); }
+
+class _ExtraTreesClassifier extends _ForestBase {
+    def init($params) {
+        super(_extraDefaults(_forestDefaults()), "ExtraTreesClassifier", "classifier");
+        this.set_params($params);
+        this._checkForest();
+        if (this.params_.max_features == null) { this.params_.max_features = "sqrt"; }
+        this.classes_ = null;
+    }
+    def _randomCuts() { return true; }
+    def _prepareTarget($v, $who) {
+        $u = np.unique($v);
+        $k = np.size($u);
+        if ($k < 2) {
+            throw $who + ": y has " + str($k) + " distinct label(s). A classifier "
+                  + "needs at least two, and a model fitted on one would score "
+                  + "100% on anything.";
+        }
+        if ($k > 1000) {
+            throw $who + ": y has " + str($k) + " distinct labels, which is a "
+                  + "regression target rather than a class set";
+        }
+        this.classes_ = $u;
+        return null;
+    }
+    def _targets($yv) {
+        $out = [];
+        $i = 0;
+        while ($i < np.size(this.classes_)) {
+            append($out, np.astype(np.equal($yv, np.get(this.classes_, [$i]), null), "f64"));
+            $i = $i + 1;
+        }
+        return $out;
+    }
+    def predict_proba($X) {
+        $who = "ExtraTreesClassifier.predict_proba";
+        $C = this._avgCols($X, $who);
+        $n = np.shape(base._asarray($X))[0];
+        $cols = [];
+        $i = 0;
+        while ($i < len($C)) {
+            append($cols, np.reshape(np.clip($C[$i], 0.0, 1.0, null), [$n, 1]));
+            $i = $i + 1;
+        }
+        $P = np.concat($cols, 1);
+        $s = np.sum($P, 1, true);
+        $s = np.where(np.equal($s, 0.0, null), 1.0, $s);
+        $P = np.divide($P, $s, null);
+        $allZero = np.equal(np.sum($P, 1, true), 0.0, null);
+        return np.where($allZero, 1.0 / (1.0 * np.size(this.classes_)), $P);
+    }
+    def predict($X) {
+        $P = this.predict_proba($X);
+        return np.take(this.classes_, np.astype(np.argmax($P, 1, false), "i64"), 0);
+    }
+    def classes() { this._check_fitted("classes"); return this.classes_; }
+    def clone() { return ExtraTreesClassifier(this._paramsCopy()); }
+}
+def ExtraTreesClassifier($params) { return new _ExtraTreesClassifier($params); }
+
+def version() { return "bkit.ensemble 1.0.0 (gradient boosting and forests over tree_*)"; }

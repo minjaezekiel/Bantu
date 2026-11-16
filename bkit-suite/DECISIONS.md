@@ -1751,3 +1751,99 @@ edited while it ran. The numbers for F1–F8 remained valid (assertions were onl
 added, never weakened), but the battery was re-run end to end against the final
 file rather than reported from a mixture. **A battery pins the file it reads;
 editing that file mid-run forfeits the run.**
+
+---
+
+### K65 — ExtraTrees is one optional argument, and [K61]'s rejection was wrong
+
+[K61] looked at three ways to let the grower take a *random* split instead of
+the best one, and recorded the middle one. Implementing it found the third,
+which is better than both — and, more usefully, found that the reason [K61]
+gave for rejecting the first was **not a real reason**.
+
+[K61] rejected a `tree_eval_split` kernel because *"the gain formula would exist
+in two places"*. Two functions in one translation unit can share one inline
+helper, so that confuses **two call sites** with **two copies**. The objection
+that survives is smaller and still sufficient: a second entry point duplicates
+the *validation* — the shape checks, the `nbins` agreement, the `NaN`-bin
+bookkeeping — and that is exactly where [K44] and [K48] both lived.
+
+The chosen answer avoids both problems by not being a second anything:
+
+```
+tree_best_split(hist, binned, λ?, γ?, min_child_weight?, min_data?, cuts?)
+```
+
+`cuts` is a per-feature vector of bin indices; when present, feature `f`
+considers **only** the cut at `cuts[f]`. The change inside the loop is one line,
+placed after the prefix accumulation and never before it, because the running
+`(G_L, H_L, n_L)` still has to walk every bin on the way to the chosen one:
+
+```
+if (haveCuts && b != (int)cuts[f]) continue;
+```
+
+It beats the virtual method [K61] chose on every axis [K61] argued over. One
+loop means one formula. One entry point means one set of validations. The scan
+stays **native**, so ExtraTrees pays nothing per node, where the override would
+have paid `O(max_features)` Bantu dispatches *and* put the regularised gain in a
+second **language**, free to drift from the C++ one with no test able to see it
+until the two disagreed. And the `NaN` double pass, the guards, the tie-break
+and the 10-slot return are inherited rather than reimplemented — which matters
+more here than anywhere else, because a randomly chosen cut is far likelier than
+a scanned one to leave a child empty or weightless, so [K45]'s and [K55]'s
+guards move from the cold path to the hot one.
+
+**The draw stays in Bantu**, and that is a testing decision as much as a [C4]
+one. No RNG inside a kernel keeps the forest reproducible from `nd_seed` alone;
+more importantly it keeps the kernel **deterministic given its argument**, so a
+test hands it a known vector and asserts the exact split it must return. A
+kernel that drew its own cuts could only be checked statistically.
+
+**It never clamps.** A bin index outside `0 .. vbins−2` raises, and a fractional
+one raises rather than truncating. Rounding into range would turn an off-by-one
+in the drawing expression into a working forest with a silently biased cut
+distribution — [K48]'s failure mode exactly, a wrong answer that still produces
+plausible trees. The consequence is that the *caller* has to be right about the
+admissible range, which is why the grower computes each feature's value-bin
+count **once per tree** (it is a property of the binned matrix, not of the node)
+and emits `−1` for a feature with fewer than two of them: such a feature has no
+cut to offer, and `−1` is already what the scan treats as "skip" when there is
+no `NaN` bin and as the missing-vs-present cut when there is.
+
+The gate that matters most is the one tying the two paths together:
+
+> forcing each feature to the cut the **full scan** chose must reproduce the
+> full scan's 10-slot answer **bit for bit**.
+
+That is what says the restricted path and the scanning path share one formula,
+rather than agreeing to within a tolerance. Alongside it, the gain of a forced
+cut is checked against the formula recomputed from the histogram's own
+`cumsum` — an independent route in [K48]'s sense, since it goes through the
+histogram rather than through the kernel.
+
+**Twelve mutations, twelve caught** — five on the kernel's `cuts` path (ignored
+entirely; the filter placed *before* the prefix accumulation rather than after;
+an out-of-range index clamped instead of refused; the filter inverted to keep
+every bin **but** the chosen one; a fractional index truncated) and seven on the
+Bantu side. Two of the seven exposed gaps nothing else would have:
+
+- **nothing asserted the cuts vary WITHIN one tree.** A per-tree draw is still
+  reproducible, still differs between seeds, and still differs from the scanned
+  tree — every existing assertion holds. The one thing it cannot do is put two
+  different thresholds on one feature in one tree, so that is what the gate
+  measures (observed: 5). This is [K63]'s per-tree/per-node distinction again,
+  arriving a second time in a different disguise.
+- **no random-cut fixture contained `NaN`**, so counting the `NaN` bin into the
+  value-bin total was *equivalent* on every matrix in the file. With `NaN` the
+  count is overstated by one and a draw can land on the last value bin, which
+  the kernel refuses. Twenty-five seeded trees over a `NaN`-bearing matrix now
+  have to grow without a single out-of-range draw.
+
+Everything else about `ExtraTrees*` is the forest with `_randomCuts()` returning
+true. `bootstrap` defaults to **false**, matching Geurts et al., and not as
+imitation: the randomness is already in the thresholds, so resampling the rows
+as well mostly just removes training data. The test asserts the difference
+structurally — with no bootstrap and every feature available, a RandomForest
+grows five **identical** trees while an ExtraTrees still grows five different
+ones, which isolates the switch to the one thing that changed.

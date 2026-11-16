@@ -929,6 +929,7 @@ eq(np.size($pbig), 600, "every row gets a prediction");
 
 print("");
 print("== TreeGrower: the SAME grower, exposed rather than copied ==");
+try {
 // K8's booster grows a tree over arbitrary (g, h) instead of over a target.
 // §8.6 is explicit that it must be THE SAME grower -- a second one would be a
 // second place that has to get [K44]'s NaN direction right, and one place
@@ -959,9 +960,11 @@ raises(def() { return $grG.grow(tree_bin($Xb, 16),
                                 np.multiply($grY, 0.0 - 1.0, null), null, null); },
        "growing with no hessians is refused -- a booster that passes only "
        + "gradients is using the wrong grower");
+} catch ($e) { section_threw("TreeGrower: the SAME grower, exposed rather than copied", $e); }
 
 print("");
 print("== TreeGrower: the column mask, and the row subsample ==");
+try {
 // §8.5's column subsampling: zero the unselected features' rows in the
 // histogram the SCAN sees. A zeroed feature has G = H = n = 0, so every cut on
 // it fails BOTH min_data and the hessian guard -- two independent reasons, and
@@ -998,9 +1001,11 @@ $rsN = $rsG.grow(tree_bin($Xb, 16), np.multiply($grY, 0.0 - 1.0, null),
                  np.ones([7], "f64"),
                  np.astype(nd([0.0, 1.0, 2.0, 3.0], "f64"), "i64"));
 eq(np.shape($rsN), [1, 7], "a subsample with a constant target grows ONE leaf");
+} catch ($e) { section_threw("TreeGrower: the column mask, and the row subsample", $e); }
 
 print("");
 print("== feature importances come from the grower, not from the node array ==");
+try {
 // A node holds the threshold, not the gain, so the gain has to be recorded
 // where it is still in hand. The assertion that it is the RIGHT number: a
 // feature the tree never split on has importance exactly 0, and the total is 1.
@@ -1030,6 +1035,181 @@ close(sc(np.sum($fiMc.feature_importances_("split"), null, false)), 1.0, 1.0e-12
       "a 3-class model's importances still sum to 1");
 ok(sc(np.sum($fiMc.splits_, null, false)) >= 1.0 * $fiMc.n_trees(),
    "and count at least one split per tree, so all K were folded in");
+} catch ($e) { section_threw("feature importances come from the grower, not from the node array", $e); }
+
+print("");
+print("== tree_best_split takes a CUTS vector, and is deterministic given one ==");
+try {
+// §8.9. ExtraTrees' "random split thresholds" are one optional argument to the
+// existing kernel rather than a second kernel or a Bantu reimplementation of
+// the gain -- so the formula, the NaN double pass, the guards, the tie-break
+// and the 10-slot return are inherited, not rewritten. The DRAW stays in
+// Bantu, which is what makes this testable: handed a known vector, the kernel
+// must return an exact split.
+$cB  = tree_bin($Xb, 256);
+$cH  = tree_hist($cB, $g, $h, null);
+$cAll = tree_best_split($cH, $cB, 0.0, 0.0, 0.0, 1.0);
+// Feature 0 has 7 value bins, feature 1 is constant (1 bin), feature 2 has 3.
+// Force feature 0 to bin 4 and leave the others with no usable cut.
+$forced = tree_best_split($cH, $cB, 0.0, 0.0, 0.0, 1.0,
+                          nd([4.0, 0.0 - 1.0, 0.0 - 1.0], "f64"));
+eq(np.get($forced, [0]), 0, "the only feature with a usable cut is chosen");
+eq(np.get($forced, [1]), 4, "and it is cut at EXACTLY the bin it was handed");
+// Its gain must equal what the full scan reports for that same cut, which is
+// the one thing a second implementation of the formula could get wrong.
+// Reconstructed from the histogram's own prefix sums, not from the kernel.
+$f0 = np.reshape(np.take($cH, np.astype(nd([0.0], "f64"), "i64"), 0), [7, 3]);
+$pre = np.cumsum($f0, 0);
+$GL = np.get($pre, [4, 0]);  $HL = np.get($pre, [4, 1]);  $NL = np.get($pre, [4, 2]);
+$GT = np.get($pre, [6, 0]);  $HT = np.get($pre, [6, 1]);  $NT = np.get($pre, [6, 2]);
+$GR = $GT - $GL;  $HR = $HT - $HL;
+$want = 0.5 * (($GL * $GL) / $HL + ($GR * $GR) / $HR - ($GT * $GT) / $HT);
+close(np.get($forced, [2]), $want, 1.0e-12,
+      "and its GAIN matches the formula computed from the histogram's own "
+      + "prefix sums");
+close(np.get($forced, [4]), $HL, 1.0e-12, "H_L is the prefix at that bin");
+close(np.get($forced, [5]), $NL, 1.0e-12, "n_L too");
+// A different forced cut must give a different answer, or the argument is
+// being ignored.
+$forced2 = tree_best_split($cH, $cB, 0.0, 0.0, 0.0, 1.0,
+                           nd([1.0, 0.0 - 1.0, 0.0 - 1.0], "f64"));
+eq(np.get($forced2, [1]), 1, "a different cut is honoured too");
+ok(np.get($forced2, [2]) != np.get($forced, [2]),
+   "and scores differently, so the vector is really being read");
+// Forcing every feature to its best cut must reproduce the unrestricted scan.
+$best0 = np.get($cAll, [0]);
+$bestB = np.get($cAll, [1]);
+$cv = [0.0 - 1.0, 0.0 - 1.0, 0.0 - 1.0];
+$cv[$best0] = 1.0 * $bestB;
+$forced3 = tree_best_split($cH, $cB, 0.0, 0.0, 0.0, 1.0, nd($cv, "f64"));
+ok(nd_tobytes($forced3, "f64") == nd_tobytes($cAll, "f64"),
+   "and forcing the winning cut reproduces the FULL scan bit for bit -- the "
+   + "restricted path and the scanning path share one formula");
+} catch ($e) { section_threw("tree_best_split takes a cuts vector", $e); }
+
+print("");
+print("== the cuts vector is validated, never clamped ==");
+try {
+// A bin index out of range is a caller error. Rounding it into range would turn
+// an off-by-one in the drawing expression into a working forest with a biased
+// cut distribution -- [K48]'s failure mode, a wrong answer that still looks
+// right.
+raises(def() { return tree_best_split($cH, $cB, 0.0, 0.0, 0.0, 1.0,
+                                      nd([6.0, 0.0 - 1.0, 0.0 - 1.0], "f64")); },
+       "a cut at the LAST bin is refused -- it would put every row left");
+raises(def() { return tree_best_split($cH, $cB, 0.0, 0.0, 0.0, 1.0,
+                                      nd([99.0, 0.0 - 1.0, 0.0 - 1.0], "f64")); },
+       "a cut past the end is refused");
+raises(def() { return tree_best_split($cH, $cB, 0.0, 0.0, 0.0, 1.0,
+                                      nd([0.0 - 2.0, 0.0 - 1.0, 0.0 - 1.0], "f64")); },
+       "a cut below -1 is refused");
+raises(def() { return tree_best_split($cH, $cB, 0.0, 0.0, 0.0, 1.0,
+                                      nd([2.5, 0.0 - 1.0, 0.0 - 1.0], "f64")); },
+       "a fractional cut is refused rather than truncated");
+raises(def() { return tree_best_split($cH, $cB, 0.0, 0.0, 0.0, 1.0,
+                                      nd([0.0, 0.0], "f64")); },
+       "a cuts vector of the wrong length is refused");
+// A feature with one value bin has NO cut, so -1 is the only thing that can be
+// said about it, and it must be accepted rather than treated as an error.
+$ok1 = tree_best_split($cH, $cB, 0.0, 0.0, 0.0, 1.0,
+                       nd([0.0, 0.0 - 1.0, 0.0], "f64"));
+ok(np.get($ok1, [0]) >= 0.0, "-1 on a constant feature is accepted");
+} catch ($e) { section_threw("the cuts vector is validated", $e); }
+
+print("");
+print("== TreeGrower.set_random_cuts: one switch, everything else unchanged ==");
+try {
+$rcG = tree.TreeGrower(3, 1, 256, 0.0, 0.0, 0.0);
+$rcG.known_features(3);
+$rcG.set_random_cuts(true);
+np.seed(101);
+$rcN = $rcG.grow($cB, $g, $h, null);
+ok(np.shape($rcN)[0] >= 1, "it grows a tree");
+// Reproducible from the seed alone, and genuinely random without it -- the
+// same pair of assertions the booster's subsamples get, for the same reason:
+// the first is vacuous unless the second holds.
+np.seed(202);
+$rcA = $rcG.grow($cB, $g, $h, null);
+np.seed(202);
+$rcB2 = $rcG.grow($cB, $g, $h, null);
+ok(nd_tobytes($rcA, "f64") == nd_tobytes($rcB2, "f64"),
+   "the same seed gives the same tree");
+$rcC = $rcG.grow($cB, $g, $h, null);
+ok(nd_tobytes($rcA, "f64") != nd_tobytes($rcC, "f64"),
+   "and without reseeding it differs, so cuts ARE being drawn");
+// And it is not the scanned tree: a random threshold is a different estimator,
+// not a slower route to the same one.
+$scanG = tree.TreeGrower(3, 1, 256, 0.0, 0.0, 0.0);
+$scanN = $scanG.grow($cB, $g, $h, null);
+ok(nd_tobytes($rcA, "f64") != nd_tobytes($scanN, "f64"),
+   "and it differs from the exhaustively scanned tree");
+raises(def() { return $rcG.set_random_cuts("yes"); },
+       "a non-boolean switch is refused");
+
+// The cuts are redrawn at every NODE, not once per tree -- the same
+// distinction [K63] turned on for feature sampling, and invisible to every
+// assertion above: a tree whose cuts were drawn once would still be
+// reproducible, still differ between seeds, and still differ from the scanned
+// tree. What it could NOT do is use two different thresholds on one feature.
+$wX = np.reshape(np.astype(np.arange(0.0, 180.0, 1.0), "f64"), [60, 3]);
+$wB = tree_bin($wX, 256);
+$wG2 = np.multiply(np.astype(np.arange(0.0, 60.0, 1.0), "f64"), 0.0 - 1.0, null);
+$wH2 = np.ones([60], "f64");
+$wGr = tree.TreeGrower(4, 1, 256, 0.0, 0.0, 0.0);
+$wGr.known_features(3);
+$wGr.set_random_cuts(true);
+np.seed(404);
+$wN = $wGr.grow($wB, $wG2, $wH2, null);
+// Collect the thresholds of every SPLIT node sharing one feature.
+$wMaxDistinct = 0;
+$wf = 0;
+while ($wf < 3) {
+    $thr = [];
+    $wi = 0;
+    while ($wi < np.shape($wN)[0]) {
+        if (np.get($wN, [$wi, 0]) == 0.0 && np.get($wN, [$wi, 1]) == 1.0 * $wf) {
+            append($thr, np.get($wN, [$wi, 2]));
+        }
+        $wi = $wi + 1;
+    }
+    if (len($thr) > 1) {
+        $d = np.size(np.unique(np.array($thr, "f64")));
+        if ($d > $wMaxDistinct) { $wMaxDistinct = $d; }
+    }
+    $wf = $wf + 1;
+}
+print("        most distinct thresholds on one feature in one tree: "
+      + str($wMaxDistinct));
+ok($wMaxDistinct > 1,
+   "one feature carries TWO different thresholds in a single tree, which is "
+   + "only possible if the cut is redrawn per node");
+
+// A feature with a NaN bin: vbins must EXCLUDE it, or the draw can land on the
+// last value bin and the kernel rightly refuses. Nothing else here has NaN, so
+// counting the NaN bin into vbins would go unnoticed.
+$nX = np.copy($wX);
+$nX = np.where(np.equal($nX, 3.0, null),
+               np.divide(np.zeros([1], "f64"), np.zeros([1], "f64"), null), $nX);
+ok(sc(np.sum(np.astype(np.isnan($nX, null), "f64"), null, false)) > 0.0,
+   "the random-cut matrix really does contain NaN");
+$nB = tree_bin($nX, 256);
+$nGr = tree.TreeGrower(4, 1, 256, 0.0, 0.0, 0.0);
+$nGr.known_features(3);
+$nGr.set_random_cuts(true);
+$nOk = true;
+$ni = 0;
+while ($ni < 25) {
+    np.seed(500 + $ni);
+    try { $nGr.grow($nB, $wG2, $wH2, null); }
+    catch ($e) { $nOk = false; print("        threw on seed " + str(500 + $ni)
+                                     + ": " + str($e)); }
+    $ni = $ni + 1;
+}
+ok($nOk,
+   "25 seeded random-cut trees over a NaN-bearing matrix all grow -- the "
+   + "value-bin count excludes the NaN bin, so no draw lands out of range");
+} catch ($e) { section_threw("TreeGrower.set_random_cuts", $e); }
+
 
 
 print("");

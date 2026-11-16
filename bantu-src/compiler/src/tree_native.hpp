@@ -416,7 +416,7 @@ inline Value kernel_hist(std::vector<Value> a) {
 // positive is skipped before the division, not after it.
 inline Value kernel_best_split(std::vector<Value> a) {
     needTreeArgs(a, 2, "tree_best_split(hist, binned, lambda?, gamma?, "
-                       "min_child_weight?, min_data?)");
+                       "min_child_weight?, min_data?, cuts?)");
     ArrayPtr Hst = asArray(a[0]);
     BinsPtr  B   = asBins(a[1], "tree_best_split");
     if (Hst->shape.size() != 3 || Hst->shape[2] != 3) {
@@ -441,6 +441,50 @@ inline Value kernel_best_split(std::vector<Value> a) {
     if (lam < 0.0) {
         throw std::runtime_error("tree_best_split: lambda must be >= 0, got " +
             std::to_string(lam));
+    }
+
+    // Optional: one chosen bin per feature. When present, feature f considers
+    // ONLY the cut at cuts[f] instead of scanning every bin -- which is all
+    // ExtraTrees' "random split thresholds" amounts to (§8.9). It is an
+    // argument rather than a second kernel on purpose: the gain formula, the
+    // NaN double pass, the guards, the tie-break and the 10-slot return are
+    // then inherited rather than reimplemented, and a randomly chosen cut needs
+    // those guards MORE than a scanned one does, because it is far likelier to
+    // leave a child empty or weightless.
+    //
+    // The draw itself stays in Bantu, so the forest is reproducible from
+    // nd_seed alone and -- the part that matters for the gate -- this kernel
+    // stays fully DETERMINISTIC: a test hands it a known vector and asserts the
+    // exact split it must return.
+    std::vector<long long> cuts;
+    bool haveCuts = false;
+    if (a.size() > 6 && !a[6].isNull()) {
+        std::vector<double> cv;
+        readVector(a[6], cols, cv, "tree_best_split", "cuts");
+        cuts.resize(cols);
+        for (size_t f = 0; f < cols; f++) {
+            const double v = cv[f];
+            const long long b = (long long)v;
+            // No clamping. An index out of range is a caller error, and
+            // rounding it into range would turn an off-by-one in the drawing
+            // expression into a working forest with a biased cut distribution --
+            // K48's failure mode exactly, a wrong answer that still looks right.
+            const int nbf   = B->nbins[f];
+            const int vbins = (B->hasNaN[f] != 0) ? nbf - 1 : nbf;
+            if ((double)b != v) {
+                throw std::runtime_error("tree_best_split: cuts[" +
+                    std::to_string(f) + "] = " + std::to_string(v) +
+                    " is not a whole number");
+            }
+            if (b < -1 || b + 1 >= (long long)vbins) {
+                throw std::runtime_error("tree_best_split: cuts[" +
+                    std::to_string(f) + "] = " + std::to_string(b) +
+                    " is not a cut on a feature with " + std::to_string(vbins) +
+                    " value bins (valid: -1.." + std::to_string(vbins - 2) + ")");
+            }
+            cuts[f] = b;
+        }
+        haveCuts = true;
     }
 
     std::vector<double> flat(cols * nb * 3);
@@ -492,6 +536,10 @@ inline Value kernel_best_split(std::vector<Value> a) {
                     HL += flat[(f * nb + (size_t)b) * 3 + 1];
                     NL += flat[(f * nb + (size_t)b) * 3 + 2];
                 }
+                // The prefix must still be accumulated past the chosen cut's
+                // predecessors, so this skips the EVALUATION and not the loop:
+                // `continue` after the accumulation above, never before it.
+                if (haveCuts && b != (int)cuts[f]) continue;
                 const double GR = G - GL, HR = Hs - HL, NR = N - NL;
                 if (NL < minN || NR < minN) continue;
                 if (HL < minCW || HR < minCW) continue;

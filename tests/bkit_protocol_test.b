@@ -203,7 +203,17 @@ $registry = [
         {"n_estimators": 5, "max_depth": 3}),                        $Xc, $y3],
     ["RandomForestRegressor(no bootstrap)", ens.RandomForestRegressor(
         {"n_estimators": 5, "max_depth": 3, "bootstrap": false,
-         "max_features": "all"}),                                    $Xc, $yc]
+         "max_features": "all"}),                                    $Xc, $yc],
+    ["ExtraTreesRegressor", ens.ExtraTreesRegressor({"n_estimators": 5,
+                                                     "max_depth": 3}),
+                                                                     $Xc, $yc],
+    ["ExtraTreesClassifier", ens.ExtraTreesClassifier({"n_estimators": 5,
+                                                       "max_depth": 3}),
+                                                                     $Xc, $yb],
+    ["ExtraTreesClassifier(3-class)", ens.ExtraTreesClassifier(
+        {"n_estimators": 5, "max_depth": 3}),                        $Xc, $y3],
+    ["ExtraTreesRegressor(bootstrapped)", ens.ExtraTreesRegressor(
+        {"n_estimators": 5, "max_depth": 3, "bootstrap": true}),     $Xc, $yc]
 ];
 
 print("");
@@ -220,7 +230,7 @@ while ($i < len($registry)) {
     else { ok(false, $nm + " violates the protocol: " + str($bad)); }
     $i = $i + 1;
 }
-eqs(len($registry), 51,
+eqs(len($registry), 55,
     "the registry names every estimator K2-K8 added, in every mode");
 
 // ── the check can still fail ────────────────────────────────────────────────

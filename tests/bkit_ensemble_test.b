@@ -835,6 +835,107 @@ raises(def() {
 }, "a tree index past the end is refused");
 } catch ($e) { section_threw("what the forest refuses", $e); }
 
+print("");
+print("== ExtraTrees: the forest with the second switch flipped ==");
+try {
+np.seed(29);
+$xt = ens.ExtraTreesRegressor({"n_estimators": 40, "max_depth": 8});
+$xt.fit($fX, $fY);
+eq($xt.n_trees(), 40, "forty trees");
+ok($xt.score($fX, $fY) > 0.9,
+   "and it fits (" + str($xt.score($fX, $fY)) + ")");
+// Geurts et al. default bootstrap to FALSE, and the reason is not stylistic:
+// the randomness is already in the thresholds, so resampling the rows as well
+// mostly removes training data.
+eq($xt.get_params().bootstrap, false, "bootstrap is OFF by default");
+eq($xt.n_in_bag(), null, "so there is no out-of-bag set to report");
+// With bootstrap off and every feature available, the ONLY randomness left is
+// the cut draw -- so the trees must still differ, and that is the cleanest
+// proof the switch does anything at all.
+np.seed(29);
+$xtA = ens.ExtraTreesRegressor({"n_estimators": 5, "max_depth": 6,
+                                "max_features": "all"});
+$xtA.fit($fX, $fY);
+ok(bits($xtA.nodes(0, null)) != bits($xtA.nodes(1, null)),
+   "no bootstrap, no column sampling, and the trees STILL differ -- the random "
+   + "thresholds are the only thing left that could do that");
+// The same configuration in a RandomForest gives five identical trees, which is
+// asserted above. Side by side, that is the whole difference between the two
+// estimators.
+$rfA = ens.RandomForestRegressor({"n_estimators": 5, "max_depth": 6,
+                                  "bootstrap": false, "max_features": "all"});
+$rfA.fit($fX, $fY);
+ok(bits($rfA.nodes(0, null)) == bits($rfA.nodes(1, null)),
+   "while the same RandomForest configuration gives identical trees");
+ok(bits($xtA.nodes(0, null)) != bits($rfA.nodes(0, null)),
+   "and an ExtraTree is not the scanned tree either");
+// Reproducible from the seed alone ([C4]), and genuinely random without it.
+def fitXT() {
+    $m = ens.ExtraTreesRegressor({"n_estimators": 6, "max_depth": 6,
+                                  "max_features": "all"});
+    $m.fit($fX, $fY);
+    return $m.predict($fX);
+}
+np.seed(303);  $xr1 = fitXT();
+np.seed(303);  $xr2 = fitXT();
+ok(bits($xr1) == bits($xr2), "the same seed gives a byte-identical model");
+ok(bits($xr1) != bits(fitXT()),
+   "and without reseeding it differs, so the cuts are drawn per node");
+} catch ($e) { section_threw("ExtraTrees regression", $e); }
+
+print("");
+print("== ExtraTrees classification, and what it refuses ==");
+try {
+np.seed(37);
+$xtc = ens.ExtraTreesClassifier({"n_estimators": 40, "max_depth": 8});
+$xtc.fit($cX, $cY);
+eq($xtc.n_outputs(), 3, "three classes, three columns per tree");
+$xp = $xtc.predict_proba($cX);
+ok(mae(np.sum($xp, 1, false), np.ones([240], "f64")) < 1.0e-12,
+   "every row sums to 1");
+ok($xtc.score($cX, $cY) > 0.85,
+   "and it classifies (" + str($xtc.score($cX, $cY)) + ")");
+eq($xtc.get_params().max_features, "sqrt",
+   "a classifier defaults to sqrt(f), as scikit-learn's does");
+eq(ens.ExtraTreesRegressor(null).get_params().max_features, "all",
+   "while a regressor defaults to every feature");
+// Averaging is still in probability space, reconstructed exactly.
+$xcCols = [];
+$i = 0;
+while ($i < 3) {
+    $acc = np.zeros([240], "f64");
+    $t = 0;
+    while ($t < $xtc.n_trees()) {
+        $acc = np.add($acc, tree_predict($xtc.nodes($t, $i), $cX), null);
+        $t = $t + 1;
+    }
+    append($xcCols, np.reshape(np.clip(np.divide($acc, 1.0 * $xtc.n_trees(), null),
+                                       0.0, 1.0, null), [240, 1]));
+    $i = $i + 1;
+}
+$xcP = np.concat($xcCols, 1);
+$xcS = np.sum($xcP, 1, true);
+$xcS = np.where(np.equal($xcS, 0.0, null), 1.0, $xcS);
+ok(bits(np.divide($xcP, $xcS, null)) == bits($xp),
+   "predict_proba IS the mean of the trees' leaf probabilities, bit for bit");
+raises(def() { return ens.ExtraTreesRegressor({"n_estimater": 10}); },
+       "a mistyped key raises");
+raises(def() { return ens.ExtraTreesClassifier({"bootstrap": "yes"}); },
+       "a non-boolean bootstrap is refused");
+raises(def() {
+    $m = ens.ExtraTreesClassifier(null);
+    return $m.fit($fX, np.ones([300], "f64"));
+}, "a single-class target is refused");
+// Bootstrap remains available, and turning it on must change the model.
+np.seed(41);
+$xtB = ens.ExtraTreesRegressor({"n_estimators": 5, "max_depth": 6,
+                                "max_features": "all", "bootstrap": true});
+$xtB.fit($fX, $fY);
+ok($xtB.n_in_bag() != null,
+   "turning bootstrap on gives an out-of-bag set again");
+} catch ($e) { section_threw("ExtraTrees classification", $e); }
+
+
 
 print("");
 print("== the HESSIAN is used, and its value is hand-derivable ==");

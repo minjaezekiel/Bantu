@@ -907,11 +907,12 @@ minimiser is unbounded, which is an artefact of the approximation and not a step
 worth taking. **A guard in the kernel is not protection for the caller**, and a
 clamp upstream of a guard can disarm it.
 
-### 8.9 The forests, and the one structural change ExtraTrees needs
+### 8.9 The forests, and the one argument ExtraTrees needs
 
-**Status: `RandomForest*` is built and gated; `ExtraTrees*` is the design
-below.** The section is kept as written, including the row this work corrected,
-because what it got wrong is the useful part.
+**Status: both are built and gated.** The section is kept as written, including
+the rows this work corrected, because what it got wrong is the useful part —
+and in this section it got two things wrong: the feature-sampling row ([K63])
+and the choice between the three ExtraTrees options ([K65]).
 
 `RandomForest*` and `ExtraTrees*` are [§8.8](#88-forests-bootstrap-and-random-thresholds)'s
 two switches over `n_estimators` independent trees, grown by the same
@@ -931,40 +932,63 @@ true of the *arithmetic* and false of the *control flow*: the grower calls
 cut. Nothing in §8.5 noticed, because the claim was checked against the kernels
 and not against the caller.
 
-Two ways out, and the choice matters more than it looks:
+Three ways out, and this section first recorded the middle one. Implementing it
+found the third, which is better than both:
 
 | option | verdict |
 |---|---|
-| a new kernel, `tree_eval_split(hist, binned, λ, γ, …, chosen_bins)` | **rejected.** It is `tree_best_split` with the argmax removed, so the gain formula would exist in two places — and [K42]'s whole argument is that one criterion serving every estimator is what makes the ×4 Gini proof worth anything |
-| **one virtual method on the grower** | **chosen.** `_chooseSplit($hist, $B)` returns the same 10-slot vector `tree_best_split` returns; `_TreeBase`'s implementation *is* that call, and an extra-trees grower overrides it |
+| a new kernel, `tree_eval_split(hist, binned, λ, γ, …, chosen_bins)` | **rejected**, and the first stated reason was *wrong*. It said the gain formula would exist in two places — but two functions in one file can share one inline helper, so that was a confusion between "two call sites" and "two copies". The real objection is smaller and still sufficient: a second entry point duplicates the *validation* — the shape checks, the `nbins` agreement, the `NaN`-bin bookkeeping — which is where [K44] and [K48] both lived |
+| one virtual method on the grower | **superseded.** `_chooseSplit($hist, $B)` overridden by an extra-trees grower, evaluating the cut **in Bantu**. Workable, and it puts the regularised gain in a second *language*, where it can drift from the C++ one silently and no test would see it until the two disagreed. It also pays `O(max_features)` native calls **per node** instead of none |
+| **one optional argument to `tree_best_split`** | **chosen.** `cuts`, a per-feature vector of bin indices: when present, feature `f` considers **only** bin `cuts[f]`. Five lines inside the existing loop — `if (haveCuts && b != cuts[f]) continue;` — and everything else is untouched |
 
-The override is the only thing that differs. Partitioning, the `NaN` direction,
-the empty-child assertion, the raw-value threshold lookup, histogram
-subtraction and the leaf guard are all still the one implementation — which is
-the same argument [§8.6] makes for sharing the grower in the first place, and
-the reason this is a method and not a second grower.
+The third option is better on every axis the first two were argued over. The
+gain formula stays in **one** place because there is only one loop. The
+validation stays in one place because there is only one entry point. The scan
+stays **native**, so ExtraTrees pays nothing per node where the virtual method
+would have paid `O(max_features)` dispatches. And the `NaN` double pass, the
+guards, the tie-break and the 10-slot return are all inherited rather than
+reimplemented — which matters more here than anywhere, because a randomly
+chosen cut is *more* likely to produce an empty or zero-hessian child than a
+scanned one, so [K45]'s and [K55]'s guards are on the hot path rather than the
+cold one.
 
-**What it costs, stated rather than assumed.** A Bantu method call is 1.78 µs
-and this one happens **per node**, not per element, alongside a `tree_hist`
-that touches `n_rows × n_features` cells. For a tree with 1,000 nodes that is
-1.8 ms of dispatch against histogram work measured in hundreds of milliseconds.
-The override's own body is a handful of small reductions per candidate feature —
-`O(max_features)` slices of a `[f, bins, 3]` array — so it is one vectorised
-call per candidate, not one per bin.
+**The random draw stays in Bantu**, not in the kernel. `cuts` is drawn per node
+from `nd_random_*`, so the forest remains reproducible from `nd_seed` alone
+([C4]) with no RNG state inside a kernel — and, more importantly for the gate,
+**the kernel becomes fully deterministic given `cuts`**. A test can hand it a
+known vector and assert the exact split it must return, which is not possible
+if the kernel draws its own.
 
-Two details the override must get right, both of which the depth-wise scan
-already taught us:
+Drawing it is one vectorised expression, because `tree_bin_nbins` already
+reports each feature's admissible range:
+
+```
+cuts = floor(random(f) * (nbins - 1))      # bin b means "values <= edges[b]"
+```
+
+so the per-node cost on the Bantu side is three native calls, not
+`O(max_features)`.
+
+Two details this gets **for free** by staying inside the one loop, and both are
+things a separate implementation would have had to rediscover:
 
 - **the chosen cut is evaluated BOTH ways for `NaN`**, exactly as [K44]
   requires. The `NaN` bin is the highest index, so a prefix sum always leaves it
   right; a random cut inherits that bias unless the direction is chosen on
-  merit. Evaluating one cut twice is cheap, and the alternative is a tree whose
-  splits do not reproduce their own gains.
-- **the same guards still apply.** A randomly chosen cut can easily produce an
-  empty or zero-hessian child, so the override returns `feature = −1` when
-  `!(H_L + λ > 0)` or `!(H_R + λ > 0)` rather than leaving it to the caller —
-  the same condition [K45] and [K55] enforce, which is the point of returning
-  the identical 10-slot vector.
+  merit. The existing two-pass loop already does this, and `cuts` restricts the
+  bin, not the pass.
+- **the same guards still apply**, and they matter *more* here. A randomly
+  chosen cut is far likelier than a scanned one to leave a child empty or
+  weightless, so `n_L < min_data`, `H_L < min_child_weight` and
+  `!(H_L + λ > 0)` are on the hot path rather than the cold one. `feature = −1`
+  comes back when every candidate fails, which the grower already treats as "no
+  split" ([K55]).
+
+One thing `cuts` must **not** do is silently clamp. A bin index outside
+`0 .. nbins_f − 2` is a caller error, not a value to round into range: clamping
+would make an off-by-one in the drawing expression look like a working forest
+with a biased cut distribution, which is precisely [K48]'s failure mode — a
+wrong answer that still produces plausible trees. It raises.
 
 **Reproducibility** is [C4] and has a sharper test here than elsewhere: each
 tree draws its index sample and its column sample from one seeded stream, so

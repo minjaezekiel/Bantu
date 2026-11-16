@@ -302,16 +302,22 @@ scikit-learn and is documented as one ([K43]). The list form is a K8 item.
 | `RandomForestClassifier`/`Regressor` | bootstrap + **per-node** feature sampling, over the same grower | [x] |
 | feature sampling, per node not per tree | a forest redraws the candidate set at every split ([K63]); per-tree sampling is a random *subspace* ensemble and scored R² 0.66 where this scores 0.995 | [x] |
 | `max_features` defaults by task | every feature for a regressor, `sqrt(f)` for a classifier — scikit-learn's split, and the measured reason for it | [x] |
-| `ExtraTrees*` | random split thresholds, via one `_chooseSplit` override on the shared grower ([§8.9], [K61]) | [ ] |
+| `ExtraTrees*` | random split thresholds, via one optional `cuts` argument to `tree_best_split` ([K65]) — **not** the `_chooseSplit` override [K61] chose, whose stated reason for rejecting a kernel argument was itself wrong | [x] |
 | permutation importance | model-agnostic, so it belongs beside `score()` rather than inside the booster | [ ] |
 | leaf-wise growth (`max_leaves`) | a follow-up *inside* the shared grower ([§8.6]); with `max_leaves` unset the two policies produce the same splits, so it changes node ordering and not the model | [ ] |
 
-**K8 is split along the roadmap's own rows.** The boosters, the four objectives,
-stopping, the subsamples, the importances **and the random forests** are done
-and gated (`tests/bkit_ensemble_test.b`, 140 assertions; 19 booster mutations
-with 18 caught and one equivalent). `ExtraTrees`, permutation importance and
-leaf-wise growth are what remain; §8.9 and [K61] record the design for the
-first, including the one structural change it needs that the boosters did not.
+**K8 is split along the roadmap's own rows**, and all but two are done: the
+boosters, the four objectives, stopping, the subsamples, the importances, the
+random forests and ExtraTrees. Gated by `tests/bkit_ensemble_test.b` (175
+assertions) and `tests/bkit_tree_test.b` (188), with four mutation batteries
+behind them — 19 booster mutations (18 caught, 1 equivalent), 12 `tree_` kernel
+mutations (12 caught), 10 forest mutations (10 caught) and 7 ExtraTrees
+mutations (7 caught).
+
+**Permutation importance and leaf-wise growth are what remain.** Permutation
+importance is model-agnostic, so it belongs beside `score()` rather than inside
+any one estimator; leaf-wise growth goes *inside* the shared grower ([§8.6]) and
+changes node ordering rather than the model when `max_leaves` is unset.
 
 ## Phase K9 — `cluster.b`, `decompose.b`
 `KMeans` (k-means++ init, seeded), `DBSCAN`, `GaussianMixture`; `PCA`,
@@ -367,14 +373,14 @@ objectives and early stopping — not split finding.
    both histograms required to choose an identical split.
 
 `base.b` is 391 lines, `preprocess.b` 1,011, `selection.b` 927, `metrics.b` 695,
-`linear.b` 857, `compose.b` 512, `tree.b` 816 and `ensemble.b` 1,191, over the
+`linear.b` 857, `compose.b` 512, `tree.b` 870 and `ensemble.b` 1,290, over the
 `tree_` family in `bantu-src/compiler/src/tree_native.hpp`;
 `tests/bkit_base_test.b` is 59 assertions,
 `tests/bkit_preprocess_test.b` 174, `tests/bkit_selection_test.b`
 117, `tests/bkit_metrics_test.b` 123, `tests/bkit_linear_test.b` 135,
-`tests/bkit_compose_test.b` 77, `tests/bkit_tree_test.b` 166,
-`tests/bkit_ensemble_test.b` 156 and `tests/bkit_protocol_test.b` 51 registry
-entries — **1,072 assertions**, all green. Read
+`tests/bkit_compose_test.b` 77, `tests/bkit_tree_test.b` 188,
+`tests/bkit_ensemble_test.b` 175 and `tests/bkit_protocol_test.b` 55 registry
+entries — **1,117 assertions**, all green. Read
 [`../docs/bkit-architecture.md`](../docs/bkit-architecture.md) first, then
 [`DECISIONS.md`](DECISIONS.md).
 

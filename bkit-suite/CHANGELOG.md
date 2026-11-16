@@ -876,3 +876,54 @@ The first native work in this package. Five kernels plus five accessors in
   demanding **bit equality**, which no tolerance or accuracy bound can
   substitute for.
 - **[test]** `tests/bkit_ensemble_test.b` 112 → **156 assertions**.
+
+### ExtraTrees — one optional kernel argument (K65)
+
+- **[feature]** `ExtraTreesRegressor` and `ExtraTreesClassifier`: the forest with
+  one switch flipped, so each node draws **one candidate cut per feature**
+  instead of scanning every bin. `bootstrap` defaults to **false**, matching
+  Geurts et al. — the randomness is already in the thresholds, so resampling the
+  rows as well mostly removes training data.
+- **[feature] `tree_best_split` takes an optional `cuts` vector**, one bin index
+  per feature; when present, feature `f` considers only `cuts[f]`. One line
+  inside the existing loop. **This supersedes [K61]**, which chose a virtual
+  `_chooseSplit` override — and whose stated reason for rejecting a kernel
+  argument was itself wrong: *"the gain formula would exist in two places"*
+  confuses two **call sites** with two **copies**, since two functions in one
+  file can share one inline helper. The surviving objection (a second entry
+  point duplicates the *validation*, which is where [K44] and [K48] both lived)
+  is answered by not adding an entry point at all.
+- **[design]** The argument wins on every axis [K61] argued over: one loop means
+  one formula; one entry point means one set of validations; the scan stays
+  **native**, where the override would have paid `O(max_features)` Bantu
+  dispatches per node *and* put the regularised gain in a second **language**,
+  free to drift silently. The `NaN` double pass, the guards, the tie-break and
+  the 10-slot return are inherited — which matters most here, because a random
+  cut is far likelier than a scanned one to leave a child empty or weightless,
+  moving [K45]'s and [K55]'s guards onto the hot path.
+- **[design] The draw stays in Bantu**, which is a testing decision as much as a
+  [C4] one: no RNG in a kernel keeps the forest reproducible from `nd_seed`
+  alone, and keeps the kernel **deterministic given its argument**, so a test
+  hands it a known vector and asserts the exact split. A kernel drawing its own
+  cuts could only be checked statistically.
+- **[design] It never clamps.** An index outside `0 .. vbins−2`, or a fractional
+  one, raises. Rounding into range would turn an off-by-one in the drawing
+  expression into a working forest with a silently biased cut distribution —
+  [K48]'s failure mode. The grower therefore computes each feature's value-bin
+  count **once per tree** and emits `−1` where there are fewer than two, which
+  the scan already treats as "skip".
+- **[test]** The gate that ties the two paths together: **forcing each feature
+  to the cut the full scan chose reproduces the full scan's 10-slot answer bit
+  for bit.** Alongside it, a forced cut's gain is checked against the formula
+  recomputed from the histogram's own `cumsum` — an independent route in
+  [K48]'s sense, through the histogram rather than through the kernel.
+- **[test]** Two gaps the battery found, both invisible beforehand: nothing
+  asserted the cuts **vary within one tree** (a per-tree draw is still
+  reproducible, still differs between seeds, and still differs from the scanned
+  tree — it just cannot put two thresholds on one feature; measured 5), and no
+  random-cut fixture contained **NaN**, so counting the NaN bin into the
+  value-bin total was equivalent on every existing matrix. 25 seeded trees over
+  a NaN-bearing matrix now have to grow without a single out-of-range draw.
+- **[test]** `tests/bkit_tree_test.b` 166 → **188**,
+  `tests/bkit_ensemble_test.b` 156 → **175**,
+  `tests/bkit_protocol_test.b` 51 → **55 registry entries**.
