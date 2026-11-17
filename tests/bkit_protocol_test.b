@@ -35,6 +35,7 @@ include "../bkit/linear.b"     as lin;
 include "../bkit/compose.b"    as compose;
 include "../bkit/tree.b"       as tree;
 include "../bkit/ensemble.b"   as ens;
+include "../bkit/decompose.b"  as dec;
 
 $R = {"pass": 0, "fail": 0};
 def ok($c, $n) {
@@ -213,7 +214,14 @@ $registry = [
     ["ExtraTreesClassifier(3-class)", ens.ExtraTreesClassifier(
         {"n_estimators": 5, "max_depth": 3}),                        $Xc, $y3],
     ["ExtraTreesRegressor(bootstrapped)", ens.ExtraTreesRegressor(
-        {"n_estimators": 5, "max_depth": 3, "bootstrap": true}),     $Xc, $yc]
+        {"n_estimators": 5, "max_depth": 3, "bootstrap": true}),     $Xc, $yc],
+    // K9. Transformers whose n_components may be a COUNT or a FRACTION, so the
+    // protocol also checks that get_params reports what was asked for rather
+    // than what was resolved ([K69]).
+    ["PCA(2)",            dec.PCA(2),                                $Xc, null],
+    ["PCA(all)",          dec.PCA(null),                             $Xc, null],
+    ["PCA(0.9)",          dec.PCA(0.9),                              $Xc, null],
+    ["TruncatedSVD(2)",   dec.TruncatedSVD(2),                       $Xc, null]
 ];
 
 print("");
@@ -230,7 +238,7 @@ while ($i < len($registry)) {
     else { ok(false, $nm + " violates the protocol: " + str($bad)); }
     $i = $i + 1;
 }
-eqs(len($registry), 55,
+eqs(len($registry), 59,
     "the registry names every estimator K2-K8 added, in every mode");
 
 // ── the check can still fail ────────────────────────────────────────────────

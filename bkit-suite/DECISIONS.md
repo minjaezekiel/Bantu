@@ -2036,3 +2036,73 @@ and `ensemble.b` overrides it with `_checkParams`/`_checkForest`.
 
 All nine values are now refused by bkit, by name, before anything is fitted.
 Nothing in the package relied on the hole: every suite stayed green.
+
+---
+
+### K69 — PCA through the SVD, and the third return that is not transposed
+
+**PCA goes through the SVD of the centred matrix and never forms the
+covariance.** The textbook route takes the eigendecomposition of
+`Xᵀ X / (n−1)`; this package refuses it for the same reason §6 refuses it for
+linear models — **the Gram matrix squares the condition number**. A design
+matrix at 1e8, ordinary for unscaled real data, gives a covariance at 1e16,
+which is the whole of double precision. The singular values of `X` are the
+square roots of the eigenvalues of `XᵀX`, so the SVD reaches the same answer at
+half the condition number. The cost is real and is stated: SVD on `[n, f]` is
+more work than `eigh` on `[f, f]` when `n ≫ f`. A wrong component at 1e-3 is
+worse than a slow one.
+
+**`nd_svd` returns `[U, S, V]`, not `[U, S, Vh]`.** NumPy returns `Vh` and this
+file assumed the same. numba's own linalg test states the convention plainly —
+*"V is n-by-k"*, reconstructing with `nd_T(V)` — so it is a deliberate choice,
+and the fix belonged in `decompose.b` rather than a complaint belonging in
+numba.
+
+What makes it worth a decision record is **how quietly it failed**. `U S V` has
+the right shape. The fit completed, every singular value was correct, every
+explained-variance ratio was correct and summed to 1, the component matrix was
+the right size, and the numbers in it looked entirely plausible. Four
+assertions caught it and three of them were consequences rather than causes.
+The one that named it was structural:
+
+> the transformed columns must be **orthogonal**, because that is what a
+> principal component *is*.
+
+`transform` returns `U·S` when the components are right, and `U` has orthonormal
+columns, so `ZᵀZ` must be diagonal. With the un-transposed `V` the largest
+off-diagonal was **0.499**. No comparison of values would have found it without
+a reference, and a reference built the same wrong way would have agreed —
+[K48]'s point exactly. **A property the output must satisfy catches a class of
+error that a comparison against a recomputed value cannot.**
+
+**The sign convention is pinned, and checked through the public surface.**
+`U S Vᵀ` is unchanged when a column of `U` and the matching row of `Vᵀ` are both
+negated, so a bare SVD yields components whose sign is an artefact of the LAPACK
+driver: two runs on the same data can disagree, and so can one run on data
+differing in the last bit. The rule is scikit-learn's — make the
+largest-magnitude entry of each left singular vector positive — with ties broken
+by the lowest index so it is **total**, as [K62] does for splits. Without the
+tie-break the suite would be flaky rather than wrong, which is harder to notice.
+
+`U` is not exposed, so the gate goes through `transform`, which returns `U·S`
+with every `S` non-negative: *the largest-magnitude entry of each transformed
+column must be positive*. The same claim, observable.
+
+**`TruncatedSVD` is a different estimator, not a faster PCA.** It factorises `X`
+rather than `X − x̄`, because centring a sparse matrix destroys its sparsity. The
+test asserts **both** halves — identical to PCA on already-centred data, and
+substantially different on uncentred data, where its leading singular value is
+over twice PCA's because the first component points at the mean. Only the
+second half says the centring step is genuinely absent.
+
+**`n_components` as a fraction is a variance target**, resolvable only after
+seeing the data, so the requested value and the resolved count are separate and
+`n_components()` requires a fit — the same split [K6] makes for
+`ColumnTransformer`'s learned widths. Gated on a fixture with variances in a
+100:10:1 ratio, where the answer for a target just under and just over each
+cumulative ratio is known in advance.
+
+**A constant matrix reports zeros, not NaN.** Every singular value is zero, so
+the ratios are `0/0`. Returning `NaN` would propagate into any downstream sum;
+zeros state the truth about that matrix, which is that it has no variance
+anywhere — the same call [K57] makes for an importance vector with no splits.

@@ -1015,3 +1015,47 @@ The first native work in this package. Five kernels plus five accessors in
 - **[test]** `tests/bkit_tree_test.b` 188 → **229**,
   `tests/bkit_ensemble_test.b` 197 → **210**, `tests/bkit_base_test.b` 59 →
   **61**. Nine mutations on the policy and the validator, nine caught.
+
+---
+
+## Phase K9 (part 1) — `decompose.b`: PCA and TruncatedSVD
+
+- **[feature]** `PCA` and `TruncatedSVD` over numba's `svd`. `n_components` as a
+  count, as a **fraction** (a variance target, resolved at fit), or null for all
+  of them; `transform`, `inverse_transform`, `components()`,
+  `singular_values()`, `explained_variance()`, `explained_variance_ratio()`.
+- **[design] Through the SVD of the centred matrix, never the covariance**
+  (K69). Forming `XᵀX/(n−1)` **squares the condition number** — a design matrix
+  at 1e8 gives a covariance at 1e16, the whole of double precision — and the
+  singular values of `X` are the square roots of that matrix's eigenvalues, so
+  the SVD reaches the same answer at half the conditioning. The cost is stated
+  rather than hidden: SVD on `[n, f]` is more work than `eigh` on `[f, f]` when
+  `n ≫ f`, and a wrong component at 1e-3 is worse than a slow one.
+- **[bug fix] `nd_svd` returns `[U, S, V]`, not `[U, S, Vh]`** as NumPy does —
+  numba's own linalg test states it (*"V is n-by-k"*, reconstructing with
+  `nd_T(V)`), so the transpose belonged here. **It failed almost silently**:
+  `U S V` has the right shape, the fit completed, every singular value and every
+  variance ratio was correct and summed to 1, and the components looked
+  plausible. The assertion that named it was **structural** — *the transformed
+  columns must be orthogonal, because that is what a principal component is* —
+  where the largest off-diagonal was **0.499**. A comparison against a reference
+  built the same wrong way would have agreed ([K48]).
+- **[design] Singular-vector signs are pinned**, by scikit-learn's rule (largest
+  magnitude entry of each left singular vector positive), with ties broken by
+  the lowest index so the rule is **total** — without that the suite is flaky
+  rather than wrong, which is harder to notice. `U` is not exposed, so the gate
+  goes through `transform`, which returns `U·S`: *the largest-magnitude entry of
+  each transformed column must be positive*.
+- **[design] `TruncatedSVD` is a different estimator, not a faster PCA.** It
+  factorises `X` rather than `X − x̄` because centring a sparse matrix destroys
+  its sparsity. The test asserts **both** halves — identical to PCA on centred
+  data, and substantially different on uncentred data, where its leading
+  singular value is over twice PCA's because the first component points at the
+  mean. Only the second says the centring is genuinely absent.
+- **[design]** A constant matrix reports **zeros**, not `NaN`: the ratios are
+  `0/0`, and `NaN` would propagate into any downstream sum while zeros state the
+  truth about that matrix — the same call [K57] makes for an importance vector
+  with no splits.
+- **[test]** `tests/bkit_decompose_test.b` — **44 assertions**, and **12
+  mutations, 12 caught**, including the `V`/`Vᵀ` bug itself (five assertions
+  red). `tests/bkit_protocol_test.b` 55 → **59 registry entries**.

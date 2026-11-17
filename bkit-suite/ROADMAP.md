@@ -320,13 +320,22 @@ forest (10), 12 ExtraTrees (12), 9 permutation importance (9), 9 leaf-wise and
 parameter validation (9).
 
 ## Phase K9 — `cluster.b`, `decompose.b`
-`KMeans` (k-means++ init, seeded), `DBSCAN`, `GaussianMixture`; `PCA`,
-`TruncatedSVD` over numba's existing SVD — asserted to agree with it to 1e-10
-rather than reimplemented.
+
+| Item | How | Status |
+|---|---|---|
+| `PCA`, `TruncatedSVD` | the SVD of the **centred** matrix, never the covariance — the Gram matrix squares the condition number ([K69]). Agreement with numba's SVD asserted to 1e-10 rather than reimplemented | [x] |
+| singular-vector signs | pinned by scikit-learn's rule with a lowest-index tie-break, so two runs agree; gated through `transform`, since `U` is not exposed | [x] |
+| `n_components` as a fraction | a **variance target**, resolved at fit — so the request and the resolved count are separate fields | [x] |
+| `KMeans` | k-means++ init seeded from `nd_seed` alone; one GEMM per assignment step; empty clusters **relocated**, not dropped | [ ] |
+| `DBSCAN` | chunked neighbour search (the constraint is memory, not speed), expansion over an explicit stack | [ ] |
+| `GaussianMixture` | EM through the **Cholesky**, never `Σ⁻¹`; `reg_covar` not optional, because a collapsed component has an unbounded likelihood | [ ] |
+
+Design in [`../docs/bkit-architecture.md`](../docs/bkit-architecture.md) §10,
+written before any of it.
 
 ## Phase K10 — `neighbors.b`
 kNN classifier/regressor, Gaussian/Multinomial/Bernoulli naive Bayes, linear
-SVM. Full SMO is an open item (§13 of the design doc, item 4 — the
+SVM. Full SMO is an open item (§14 of the design doc, item 4 — the
 reference used to point at §8.4, which has never existed).
 
 ## Phase K11 — `persist.b`
@@ -373,14 +382,15 @@ objectives and early stopping — not split finding.
    both histograms required to choose an identical split.
 
 `base.b` is 391 lines, `preprocess.b` 1,011, `selection.b` 1,051, `metrics.b` 695,
-`linear.b` 857, `compose.b` 512, `tree.b` 870 and `ensemble.b` 1,290, over the
+`linear.b` 857, `compose.b` 512, `tree.b` 870, `ensemble.b` 1,290 and `decompose.b` 271, over the
 `tree_` family in `bantu-src/compiler/src/tree_native.hpp`;
 `tests/bkit_base_test.b` is 61 assertions,
 `tests/bkit_preprocess_test.b` 174, `tests/bkit_selection_test.b`
 117, `tests/bkit_metrics_test.b` 123, `tests/bkit_linear_test.b` 135,
 `tests/bkit_compose_test.b` 77, `tests/bkit_tree_test.b` 229,
-`tests/bkit_ensemble_test.b` 210 and `tests/bkit_protocol_test.b` 55 registry
-entries — **1,195 assertions**, all green. Read
+`tests/bkit_ensemble_test.b` 210, `tests/bkit_decompose_test.b` 44 and
+`tests/bkit_protocol_test.b` 59 registry
+entries — **1,243 assertions**, all green. Read
 [`../docs/bkit-architecture.md`](../docs/bkit-architecture.md) first, then
 [`DECISIONS.md`](DECISIONS.md).
 

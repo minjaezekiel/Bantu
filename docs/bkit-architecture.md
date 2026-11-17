@@ -1130,7 +1130,129 @@ first is both lossy and a different model.
 
 ---
 
-## 10. Persistence
+## 10. K9 — `decompose.b` and `cluster.b`
+
+Written before the code, as every section here is. What this phase mostly needs
+is **decisions about numerical conditioning and determinism**, not kernels:
+numba already exposes `svd`, `eigh`, `qr`, `solve`, `pinv` and `cholesky`.
+
+### 10.1 PCA goes through the SVD of the centred matrix, never the covariance
+
+The textbook route is to form `Xᵀ X / (n−1)` and take its eigendecomposition.
+This package refuses that for the same reason §6 refuses it for linear models:
+**the Gram matrix squares the condition number.** A design matrix with
+condition number 10⁸ — ordinary for unscaled real data — yields a covariance
+with 10¹⁶, which is the whole of double precision. The singular values of `X`
+are the square roots of the eigenvalues of `XᵀX`, so SVD gets the same answer at
+half the condition number, and the two agree to machine precision only when the
+problem was easy to begin with.
+
+The cost is that SVD on `[n, f]` is more expensive than `eigh` on `[f, f]` when
+`n ≫ f`. That is accepted and stated rather than quietly traded: a wrong
+component at 10⁻³ is worse than a slow one.
+
+### 10.2 Singular vectors have arbitrary signs, and that must be pinned
+
+`U S Vᵀ` is unchanged if a column of `U` and the matching row of `Vᵀ` are both
+negated, so a bare SVD gives components whose **sign is an artefact of the
+LAPACK driver**. Two runs on the same data can disagree; so can one run on data
+differing in the last bit. That is not acceptable from an estimator whose
+output is read by eye and compared across runs.
+
+So each component's sign is fixed deterministically, by scikit-learn's rule:
+make the entry of **largest absolute value** in each left singular vector
+positive, and flip the matching component with it. A tie is broken by the lowest
+index, as [K62] does for splits, so the rule is total.
+
+**The gate is that it survives a sign flip injected on purpose**: negate a
+column of `U` and the matching row of `Vᵀ`, reconstruct, and the fitted
+components must come back identical. Without `svd_flip` the test is red; without
+a tie-break the test is flaky, which is worse.
+
+### 10.3 `n_components` as a float means "enough variance", and that is a fit-time quantity
+
+`n_components = 0.95` is the useful form, and it cannot be resolved before
+seeing the data. So the *requested* value and the *resolved* count are different
+fields, and `n_components_` is only available after a fit — the same split
+[K6] makes for `ColumnTransformer`'s learned output widths.
+
+### 10.4 `TruncatedSVD` does not centre, and that is its entire reason to exist
+
+Centring a sparse matrix destroys its sparsity. `TruncatedSVD` therefore
+factorises `X` itself rather than `X − x̄`, which makes it a different estimator
+from PCA rather than a faster one: on centred data they agree exactly, and on
+uncentred data the first component of `TruncatedSVD` points at the mean. The
+test asserts **both** — agreement after centring, and disagreement before —
+because only the second says the centring step is really absent.
+
+### 10.5 k-means: one GEMM per iteration, k-means++ seeded, and empty clusters relocated
+
+`‖x − c‖² = ‖x‖² − 2 x·c + ‖c‖²`, so a whole assignment step is **one matmul**
+plus two broadcasts. That is what makes k-means viable in Bantu at all: the
+per-element work is native, and the loop body is a handful of `nd_*` calls per
+iteration rather than per point.
+
+The `‖x‖²` term is constant across iterations and is computed once. It can be
+dropped entirely from the `argmin` — it does not depend on `c` — and it is kept
+only when the inertia itself is wanted, which is once per run rather than once
+per iteration.
+
+**k-means++ init, from `nd_seed` alone** ([C4]): the first centre uniformly at
+random, each subsequent one with probability proportional to `D(x)²`. Written
+with the same cumulative-sum-and-search construction the rest of the package
+uses for weighted draws, so nothing carries RNG state.
+
+**An empty cluster is relocated to the farthest point**, not dropped. Dropping
+it silently returns fewer clusters than asked for, which is a wrong answer that
+looks like a right one — the caller asked for `k` and a later `predict` would
+index a centre that does not exist. Relocation is what scikit-learn does and it
+keeps `k` an invariant rather than a request.
+
+`n_init` restarts and keeps the lowest **inertia**, which is the objective
+Lloyd's algorithm actually descends; keeping the best by anything else would be
+choosing a run by a criterion it was not optimising.
+
+### 10.6 DBSCAN's constraint is memory, not speed
+
+A full pairwise distance matrix for `n = 10,000` is 800 MB, so the neighbour
+search is **chunked**: one GEMM per chunk of rows, thresholded to a boolean, and
+the neighbour lists accumulated. The per-element work stays native and the peak
+memory is the chunk, not the matrix. The chunk size is a parameter with a
+documented default rather than a constant, because the right value depends on
+`f` as well as `n`.
+
+Expansion is **iterative over an explicit stack**. Bantu's call depth is capped
+at 1000 and a cluster can easily be longer than that, so a recursive flood fill
+would fail on exactly the inputs DBSCAN is for — the same reason [§8] grows
+trees over a queue.
+
+Border points are assigned to the **first** core point that reaches them, which
+is order-dependent and is documented as such. scikit-learn has the same
+property; stating it is the difference between a documented behaviour and a
+surprise.
+
+### 10.7 Gaussian mixtures need the Cholesky, not the inverse
+
+EM wants `(x − μ)ᵀ Σ⁻¹ (x − μ)` and `log det Σ`. Both come from the Cholesky
+factor without ever forming `Σ⁻¹`: the quadratic form is the squared norm of a
+triangular solve, and the log-determinant is twice the sum of the log diagonal.
+Forming the inverse costs accuracy for no gain, and is the same mistake as
+forming the Gram matrix one section up.
+
+`reg_covar` is added to the diagonal before factorising, and is **not** optional:
+a component that collapses onto a single point has a singular covariance and a
+likelihood that diverges to `+∞`, which EM will happily walk towards. That is
+the mixture-model equivalent of [K45]'s `+inf` gain — an unbounded objective
+reached by a degenerate solution — and the guard is the same shape.
+
+The responsibilities go through **log-sum-exp with the row maximum subtracted**,
+not through a ratio of exponentials. `exp(−800)` is zero and `exp(800)` is
+infinity, and both occur on ordinary data once the dimension is more than a
+handful.
+
+---
+
+## 11. Persistence
 
 `.btsd` with `kind: "bkit.estimator"` ([C3]). One container, one SHA-256, one
 set of twelve load-failure messages — already written for btorch, not rewritten
@@ -1148,7 +1270,7 @@ memory.
 
 ---
 
-## 11. Gates
+## 12. Gates
 
 Six tiers, as every phase in this project. Gradcheck does not apply (no
 autograd here); its slot is taken by **differential testing against published
@@ -1186,7 +1308,7 @@ measured from a reloaded `.btsd` model, not from memory.
 
 ---
 
-## 12. What is deliberately out
+## 13. What is deliberately out
 
 | item | why |
 |---|---|
@@ -1199,7 +1321,7 @@ measured from a reloaded `.btsd` model, not from memory.
 
 ---
 
-## 13. Open items
+## 14. Open items
 
 | # | item | settled by |
 |---|---|---|
