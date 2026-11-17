@@ -204,7 +204,21 @@ About 150 builtins, `nd_` prefixed, matching arctic's `col_` convention and deci
 | **ufuncs** | arithmetic; `sqrt cbrt exp expm1 log log1p log2 log10 sin cos tan asin acos atan atan2 hypot sinh cosh tanh asinh acosh atanh floor ceil trunc round rint sign reciprocal square isnan isinf isfinite clip where minimum maximum copysign`; comparisons and boolean logic; `nd_isclose/allclose/array_equal` |
 | **reductions** | `sum prod mean std var min max ptp argmin argmax any all count_nonzero median quantile`, the `nan*` variants, `cumsum cumprod cummax cummin diff` — all with `axis` and `keepdims` |
 | **indexing / search** | `nd_get/set/index/take/put/mask/compress/nonzero`, `nd_sort/argsort/partition/argpartition/searchsorted/unique/unique_counts/bincount/histogram` |
-| **linear algebra** | `nd_dot/matmul/inner/outer`, `nd_solve/inv/det/slogdet/lu/solve_triangular/cholesky/cho_solve/qr/lstsq/pinv/norm/trace/matrix_rank/cond`, `nd_svd`, `nd_eigh` |
+| **linear algebra** | `nd_dot/matmul/outer`, `nd_solve/inv/det/slogdet/cholesky/qr/lstsq/pinv/norm/trace/matrix_rank/cond`, `nd_svd`, `nd_eigh` |
+
+> **This row used to claim four builtins that do not exist**: `nd_inner`,
+> `nd_lu`, `nd_solve_triangular` and `nd_cho_solve`. They were listed from the
+> *design* and never implemented, and the row was never checked against the
+> registry. Found from bkit, which went looking for `nd_solve_triangular` to
+> build a Gaussian mixture's quadratic form; the diagnostic the stale-binary
+> work added (N-series, "an unbound `nd_*` says so") correctly reported the name
+> as unbound, and the honest reading was that the *document* was wrong rather
+> than the binary stale. Adding them is a real item — the factorisations behind
+> them (LU, Cholesky) are already there, so each is a solve away — but it is
+> numba work and the stage order is the user's, so it is recorded rather than
+> smuggled in. A caller needing a triangular solve today uses `nd_solve` on the
+> triangular factor: more flops than necessary, exact to the same precision, and
+> it still avoids forming the inverse, which is the property that matters.
 
 Every binary ufunc takes an optional trailing `out` array. Every reduction takes `axis` (null, a
 number, or a list) and `keepdims`.
@@ -226,8 +240,13 @@ implementation by design.
 
 Hand-written, each 40–150 lines of textbook numerics: blocked matmul (64×64 tiles, `ikj` inner order
 so B streams at unit stride), blocked copy-transpose, LU with partial pivoting (which yields `det`,
-`solve`, `inv`, `slogdet`, `matrix_rank`), forward/back triangular substitution, Cholesky and
-`cho_solve`, Householder QR and `lstsq`, norms, trace and condition number.
+`solve`, `inv`, `slogdet`, `matrix_rank`), forward/back triangular substitution, Cholesky,
+Householder QR and `lstsq`, norms, trace and condition number.
+
+The triangular substitution and the Cholesky are **internal**: they power
+`solve`, `inv` and `cholesky`, but neither is exposed as a builtin of its own.
+`nd_solve_triangular` and `nd_cho_solve` are therefore *not* part of the
+surface, however much the table above used to suggest otherwise.
 
 Two deliberately "easy algorithm" choices:
 

@@ -1012,3 +1012,47 @@ double-draw comparisons real.
 That is twice in one file: `ok(nd_all(...))` could not fail at all, and then a
 reference that could fail only when the code was already right. Both were found
 by mutation and neither by review.
+
+---
+
+### N42 — the architecture doc claimed four builtins that were never implemented
+
+Found from bkit, not from numba. K9's Gaussian mixture wants
+`(x−μ)ᵀ Σ⁻¹ (x−μ)` without forming `Σ⁻¹`, which is a triangular solve against
+the Cholesky factor — and `docs/numba-architecture.md` listed
+`nd_solve_triangular` and `nd_cho_solve` in its linear-algebra row. Neither
+exists. Probing the rest of that row found two more: `nd_lu` and `nd_inner`.
+
+**Four of its entries were listed from the design and never checked against the
+registry.** The row was written when the phase was planned and never reread
+after the phase shipped with a narrower surface.
+
+Two things went right, and they are the reason this was a five-minute diagnosis
+rather than an afternoon:
+
+- the **unbound-builtin diagnostic** said exactly what it should —
+  *"'nd_solve_triangular' is in the numba (arrays) native family, so an unbound
+  one usually means this bantu binary is OLDER than the code it is running"*.
+  That message exists because of the stale-install work, and it is the right
+  first guess;
+- it was nonetheless the **wrong** guess here, and the way to tell was cheap:
+  the binary was built minutes earlier, so the document was the stale thing. A
+  diagnostic that names its own most likely cause is still only a hypothesis.
+
+The internal routines *are* there — triangular substitution powers `solve` and
+`inv`, and `cholesky` is exposed — so each missing builtin is a thin wrapper
+away. **Adding them is a real item and is not done here**: it is numba work, and
+the stage order is the user's to change, not mine to reinterpret because I
+happened to be in a neighbouring file.
+
+A caller needing a triangular solve today uses `nd_solve` on the triangular
+factor. It costs more flops than back-substitution and is exact to the same
+precision — verified against the forbidden route on a 2×2:
+`‖L⁻¹d‖² = dᵀΣ⁻¹d = 0.568182` and `2 Σ log Lᵢᵢ = log det Σ = 2.3979`, both to
+every printed digit. It still avoids forming the inverse, which is the property
+the design actually requires.
+
+The doc row is corrected, with the four names called out rather than quietly
+deleted: a surface that *shrank* in a document is worth a sentence, because
+anyone who read the old row and wrote code against it deserves to find out why
+it does not bind.

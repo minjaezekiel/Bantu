@@ -1059,3 +1059,54 @@ The first native work in this package. Five kernels plus five accessors in
 - **[test]** `tests/bkit_decompose_test.b` — **44 assertions**, and **12
   mutations, 12 caught**, including the `V`/`Vᵀ` bug itself (five assertions
   red). `tests/bkit_protocol_test.b` 55 → **59 registry entries**.
+
+## Phase K9 (part 2) — `cluster.b`: KMeans
+
+- **[feature]** `KMeans` with k-means++ init, `n_init` restarts, Lloyd
+  iterations, `transform` (distance to every centre) and a `score` that is the
+  **negated** inertia so higher is better and a grid search over `n_clusters` is
+  not inverted.
+- **[perf] One GEMM per assignment step.** `‖a−c‖² = ‖a‖² − 2a·c + ‖c‖²`, so a
+  whole assignment is one matmul plus two broadcasts — the per-element work is
+  native and the loop body is a handful of `nd_*` calls per *iteration* rather
+  than per point. 4000×6 into 8 clusters with 3 restarts: **69 ms**.
+- **[bug fix] A defensive clamp made a sign error silent** (K70). The identity's
+  first version **subtracted** `‖c‖²`; every distance came out negative, the
+  `maximum(d, 0)` clamp turned them all into **exactly zero**, and the fit
+  completed and returned three plausible centres — one sitting neatly halfway
+  between two blobs. The only visible symptom was an **inertia of exactly 0**.
+  The clamp is right and is kept (cancellation genuinely produces negatives:
+  measured at `f = 50`, magnitude 1e7, **15 of 1600** entries, worst **−1**), so
+  the lesson is that anything behind a clamp needs a gate that does not go
+  through it. `_dist2` is now checked against a **brute-force double loop** plus
+  two properties — zero diagonal, no negatives — and one hand-computable case.
+  Worst deviation from brute force: **1.8e-15**.
+- **[design]** This is [K69]'s lesson in a second costume: there an
+  un-transposed `V` gave plausible components and only *the transformed columns
+  must be orthogonal* caught it; here a clamped sign error gave plausible
+  centres and only *the distance must equal the definition* caught it. **Both
+  times a comparison against a recomputed value would have agreed with the
+  bug**, because the recomputation goes through the same wrong expression.
+- **[design]** An **empty cluster is relocated, not dropped** — dropping it
+  returns fewer clusters than asked for and a later `predict` would index a
+  centre that does not exist. `n_init` keeps the **lowest inertia**, the
+  objective Lloyd descends. Convergence is on **centre movement**, since labels
+  can be stable while centres still move on a tie.
+- **[test]** `tests/bkit_cluster_test.b` — **53 assertions**; **12 mutations, 11
+  caught, 1 equivalent**. The first battery was 7 of 12 and all four survivors
+  were [K60]'s pattern: the clamp gate's fixture was too benign to make it
+  load-bearing, "four non-NaN centres" was equally true of no relocation,
+  "`n_init = 5` is no worse than 1" was true of keeping the *last* restart, and
+  "fewer than `max_iter`" was true of a loop that always stops after one pass.
+  Each replacement is exact rather than directional — notably *the kept inertia
+  equals the minimum over the restarts*, since Lloyd draws nothing and five
+  sequential `n_init = 1` fits consume exactly one `n_init = 5` fit's stream.
+- **[test]** The relocation mutation is recorded as **equivalent** with the
+  evidence rather than papered over with a contrived fixture: k-means++ puts
+  every initial centre on a data row and spreads them by `D²`, so over 30 seeds
+  with `k = 3` across four separated blobs **no cluster ends empty either way**.
+  The branch is reachable, correct and unobservable — the same shape as K7's
+  empty-child assertion, and kept for the same reason.
+- **[test]** `tests/bkit_protocol_test.b` 59 → **61 registry entries**, now
+  including a **clusterer** — a task `base.b`'s `score()` does not dispatch on,
+  so the contract is checked against an estimator that has no `y` at all.

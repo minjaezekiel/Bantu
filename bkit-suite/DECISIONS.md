@@ -2106,3 +2106,114 @@ cumulative ratio is known in advance.
 the ratios are `0/0`. Returning `NaN` would propagate into any downstream sum;
 zeros state the truth about that matrix, which is that it has no variance
 anywhere — the same call [K57] makes for an importance vector with no splits.
+
+---
+
+### K70 — a defensive clamp made a sign error silent
+
+`_dist2` computes `‖a−c‖² = ‖a‖² − 2a·c + ‖c‖²` so that a whole k-means
+assignment step is **one matmul** plus two broadcasts. That is what makes
+k-means viable in Bantu at all: the per-element work is native and the loop body
+is a handful of `nd_*` calls per *iteration* rather than per point. `‖a‖²` does
+not depend on `c`, so it could be dropped from the `argmin` entirely; it is kept
+because the inertia wants it, and the inertia is computed once per run.
+
+**The first version subtracted `‖c‖²` instead of adding it.** The interesting
+part is not the typo, it is what happened next:
+
+1. every squared distance came out **negative**;
+2. the function clamps at zero — `maximum(d, 0)` — because the identity is exact
+   in real arithmetic and can go slightly negative in floating point when a row
+   and a centre coincide, and a negative "squared distance" becomes `NaN` the
+   moment anyone takes its root;
+3. so **every distance became exactly 0**;
+4. the fit completed, converged, and returned three centres that looked
+   entirely plausible — one of them sitting neatly halfway between two blobs.
+
+The only visible symptom was an **inertia of exactly 0**. Two labels for three
+requested clusters was the second clue, and both were noticed only because the
+smoke test printed numbers whose correct values were known in advance.
+
+**The clamp is right and is kept.** The lesson is not to remove it; it is that a
+defensive clamp converts a wrong answer into a *quiet* wrong answer, so anything
+behind one needs a gate that does not go through it. `_dist2` is now checked
+against a **brute-force double loop** — the definition, in Bantu, sharing no
+arithmetic with the matmul form — plus two properties that would have caught the
+sign error with no reference at all:
+
+- `_dist2(A, A)` must have a **zero diagonal**;
+- no squared distance may be **negative** (which, with the clamp in place, is
+  about the clamp doing nothing rather than doing its job);
+
+and one hand-computable case: `(3,4)` is at squared distance **25** from the
+origin. Worst deviation from brute force, measured: **1.8e-15**.
+
+This is [K69]'s lesson arriving a second time in a different costume. There, the
+un-transposed `V` produced plausible components and only *the transformed
+columns must be orthogonal* caught it. Here, a clamped sign error produced
+plausible centres and only *the distance must equal the definition* caught it.
+**Both times the diagnostic assertion was a property the output must satisfy,
+and both times a comparison against a recomputed value would have agreed with
+the bug** — because the recomputation would have gone through the same wrong
+expression.
+
+Two smaller decisions recorded with it:
+
+**An empty cluster is relocated, not dropped.** Dropping it silently returns
+fewer clusters than the caller asked for — a wrong answer that looks like a
+right one, and a later `predict` would index a centre that does not exist.
+Relocation to the farthest point keeps `k` an invariant rather than a request,
+and is what scikit-learn does. The gate asks four clusters of three distinct
+points and requires four non-`NaN` centres back.
+
+**`n_init` keeps the lowest inertia**, which is the objective Lloyd's algorithm
+descends; keeping the best by anything else would be choosing a run by a
+criterion it was not optimising. The gate for it is **exact rather than
+statistical**: under one seed, an `n_init = 5` run's first restart *is* the
+`n_init = 1` run, so its kept inertia cannot be worse.
+
+**Convergence is on centre movement, not label churn**, because labels can be
+stable while centres still move on a tie.
+
+**The first battery was 7 of 12, and all four survivors were [K60]'s pattern
+again** — a gate that cannot distinguish the right answer from a wrong one:
+
+| mutation | why it survived | the exact replacement |
+|---|---|---|
+| the negative clamp removed | at `f = 3` and magnitude 1 the identity **cancels exactly**, so removing the clamp changed nothing on the fixture | cancellation needs dimension *and* magnitude: measured at `f = 50`, magnitude 1e7, **15 of 1600** entries go negative, worst **−1**. The gate uses that fixture and also asserts `transform` yields no `NaN` there |
+| an empty cluster keeps its old centre | *"four non-`NaN` centres came back"* is equally true of leaving the stranded centre where it was | **not fixable, and that is the finding** — see below |
+| `n_init` keeps the **last** restart | on separated blobs every restart finds the same optimum, so "best" and "last" are the same number | Lloyd draws nothing, so five sequential `n_init = 1` fits consume exactly one `n_init = 5` fit's draws: the kept inertia must **equal the minimum** over them. Fixture deliberately awkward — measured restarts `[92.6, 131.3, 94.6, 94.6, 94.6]`, so best ≠ last |
+| convergence always "succeeds" (shift forced to 0) | `n_iter < max_iter` and `n_iter >= 1` are both true of a loop that always stops after one pass | the converged centres must be a **fixed point** (more iterations move nothing) *and* reaching it must take **more than one pass** |
+
+**The relocation mutation survived every attempt, and the honest conclusion is
+that it is equivalent.** Three fixtures were measured:
+
+- k-means++ places every initial centre **on a data row** and spreads them by
+  `D²`, so a stranded centre is already on a row whether or not anything moves
+  it — which is why the "sits on a data row" assertion cannot distinguish the
+  two;
+- over **30 seeds** with `k = 3` across four separated blobs — more groups than
+  clusters, so an empty cluster is never forced — **no cluster ends empty**,
+  with relocation *or* without. k-means++ does not strand one when there is
+  somewhere better to be;
+- the only fixture that reliably empties a cluster is `k` exceeding the number
+  of **distinct points**, and there the farthest point is at distance zero from
+  an existing centre, so relocation fires (traced: it does move the centre) and
+  lands somewhere just as good.
+
+So the branch is **reachable, correct, and unobservable in its effect** — the
+same shape as K7's empty-child assertion, which is also documented unreachable
+and also kept. It stays because it protects `k` as an invariant and prevents a
+`0/0` mean, and the test now says in as many words that the assertions around it
+are an invariant check rather than evidence the relocation was tested. Claiming
+a gate that does not exist is worse than recording its absence.
+
+Final: **12 mutations, 11 caught, 1 equivalent.**
+
+The convergence gate also corrected a false claim of mine. I first asserted that
+a one-iteration fit gives *different* centres from the converged one; it does
+not. On separated blobs the first pass already finds the final assignment, so
+the second moves nothing — the loop simply cannot know that until it has run and
+measured a zero shift. So the thing to assert is the **count**, not the centres,
+and the test says so explicitly rather than leaving a reader to wonder why the
+weaker-looking assertion is the right one.

@@ -36,6 +36,7 @@ include "../bkit/compose.b"    as compose;
 include "../bkit/tree.b"       as tree;
 include "../bkit/ensemble.b"   as ens;
 include "../bkit/decompose.b"  as dec;
+include "../bkit/cluster.b"    as cl;
 
 $R = {"pass": 0, "fail": 0};
 def ok($c, $n) {
@@ -221,7 +222,12 @@ $registry = [
     ["PCA(2)",            dec.PCA(2),                                $Xc, null],
     ["PCA(all)",          dec.PCA(null),                             $Xc, null],
     ["PCA(0.9)",          dec.PCA(0.9),                              $Xc, null],
-    ["TruncatedSVD(2)",   dec.TruncatedSVD(2),                       $Xc, null]
+    ["TruncatedSVD(2)",   dec.TruncatedSVD(2),                       $Xc, null],
+    // A CLUSTERER, which is a task base.b's score() does not dispatch on -- so
+    // KMeans provides its own (negated inertia, higher-is-better) and the
+    // protocol checks that an estimator with no y still satisfies the contract.
+    ["KMeans(3)",         cl.KMeans({"n_clusters": 3, "n_init": 2}),  $Xc, null],
+    ["KMeans(2)",         cl.KMeans({"n_clusters": 2, "n_init": 1}),  $Xc, null]
 ];
 
 print("");
@@ -238,7 +244,7 @@ while ($i < len($registry)) {
     else { ok(false, $nm + " violates the protocol: " + str($bad)); }
     $i = $i + 1;
 }
-eqs(len($registry), 59,
+eqs(len($registry), 61,
     "the registry names every estimator K2-K8 added, in every mode");
 
 // ── the check can still fail ────────────────────────────────────────────────
